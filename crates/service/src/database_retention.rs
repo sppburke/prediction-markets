@@ -243,6 +243,9 @@ pub(crate) fn retention_paper_state(
     let mut latest_prepared = None;
     for frame in frames {
         match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_)) => {
+                latest_prepared = None;
+            }
             PaperLogFrame::Record(PaperLogRecord::MembershipChanged { removed, added, .. }) => {
                 for wallet in removed.iter().chain(added) {
                     membership.insert(

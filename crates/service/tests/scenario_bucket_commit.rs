@@ -3042,6 +3042,7 @@ async fn valid_pending_restart_resumes_once() {
             start_receipt,
             pe_core_types::CollateralAmount::from_decimal_exact(rust_decimal::Decimal::from(1_000))
                 .unwrap(),
+            None,
         )
         .unwrap();
     let rows = [

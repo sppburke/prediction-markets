@@ -649,6 +649,7 @@ async fn run_case(boot_waves: bool) {
         .reset_financial_era(
             start_receipt,
             CollateralAmount::from_decimal_exact(dec!(10000)).unwrap(),
+            None,
         )
         .unwrap();
     *state.start.lock().unwrap() = Some(start_receipt);
@@ -1287,6 +1288,7 @@ impl CheckpointFixture {
             .reset_financial_era(
                 receipt,
                 CollateralAmount::from_decimal_exact(dec!(10000)).unwrap(),
+                None,
             )
             .unwrap();
         *state.start.lock().unwrap() = Some(receipt);

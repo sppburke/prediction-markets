@@ -73,6 +73,7 @@ async fn exact_paper_api_contract_uses_decimal_strings() {
     db.reset_financial_era(
         start,
         CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+        None,
     )
     .unwrap();
     db.apply_financial_fill(
@@ -175,6 +176,7 @@ async fn paper_pnl_is_typed_unavailable_when_price_is_missing() {
     db.reset_financial_era(
         start,
         CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+        None,
     )
     .unwrap();
     db.apply_financial_fill(

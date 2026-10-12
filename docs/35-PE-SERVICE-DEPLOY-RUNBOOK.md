@@ -264,6 +264,12 @@ create a generation, stage new state paths, invoke `seed_v1_empty.sh`, or replac
 `/home/sean/pe-financial-era.json` (`kind: financial-era-v1`) is the sole financial-transition
 manifest.
 
+This section is the **first-era activation** route. Its `Legacy17` initialization, installed-old
+artifact checks against #557, `rehearsal545.sh`, schema/config installation and absent-fixed-path
+manifest retirement apply only before the generation's first Start. After a verified financial era,
+use the [#770 successor route](#770-successive-financial-era-paper-pl-reset); it uses the currently
+installed old authority and atomically replaces the fixed manifest without removing it first.
+
 ### Bounded final-head rehearsal
 
 Run the final-head harness before financial activation. Pass the same reviewed `service.toml` and
@@ -769,6 +775,325 @@ cases belong to `crates/service/tests/scenario_bucket_commit.rs`, except the rea
 exact reviewed release before deployment. A passing census never substitutes for boot
 validation or the first financial Start procedure.
 
+## #770 successive financial era (paper P&L reset)
+
+This is the separately authorized reset inside an existing generation. It archives the current
+Supabase `paper_fills`, `settled_markets`, `paper_positions`, `paper_bankroll` and
+`fill_market_snapshots`, resets the local financial book, and appends a successor
+`QualificationStarted`. Decisions, anchors, fences, structural membership, first-entry history and
+all three logs carry over. Historical ranker statistics remain. Qualification and membership retain
+the generation's first Start and its existing seal; the successor re-pins no members and creates no
+seal or report. The contracts are owned by the
+[glossary](_GLOSSARY.md#paper-qualification-measurement--quantified) and
+[retention policy](_GLOSSARY.md#paper-source-retention-release-2).
+
+**Consent and scheduling.** The owner chose paper on schedule, reset later. Complete #757's VPS
+paper-mode cutover before this reset; the archive includes every trade before this later transition,
+including new-rule trades. Obtain explicit owner consent for the capture stop, fresh bankroll,
+acceptance of the rehearsal PASS and measured timings, and production stop. Neither this runbook nor
+a driver invocation grants any of those consents. Select the configured `bankroll_usd` as the default
+baseline and pass it explicitly as `--fresh-bankroll`; it must equal the effective reviewed target
+config, including environment overrides. Live accounts must remain requested/effective `off` and
+unarmed; the driver only observes them and never changes their modes.
+
+Schedule the stop window away from UTC midnight. `start_unix` is chosen once when the manifest is
+created and remains fixed on retry. Before its first following UTC midnight, risk uses the new
+starting bankroll baseline; from that cutoff it requires a new-era mark. If the window crosses
+midnight, admission fails closed with `MarkMissing` until normal poller catch-up writes that mark.
+The new bankroll also becomes the basis for the glossary's
+[cash floor](_GLOSSARY.md#cash-fraction-sizing) and
+[absolute-loss policy](_GLOSSARY.md#drawdown-policy).
+
+### Quiesced capture and successor rehearsal
+
+The harness consumes a caller-supplied capture and captures nothing from production. Under the
+deploy lock and the [Procedure](#procedure)'s ownership, stop and census rules, measure the consented
+stop, prove quiescence, and make a sparse copy of the checkpointed SQLite main and all three logs.
+Keep the complete retention inventory together: authority, dense receipts, pins in the source log,
+committed feed files, checkpoint manifest and invalidation companions, and any captured history
+input. Export the matching authority rows in a read-only repeatable-read transaction while the
+service is inert. Record the capture's stop/restart duration separately from transfer and rehearsal.
+Restart through fresh clearance, then re-prove ownership; preserve the original capture unchanged.
+
+The authority CSVs include the current paper tables and their archives, all raw `service_config`
+rows, `accounts`, `service_watchlist`, `service_runtime`, `ranking_batches` and `ranking_entries`.
+Never export `account_credentials`. Keep their exact export columns; materialized views are refreshed
+locally.
+
+The capture directory contains `capture.json`, `copied.sha256`, `state/`, `authority/*.csv`,
+`pe-financial-era.json` (the verified predecessor) and `pe-activation.json` (#557). Inventory every
+regular file except `copied.sha256` itself with relative-path SHA-256 entries. Symlinks, an
+incomplete inventory, changed bytes and SQLite `-wal` or `-shm` files refuse the harness. Include
+the installed-old binary, config, unit policy and secret-free normalized environment template in
+that inventory. The template retains non-secret assignments and uses placeholders for private
+credentials; never transfer production secrets. Record original environment SHA-256, template
+SHA-256 and every path, endpoint and credential substitution in a transformation receipt.
+
+`capture.json` has `kind: successor-capture-v1`, `quiesced: true`, `old_tuple` and
+`environment_transformations`. `old_tuple` binds `binary_sha256`, `config_sha256`,
+`environment_sha256` (the original installed file), `environment_template_sha256` and
+`unit_policy_sha256`. The separate unit-policy JSON supplies `KillSignal` and `TimeoutStopSec` from
+the captured installed unit. The installed-old inputs are distinct from the reviewed target tuple:
+pre-transition boot and rollback use old; adoption uses target.
+
+Run the reviewed tree's harness on a fresh isolated root:
+
+```bash
+scripts/deploy/rehearsal_successor.sh \
+  --capture <quiesced-capture-directory> \
+  --run-root <fresh-private-run-directory> \
+  --target-binary <reviewed-pe-service> \
+  --target-config <reviewed-service.toml> \
+  --target-environment <reviewed-production-env> \
+  --old-binary <captured-installed-pe-service> \
+  --old-config <captured-installed-service.toml> \
+  --old-environment <captured-secret-free-env-template> \
+  --old-unit-policy <captured-unit-policy.json> \
+  --fresh-bankroll <approved-configured-bankroll>
+```
+
+The same inputs with `--dry-run` print the input and evidence contracts without running the
+rehearsal. Optional `--pg-port`, `--http-port`, `--service-port` and `--postgrest-port` select distinct
+private ports. Before launching either tuple, the harness checks the SQLite copy against the export:
+predecessor Start, Prepared cursor, financial rows, cash and holdings. A mismatch refuses before
+transition. The old binary's boot and the successor preflight validate the paper chain and
+membership.
+
+It sparsely clones the validated base, rebinds migration paths only in the private copy through the
+existing `--update-paper-migration-paths` owner, and uses a private loopback PostgreSQL and PostgREST
+authority loaded from the capture's export, with freshly minted local keys. Bootstrap without prior
+PASS is allowed only under testing mode after isolated paths, loopback HTTP/SQL endpoints and local
+credentials are proved. Production has no PASS bypass. A `systemctl` shim forwards the real driver
+to a private user unit: census, disable/stop, clearance and activation checks run against real
+processes. `verify_installed_unit_owner` retains its testing-mode skip because it needs the
+production credential directory/environment; the evidence explicitly says
+`ownership_proof: skipped: testing mode`. Production still requires that proof before its stop.
+
+Readiness needs a successful venue poll, and the `verified` status proof needs the activity
+websocket on (`source_health` is published only then; its address is fixed in the binary). The dev
+box shares Forge's public address, and the venue rate-limits Forge's request API, so keep the
+websocket on and pass `--venue-url http://127.0.0.1:28009`, a loopback endpoint that answers every
+request with an empty JSON list. The harness points the private environments'
+`PE_POLYMARKET_BASE_URL`, `PE_GAMMA_BASE_URL` and `PE_POLYMARKET_CLOB_BASE_URL` at it and records the
+substitution in each branch's transformation receipt. Do not edit the venue addresses into either
+environment input: the evidence binds the target environment's hash, and activation compares it with
+the reviewed production file.
+
+```bash
+python3 -c 'import http.server as h
+class S(h.BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length","2"); self.end_headers(); self.wfile.write(b"[]")
+    def log_message(self,*a): pass
+h.ThreadingHTTPServer(("127.0.0.1",28009),S).serve_forever()'
+```
+
+The forward clone exercises `prepared → guarded → archive → Start → seed → adopt → started →
+verified`, interrupted at guarded and before producers start. Before starting producers it checks
+the fresh authority's empty detail tables, new Start/bankroll and null Prepared cursor, archive
+counts against the guarded census, and unchanged predecessor archives. The forward unit is stopped
+before the rollback clone starts, keeping the unrestricted census meaningful.
+
+The rollback clone keeps the exact target bytes. After its remote archive commits, the harness
+holds the paper writer's existing exclusive lock: Start commits the local reset, then fails opening
+the writer. The harness requires the expected local Start identity and writer-lock error. With the
+lock released and cached status deliberately stale, rollback must certify exact remote row-set
+restoration and SQLite backup-byte equality with absent sidecars while inert. It then reinstates the
+predecessor, resumes the old service and succeeds with a fresh transition id through `verified`.
+
+PASS prints `SUCCESSOR_REHEARSAL_PASS` and writes `<run-root>/evidence.json` with kind
+`successor-rehearsal-evidence-v1`, binding `<run-root>/result.json` by SHA-256. The result binds
+original old/target identities separately from normalized copy identities and transformations,
+generation, predecessor manifest SHA-256 and Start, capture inventory, execution closure, stop
+policy, PASS rows and phase timings. Preserve both JSON files and branch logs. The driver's closure
+owner is `scripts/deploy/generation_common.sh::successor_harness_bundle_digest`: it covers the
+harness, activation driver, sourced helper, census helper and SQL files. Changing any of those
+bytes invalidates the evidence. The original old tuple must match production's ownership-verified
+installed binary/config/environment before the production stop; a regression capture of another
+installed tuple cannot satisfy that gate.
+
+The PASS rows do not observe boot membership, seal suppression or the retention pause. Record
+them from the forward unit's journal alongside the rehearsal: the first `pe-service listening`
+wallet list after Start equals the pre-transition boot's, no `qualification seal started` line
+appears, and after the first hourly tick the `source retention` line's `skip_reason` is not
+`unsealed_start`.
+
+For the local historical regression bundle, preserve the unprimed snapshot separately. Prime only
+a private copy with a retention-capable old tuple under private authority through a retention
+advance, then stop, prove quiescence, export that progressed authority and regenerate the inventory
+and consistency proof. Record that priming tuple as installed-old. An earlier binary unable to boot
+a retained log cannot be its rollback tuple. Regression PASS alone does not authorize production.
+
+### Stage and activate
+
+Stage the reviewed binary, complete target config/environment, full execution closure and bound
+PASS result on the production host. Keep the result's absolute `manifest_path` resolvable and its
+bytes unchanged. Verify staged revision/BLAKE3 and file hashes before entry; do not replace installed
+artifacts by hand. The installed current binary/config/environment are rollback authority, even
+after an ordinary redeploy; #557 remains only generation identity, not the successor's old artifact
+hash authority. The Financial15 read-only helper checks callable signatures/grants, absence of
+retired overloads, account-read privileges, role attributes and bankroll Start columns before stop,
+before Start and on roll-forward.
+
+Successor mode exports every raw `service_config` row. Rust partitions optional
+`risk_halt_release_hash` through the existing incident-control owner, then parses Financial15 and
+hashes the economic rows. Absent or valid incident control does not change that hash; malformed,
+duplicate or wrong-type incident rows warn and are ignored under that owner's policy. They cannot
+release a halt during these offline commands. Retired economic keys, including `fill_mode` and
+`polymarket_fee_rate`, and unknown keys refuse. The optional Kelly override retains its runtime
+parsing policy; the shell maintains no second key allowlist.
+
+Record the SHA-256 of the fixed **verified predecessor** manifest before entry. Run from the exact
+staged release tree, with the admin URL loaded without exposing it in argv or shell tracing:
+
+```bash
+read -r SUPABASE_DB_URL < <mode-0600-session-pooler-url-file> && export SUPABASE_DB_URL
+scripts/paper_reset/activate_financial_era.sh \
+  --target-binary <reviewed-pe-service> \
+  --target-config <reviewed-service.toml> \
+  --target-environment <reviewed-production-env> \
+  --paper-log <active-generation-paper.log> \
+  --source-log <active-generation-source_events.log> \
+  --live-journal <active-generation-live_journal.log> \
+  --paper-state <active-generation-paper_state.db> \
+  --fresh-bankroll <approved-configured-bankroll> \
+  --rehearsal-evidence <successor-evidence.json> \
+  --successor-of <verified-predecessor-manifest-sha256>
+```
+
+Supply neither `--membership-json` nor `--ranking-batch-id`; either flag refuses in successor mode.
+The Start carries `membership: []`, the predecessor's batch and an empty-set proof binding.
+First-era mode still requires nonempty membership and a supplied batch. Successor version fields
+are checked against the compiled schema, financial-semantic and Start-parser owners; the Start
+envelope retains its paper-log schema.
+
+Under the provisioned deploy lock, a fresh entry verifies predecessor identity/latest Start,
+generation seal, guards, target and PASS bindings, and transition freshness. It generates
+`era-<UTC yyyymmddThhmmssZ>` once, refuses used Start ids, archive stamps, retired-manifest and
+backup collisions, and durably copies the predecessor to
+`/home/sean/pe-financial-era.<predecessor-id>.verified.json`. An identical existing copy is accepted;
+a conflicting copy refuses. It atomically replaces `/home/sean/pe-financial-era.json` with the
+complete `prepared` successor manifest, preserving continuous authority. The transition id is the
+archive stamp and successor activation id; `generation_activation_id` keeps #557 identity separate.
+
+Before stop, production ownership proof and serving census permit only the unit's verified MainPID.
+The driver checks a privileged authority account census separately from cached `status.json`, both
+before and after stop; every requested/effective account mode must be `off`. It records stop intent,
+disables and stops, proves disabled/inactive, MainPID zero and old-PID exit, then clears a fresh
+unrestricted census. Every stopped resume and the interval immediately before enable/start repeat
+clearance; old receipts grant none. A stray or uninspectable process refuses before backup, reset or
+artifact mutation. An already-running target is accepted only after fresh ownership and census.
+
+Successor `--financial-era=preflight` is a short local check: it reads the small paper log, durable
+local state/live journal, target config and cached posture, but **does not rebuild the source log**
+(`crates/service/src/qualification.rs:5671`). The shared guards refuse active risk halts, active feed
+incidents, any live-journal record, durable dispatch seeds, open decisions or invalid/unmatched
+Prepared/Final work. Version, bankroll, predecessor and generation-seal mismatches also refuse.
+The driver repeats preflight immediately after stopping, before the backup.
+
+The stopped driver takes and integrity-checks the complete backup
+`/home/sean/prediction-markets/financial-era-<transition-id>-paper-state.db`, records remote census
+and immutable log hashes, then calls read-only `prepare`. Preparation rebuilds the source index
+with `SourceReceiptIndex::replay`, authenticating retention authority, durable receipts, pins and
+retained window, and binds its verified tail. Thus damaged retained source evidence refuses at
+prepare **after stop and backup, before any archive/reset**. Start fully recomputes preparation,
+including another rebuild; changed evidence refuses before the local reset or append. Rollback-check
+with a preparation also rebuilds for continuity. No preflight source-rebuild timing is implied.
+
+From `guarded`, remote archive/reset runs under the transition id, followed by local reset and the
+synced successor Start. After Start, the driver records `skipped: successor` receipts for the
+first-era paper schema, live schema and #545 config migration, seeds the new authority Start,
+refreshes `wallet_live_stats_mv`, adopts the hash-bound artifacts after cleared census, enables and
+starts once, records `started`, and exits. Run the **same command a second time** to reach `verified`.
+Fresh status and readiness must already pass; there is no driver wait/soak. If incomplete, retain
+the manifest and rerun. New-era fills and legitimate membership maintenance are allowed meanwhile.
+
+### Resume, rollback and verification
+
+Forward resume accepts `prepared`, `guarded` or `started` with the same predecessor, paths,
+bankroll and target identities; reuse the original `--successor-of` hash and persisted transition id
+and timestamp. An interrupted `rolling_back` resumes only with the same command plus
+`--rollback-before-start`; forward entry refuses until rollback and predecessor reinstatement
+complete. Never remove the fixed manifest or manually advance it. A resumed stop that already
+disabled the unit skips the pre-stop early warnings, and rollback re-enables an old unit that is
+still running but was disabled.
+
+Successor rollback-check preserves `complete_start` and adds
+`start_state: absent | partial | complete`. Once the manifest holds a preparation it also returns
+`source_continuity: {authenticated: true, anchor: {sequence, hash, end_offset}}`; the anchor is the
+preparation's source prefix (`crates/service/src/qualification.rs:6262`). A broken anchor fails the
+command. Only stopped pre-Start recovery may repair a torn paper append against that trusted prefix.
+A complete expected Start is idempotent and always forces roll-forward, even when shell state or
+status lags. A different latest Start conflicts. Successor pre-Start rollback uses durable evidence
+and does not require a fresh cached live-status sample.
+
+Rollback first reconciles any remote archive intent with its durable stamp. Before reinstating the
+predecessor it accepts only one of these certified outcomes:
+
+- **No financial mutation:** `no_financial_mutation: true`, no archive stamp, no local reset or
+  successor Start, latest Start still predecessor, and original installed authority preserved.
+  Archive and backup artifacts are unnecessary when the refusal happened before they existed.
+- **Archive committed:** exact restored remote row sets, local backup bytes and absent SQLite
+  sidecars are certified while inert; the predecessor remains latest. The restore receipt is
+  persisted before the old service resumes.
+
+If preparation/guarded source evidence exists, resumed rollback and reinstatement authenticate its
+anchor through the retention-aware index. Paper/live prefix checks remain byte-based; raw source
+byte equality is used only while stopped and immutable. Legitimate old-service fills, settlements
+and retention advances after an evidenced restart are preserved; the running book need not equal
+its backup. A certified no-mutation rollback that never reached guarded needs no manufactured source
+binding. The next attempt's stopped preparation verifies the current source before financial
+mutation.
+
+The driver copies the failed manifest to
+`/home/sean/pe-financial-era.<transition-id>.rolled_back.json` and atomically reinstates the saved
+verified predecessor. Interrupted retirement/reinstatement resumes through the same rollback
+command. A subsequent forward invocation with that predecessor hash creates a **new** transition id;
+the rolled-back id is never reused.
+
+`verified` proves installed and local/remote Start identity, fresh authoritative paper status and
+applied hot hash, healthy required producers/critical owners, live off/unarmed with no dispatch
+work, and one successful ready response. It takes a coherent observation per store and independently
+derives cash from the new Start bankroll minus fill principal/fees plus settlement credits, with
+aggregate-per-outcome rounding. It reconstructs net quantities from financial fills and compares
+physical position rows, including rows retained after settlement. Each cursor must equal that
+store's maximum fill/settlement Prepared sequence, or null when empty, with financial rows after
+the latest Start. The shipped conservation helper checks those sequence bounds and the maximum;
+it does not match each store row to an authenticated Prepared receipt in the paper log. Authority
+progress may lead the local projection; cross-store simultaneous equality is not required.
+Projection convergence requires the status token to equal
+`service_runtime.updated_at` and the applied/status count to equal `service_watchlist` rows.
+Retention-aware source continuity and paper/live prefixes must pass. Neither manifest membership
+nor `max(batch_id)` is compared (`verified_ranking_membership: skipped: successor`).
+
+After the materialized-view refresh and the site's existing page revalidation, confirm that paper
+P&L/trades contain only the current era; new-era trades may already appear. Historical ranking
+statistics remain. This dashboard confirmation is an operator check, not a driver PASS field.
+
+**Recovery-required.** Inactive/failed activation, nonzero `ExecMainStatus` (including status 78),
+unknown unit outcomes, or interrupted enable/start require diagnosis from the unit journal and
+durable receipts before retry. The driver attempts to normalize a failed start to disabled/stopped,
+certifies clearance only after its stop proof passes, and emits `recovery-required`. A failed unit
+stays `failed` after `systemctl stop`, and the
+stop proof requires `inactive`, so a rerun refuses instead of restarting a status-78 binary. Record
+the outcome as in [O2](#o2--deployment), preserving retention authority, receipts, pins, feed files
+and checkpoint companions, then `systemctl reset-failed pe-service` and rerun the same command.
+Never enable manually or advance the manifest to bypass it.
+Before complete Start, use the certified rollback route. After complete Start, preserve the era and
+fix forward with a compatible reader: an older one-Start reader is no rollback target. Keep all
+archives, manifests and backups.
+
+**Stop timings.** Retain every stderr line shaped
+`financial-era timing phase=<phase> elapsed_ns=<duration> result=<exit-status>`.
+The shipped component phases are `preflight`, `prepare`, `start`, `rollback-check`, `sqlite_backup`,
+`sqlite_integrity`, `hashing` and `authority`. Distinguish each repeated invocation; source rebuilds
+are inside prepare, non-idempotent Start and preparation-bearing rollback-check, not preflight.
+The harness records branch invocation timings and stop-phase durations through readiness in
+`timings.tsv` and `stop-durations.tsv`, bound in PASS evidence. Report stop/census, retained
+verification, backup/integrity, hashing, authority calls and boot-to-ready separately, including any
+unattributed time; component lines do not cover every driver helper. Give host/storage differences
+and measured transfer time as diagnostics. Dev-host timings are not a bound on VPS downtime. The
+owner reviews this breakdown and accepts the PASS before consenting to production reset.
+
 ## Facts
 
 | item | value |
@@ -887,8 +1212,10 @@ checkout/binary pair and restore the recorded run intent. This Forge release nee
 owner's consent for this restart. Re-run `scripts/probe_activity_ws.py` and record the source
 re-verification in [15-SOURCES.md](15-SOURCES.md) before deployment. Use the same locked,
 identity-bound swap below: prepare the source checkpoint with the staged binary while the old
-service runs, then activate with one restart. Preserve the existing Start and seal; create
-neither a second Start nor a second seal. Open continuation-6 work resumes under financial
+service runs, then activate with one restart. An ordinary in-era update preserves the existing Start
+and seal and creates neither. Only the separately authorized
+[#770 reset](#770-successive-financial-era-paper-pl-reset) creates a successor Start, with no new
+seal. Open continuation-6 work resumes under financial
 semantic 2 before the semantic-3 seal check; continuation 7 selects semantic 3. Verify boot
 replay before and after REST reconciliation before deployment, then capture the first frame
 fill's AC15 evidence and the frozen AC16 cohort using

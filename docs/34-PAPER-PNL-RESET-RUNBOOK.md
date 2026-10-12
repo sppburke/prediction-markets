@@ -11,6 +11,11 @@ issue #545. The latter preserves the active generation, database, all three fram
 anchors, and fences; it resets only financial rows and appends `QualificationStarted`. Never invoke
 `seed_v1_empty.sh` for a financial-era transition.
 
+For a reset after an existing financial Start, use
+[docs/35's #770 successive financial-era procedure](35-PE-SERVICE-DEPLOY-RUNBOOK.md#770-successive-financial-era-paper-pl-reset).
+It preserves the generation, creates no new generation, and carries structural membership and the
+generation's qualification seal across the financial reset.
+
 ## Authority and invariants
 
 Paper state spans Supabase, the local SQLite main, `paper.log`, `live_journal.log`, and

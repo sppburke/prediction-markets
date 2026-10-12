@@ -24,8 +24,8 @@ use pe_service::paper_migration::{
     validate_initial_configuration, validate_migration_authority,
 };
 use pe_service::paper_recovery::{
-    active_risk_halts, build_leader_ledger, paper_era, reconcile_paper_state, replay_membership,
-    scan_paper_log,
+    active_risk_halts, build_leader_ledger, paper_era, paper_generation, reconcile_paper_state,
+    replay_membership, scan_paper_log,
 };
 use pe_service::position_seeder::CausalPositionValidator;
 use pe_source_polymarket_public::{
@@ -504,14 +504,16 @@ async fn run() -> Result<()> {
     // Derive the financial era exactly once, from the verified paper log, before constructing
     // any HTTP client. A Start has no local-authority interpretation: credentials and the
     // Start-bound Supabase protocol are mandatory for every subsequent boot.
-    let financial_era = if cfg.event_log_path.exists() {
-        Some(paper_era(
+    let paper_frames = if cfg.event_log_path.exists() {
+        Some(
             scan_paper_log(&cfg.event_log_path)
                 .context("verify paper log and derive financial era")?,
-        ))
+        )
     } else {
         None
     };
+    let membership_generation = paper_frames.clone().map(paper_generation);
+    let financial_era = paper_frames.map(paper_era);
     let financial_start_record = financial_era.as_ref().and_then(|era| era.start.clone());
     let active_risk_halt_count = financial_era
         .as_ref()
@@ -685,7 +687,9 @@ async fn run() -> Result<()> {
         HashMap<_, _>,
         Option<i64>,
         bool,
-    ) = if let Some((_, start)) = &financial_start_record {
+    ) = if let Some(generation) = &membership_generation
+        && let Some((_, start)) = &generation.start
+    {
         let (start_batch, mut start_last_trade) = supabase_reader::fetch_batch(
             &ranking_client,
             &cfg.supabase_url,
@@ -695,15 +699,12 @@ async fn run() -> Result<()> {
         )
         .await
         .context("fetch QualificationStarted ranking batch")?;
-        let era = financial_era
-            .as_ref()
-            .context("QualificationStarted is missing its financial era")?;
         let replayed = match source_log_boot.as_ref() {
-            Some(boot) => boot.replay_membership(era, start_batch),
-            None => replay_membership(era, start_batch, &cfg.source_event_log_path),
+            Some(boot) => boot.replay_membership(generation, start_batch),
+            None => replay_membership(generation, start_batch, &cfg.source_event_log_path),
         }
         .context("replay Start-bound structural membership")?
-        .context("QualificationStarted is missing from its financial era")?;
+        .context("QualificationStarted is missing from its membership generation")?;
         let restored = replayed
             .watchlist
             .entries

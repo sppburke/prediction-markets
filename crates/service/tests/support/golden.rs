@@ -542,6 +542,22 @@ impl SupabaseStateTrait for GoldenAuthority {
     }
 }
 
+struct UnavailableFrameIdentity;
+
+impl pe_source_polymarket_public::ReconciliationFetcher for UnavailableFrameIdentity {
+    fn fetch<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, pe_source_core::SourceError>> + Send + 'a>>
+    {
+        Box::pin(async {
+            Err(pe_source_core::SourceError::Fatal {
+                message: "duplicate fixture uses its durable identity owner".to_owned(),
+            })
+        })
+    }
+}
+
 #[derive(Default)]
 struct GoldenBookFetcher {
     books: Mutex<HashMap<String, OrderBook>>,
@@ -1559,6 +1575,7 @@ fn derive_golden_start(
         guarded_logs: None,
         start_receipt: None,
         started_unix: None,
+        predecessor_start: None,
     };
     let manifest_path = dir.join("financial-era.json");
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -1751,6 +1768,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
         .reset_financial_era(
             start_receipt,
             CollateralAmount::from_decimal_exact(STARTING_BANKROLL).unwrap(),
+            None,
         )
         .unwrap();
     let authority = GoldenAuthority::new(start_receipt);
@@ -2982,10 +3000,57 @@ impl BracketFinancialHarness {
             .reset_financial_era(
                 start,
                 CollateralAmount::from_decimal_exact(STARTING_BANKROLL).unwrap(),
+                None,
             )
             .unwrap();
+        let terminal_unix = if deployed {
+            start_unix + 1 + i64::try_from(QUALIFICATION_DAYS).unwrap() * DAY_SECS
+        } else {
+            100
+        };
+        Self::boot_existing(
+            dir,
+            paper,
+            golden_watchlist(initial_wallets),
+            runtime,
+            deployed,
+            terminal_unix,
+        )
+        .await
+    }
+
+    /// Boot the recorded financial era without adding a Start or changing structural membership.
+    pub(crate) async fn boot_existing(
+        dir: &std::path::Path,
+        paper: Arc<PaperStateDb>,
+        initial: Watchlist,
+        runtime: RuntimeConfig,
+        deployed: bool,
+        terminal_unix: i64,
+    ) -> Self {
+        let paper_path = dir.join("paper.log");
+        let source_path = dir.join("source.log");
+        let live_path = dir.join("live_journal.log");
+        let era = paper_era(scan_paper_log(&paper_path).unwrap());
+        let start_unix = era.frames[0].envelope.received_at.0.unix_timestamp();
+        let (start, started) = era.start.unwrap();
+        let bankroll = started.starting_bankroll.to_decimal();
         let authority = GoldenAuthority::new(start);
+        authority.state.lock().unwrap().bankroll = bankroll;
         let receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+        let paper_log = pe_service::paper_recovery::PaperLog::open(&paper_path).unwrap();
+        assert_eq!(
+            pe_service::supabase_state::reconcile_active_financial_frames(
+                &authority,
+                &paper,
+                pe_service::supabase_state::SourceEvidence::Index(&receipts),
+                &paper_log,
+            )
+            .await
+            .unwrap(),
+            0
+        );
+
         let (source, source_rx) = SourceLogHandle::channel(64);
         let (trigger_tx, trigger_rx) = mpsc::channel(1);
         let coordinator = tokio::spawn(
@@ -3025,15 +3090,14 @@ impl BracketFinancialHarness {
             .financial_clock_unix
             .store(100, std::sync::atomic::Ordering::SeqCst);
         let books = Arc::new(GoldenBookFetcher::default());
-        let initial = golden_watchlist(initial_wallets);
         let live = LiveWatchlist::new(initial.clone());
         let writer_lock = Arc::new(tokio::sync::Mutex::new(()));
         let (control, control_rx) = mpsc::channel(4);
         let mut orchestrator = Orchestrator::new_with_authority(
             live.clone(),
             OrchestratorConfig {
-                bankroll: STARTING_BANKROLL,
-                mode: if mode == "shadow" {
+                bankroll,
+                mode: if runtime.mode == "shadow" {
                     ExecutionMode::Shadow
                 } else {
                     ExecutionMode::Paper
@@ -3045,7 +3109,9 @@ impl BracketFinancialHarness {
                 min_fill_price: runtime.min_fill_price,
                 price_impact_cap_bps: 300,
                 entry_gate_config: CopyEntryGateConfig,
-                runtime_config: None,
+                runtime_config: Some(pe_service::runtime_config::LiveRuntimeConfig::new(
+                    runtime.clone(),
+                )),
                 live_accounts: deployed.then(|| accounts.clone()),
                 live_journal: deployed.then(|| {
                     Arc::new(pe_execution_core::LiveJournal::open(&live_path).unwrap()).into()
@@ -3055,7 +3121,7 @@ impl BracketFinancialHarness {
                 watchlist_writer_lock: Some(writer_lock.clone()),
             },
             WinnerFollowStrategy::new(runtime.winner_follow_config()),
-            pe_service::paper_recovery::PaperLog::open(&paper_path).unwrap(),
+            paper_log,
             paper.clone(),
             pe_service::paper_recovery::build_leader_ledger(&paper).unwrap(),
             new_shared_health_with_ws(false, true, 90),
@@ -3076,6 +3142,18 @@ impl BracketFinancialHarness {
             books.clone(),
         )
         .unwrap();
+        orchestrator = orchestrator.with_activity_frames(
+            source.clone(),
+            90,
+            Arc::new(
+                pe_service::asset_identity::AssetIdentityResolver::new_runtime(
+                    Arc::new(UnavailableFrameIdentity),
+                    "fixture://gamma".to_owned(),
+                    pe_source_polymarket_public::GAMMA_BATCH_SIZE,
+                    source.clone(),
+                ),
+            ),
+        );
         orchestrator.set_scenario_hooks(hooks.clone());
         orchestrator
             .configure_financial_log_paths(
@@ -3098,12 +3176,7 @@ impl BracketFinancialHarness {
         // One fixed terminal instant at the end of the recorded financial window; the short
         // bracket cases use their existing financial clock. Admission/Prepared clocks remain
         // independently controlled by each attempt's hooks.
-        let terminal_at = OffsetDateTime::from_unix_timestamp(if deployed {
-            start_unix + 1 + i64::try_from(QUALIFICATION_DAYS).unwrap() * DAY_SECS
-        } else {
-            100
-        })
-        .unwrap();
+        let terminal_at = OffsetDateTime::from_unix_timestamp(terminal_unix).unwrap();
         let actor = tokio::spawn(
             pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK
                 .scope(terminal_at, orchestrator.run(std::future::pending::<()>())),
@@ -3207,7 +3280,7 @@ impl BracketFinancialHarness {
         self
     }
 
-    async fn entries_in_one_bucket(
+    pub(crate) async fn entries_in_one_bucket(
         &self,
         paper: &PaperStateDb,
         wallet: WalletAddress,
@@ -3215,17 +3288,34 @@ impl BracketFinancialHarness {
         indices: &[usize],
     ) {
         let mut rows = Vec::new();
+        let mut admissions = Vec::new();
         for index in indices {
             let bodies = golden_trade_bodies(*index, epoch);
-            self.record_entry_admission(&bodies, epoch).await;
             let mut activity: Vec<serde_json::Value> =
                 serde_json::from_slice(&bodies.activity).unwrap();
             activity[0]["proxyWallet"] = wallet.to_string().into();
             rows.extend(activity);
+            admissions.push(bodies);
         }
         let payload = serde_json::to_vec(&rows).unwrap();
         let page = append_source_at(&self.source, ACTIVITY_POLL_SOURCE_ID, &payload, epoch).await;
         let read = support::producer_shaped_read_v2(wallet, &payload, epoch, epoch, page);
+        // The bucket owner resumes groups in canonical identity order.
+        let mut ordered = read.aggregates.iter().collect::<Vec<_>>();
+        ordered.sort_by(|a, b| a.group_id.key().0.cmp(&b.group_id.key().0));
+        for aggregate in ordered {
+            let condition = aggregate
+                .group_id
+                .components()
+                .condition_id
+                .as_ref()
+                .unwrap();
+            let bodies = admissions
+                .iter()
+                .find(|bodies| &bodies.condition == condition)
+                .unwrap();
+            self.record_entry_admission(bodies, epoch).await;
+        }
         let commitment = append_source_at(
             &self.source,
             ACTIVITY_READ_COMMITMENT_SOURCE_ID,
@@ -3245,7 +3335,11 @@ impl BracketFinancialHarness {
             .await
             .unwrap();
         ack.await.unwrap().unwrap();
-        assert!(paper.open_decision_pending().unwrap().is_empty());
+        assert!(
+            paper.open_decision_pending().unwrap().is_empty(),
+            "pending at {epoch}: {:?}",
+            paper.open_decision_pending().unwrap()
+        );
     }
 
     pub(crate) fn entry_payload(wallet: WalletAddress, epoch: i64) -> Vec<u8> {
@@ -3305,6 +3399,61 @@ impl BracketFinancialHarness {
             .await
             .unwrap();
         ack
+    }
+
+    /// Repeat a recorded entry through the frame owner and its complete REST counterpart.
+    pub(crate) async fn repeat_entry(&self, wallet: WalletAddress, epoch: i64, delivered: i64) {
+        let bodies = golden_trade_bodies(1, epoch);
+        let mut frame: serde_json::Value = serde_json::from_slice(&bodies.websocket).unwrap();
+        frame["proxyWallet"] = wallet.to_string().into();
+        let receipt = append_source_at(
+            &self.source,
+            pe_service::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+            &serde_json::to_vec(&frame).unwrap(),
+            delivered,
+        )
+        .await;
+        self.control
+            .send(OrchestratorControl::ActivityFrameDecision { receipt })
+            .await
+            .unwrap();
+        let payload = Self::entry_payload(wallet, epoch);
+        let page =
+            append_source_at(&self.source, ACTIVITY_POLL_SOURCE_ID, &payload, delivered).await;
+        let read = support::producer_shaped_read_v2(wallet, &payload, delivered, delivered, page);
+        let commitment = append_source_at(
+            &self.source,
+            ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+            &read.commitment_payload,
+            delivered,
+        )
+        .await;
+        let mut context = support::read_context(&read, commitment, delivered);
+        context.applied_configuration = self.runtime.clone();
+        let (committed, ack) = oneshot::channel();
+        self.control
+            .send(OrchestratorControl::CommitActivityBucket {
+                aggregates: read.aggregates,
+                context: Arc::new(context),
+                committed,
+            })
+            .await
+            .unwrap();
+        ack.await.unwrap().unwrap();
+    }
+
+    pub(crate) fn runtime(&self) -> RuntimeConfig {
+        self.runtime.clone()
+    }
+
+    pub(crate) fn set_runtime(&mut self, runtime: RuntimeConfig) {
+        self.runtime = runtime;
+    }
+
+    pub(crate) fn set_clock(&self, unix: i64) {
+        self.hooks
+            .financial_clock_unix
+            .store(unix, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn mutations(&self) -> usize {
@@ -3479,7 +3628,7 @@ impl BracketFinancialHarness {
             .store(epoch, std::sync::atomic::Ordering::SeqCst);
     }
 
-    async fn deployed_boundary(&self, cutoff: i64) {
+    pub(crate) async fn deployed_boundary(&self, cutoff: i64) {
         self.hooks
             .financial_clock_unix
             .store(cutoff, std::sync::atomic::Ordering::SeqCst);

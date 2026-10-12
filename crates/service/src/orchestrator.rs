@@ -49,8 +49,8 @@ use crate::mark_prices::HistoricalMarkAdapter;
 use crate::mid_price_cache::MidPriceCache;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{
-    PAPER_LOG_SCHEMA_VERSION, PaperLogFrame, PaperLogRecord, PaperMarkPrice, PortfolioMark,
-    QualificationSealed, SealReason, TailBinding,
+    PAPER_LOG_SCHEMA_VERSION, PaperLogRecord, PaperMarkPrice, PortfolioMark, QualificationSealed,
+    SealReason, TailBinding,
 };
 use crate::risk_inputs::{
     BoundaryMarkError, RiskInputsUnavailable, SourceReceiptIndex, apply_global_risk_halts,
@@ -656,23 +656,18 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .financial_log_paths
             .as_ref()
             .ok_or_else(|| "qualification seal is unavailable before Start".to_owned())?;
-        let era = crate::paper_recovery::paper_era(
-            self.paper_writer
-                .snapshot()
-                .map_err(|error| error.to_string())?,
-        );
+        let frames = self
+            .paper_writer
+            .snapshot()
+            .map_err(|error| error.to_string())?;
+        if crate::paper_recovery::generation_qualification_sealed(&frames) {
+            return Ok(());
+        }
+        let era = crate::paper_recovery::paper_generation(frames);
         let (start_receipt, started) = era
             .start
             .as_ref()
             .ok_or_else(|| "qualification seal has no verified Start".to_owned())?;
-        if era.frames.iter().any(|frame| {
-            matches!(
-                &frame.frame,
-                PaperLogFrame::Record(PaperLogRecord::QualificationSealed(_))
-            )
-        }) {
-            return Ok(());
-        }
         if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
             return Err("qualification seal waits for the oldest unmatched Prepared".to_owned());
         }
@@ -767,11 +762,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .financial_log_paths
             .as_ref()
             .ok_or_else(|| "qualification seal check is unavailable before Start".to_owned())?;
-        let era = crate::paper_recovery::paper_era(
-            self.paper_writer
-                .snapshot()
-                .map_err(|error| error.to_string())?,
-        );
+        let frames = self
+            .paper_writer
+            .snapshot()
+            .map_err(|error| error.to_string())?;
+        if crate::paper_recovery::generation_qualification_sealed(&frames) {
+            return Ok(());
+        }
+        let era = crate::paper_recovery::paper_generation(frames);
         let (_, started) = era
             .start
             .as_ref()
@@ -810,11 +808,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .financial_log_paths
             .as_ref()
             .ok_or_else(|| "qualification seal check is unavailable before Start".to_owned())?;
-        let era = crate::paper_recovery::paper_era(
-            self.paper_writer
-                .snapshot()
-                .map_err(|error| error.to_string())?,
-        );
+        let frames = self
+            .paper_writer
+            .snapshot()
+            .map_err(|error| error.to_string())?;
+        let sealed = crate::paper_recovery::generation_qualification_sealed(&frames);
+        let era = crate::paper_recovery::paper_generation(frames);
         let seal_needed = era.start.as_ref().is_some_and(|(_, start)| {
             Self::qualification_seal_reason(
                 start,
@@ -822,12 +821,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 proposed_financial_semantic_version,
             )
             .is_some()
-        }) && !era.frames.iter().any(|frame| {
-            matches!(
-                &frame.frame,
-                PaperLogFrame::Record(PaperLogRecord::QualificationSealed(_))
-            )
-        });
+        }) && !sealed;
         if seal_needed && !self.pending_boot.is_empty() {
             // The seal digest requires terminal decisions. Finish only the preceding
             // generation's frozen continuations before sealing; no new source producer is
@@ -1546,12 +1540,19 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let mark_is_valid = mark.invalid.is_none();
         self.append_paper_record(&PaperLogRecord::PortfolioMark(Box::new(mark)))?;
         let completion = if mark_is_valid {
-            let era = crate::paper_recovery::paper_era(
-                self.paper_writer
-                    .snapshot()
-                    .map_err(|error| error.to_string())?,
-            );
-            crate::qualification::qualification_completion_for_causal_facts(&era, &completed)
+            let frames = self
+                .paper_writer
+                .snapshot()
+                .map_err(|error| error.to_string())?;
+            if crate::paper_recovery::generation_qualification_sealed(&frames) {
+                None
+            } else {
+                let generation = crate::paper_recovery::paper_generation(frames);
+                crate::qualification::qualification_completion_for_causal_facts(
+                    &generation,
+                    &completed,
+                )
+            }
         } else {
             None
         };
@@ -5687,6 +5688,7 @@ mod tests {
             .reset_financial_era(
                 start,
                 CollateralAmount::from_decimal_exact(dec!(1_000)).unwrap(),
+                None,
             )
             .unwrap();
         StartedSealFixture {
@@ -5839,8 +5841,8 @@ mod tests {
     }
 
     fn sealed_records(path: &Path) -> Vec<QualificationSealed> {
-        paper_era(scan_paper_log(path).unwrap())
-            .frames
+        scan_paper_log(path)
+            .unwrap()
             .into_iter()
             .filter_map(|frame| match &frame.frame {
                 PaperLogFrame::Record(PaperLogRecord::QualificationSealed(seal)) => {
@@ -7180,14 +7182,55 @@ mod tests {
     /// on opposite sides of the seal-start event, and both lifecycle events expose their fields.
     #[tokio::test]
     async fn daily_boundary_seals_retained_mark_tail_across_concurrent_append() {
+        check_daily_boundary_seal(false).await;
+    }
+
+    #[tokio::test]
+    async fn successor_completion_mark_does_not_select_source_prefix_or_append_seal() {
+        check_daily_boundary_seal(true).await;
+    }
+
+    async fn check_daily_boundary_seal(successor: bool) {
         let StartedSealFixture {
             _dir,
             paper_path,
             source_path,
-            state,
+            mut state,
             paper_writer,
-            start,
+            mut start,
         } = started_seal_fixture("start-hash");
+        if successor {
+            append_paper(
+                &paper_writer,
+                &PaperLogRecord::QualificationSealed(Box::new(QualificationSealed {
+                    start_receipt: start,
+                    source_prefix: TailBinding::from(&Scanner::verify(&source_path).unwrap()),
+                    financial_prefix: TailBinding::from(&paper_writer.verified_tail().unwrap()),
+                    live_prefix: TailBinding::from(
+                        &pe_execution_core::LiveJournal::verified_tail(
+                            _dir.path().join("live_journal.log"),
+                        )
+                        .unwrap(),
+                    ),
+                    decision_evidence_digest: blake3::hash(&[]).to_hex().to_string(),
+                    sealed_cutoff_unix: SEAL_START_UNIX,
+                    reason: SealReason::Complete,
+                })),
+                SEAL_START_UNIX,
+            );
+            let mut record = qualification_start(
+                TailBinding::from(&paper_writer.verified_tail().unwrap()),
+                TailBinding::from(&Scanner::verify(&source_path).unwrap()),
+                "start-hash",
+            );
+            if let PaperLogRecord::QualificationStarted(value) = &mut record {
+                Arc::make_mut(value).activation_id = "successor".to_owned();
+            }
+            start = append_paper(&paper_writer, &record, SEAL_START_UNIX);
+            state = Arc::new(PaperStateDb::open(&_dir.path().join("successor.db")).unwrap());
+            state.seed_financial_start(start).unwrap();
+            state.init_bankroll(dec!(1_000)).unwrap();
+        }
         let final_cutoff = SEAL_START_UNIX + 30 * 86_400;
         let mut source_writer = Writer::open(&source_path).unwrap();
         let financial_source = append_source(
@@ -7397,9 +7440,13 @@ mod tests {
             pe_event_log::scan_metrics::count(&paper_path).unwrap(),
             paper_walks
         );
-        assert!(!appended.load(Ordering::SeqCst));
+        assert_eq!(appended.load(Ordering::SeqCst), successor);
         let file_tail = Scanner::verify(&source_path).unwrap();
-        assert_ne!(file_tail, mark_candidate);
+        if successor {
+            assert_eq!(file_tail, mark_candidate);
+        } else {
+            assert_ne!(file_tail, mark_candidate);
+        }
         let era = paper_era(scan_paper_log(&paper_path).unwrap());
         let marks = era
             .frames
@@ -7420,6 +7467,29 @@ mod tests {
         );
         let seals = sealed_records(&paper_path);
         assert_eq!(seals.len(), 1);
+        if successor {
+            assert_ne!(seals[0].start_receipt, start);
+            assert!(events.lock().unwrap().iter().all(|event| {
+                event.message != "qualification seal started"
+                    && event.message != "qualification seal completed"
+            }));
+            let tail = orchestrator.paper_writer.verified_tail().unwrap();
+            orchestrator
+                .seal_before_resume("changed-hash", 1)
+                .await
+                .unwrap();
+            assert_eq!(orchestrator.paper_writer.verified_tail().unwrap(), tail);
+            apply_seal_check_control(&mut orchestrator, "changed-hash")
+                .await
+                .unwrap();
+            orchestrator.source_receipts = None;
+            orchestrator.apply_seal_check("changed-hash", 1).unwrap();
+            orchestrator
+                .seal_qualification(SealReason::Complete, final_cutoff, file_tail)
+                .unwrap();
+            assert_eq!(orchestrator.paper_writer.verified_tail().unwrap(), tail);
+            return;
+        }
         assert_eq!(seals[0].source_prefix, TailBinding::from(&index_candidate));
         assert_ne!(seals[0].source_prefix, TailBinding::from(&file_tail));
 
@@ -7473,6 +7543,7 @@ mod tests {
             .reset_financial_era(
                 start,
                 CollateralAmount::from_decimal_exact(dec!(1_000)).unwrap(),
+                None,
             )
             .unwrap();
         let mut orchestrator = test_orchestrator(
@@ -7597,6 +7668,7 @@ mod tests {
             .reset_financial_era(
                 start,
                 CollateralAmount::from_decimal_exact(dec!(1_000)).unwrap(),
+                None,
             )
             .unwrap();
         let mut source_writer = Writer::open(&source_path).unwrap();

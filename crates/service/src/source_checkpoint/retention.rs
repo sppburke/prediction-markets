@@ -24,7 +24,10 @@ use crate::decision_replay::{
     economic_source_receipts,
 };
 use crate::orchestrator_control::OrchestratorControl;
-use crate::paper_recovery::{FinancialPayload, PaperLog, PaperLogFrame, PaperLogRecord, paper_era};
+use crate::paper_recovery::{
+    FinancialPayload, PaperLog, PaperLogFrame, PaperLogRecord, generation_qualification_sealed,
+    paper_era, paper_generation,
+};
 use crate::risk_inputs::{SourceFrameMetadata, SourceReceiptIndex};
 use crate::source_log_boot::{FrozenCheckpoint, FrozenPrefix};
 use crate::trade_poller::PendingBoundary;
@@ -111,16 +114,16 @@ pub enum RetentionCommitOutcome {
 }
 
 pub(crate) fn pause_reason(context: &RetentionContext) -> anyhow::Result<Option<&'static str>> {
-    let era = paper_era(context.paper_log.snapshot()?);
-    if era.start.is_none() {
-        return Ok(Some("no_start"));
-    }
-    if !era.frames.iter().any(|frame| {
+    let frames = context.paper_log.snapshot()?;
+    if !frames.iter().any(|frame| {
         matches!(
-            &frame.frame,
-            PaperLogFrame::Record(PaperLogRecord::QualificationSealed(_))
+            frame.frame,
+            PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_))
         )
     }) {
+        return Ok(Some("no_start"));
+    }
+    if !generation_qualification_sealed(&frames) {
         return Ok(Some("unsealed_start"));
     }
     if (context.database_inputs)()?.dispatch_seeds_exist {
@@ -305,7 +308,9 @@ fn decision_pins(
     cutoff: i64,
     cache: &mut DecisionPinCache,
 ) -> anyhow::Result<DecisionPins> {
-    let era = paper_era(context.paper_log.snapshot()?);
+    let frames = context.paper_log.snapshot()?;
+    let generation = paper_generation(frames.clone());
+    let era = paper_era(frames);
     let local_last = context.paper_state.financial_last_prepared_seq()?;
     let finals = era
         .frames
@@ -330,36 +335,39 @@ fn decision_pins(
         .collect::<HashSet<_>>();
     let mut financial_decisions = HashSet::new();
     let mut receipts = Vec::new();
+    for frame in &generation.frames {
+        if let PaperLogFrame::Record(PaperLogRecord::MembershipChanged { evidence, .. }) =
+            &frame.frame
+        {
+            let typed: crate::paper_recovery::SealedMembershipEvidence =
+                serde_json::from_value(evidence.clone())?;
+            collect_receipts(&serde_json::to_value(typed)?, &mut receipts)?;
+        }
+    }
     for frame in &era.frames {
-        match &frame.frame {
-            PaperLogFrame::Record(PaperLogRecord::MembershipChanged { evidence, .. }) => {
-                let typed: crate::paper_recovery::SealedMembershipEvidence =
-                    serde_json::from_value(evidence.clone())?;
-                collect_receipts(&serde_json::to_value(typed)?, &mut receipts)?
-            }
-            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared { payload, .. }) => {
-                let needs_terminal = matches!(payload, FinancialPayload::Fill { operation, .. } if open.contains(&operation.source_trade_id));
-                let needs_projection = local_last.is_none_or(|last| frame.receipt.sequence > last)
-                    || !finals.contains(&frame.receipt.sequence)
-                    || needs_terminal;
-                let recent_decision = matches!(payload, FinancialPayload::Fill { operation, .. } if recent.contains(&operation.source_trade_id));
-                if needs_projection || recent_decision {
-                    match payload {
-                        FinancialPayload::Fill {
-                            operation,
-                            economic,
-                        } => {
-                            financial_decisions.insert(operation.source_trade_id.clone());
-                            receipts.extend(economic_source_receipts(economic));
-                        }
-                        FinancialPayload::Resolution {
-                            resolution_source_receipt,
-                            ..
-                        } => receipts.push(*resolution_source_receipt),
+        if let PaperLogFrame::Record(PaperLogRecord::FinancialPrepared { payload, .. }) =
+            &frame.frame
+        {
+            let needs_terminal = matches!(payload, FinancialPayload::Fill { operation, .. } if open.contains(&operation.source_trade_id));
+            let needs_projection = local_last.is_none_or(|last| frame.receipt.sequence > last)
+                || !finals.contains(&frame.receipt.sequence)
+                || needs_terminal;
+            let recent_decision = matches!(payload, FinancialPayload::Fill { operation, .. } if recent.contains(&operation.source_trade_id));
+            if needs_projection || recent_decision {
+                match payload {
+                    FinancialPayload::Fill {
+                        operation,
+                        economic,
+                    } => {
+                        financial_decisions.insert(operation.source_trade_id.clone());
+                        receipts.extend(economic_source_receipts(economic));
                     }
+                    FinancialPayload::Resolution {
+                        resolution_source_receipt,
+                        ..
+                    } => receipts.push(*resolution_source_receipt),
                 }
             }
-            _ => {}
         }
     }
     let mut payload_hashes = BTreeSet::new();
@@ -406,6 +414,283 @@ fn decision_pins(
         rows: total,
         derived,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use pe_core_types::{BasisPoints, CollateralAmount, ReceivedAt, SourceId, SourceTimestamp};
+    use pe_event_log::{ContentType, EnvelopeIn, Writer};
+    use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
+    use rust_decimal_macros::dec;
+    use time::OffsetDateTime;
+
+    use super::*;
+    use crate::paper_recovery::{
+        CanonicalResolutionResult, CapacityMembershipArtifact, ExpectedAuthority, FinancialResult,
+        MembershipReason, QualificationSealed, QualificationStarted, SealReason,
+        SealedMembershipEvidence, TailBinding as PaperTailBinding, replay_membership_with_source,
+    };
+
+    const NOW: i64 = 1_800_000_000;
+    const OLD: i64 = NOW - 8 * 86_400;
+
+    fn input(source_id: &str, payload: Vec<u8>, unix: i64, schema_version: u32) -> EnvelopeIn {
+        let at = OffsetDateTime::from_unix_timestamp(unix).unwrap();
+        EnvelopeIn {
+            source_id: SourceId(source_id.to_owned()),
+            schema_version,
+            parser_version: 1,
+            observed_at: SourceTimestamp(at),
+            received_at: ReceivedAt(at),
+            content_type: ContentType::Json,
+            payload,
+        }
+    }
+
+    fn append(paper: &PaperLog, record: &PaperLogRecord) -> AppendReceipt {
+        paper
+            .append_synced(input("paper", serde_json::to_vec(record).unwrap(), OLD, 2))
+            .unwrap()
+    }
+
+    fn entry(wallet: WalletAddress) -> WatchlistEntry {
+        WatchlistEntry {
+            wallet,
+            tier: WatchlistTier::Active,
+            leader_score_bps: BasisPoints(500),
+            lcb_5pct_bps: BasisPoints(500),
+            win_rate_bps: BasisPoints(6_000),
+            closed_trades_in_window: 20,
+            reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),
+        }
+    }
+
+    #[test]
+    fn successor_retention_advances_with_generation_membership_and_retired_prior_economics() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        let activation_receipt = writer
+            .append_synced(input("activation", b"activation".to_vec(), OLD, 1))
+            .unwrap();
+        let activation = writer.verified_tail().unwrap();
+        let retired_economic = writer
+            .append_synced(input("resolution", b"old economics".to_vec(), OLD, 1))
+            .unwrap();
+        let first_wallet = WalletAddress([1; 20]);
+        let second_wallet = WalletAddress([2; 20]);
+        let membership = writer
+            .append_synced(input(
+                crate::watchlist_admission::CAPACITY_CONFIG_SOURCE_ID,
+                serde_json::to_vec(&CapacityMembershipArtifact {
+                    generation: 1,
+                    target: 1,
+                    published_entries: vec![entry(first_wallet)],
+                })
+                .unwrap(),
+                OLD,
+                crate::watchlist_admission::MEMBERSHIP_ARTIFACT_SCHEMA_VERSION,
+            ))
+            .unwrap();
+        writer
+            .append_synced(input("old", b"old".to_vec(), OLD, 1))
+            .unwrap();
+        writer
+            .append_synced(input("recent", b"recent".to_vec(), NOW, 1))
+            .unwrap();
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let tail = index.current_tail_binding().unwrap();
+        let metadata = index.checkpoint_suffix(0, 5, &tail).unwrap();
+        std::fs::write(
+            crate::source_checkpoint::receipts_path(&source_path),
+            metadata
+                .iter()
+                .flat_map(crate::source_checkpoint::encode_record)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        crate::source_checkpoint::install_retention_fence(&source_path).unwrap();
+        let old_boundary = RetentionBoundary {
+            sequence: membership.sequence,
+            offset: metadata[2].byte_offset.unwrap(),
+        };
+        let old_authority = RetentionAuthority {
+            format_version: 1,
+            epoch: 1,
+            advanced_at: OLD,
+            boundary: old_boundary,
+            chain_head: retired_economic.this_hash,
+            pins: vec![
+                pin_for_receipt(&index, old_boundary, activation_receipt, false)
+                    .unwrap()
+                    .unwrap(),
+            ],
+            retained_tail: TailBinding::from(&tail),
+            feed: Vec::new(),
+        };
+        old_authority.write(&source_path).unwrap();
+        index.install_retention(old_authority).unwrap();
+        assert!(matches!(
+            index.source_envelope(retired_economic),
+            Err(crate::risk_inputs::RiskInputsUnavailable::Erased)
+        ));
+
+        let paper = Arc::new(PaperLog::open(dir.path().join("paper.log")).unwrap());
+        let empty = PaperTailBinding::from(&paper.verified_tail().unwrap());
+        let mut started = QualificationStarted {
+            starting_bankroll: CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
+            paper_prefix: empty.clone(),
+            source_prefix: PaperTailBinding::from(&activation),
+            live_prefix: empty.clone(),
+            artifact_blake3: "artifact".to_owned(),
+            static_config_hash: "static".to_owned(),
+            hot_config_hash: "hot".to_owned(),
+            generation: "generation".to_owned(),
+            activation_id: "first".to_owned(),
+            ranking_batch_id: 7,
+            membership: vec![first_wallet, second_wallet],
+            membership_proofs_hash: "proof".to_owned(),
+            schema_version: 3,
+            parser_version: 1,
+            financial_semantic_version: 3,
+        };
+        let first = append(
+            &paper,
+            &PaperLogRecord::QualificationStarted(Arc::new(started.clone())),
+        );
+        let prepared = append(
+            &paper,
+            &PaperLogRecord::FinancialPrepared {
+                expected_authority: ExpectedAuthority {
+                    qualification_start_receipt: first,
+                    prior_completed_prepared_sequence: None,
+                },
+                payload: FinancialPayload::Resolution {
+                    condition_id: pe_core_types::PolymarketConditionId("condition".to_owned()),
+                    payout_by_outcome_index_json: "[\"1\",\"0\"]".to_owned(),
+                    resolution_source_receipt: retired_economic,
+                },
+            },
+        );
+        append(
+            &paper,
+            &PaperLogRecord::FinancialFinal {
+                prepared_receipt: prepared,
+                result: FinancialResult::Resolution {
+                    canonical: CanonicalResolutionResult {
+                        outcome: "applied".to_owned(),
+                        bankroll: dec!(100),
+                        applied_prepared_seq: prepared.sequence,
+                        credit: CollateralAmount::ZERO,
+                        settled_at_unix: OLD,
+                    },
+                },
+            },
+        );
+        let membership_record = append(
+            &paper,
+            &PaperLogRecord::MembershipChanged {
+                reason: MembershipReason::CapacityChange,
+                removed: vec![second_wallet],
+                added: Vec::new(),
+                capacity: 1,
+                ranking_batch_id: None,
+                evidence: SealedMembershipEvidence::capacity_change(1, membership, Vec::new())
+                    .unwrap(),
+            },
+        );
+        append(
+            &paper,
+            &PaperLogRecord::QualificationSealed(Box::new(QualificationSealed {
+                start_receipt: first,
+                source_prefix: PaperTailBinding::from(&activation),
+                financial_prefix: PaperTailBinding::from(&paper.verified_tail().unwrap()),
+                live_prefix: empty,
+                decision_evidence_digest: "digest".to_owned(),
+                sealed_cutoff_unix: OLD,
+                reason: SealReason::Complete,
+            })),
+        );
+        let before = crate::database_retention::retention_paper_state(&paper.snapshot().unwrap());
+        assert_eq!(before.1, Some(prepared.sequence));
+        started.activation_id = "successor".to_owned();
+        started.membership.clear();
+        started.paper_prefix = PaperTailBinding::from(&paper.verified_tail().unwrap());
+        let successor = append(
+            &paper,
+            &PaperLogRecord::QualificationStarted(Arc::new(started)),
+        );
+        let after = crate::database_retention::retention_paper_state(&paper.snapshot().unwrap());
+        assert_eq!(after.1, None);
+        assert_eq!(before.0, after.0);
+        assert_eq!(after.0[&second_wallet].0, membership_record.sequence);
+        let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        state.seed_financial_start(successor).unwrap();
+        let (control, _rx) = mpsc::channel(1);
+        let context = RetentionContext {
+            paper_state: state,
+            paper_log: paper.clone(),
+            live_journal_path: None,
+            control,
+            database_inputs: Arc::new(|| Ok(RetentionDatabaseInputs::default())),
+            #[cfg(feature = "scenario")]
+            hooks: Arc::new(RetentionHooks::default()),
+        };
+        assert_eq!(pause_reason(&context).unwrap(), None);
+        let decisions = decision_pins(
+            &context,
+            &index,
+            NOW - SOURCE_RETENTION_BUFFER_SECS,
+            &mut DecisionPinCache::default(),
+        )
+        .unwrap();
+        assert!(decisions.receipts.contains(&membership));
+        assert!(!decisions.receipts.contains(&retired_economic));
+        let frozen = FrozenCheckpoint {
+            authority_generation: Some(0),
+            capture_unix_ms: u64::try_from(NOW).unwrap() * 1000,
+            financial_era: true,
+            activation,
+            tail: tail.clone(),
+            prefix: FrozenPrefix::Verified(Box::new(blake3::Hasher::new())),
+            reducers: crate::source_log_boot::Reducers::new(true),
+        };
+        let PreparedRetention::Advance(request) =
+            prepare(&frozen, &context, &index, &[], NOW, &AtomicBool::new(false)).unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(request.authority.boundary.sequence, EventSeq(4));
+        assert!(request.authority.pin(membership.sequence).is_some());
+        assert!(request.authority.pin(retired_economic.sequence).is_none());
+        assert!(matches!(
+            commit(*request).unwrap(),
+            RetentionCommitOutcome::Committed { .. }
+        ));
+        let authority = RetentionAuthority::load(&source_path).unwrap().unwrap();
+        assert_eq!(authority.epoch, 2);
+        let boot_index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let generation = paper_generation(
+            crate::paper_recovery::scan_paper_log(&dir.path().join("paper.log")).unwrap(),
+        );
+        let replayed = replay_membership_with_source(
+            &generation,
+            Watchlist {
+                entries: vec![entry(first_wallet), entry(second_wallet)],
+                snapshot_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+                active_count: 2,
+                incubator_count: 0,
+            },
+            &crate::qualification::PublishedMembershipSource::from_index(boot_index),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(replayed.watchlist.entries.len(), 1);
+        assert_eq!(replayed.watchlist.entries[0].wallet, first_wallet);
+    }
 }
 
 #[derive(Deserialize)]

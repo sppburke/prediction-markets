@@ -1037,6 +1037,7 @@ fn watchlist_with_entries(mut watchlist: Watchlist, entries: Vec<WatchlistEntry>
 /// `QualificationStarted.ranking_batch_id`. Later replacement vectors are reconstructed and
 /// verified from the immutable source-log artifacts named by each durable record, never from the
 /// moving ranking view.
+/// `era` must be the `paper_generation` view of the whole verified paper snapshot.
 pub fn replay_membership(
     era: &PaperEra,
     start_batch: Watchlist,
@@ -1320,7 +1321,7 @@ pub enum PaperLogScanError {
         sequence: u64,
         source: serde_json::Error,
     },
-    #[error("paper log contains distinct qualification starts")]
+    #[error("paper log contains an invalid qualification Start or seal chain")]
     ConflictingStart,
     #[error("paper financial protocol is invalid at sequence {sequence}: {reason}")]
     FinancialProtocol { sequence: u64, reason: String },
@@ -1509,12 +1510,8 @@ pub fn paper_era(frames: Vec<Arc<ScannedPaperFrame>>) -> PaperEra {
             _ => None,
         };
         if let Some((receipt, candidate)) = candidate {
-            // `scan_paper_log` rejects every second physical Start. Preserve the first Start
-            // defensively for callers that construct an era view from already-validated frames.
-            if start.is_none() {
-                start = Some((receipt, candidate));
-                era_frames.clear();
-            }
+            start = Some((receipt, candidate));
+            era_frames.clear();
         }
         era_frames.push(frame);
     }
@@ -1524,18 +1521,89 @@ pub fn paper_era(frames: Vec<Arc<ScannedPaperFrame>>) -> PaperEra {
     }
 }
 
+/// Membership and qualification retain the generation's first Start across financial resets.
+#[must_use]
+pub fn paper_generation(frames: Vec<Arc<ScannedPaperFrame>>) -> PaperEra {
+    let first = frames.iter().position(|frame| {
+        matches!(
+            frame.frame,
+            PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_))
+        )
+    });
+    let start = first.and_then(|index| match &frames[index].frame {
+        PaperLogFrame::Record(PaperLogRecord::QualificationStarted(start)) => {
+            Some((frames[index].receipt, Arc::clone(start)))
+        }
+        _ => None,
+    });
+    PaperEra {
+        start,
+        frames: frames.into_iter().skip(first.unwrap_or(0)).collect(),
+    }
+}
+
+/// Only a seal following and naming the first Start closes this generation's qualification.
+#[must_use]
+pub fn generation_qualification_sealed(frames: &[Arc<ScannedPaperFrame>]) -> bool {
+    let mut first_start = None;
+    for frame in frames {
+        match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_))
+                if first_start.is_none() =>
+            {
+                first_start = Some(frame.receipt);
+            }
+            PaperLogFrame::Record(PaperLogRecord::QualificationSealed(seal))
+                if Some(seal.start_receipt) == first_start =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+pub(crate) fn start_extends_prefix(
+    frame: &ScannedPaperFrame,
+    start: &QualificationStarted,
+) -> bool {
+    let expected = start
+        .paper_prefix
+        .last_sequence
+        .map_or(Some(0), |sequence| sequence.0.checked_add(1));
+    expected == Some(frame.receipt.sequence.0)
+        && blake3::Hash::from_hex(&start.paper_prefix.last_hash)
+            .is_ok_and(|hash| frame.envelope.prev_hash == hash)
+}
+
 fn validate_qualification_starts(
     frames: &[Arc<ScannedPaperFrame>],
 ) -> Result<(), PaperLogScanError> {
-    let mut start_seen = false;
+    let mut first_start = None;
+    let mut sealed = false;
+    let mut activation_ids = HashSet::new();
     for frame in frames {
-        let PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_)) = &frame.frame else {
-            continue;
-        };
-        if start_seen {
-            return Err(PaperLogScanError::ConflictingStart);
+        match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::QualificationStarted(start)) => {
+                if first_start.is_some()
+                    && (!sealed
+                        || !start_extends_prefix(frame, start)
+                        || activation_ids.contains(&start.activation_id))
+                {
+                    return Err(PaperLogScanError::ConflictingStart);
+                }
+                first_start.get_or_insert(frame.receipt);
+                activation_ids.insert(&start.activation_id);
+            }
+            PaperLogFrame::Record(PaperLogRecord::QualificationSealed(seal)) => {
+                if first_start != Some(seal.start_receipt) {
+                    return Err(PaperLogScanError::ConflictingStart);
+                }
+                sealed = true;
+            }
+            _ => {}
         }
-        start_seen = true;
     }
     Ok(())
 }
@@ -1548,17 +1616,18 @@ fn validate_financial_pairs(frames: &[Arc<ScannedPaperFrame>]) -> Result<(), Pap
     let mut active_start = None::<AppendReceipt>;
     for frame in frames {
         match &frame.frame {
-            PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_))
-                if active_start.is_none() =>
-            {
-                // An equal Start payload can be observed again after an interrupted seeding
-                // attempt, but it does not establish a new era or reset financial ordering.
-                // `validate_qualification_starts` has already rejected a distinct payload.
+            PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_)) => {
+                if unmatched.is_some() {
+                    return Err(PaperLogScanError::FinancialProtocol {
+                        sequence: frame.receipt.sequence.0,
+                        reason: "Start overtakes an unmatched Prepared".to_owned(),
+                    });
+                }
                 active_start = Some(frame.receipt);
-                unmatched = None;
                 completed = None;
+                prepared.clear();
+                finalized.clear();
             }
-            PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_)) => {}
             PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
                 expected_authority,
                 payload,
@@ -1660,6 +1729,56 @@ pub fn oldest_unmatched_prepared(era: &PaperEra) -> Option<&ScannedPaperFrame> {
             ) && !completed.contains(&frame.receipt)
         })
         .map(AsRef::as_ref)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SuccessorGuardError {
+    #[error("financial-era successor found an active risk halt")]
+    ActiveRiskHalt,
+    #[error("financial-era successor found an active feed incident")]
+    ActiveFeedIncident,
+    #[error("financial-era successor found live-journal records")]
+    LiveJournalRecords,
+    #[error("financial-era successor found durable dispatch seeds")]
+    DispatchSeeds,
+    #[error("financial-era successor found an open decision")]
+    OpenDecision,
+    #[error("financial-era successor found an unmatched Prepared")]
+    UnmatchedPrepared,
+    #[error("financial-era successor paper protocol: {0}")]
+    PaperLog(#[from] PaperLogScanError),
+    #[error("financial-era successor paper state: {0}")]
+    PaperState(#[from] pe_paper_state::PaperStateError),
+}
+
+/// Read-only guard shared by successor preflight, preparation, and Start recomputation.
+/// Callers supply the verified whole paper snapshot and durable live-journal record count.
+pub fn validate_successor_guards(
+    frames: &[Arc<ScannedPaperFrame>],
+    state: &PaperStateDb,
+    live_record_count: usize,
+) -> Result<(), SuccessorGuardError> {
+    validate_financial_pairs(frames)?;
+    let era = paper_era(frames.to_vec());
+    if !active_risk_halts(&era).is_empty() {
+        return Err(SuccessorGuardError::ActiveRiskHalt);
+    }
+    if feed_latch_basis(&era)?.engaged() {
+        return Err(SuccessorGuardError::ActiveFeedIncident);
+    }
+    if live_record_count != 0 {
+        return Err(SuccessorGuardError::LiveJournalRecords);
+    }
+    if state.dispatch_seeds_exist()? {
+        return Err(SuccessorGuardError::DispatchSeeds);
+    }
+    if !state.open_decision_pending()?.is_empty() {
+        return Err(SuccessorGuardError::OpenDecision);
+    }
+    if oldest_unmatched_prepared(&era).is_some() {
+        return Err(SuccessorGuardError::UnmatchedPrepared);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1814,6 +1933,7 @@ mod paper_log_tests {
             .reset_financial_era(
                 receipt(20),
                 CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
+                None,
             )
             .unwrap();
         assert_eq!(paper_state.decision_pending_history().unwrap().len(), 1);
@@ -2078,6 +2198,34 @@ mod paper_log_tests {
                 payload: serde_json::to_vec(value).unwrap(),
             })
             .unwrap()
+    }
+
+    fn append_start(writer: &mut Writer, activation_id: &str) -> AppendReceipt {
+        let mut started = start(activation_id);
+        started.paper_prefix = TailBinding::from(&writer.verified_tail().unwrap());
+        started.membership.clear();
+        append(
+            writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Arc::new(started)),
+        )
+    }
+
+    fn append_seal(writer: &mut Writer, start_receipt: AppendReceipt) -> AppendReceipt {
+        let financial_prefix = TailBinding::from(&writer.verified_tail().unwrap());
+        append(
+            writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationSealed(Box::new(QualificationSealed {
+                start_receipt,
+                source_prefix: tail(),
+                financial_prefix,
+                live_prefix: tail(),
+                decision_evidence_digest: blake3::hash(&[]).to_hex().to_string(),
+                sealed_cutoff_unix: 0,
+                reason: SealReason::Complete,
+            })),
+        )
     }
 
     fn append_membership_artifact<T: Serialize>(
@@ -3119,7 +3267,7 @@ mod paper_log_tests {
                 ..
             })) if added.is_empty()
         ));
-        let replayed = replay_membership(&era, watchlist(initial_entries), &source_path)
+        let replayed = replay_membership(&era, watchlist(initial_entries.clone()), &source_path)
             .unwrap()
             .unwrap();
         let replayed_wallets = replayed
@@ -3130,6 +3278,25 @@ mod paper_log_tests {
             .collect::<HashSet<_>>();
         assert_eq!(replayed_wallets, live.structural_membership());
         assert_eq!(replayed_wallets.len(), 18);
+        assert_eq!(replayed.last_ranking_batch_id, 9);
+
+        let mut writer = Writer::open(&paper_path).unwrap();
+        append_seal(&mut writer, era.start.as_ref().unwrap().0);
+        append_start(&mut writer, "successor");
+        drop(writer);
+        let generation = paper_generation(scan_paper_log(&paper_path).unwrap());
+        let across_eras = replay_membership(&generation, watchlist(initial_entries), &source_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            across_eras.last_ranking_batch_id,
+            replayed.last_ranking_batch_id
+        );
+        assert_eq!(
+            serde_json::to_vec(&across_eras.watchlist.entries).unwrap(),
+            serde_json::to_vec(&replayed.watchlist.entries).unwrap()
+        );
+        assert!(across_eras.post_start_record_replayed);
         assert!(replayed_wallets.contains(&absent_candidate));
     }
 
@@ -4984,7 +5151,7 @@ mod paper_log_tests {
     }
 
     #[test]
-    fn scanner_accepts_at_most_one_physical_start() {
+    fn scanner_preserves_first_start_and_refuses_unsealed_successors() {
         let dir = tempdir().unwrap();
         let zero_path = dir.path().join("zero.log");
         let mut zero = Writer::open(&zero_path).unwrap();
@@ -5039,6 +5206,326 @@ mod paper_log_tests {
             scan_paper_log(&conflict_path),
             Err(PaperLogScanError::ConflictingStart)
         ));
+    }
+
+    #[test]
+    fn successive_start_chains_require_generation_seal_prefix_and_unique_activation() {
+        for case in [
+            "two",
+            "three",
+            "wrong_seal",
+            "successor_seal",
+            "early_seal",
+            "missing_seal",
+            "prefix_gap",
+            "prefix_hash",
+            "prefix_overflow",
+            "duplicate",
+            "older_duplicate",
+        ] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("chain.log");
+            let mut writer = Writer::open(&path).unwrap();
+            if case == "early_seal" {
+                append_seal(&mut writer, receipt(0));
+            }
+            let first = append_start(&mut writer, "first");
+            if case != "missing_seal" {
+                append_seal(
+                    &mut writer,
+                    if case == "wrong_seal" {
+                        receipt(99)
+                    } else {
+                        first
+                    },
+                );
+            }
+            let mut successor = start(if case == "duplicate" {
+                "first"
+            } else {
+                "second"
+            });
+            successor.membership.clear();
+            successor.paper_prefix = TailBinding::from(&writer.verified_tail().unwrap());
+            match case {
+                "prefix_gap" => successor.paper_prefix.last_sequence = Some(EventSeq(10)),
+                "prefix_hash" => successor.paper_prefix.last_hash = "00".repeat(32),
+                "prefix_overflow" => {
+                    successor.paper_prefix.last_sequence = Some(EventSeq(u64::MAX));
+                }
+                _ => {}
+            }
+            let second = append(
+                &mut writer,
+                PAPER_LOG_SCHEMA_VERSION,
+                &PaperLogRecord::QualificationStarted(Arc::new(successor)),
+            );
+            if case == "successor_seal" {
+                append_seal(&mut writer, second);
+            }
+            if case == "three" || case == "older_duplicate" {
+                append_start(&mut writer, if case == "three" { "third" } else { "first" });
+            }
+            drop(writer);
+            let scanned = scan_paper_log(&path);
+            if case == "two" || case == "three" {
+                let frames = scanned.unwrap();
+                assert!(generation_qualification_sealed(&frames), "{case}");
+                assert_eq!(
+                    paper_generation(frames.clone()).start.unwrap().0,
+                    first,
+                    "{case}"
+                );
+                assert_eq!(
+                    paper_era(frames).start.unwrap().1.activation_id,
+                    if case == "two" { "second" } else { "third" }
+                );
+            } else {
+                assert!(
+                    matches!(scanned, Err(PaperLogScanError::ConflictingStart)),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generation_seal_requires_first_start_and_later_placement() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("seal.log");
+        let mut writer = Writer::open(&path).unwrap();
+        let first = append_start(&mut writer, "first");
+        writer.sync().unwrap();
+        let before = scan_paper_log(&path).unwrap();
+        assert!(!generation_qualification_sealed(&[]));
+        assert!(!generation_qualification_sealed(&before));
+        append_seal(&mut writer, first);
+        let second = append_start(&mut writer, "second");
+        drop(writer);
+        let frames = scan_paper_log(&path).unwrap();
+        assert!(generation_qualification_sealed(&frames));
+        let seal = frames[1].clone();
+        assert!(!generation_qualification_sealed(&[
+            seal.clone(),
+            frames[0].clone()
+        ]));
+        let mut wrong = seal.as_ref().clone();
+        let PaperLogFrame::Record(PaperLogRecord::QualificationSealed(value)) = &mut wrong.frame
+        else {
+            unreachable!();
+        };
+        value.start_receipt = second;
+        assert!(!generation_qualification_sealed(&[
+            frames[0].clone(),
+            Arc::new(wrong)
+        ]));
+        assert_eq!(paper_era(frames.clone()).frames.len(), 1);
+        assert_eq!(paper_generation(frames).frames.len(), 3);
+    }
+
+    #[test]
+    fn financial_pairs_reset_at_start_and_refuse_cross_era_records() {
+        for case in [
+            "valid",
+            "unmatched",
+            "cross_final",
+            "old_start",
+            "old_prior",
+        ] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("pairs.log");
+            let mut writer = Writer::open(&path).unwrap();
+            let first = append_start(&mut writer, "first");
+            let prepared = append(
+                &mut writer,
+                PAPER_LOG_SCHEMA_VERSION,
+                &prepared_after(first, None, "first"),
+            );
+            if case != "unmatched" {
+                append(&mut writer, PAPER_LOG_SCHEMA_VERSION, &final_fill(prepared));
+            }
+            append_seal(&mut writer, first);
+            let second = append_start(&mut writer, "second");
+            if case == "cross_final" {
+                append(&mut writer, PAPER_LOG_SCHEMA_VERSION, &final_fill(prepared));
+            } else if case != "unmatched" {
+                let next = append(
+                    &mut writer,
+                    PAPER_LOG_SCHEMA_VERSION,
+                    &prepared_after(
+                        if case == "old_start" { first } else { second },
+                        (case == "old_prior").then_some(prepared.sequence),
+                        "second",
+                    ),
+                );
+                append(&mut writer, PAPER_LOG_SCHEMA_VERSION, &final_fill(next));
+            }
+            drop(writer);
+            let scanned = scan_paper_log(&path);
+            if case == "valid" {
+                let era = paper_era(scanned.unwrap());
+                assert!(oldest_unmatched_prepared(&era).is_none());
+                assert_eq!(era.frames.len(), 3);
+            } else {
+                assert!(
+                    matches!(scanned, Err(PaperLogScanError::FinancialProtocol { .. })),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn successor_scan_keeps_earlier_era_decode_and_chain_validation() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        for corrupt_bytes in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("corrupt.log");
+            let mut writer = Writer::open(&path).unwrap();
+            let first = append_start(&mut writer, "first");
+            if !corrupt_bytes {
+                writer
+                    .append_synced(EnvelopeIn {
+                        payload: b"invalid JSON".to_vec(),
+                        ..paper_input(PAPER_LOG_SCHEMA_VERSION, &prepared("bad"))
+                    })
+                    .unwrap();
+            }
+            append_seal(&mut writer, first);
+            append_start(&mut writer, "second");
+            drop(writer);
+            if corrupt_bytes {
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .unwrap();
+                file.seek(SeekFrom::Start(32)).unwrap();
+                let mut byte = [0];
+                file.read_exact(&mut byte).unwrap();
+                byte[0] ^= 1;
+                file.seek(SeekFrom::Start(32)).unwrap();
+                file.write_all(&byte).unwrap();
+                file.sync_all().unwrap();
+                assert!(matches!(
+                    scan_paper_log(&path),
+                    Err(PaperLogScanError::EventLog(_))
+                ));
+            } else {
+                assert!(matches!(
+                    scan_paper_log(&path),
+                    Err(PaperLogScanError::Decode { sequence: 1, .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn successor_guards_refuse_each_uncarryable_state_without_mutation() {
+        for case in [
+            "clear", "risk", "feed", "live", "dispatch", "decision", "prepared", "final",
+        ] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("guard.log");
+            let db_path = dir.path().join("paper.db");
+            let state = PaperStateDb::open(&db_path).unwrap();
+            let mut writer = Writer::open(&path).unwrap();
+            let first = append_start(&mut writer, "first");
+            match case {
+                "risk" => {
+                    append(
+                        &mut writer,
+                        PAPER_LOG_SCHEMA_VERSION,
+                        &PaperLogRecord::RiskHaltChanged {
+                            owner: RiskHaltOwner::Paper,
+                            cause: RiskHaltCause::AbsoluteLoss,
+                            state: HaltState::Engaged,
+                            evidence: serde_json::json!({}),
+                        },
+                    );
+                }
+                "feed" => {
+                    append(
+                        &mut writer,
+                        PAPER_LOG_SCHEMA_VERSION,
+                        &PaperLogRecord::FeedIncidentChanged {
+                            incident: FeedIncident {
+                                cause: FeedIncidentCause::Absence,
+                                frame_receipt: receipt(1),
+                                deciding_commitment_receipt: receipt(2),
+                                counterpart_identity: None,
+                                engagement_receipt: None,
+                            },
+                            state: HaltState::Engaged,
+                        },
+                    );
+                }
+                "prepared" => {
+                    append(
+                        &mut writer,
+                        PAPER_LOG_SCHEMA_VERSION,
+                        &prepared_after(first, None, "open"),
+                    );
+                }
+                "dispatch" => {
+                    state
+                        .stage_dispatch_seed(&pe_paper_state::DispatchSeedRecord {
+                            dispatch_id: "seed".to_owned(),
+                            signal_json: "{}".to_owned(),
+                            source_trade_id: "trade".to_owned(),
+                            created_at_unix: 0,
+                            targets: Vec::new(),
+                        })
+                        .unwrap();
+                }
+                "decision" => {
+                    let connection = rusqlite::Connection::open(&db_path).unwrap();
+                    connection
+                        .execute(
+                            "INSERT INTO decision_pending
+                                (source_trade_id, semantic_revision, wallet_hex, source_epoch,
+                                 frozen_inputs_json, post_commit_inputs_json, state, updated_at_unix)
+                             VALUES ('trade', 'revision', ?1, 0, '{}', '{}', 'open', 0)",
+                            [wallet().to_string()],
+                        )
+                        .unwrap();
+                }
+                _ => {}
+            }
+            drop(writer);
+            let mut frames = scan_paper_log(&path).unwrap();
+            if case == "final" {
+                let mut frame = frames[0].as_ref().clone();
+                frame.frame = PaperLogFrame::Record(final_fill(receipt(99)));
+                frames.push(Arc::new(frame));
+            }
+            let paper_before = std::fs::read(&path).unwrap();
+            let balance_before = state.bankroll().unwrap();
+            let result = validate_successor_guards(&frames, &state, usize::from(case == "live"));
+            match case {
+                "clear" => assert!(result.is_ok()),
+                "risk" => assert!(matches!(result, Err(SuccessorGuardError::ActiveRiskHalt))),
+                "feed" => assert!(matches!(
+                    result,
+                    Err(SuccessorGuardError::ActiveFeedIncident)
+                )),
+                "live" => assert!(matches!(
+                    result,
+                    Err(SuccessorGuardError::LiveJournalRecords)
+                )),
+                "dispatch" => assert!(matches!(result, Err(SuccessorGuardError::DispatchSeeds))),
+                "decision" => assert!(matches!(result, Err(SuccessorGuardError::OpenDecision))),
+                "prepared" => assert!(matches!(
+                    result,
+                    Err(SuccessorGuardError::UnmatchedPrepared)
+                )),
+                "final" => assert!(matches!(result, Err(SuccessorGuardError::PaperLog(_)))),
+                _ => unreachable!(),
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), paper_before);
+            assert_eq!(state.bankroll().unwrap(), balance_before);
+        }
     }
 
     #[test]

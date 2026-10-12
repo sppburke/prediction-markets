@@ -2081,16 +2081,7 @@ fn verify_start_prefix(
     start_frame: &ScannedPaperFrame,
     start: &QualificationStarted,
 ) -> Result<(), QualificationError> {
-    let expected_sequence = start
-        .paper_prefix
-        .last_sequence
-        .map_or(Some(0), |sequence| sequence.0.checked_add(1))
-        .ok_or_else(|| {
-            QualificationError::InsufficientEvidence("Start sequence overflow".to_owned())
-        })?;
-    if start_frame.receipt.sequence.0 != expected_sequence
-        || start_frame.envelope.prev_hash != tail_hash(&start.paper_prefix)?
-    {
+    if !crate::paper_recovery::start_extends_prefix(start_frame, start) {
         return insufficient("QualificationStarted does not extend its paper prefix");
     }
     Ok(())
@@ -5567,6 +5558,8 @@ pub struct FinancialEraManifest {
     pub kind: String,
     pub state: String,
     pub activation_id: String,
+    #[serde(default)]
+    pub predecessor_start: Option<AppendReceipt>,
     pub generation: String,
     pub fresh_bankroll: CollateralAmount,
     pub target_revision: String,
@@ -5654,7 +5647,7 @@ pub fn run_financial_era(
 ) -> Result<String, QualificationError> {
     let bytes = fs::read(manifest_path)?;
     let manifest: FinancialEraManifest = serde_json::from_slice(&bytes)?;
-    if !matches!(command, FinancialEraCommand::Preflight) {
+    if manifest.predecessor_start.is_none() && !matches!(command, FinancialEraCommand::Preflight) {
         require_complete_source_prefix(&manifest.paths.source_log)?;
     }
     validate_financial_manifest(&manifest, config)?;
@@ -5675,6 +5668,26 @@ pub fn run_financial_era(
         }
         FinancialEraCommand::RollbackCheck => rollback_check_financial_era(&manifest, config),
         FinancialEraCommand::Preflight => {
+            if manifest.predecessor_start.is_some() {
+                // The same short answer as the first-era preflight below: local files and the small
+                // paper log only. The source-log rebuild belongs to `prepare` and Start.
+                validate_financial_target_config(config)?;
+                let rows = read_financial_config_rows(financial_config_rows_path)?;
+                let hot_config_hash = derive_successor_hot_config_hash(&rows, config)?;
+                let accounts = verify_live_status_posture(&config.status_path)?;
+                let frames = scan_paper_log(&manifest.paths.paper_log)?;
+                let state =
+                    PaperStateDb::open_read_only_allowing_unmigrated(&manifest.paths.paper_state)?;
+                verify_successor_guards(&manifest, config, &frames, &state)?;
+                return Ok(serde_json::to_string(&serde_json::json!({
+                    "gates": [
+                        "financial_manifest", "financial_target_config", "financial15_config_rows",
+                        "live_status_posture", "successor_guards",
+                    ],
+                    "hot_config_hash": hot_config_hash,
+                    "live_accounts": accounts.len(),
+                }))?);
+            }
             // Five gate groups: the manifest (already validated above), the staged target
             // configuration, the exported Financial15 rows, `status.json`, and the membership
             // proof. Four read a local file; the fifth reads the paper state. No log scan, so this
@@ -5782,6 +5795,81 @@ fn derive_hot_config_hash(
         QualificationError::InsufficientEvidence(format!(
             "exported Financial15 rows are invalid: {error}"
         ))
+    })
+}
+
+fn derive_successor_hot_config_hash(
+    rows: &[ConfigRow],
+    config: &ServiceConfig,
+) -> Result<String, QualificationError> {
+    let partitioned = crate::config_poller::partition_risk_halt_release_hash(rows);
+    if let Some(warning) = partitioned.warning {
+        tracing::warn!(?warning, "financial-era risk halt release row ignored");
+    }
+    derive_hot_config_hash(&partitioned.economic_rows, config)
+}
+
+impl PaperLogRecord {
+    /// Parser identity of the financial Start writer.
+    pub(crate) const START_PARSER_VERSION: u32 = 1;
+}
+
+fn verify_successor_guards(
+    manifest: &FinancialEraManifest,
+    config: &ServiceConfig,
+    frames: &[Arc<ScannedPaperFrame>],
+    state: &PaperStateDb,
+) -> Result<LogTailBinding, QualificationError> {
+    if i64::from(manifest.schema_version) != pe_paper_state::SCHEMA_VERSION
+        || manifest.financial_semantic_version != FINANCIAL_SEMANTIC_VERSION
+        || manifest.parser_version != PaperLogRecord::START_PARSER_VERSION
+    {
+        return insufficient("financial-era successor versions differ from compiled owners");
+    }
+    let bankroll = config.bankroll_usd.parse::<Decimal>().map_err(|error| {
+        QualificationError::InsufficientEvidence(format!("invalid configured bankroll: {error}"))
+    })?;
+    if manifest.fresh_bankroll.to_decimal() != bankroll {
+        return insufficient("financial-era successor bankroll differs from target configuration");
+    }
+    let era = paper_era(frames.to_vec());
+    let Some((receipt, predecessor)) = &era.start else {
+        return insufficient("financial-era successor has no predecessor Start");
+    };
+    if Some(*receipt) != manifest.predecessor_start {
+        return insufficient("financial-era successor predecessor is not the latest Start");
+    }
+    if !crate::paper_recovery::generation_qualification_sealed(frames) {
+        return insufficient("financial-era successor requires the generation qualification seal");
+    }
+    if !manifest.membership.is_empty()
+        || manifest.ranking_batch_id != predecessor.ranking_batch_id
+        || manifest.generation != predecessor.generation
+    {
+        return insufficient("financial-era successor membership, batch or generation differs");
+    }
+    if frames.iter().any(|frame| {
+        matches!(&frame.frame, PaperLogFrame::Record(PaperLogRecord::QualificationStarted(start))
+            if start.activation_id == manifest.activation_id)
+    }) {
+        return insufficient("financial-era successor activation id was already used");
+    }
+    let before = pe_execution_core::LiveJournal::verified_tail(&manifest.paths.live_journal)
+        .map_err(|error| {
+            QualificationError::InsufficientEvidence(format!("live journal: {error}"))
+        })?;
+    crate::paper_recovery::validate_successor_guards(
+        frames,
+        state,
+        usize::from(before.last_sequence.is_some()),
+    )
+    .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    Ok(before)
+}
+
+fn rebuild_financial_source(path: &Path) -> Result<SourceReceiptIndex, QualificationError> {
+    SourceReceiptIndex::replay(path).map_err(|error| {
+        QualificationError::InsufficientEvidence(format!("financial-era source rebuild: {error}"))
     })
 }
 
@@ -5996,48 +6084,74 @@ fn prepare_financial_era(
     config: &ServiceConfig,
     financial_config_rows: &[ConfigRow],
 ) -> Result<FinancialEraPreparation, QualificationError> {
-    require_complete_source_prefix(&manifest.paths.source_log)?;
+    let successor = manifest.predecessor_start.is_some();
+    if !successor {
+        require_complete_source_prefix(&manifest.paths.source_log)?;
+    }
     let paper_prefix = Scanner::verify(&manifest.paths.paper_log)?;
-    let source_prefix = Scanner::verify(&manifest.paths.source_log)?;
-    let live_path = configured_live_journal_path(config);
-    let live_prefix = verify_live_preparation_posture(
-        &live_path,
-        &manifest.paths.source_log,
-        &config.status_path,
-    )?;
     let state = PaperStateDb::open_read_only_allowing_unmigrated(&manifest.paths.paper_state)?;
-    if !state.open_decision_pending()?.is_empty() {
-        return insufficient("financial-era prepare found an open decision");
-    }
     let paper_frames = scan_paper_log(&manifest.paths.paper_log)?;
-    if paper_frames.iter().any(|frame| {
-        matches!(
-            frame.frame,
-            PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_))
-        )
-    }) {
-        return insufficient("financial era is already started");
-    }
-    let mut unmatched_prepared = HashSet::new();
-    for frame in &paper_frames {
-        match &frame.frame {
-            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared { .. })
-                if !unmatched_prepared.insert(receipt_key(frame.receipt)) =>
-            {
-                return insufficient("financial-era prepare found a duplicate Prepared receipt");
-            }
-            PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
-                prepared_receipt, ..
-            }) if !unmatched_prepared.remove(&receipt_key(*prepared_receipt)) => {
-                return insufficient("financial-era prepare found an unmatched Final");
-            }
-            _ => {}
+    let (source_prefix, live_prefix, hot_config_hash) = if successor {
+        let live_prefix = verify_successor_guards(manifest, config, &paper_frames, &state)?;
+        verify_live_status_posture(&config.status_path)?;
+        let hot_config_hash = derive_successor_hot_config_hash(financial_config_rows, config)?;
+        let index = rebuild_financial_source(&manifest.paths.source_log)?;
+        let source_prefix = index.current_tail_binding().map_err(|error| {
+            QualificationError::InsufficientEvidence(format!("financial-era source tail: {error}"))
+        })?;
+        let live_after =
+            pe_execution_core::LiveJournal::verified_tail(&manifest.paths.live_journal).map_err(
+                |error| QualificationError::InsufficientEvidence(format!("live journal: {error}")),
+            )?;
+        if live_after != live_prefix {
+            return insufficient("live journal changed during financial-era preparation");
         }
-    }
-    if !unmatched_prepared.is_empty() {
-        return insufficient("financial-era prepare found an unmatched Prepared");
-    }
-    let hot_config_hash = derive_hot_config_hash(financial_config_rows, config)?;
+        (source_prefix, live_prefix, hot_config_hash)
+    } else {
+        let source_prefix = Scanner::verify(&manifest.paths.source_log)?;
+        let live_prefix = verify_live_preparation_posture(
+            &configured_live_journal_path(config),
+            &manifest.paths.source_log,
+            &config.status_path,
+        )?;
+        if !state.open_decision_pending()?.is_empty() {
+            return insufficient("financial-era prepare found an open decision");
+        }
+        if paper_frames.iter().any(|frame| {
+            matches!(
+                frame.frame,
+                PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_))
+            )
+        }) {
+            return insufficient("financial era is already started");
+        }
+        let mut unmatched_prepared = HashSet::new();
+        for frame in &paper_frames {
+            match &frame.frame {
+                PaperLogFrame::Record(PaperLogRecord::FinancialPrepared { .. })
+                    if !unmatched_prepared.insert(receipt_key(frame.receipt)) =>
+                {
+                    return insufficient(
+                        "financial-era prepare found a duplicate Prepared receipt",
+                    );
+                }
+                PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
+                    prepared_receipt, ..
+                }) if !unmatched_prepared.remove(&receipt_key(*prepared_receipt)) => {
+                    return insufficient("financial-era prepare found an unmatched Final");
+                }
+                _ => {}
+            }
+        }
+        if !unmatched_prepared.is_empty() {
+            return insufficient("financial-era prepare found an unmatched Prepared");
+        }
+        (
+            source_prefix,
+            live_prefix,
+            derive_hot_config_hash(financial_config_rows, config)?,
+        )
+    };
     let membership_proofs_hash = derive_membership_proofs_hash(&state, &manifest.membership)?;
     let start = QualificationStarted {
         starting_bankroll: manifest.fresh_bankroll,
@@ -6056,7 +6170,7 @@ fn prepare_financial_era(
         parser_version: manifest.parser_version,
         financial_semantic_version: manifest.financial_semantic_version,
     };
-    let envelope = start_envelope(&start, manifest.start_unix)?;
+    let envelope = financial_start_envelope(manifest, &start)?;
     let next_sequence = paper_prefix
         .last_sequence
         .map_or(Some(0), |sequence| sequence.0.checked_add(1))
@@ -6088,7 +6202,9 @@ fn start_financial_era(
     config: &ServiceConfig,
     financial_config_rows: &[ConfigRow],
 ) -> Result<String, QualificationError> {
-    require_complete_source_prefix(&manifest.paths.source_log)?;
+    if manifest.predecessor_start.is_none() {
+        require_complete_source_prefix(&manifest.paths.source_log)?;
+    }
     if manifest.state != "guarded" && manifest.state != "started" {
         return insufficient("financial-era start requires guarded or started state");
     }
@@ -6098,20 +6214,17 @@ fn start_financial_era(
         )
     })?;
     let frames = scan_paper_log(&manifest.paths.paper_log)?;
-    if let Some(existing) = frames.iter().find(|frame| {
-        matches!(
-            frame.frame,
-            PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_))
-        )
-    }) {
-        if existing.receipt == preparation.expected_receipt
-            && matches!(
-                &existing.frame,
-                PaperLogFrame::Record(PaperLogRecord::QualificationStarted(start))
-                    if start.as_ref() == &preparation.start
-            )
+    let latest = if manifest.predecessor_start.is_some() {
+        paper_era(frames)
+    } else {
+        crate::paper_recovery::paper_generation(frames)
+    };
+    if latest.start.as_ref().map(|(receipt, _)| *receipt) != manifest.predecessor_start {
+        if let Some((receipt, start)) = latest.start
+            && receipt == preparation.expected_receipt
+            && start.as_ref() == &preparation.start
         {
-            return Ok(serde_json::to_string(&existing.receipt)?);
+            return Ok(serde_json::to_string(&receipt)?);
         }
         return insufficient("paper log contains a different QualificationStarted suffix");
     }
@@ -6124,10 +6237,14 @@ fn start_financial_era(
         return insufficient("financial-era preparation differs from the verified manifest inputs");
     }
     let state = PaperStateDb::open(&manifest.paths.paper_state)?;
-    if !state.open_decision_pending()?.is_empty() {
+    if manifest.predecessor_start.is_none() && !state.open_decision_pending()?.is_empty() {
         return insufficient("financial-era start found an open decision");
     }
-    state.reset_financial_era(preparation.expected_receipt, manifest.fresh_bankroll)?;
+    state.reset_financial_era(
+        preparation.expected_receipt,
+        manifest.fresh_bankroll,
+        manifest.predecessor_start,
+    )?;
     let expected = LogTailBinding {
         path: current.path,
         physical_tail: current.physical_tail,
@@ -6135,7 +6252,7 @@ fn start_financial_era(
         last_hash: current.last_hash,
     };
     let mut writer = Writer::open_with_expected_tail(&manifest.paths.paper_log, &expected)?;
-    let receipt = writer.append_synced(start_envelope(&preparation.start, manifest.start_unix)?)?;
+    let receipt = writer.append_synced(financial_start_envelope(manifest, &preparation.start)?)?;
     if receipt != preparation.expected_receipt {
         return insufficient("synchronized QualificationStarted receipt differs from preparation");
     }
@@ -6146,7 +6263,10 @@ fn rollback_check_financial_era(
     manifest: &FinancialEraManifest,
     config: &ServiceConfig,
 ) -> Result<String, QualificationError> {
-    require_complete_source_prefix(&manifest.paths.source_log)?;
+    let successor = manifest.predecessor_start.is_some();
+    if !successor {
+        require_complete_source_prefix(&manifest.paths.source_log)?;
+    }
     validate_financial_manifest(manifest, config)?;
     let scan = Scanner::inspect(&manifest.paths.paper_log)?;
     let frames = scan_verified_paper_prefix(
@@ -6154,36 +6274,63 @@ fn rollback_check_financial_era(
         scan.verified_tail.physical_tail,
         scan.incomplete_tail.is_none(),
     )?;
-    if let Some(started) = frames.iter().find(|frame| {
-        matches!(
-            frame.frame,
-            PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_))
-        )
-    }) {
+    let latest = if manifest.predecessor_start.is_some() {
+        paper_era(frames)
+    } else {
+        crate::paper_recovery::paper_generation(frames)
+    };
+    // The preparation recorded at `guarded` holds the authenticated source anchor.
+    let continuity = if successor {
+        manifest
+            .preparation
+            .as_ref()
+            .map(|preparation| {
+                verify_financial_source_continuity(
+                    &manifest.paths.source_log,
+                    &preparation.start.source_prefix,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    if latest.start.as_ref().map(|(receipt, _)| *receipt) != manifest.predecessor_start {
         let preparation = manifest.preparation.as_ref().ok_or_else(|| {
             QualificationError::InsufficientEvidence(
                 "complete Start exists without a prepared manifest identity".to_owned(),
             )
         })?;
-        if started.receipt != preparation.expected_receipt
-            || !matches!(
-                &started.frame,
-                PaperLogFrame::Record(PaperLogRecord::QualificationStarted(start))
-                    if start.as_ref() == &preparation.start
-            )
-        {
+        let Some((receipt, start)) = latest.start else {
+            return insufficient("financial-era predecessor Start is absent");
+        };
+        if receipt != preparation.expected_receipt || start.as_ref() != &preparation.start {
             return insufficient("complete Start differs from the financial-era manifest");
         }
-        return Ok(format!(
-            "{{\"complete_start\":true,\"receipt\":{}}}",
-            serde_json::to_string(&started.receipt)?
-        ));
+        let mut result = serde_json::json!({"complete_start": true, "receipt": receipt});
+        if successor {
+            result["start_state"] = serde_json::json!("complete");
+            if let Some(continuity) = continuity {
+                result["source_continuity"] = continuity;
+            }
+        }
+        return Ok(serde_json::to_string(&result)?);
     }
-    verify_live_preparation_posture(
-        &configured_live_journal_path(config),
-        &config.source_event_log_path,
-        &config.status_path,
-    )?;
+    if successor {
+        // A refused, stopped attempt must remain recoverable even after its status sample expires.
+        let live = pe_execution_core::LiveJournal::verified_tail(&manifest.paths.live_journal)
+            .map_err(|error| {
+                QualificationError::InsufficientEvidence(format!("live journal: {error}"))
+            })?;
+        if live.last_sequence.is_some() {
+            return insufficient("financial-era rollback found live-journal records");
+        }
+    } else {
+        verify_live_preparation_posture(
+            &configured_live_journal_path(config),
+            &config.source_event_log_path,
+            &config.status_path,
+        )?;
+    }
     let mut repaired = false;
     if scan.incomplete_tail.is_some() {
         let preparation = manifest.preparation.as_ref().ok_or_else(|| {
@@ -6200,9 +6347,92 @@ fn rollback_check_financial_era(
         Writer::open_with_expected_tail(&manifest.paths.paper_log, &expected)?;
         repaired = true;
     }
-    Ok(format!(
-        "{{\"complete_start\":false,\"repaired\":{repaired}}}"
-    ))
+    let mut result = serde_json::json!({"complete_start": false, "repaired": repaired});
+    if successor {
+        result["start_state"] = serde_json::json!(if repaired { "partial" } else { "absent" });
+        if let Some(continuity) = continuity {
+            result["source_continuity"] = continuity;
+        }
+    }
+    Ok(serde_json::to_string(&result)?)
+}
+
+fn verify_financial_source_continuity(
+    path: &Path,
+    anchor: &TailBinding,
+) -> Result<serde_json::Value, QualificationError> {
+    let index = rebuild_financial_source(path)?;
+    let tail = index.current_tail_binding().map_err(|error| {
+        QualificationError::InsufficientEvidence(format!("financial-era source tail: {error}"))
+    })?;
+    let authenticated_end = if let Some(sequence) = anchor.last_sequence {
+        let receipt = index.receipt_at(sequence).map_err(|error| {
+            QualificationError::InsufficientEvidence(format!("guarded source receipt: {error}"))
+        })?;
+        let hash = tail_hash(anchor)?;
+        if receipt.is_none_or(|(receipt, _)| receipt.this_hash != hash) {
+            return insufficient("guarded source receipt differs from the authenticated index");
+        }
+        if tail.last_sequence == Some(sequence) {
+            tail.physical_tail
+        } else {
+            let next = sequence.0.checked_add(1).ok_or_else(|| {
+                QualificationError::InsufficientEvidence(
+                    "guarded source sequence overflow".to_owned(),
+                )
+            })?;
+            let (next_receipt, _) = index
+                .receipt_at(EventSeq(next))
+                .map_err(|error| {
+                    QualificationError::InsufficientEvidence(format!(
+                        "guarded source successor: {error}"
+                    ))
+                })?
+                .ok_or_else(|| {
+                    QualificationError::InsufficientEvidence(
+                        "guarded source successor is absent".to_owned(),
+                    )
+                })?;
+            let binding = LogTailBinding {
+                last_sequence: Some(next_receipt.sequence),
+                last_hash: next_receipt.this_hash,
+                ..tail
+            };
+            let start = usize::try_from(next).map_err(|error| {
+                QualificationError::InsufficientEvidence(format!(
+                    "guarded source sequence: {error}"
+                ))
+            })?;
+            let count = start.checked_add(1).ok_or_else(|| {
+                QualificationError::InsufficientEvidence("guarded source index overflow".to_owned())
+            })?;
+            index
+                .checkpoint_suffix(start, count, &binding)
+                .map_err(|error| {
+                    QualificationError::InsufficientEvidence(format!("guarded source end: {error}"))
+                })?
+                .first()
+                .and_then(|metadata| metadata.byte_offset)
+                .ok_or_else(|| {
+                    QualificationError::InsufficientEvidence(
+                        "guarded source end is absent".to_owned(),
+                    )
+                })?
+        }
+    } else {
+        if tail_hash(anchor)? != blake3::Hash::from_bytes([0; 32]) {
+            return insufficient("empty guarded source anchor has a nonempty hash");
+        }
+        pe_event_log::HEADER_LEN
+    };
+    if authenticated_end != anchor.physical_tail {
+        return insufficient("guarded source end offset differs from the authenticated index");
+    }
+    Ok(serde_json::json!({
+        "authenticated": true,
+        "anchor": {"sequence": anchor.last_sequence, "hash": anchor.last_hash,
+                   "end_offset": anchor.physical_tail},
+    }))
 }
 
 static ROLLBACK_PREFIX_COPY_SEQUENCE: std::sync::atomic::AtomicU64 =
@@ -6268,6 +6498,17 @@ fn start_envelope(
             start.clone(),
         )))?,
     })
+}
+
+fn financial_start_envelope(
+    manifest: &FinancialEraManifest,
+    start: &QualificationStarted,
+) -> Result<EnvelopeIn, QualificationError> {
+    let mut envelope = start_envelope(start, manifest.start_unix)?;
+    if manifest.predecessor_start.is_some() {
+        envelope.parser_version = PaperLogRecord::START_PARSER_VERSION;
+    }
+    Ok(envelope)
 }
 
 fn verify_paper_prepared_freshness(
@@ -12292,6 +12533,7 @@ mod tests {
             kind: FINANCIAL_ERA_KIND.to_owned(),
             state: "prepared".to_owned(),
             activation_id: "act-545".to_owned(),
+            predecessor_start: None,
             generation: "g557".to_owned(),
             fresh_bankroll: CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
             target_revision: "1".repeat(40),
@@ -13188,6 +13430,7 @@ mod tests {
             kind: FINANCIAL_ERA_KIND.to_owned(),
             state: "prepared".to_owned(),
             activation_id: "act-545".to_owned(),
+            predecessor_start: None,
             generation: "g557".to_owned(),
             fresh_bankroll: CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
             target_revision: "1".repeat(40),
@@ -13313,6 +13556,7 @@ mod tests {
             kind: FINANCIAL_ERA_KIND.to_owned(),
             state: "prepared".to_owned(),
             activation_id: "act-545".to_owned(),
+            predecessor_start: None,
             generation: "g557".to_owned(),
             fresh_bankroll: CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
             target_revision: "1".repeat(40),
@@ -13458,6 +13702,560 @@ mod tests {
         );
         assert_eq!(fs::metadata(&paper_log).unwrap().len(), incomplete_len);
     }
+    fn successor_fixture(root: &Path) -> (FinancialEraManifest, ServiceConfig) {
+        let (mut manifest, mut config) = financial_era_live_source_fixture(root);
+        fs::remove_file(&manifest.paths.live_journal).unwrap();
+        drop(LiveJournal::open(&manifest.paths.live_journal).unwrap());
+        fs::remove_file(&manifest.paths.source_log).unwrap();
+        drop(Writer::open(&manifest.paths.source_log).unwrap());
+        append_unreferenced_source_frames(&manifest.paths.source_log, 6);
+        config.bankroll_usd = "100".to_owned();
+        config.supabase_authoritative = true;
+        config.supabase_url = "https://unused.invalid".to_owned();
+        config.supabase_secret_key = "test-service-role".to_owned();
+        manifest.schema_version = u32::try_from(pe_paper_state::SCHEMA_VERSION).unwrap();
+        manifest.parser_version = PaperLogRecord::START_PARSER_VERSION;
+        manifest.financial_semantic_version = FINANCIAL_SEMANTIC_VERSION;
+        let first = prepare_financial_era(&manifest, &config, &financial_config_rows()).unwrap();
+        let mut writer = Writer::open(&manifest.paths.paper_log).unwrap();
+        let predecessor = writer
+            .append_synced(start_envelope(&first.start, manifest.start_unix).unwrap())
+            .unwrap();
+        assert_eq!(predecessor, first.expected_receipt);
+        let seal = QualificationSealed {
+            start_receipt: predecessor,
+            source_prefix: first.start.source_prefix.clone(),
+            financial_prefix: TailBinding::from(&writer.verified_tail().unwrap()),
+            live_prefix: first.start.live_prefix.clone(),
+            decision_evidence_digest: "d".repeat(64),
+            sealed_cutoff_unix: manifest.start_unix,
+            reason: SealReason::InsufficientEvidence("generation sealed".to_owned()),
+        };
+        append_paper_record_at(
+            &mut writer,
+            &PaperLogRecord::QualificationSealed(Box::new(seal)),
+            manifest.start_unix,
+        );
+        drop(writer);
+        let state = PaperStateDb::open(&manifest.paths.paper_state).unwrap();
+        state
+            .reset_financial_era(predecessor, manifest.fresh_bankroll, None)
+            .unwrap();
+        state.set_cursor(&WalletAddress([42; 20]), 77).unwrap();
+        drop(state);
+        manifest.activation_id = "era-20261011T120000Z".to_owned();
+        manifest.predecessor_start = Some(predecessor);
+        (manifest, config)
+    }
+
+    fn guard_successor(manifest: &mut FinancialEraManifest, config: &ServiceConfig) {
+        let preparation =
+            prepare_financial_era(manifest, config, &financial_config_rows()).unwrap();
+        manifest.preparation = Some(preparation);
+        manifest.state = "guarded".to_owned();
+    }
+
+    fn retain_successor_sources(path: &Path, boundary: usize, epoch: u64) {
+        use std::io::{Seek as _, Write as _};
+        let index = SourceReceiptIndex::replay(path).unwrap();
+        let tail = index.current_tail_binding().unwrap();
+        let count = usize::try_from(tail.last_sequence.unwrap().0 + 1).unwrap();
+        let frames = index.checkpoint_suffix(0, count, &tail).unwrap();
+        let authority = pe_event_log::RetentionAuthority {
+            format_version: 1,
+            epoch,
+            advanced_at: 1_700_000_000,
+            boundary: pe_event_log::RetentionBoundary {
+                sequence: EventSeq(u64::try_from(boundary).unwrap()),
+                offset: frames[boundary].byte_offset.unwrap(),
+            },
+            chain_head: frames[boundary - 1].receipt.this_hash,
+            pins: vec![pe_event_log::RetentionPin {
+                sequence: frames[0].receipt.sequence,
+                offset: frames[0].byte_offset.unwrap(),
+                hash: frames[0].receipt.this_hash,
+                predecessor_hash: blake3::Hash::from_bytes([0; 32]),
+                reducer: false,
+                wallet: None,
+            }],
+            retained_tail: (&tail).into(),
+            feed: Vec::new(),
+        };
+        let mut receipts = fs::File::create(crate::source_checkpoint::receipts_path(path)).unwrap();
+        for frame in &frames {
+            receipts
+                .write_all(
+                    &pe_event_log::ReceiptRecord {
+                        receipt: frame.receipt,
+                        received_millis: frame.received_millis,
+                        byte_offset: frame.byte_offset,
+                    }
+                    .encode(),
+                )
+                .unwrap();
+        }
+        receipts.sync_all().unwrap();
+        authority.write(path).unwrap();
+        let mut log = fs::OpenOptions::new().write(true).open(path).unwrap();
+        for sequence in 1..boundary {
+            let start = frames[sequence].byte_offset.unwrap();
+            let end = frames[sequence + 1].byte_offset.unwrap();
+            log.seek(std::io::SeekFrom::Start(start)).unwrap();
+            log.write_all(&vec![0; usize::try_from(end - start).unwrap()])
+                .unwrap();
+        }
+        log.sync_all().unwrap();
+    }
+
+    #[test]
+    fn financial_successor_preflight_prepare_and_start_refuse_before_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut manifest, config) = successor_fixture(temp.path());
+        guard_successor(&mut manifest, &config);
+        PaperStateDb::open(&manifest.paths.paper_state)
+            .unwrap()
+            .stage_dispatch_seed(&pe_paper_state::DispatchSeedRecord {
+                dispatch_id: "seed".to_owned(),
+                signal_json: "{}".to_owned(),
+                source_trade_id: "trade".to_owned(),
+                created_at_unix: 0,
+                targets: Vec::new(),
+            })
+            .unwrap();
+        fs::write(
+            temp.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("rows.json"),
+            serde_json::to_vec(&financial_config_rows()).unwrap(),
+        )
+        .unwrap();
+        let paper_before = fs::read(&manifest.paths.paper_log).unwrap();
+        let database_before = fs::read(&manifest.paths.paper_state).unwrap();
+        for command in [
+            FinancialEraCommand::Preflight,
+            FinancialEraCommand::Prepare,
+            FinancialEraCommand::Start,
+        ] {
+            let mut input = manifest.clone();
+            if command == FinancialEraCommand::Prepare {
+                input.state = "prepared".to_owned();
+            }
+            fs::write(
+                temp.path().join("manifest.json"),
+                serde_json::to_vec(&input).unwrap(),
+            )
+            .unwrap();
+            let error = run_financial_era(
+                command,
+                &temp.path().join("manifest.json"),
+                &config,
+                Some(&temp.path().join("rows.json")),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("durable dispatch seeds"),
+                "{command:?}: {error}"
+            );
+            assert_eq!(fs::read(&manifest.paths.paper_log).unwrap(), paper_before);
+            assert_eq!(
+                fs::read(&manifest.paths.paper_state).unwrap(),
+                database_before
+            );
+            assert_eq!(
+                PaperStateDb::open_read_only(&manifest.paths.paper_state)
+                    .unwrap()
+                    .financial_start()
+                    .unwrap(),
+                manifest.predecessor_start
+            );
+        }
+    }
+
+    #[test]
+    fn financial_successor_guards_reject_versions_bankroll_and_stale_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, config) = successor_fixture(temp.path());
+        let frames = scan_paper_log(&manifest.paths.paper_log).unwrap();
+        let state = PaperStateDb::open_read_only(&manifest.paths.paper_state).unwrap();
+        verify_successor_guards(&manifest, &config, &frames, &state).unwrap();
+        for field in [
+            "schema",
+            "parser",
+            "semantic",
+            "bankroll",
+            "predecessor",
+            "collision",
+            "membership",
+            "batch",
+            "generation",
+        ] {
+            let mut changed = manifest.clone();
+            match field {
+                "schema" => changed.schema_version += 1,
+                "parser" => changed.parser_version += 1,
+                "semantic" => changed.financial_semantic_version += 1,
+                "bankroll" => {
+                    changed.fresh_bankroll =
+                        CollateralAmount::from_decimal_exact(dec!(101)).unwrap()
+                }
+                "predecessor" => changed.predecessor_start = Some(test_receipt(99)),
+                "collision" => changed.activation_id = "act-545".to_owned(),
+                "membership" => changed.membership.push(WalletAddress([42; 20])),
+                "batch" => changed.ranking_batch_id += 1,
+                "generation" => changed.generation = "other".to_owned(),
+                _ => unreachable!(),
+            }
+            assert!(
+                verify_successor_guards(&changed, &config, &frames, &state).is_err(),
+                "{field}"
+            );
+        }
+        assert!(
+            verify_successor_guards(&manifest, &config, &frames[..1], &state)
+                .unwrap_err()
+                .to_string()
+                .contains("generation qualification seal")
+        );
+        let mut legacy = serde_json::to_value(&manifest).unwrap();
+        legacy.as_object_mut().unwrap().remove("predecessor_start");
+        let legacy: FinancialEraManifest = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.predecessor_start.is_none());
+    }
+
+    #[test]
+    fn financial_successor_config_inventory_keeps_incident_control_out_of_economic_hash() {
+        let config = ServiceConfig::default();
+        let rows = financial_config_rows();
+        assert!(!rows.iter().any(|row| row.key == "kelly_fraction_override"));
+        let expected = derive_successor_hot_config_hash(&rows, &config).unwrap();
+        let mut incident = rows.clone();
+        incident.push(ConfigRow {
+            key: RISK_HALT_RELEASE_HASH_KEY.to_owned(),
+            value: "a".repeat(64),
+            value_type: "text".to_owned(),
+        });
+        assert_eq!(
+            derive_successor_hot_config_hash(&incident, &config).unwrap(),
+            expected
+        );
+        assert!(derive_hot_config_hash(&incident, &config).is_err());
+        for (value, value_type) in [("true", "bool"), ("malformed", "text")] {
+            let mut ignored = rows.clone();
+            ignored.push(ConfigRow {
+                key: RISK_HALT_RELEASE_HASH_KEY.to_owned(),
+                value: value.to_owned(),
+                value_type: value_type.to_owned(),
+            });
+            assert_eq!(
+                derive_successor_hot_config_hash(&ignored, &config).unwrap(),
+                expected
+            );
+        }
+        for (key, value, value_type) in [
+            ("fill_mode", "clob", "text"),
+            ("polymarket_fee_rate", "0.01", "decimal"),
+            ("unknown", "true", "bool"),
+        ] {
+            let mut invalid = rows.clone();
+            invalid.push(ConfigRow {
+                key: key.to_owned(),
+                value: value.to_owned(),
+                value_type: value_type.to_owned(),
+            });
+            assert!(
+                derive_successor_hot_config_hash(&invalid, &config).is_err(),
+                "{key}"
+            );
+        }
+        incident.push(incident.last().unwrap().clone());
+        assert_eq!(
+            derive_successor_hot_config_hash(&incident, &config).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn financial_successor_prepare_authenticates_punched_prefix_pins_and_receipts() {
+        for damage in ["none", "pin", "receipt"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (manifest, config) = successor_fixture(temp.path());
+            retain_successor_sources(&manifest.paths.source_log, 3, 1);
+            let mut path = manifest.paths.source_log.clone();
+            let offset = if damage == "receipt" {
+                path = crate::source_checkpoint::receipts_path(&path);
+                0
+            } else {
+                usize::try_from(pe_event_log::HEADER_LEN + 12).unwrap()
+            };
+            if damage != "none" {
+                let mut bytes = fs::read(&path).unwrap();
+                bytes[offset] ^= 0xff;
+                fs::write(path, bytes).unwrap();
+            }
+            let before = fs::read(&manifest.paths.paper_state).unwrap();
+            let result = prepare_financial_era(&manifest, &config, &financial_config_rows());
+            if damage == "none" {
+                let preparation = result.unwrap();
+                assert_eq!(
+                    preparation.start.source_prefix,
+                    TailBinding::from(&Scanner::verify(&manifest.paths.source_log).unwrap())
+                );
+                assert_eq!(preparation.start.activation_id, manifest.activation_id);
+                assert!(preparation.start.membership.is_empty());
+                MembershipProofBinding::decode_and_verify(
+                    &preparation.start.membership_proofs_hash,
+                    &[],
+                )
+                .unwrap();
+                fs::write(
+                    temp.path().join("manifest.json"),
+                    serde_json::to_vec(&manifest).unwrap(),
+                )
+                .unwrap();
+                fs::write(
+                    temp.path().join("rows.json"),
+                    serde_json::to_vec(&financial_config_rows()).unwrap(),
+                )
+                .unwrap();
+                run_preflight(temp.path(), &config).unwrap();
+            } else {
+                assert!(result.is_err(), "{damage}");
+            }
+            assert_eq!(fs::read(&manifest.paths.paper_state).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn financial_successor_start_refuses_interior_source_damage_before_reset_or_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut manifest, config) = successor_fixture(temp.path());
+        retain_successor_sources(&manifest.paths.source_log, 3, 1);
+        guard_successor(&mut manifest, &config);
+        let authority = pe_event_log::RetentionAuthority::load(&manifest.paths.source_log)
+            .unwrap()
+            .unwrap();
+        let mut bytes = fs::read(&manifest.paths.source_log).unwrap();
+        bytes[usize::try_from(authority.boundary.offset + 12).unwrap()] ^= 0xff;
+        fs::write(&manifest.paths.source_log, bytes).unwrap();
+        let before = fs::read(&manifest.paths.paper_state).unwrap();
+        let paper_before = fs::read(&manifest.paths.paper_log).unwrap();
+        assert!(
+            start_financial_era(&manifest, &config, &financial_config_rows())
+                .unwrap_err()
+                .to_string()
+                .contains("source rebuild")
+        );
+        assert_eq!(fs::read(&manifest.paths.paper_state).unwrap(), before);
+        assert_eq!(fs::read(&manifest.paths.paper_log).unwrap(), paper_before);
+    }
+
+    #[test]
+    fn financial_successor_start_retries_reset_before_locked_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut manifest, config) = successor_fixture(temp.path());
+        guard_successor(&mut manifest, &config);
+        let expected = manifest.preparation.as_ref().unwrap().expected_receipt;
+        let paper_before = fs::read(&manifest.paths.paper_log).unwrap();
+        let writer = Writer::open(&manifest.paths.paper_log).unwrap();
+        assert!(matches!(
+            start_financial_era(&manifest, &config, &financial_config_rows()),
+            Err(QualificationError::EventLog(
+                pe_event_log::LogError::Locked { .. }
+            ))
+        ));
+        assert_eq!(fs::read(&manifest.paths.paper_log).unwrap(), paper_before);
+        assert_eq!(
+            PaperStateDb::open_read_only(&manifest.paths.paper_state)
+                .unwrap()
+                .financial_start()
+                .unwrap(),
+            Some(expected)
+        );
+        drop(writer);
+        let receipt = start_financial_era(&manifest, &config, &financial_config_rows()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AppendReceipt>(&receipt).unwrap(),
+            expected
+        );
+        assert_eq!(
+            start_financial_era(&manifest, &config, &financial_config_rows()).unwrap(),
+            receipt
+        );
+        let state = PaperStateDb::open_read_only(&manifest.paths.paper_state).unwrap();
+        assert_eq!(state.cursor(&WalletAddress([42; 20])).unwrap(), Some(77));
+        assert_eq!(scan_paper_log(&manifest.paths.paper_log).unwrap().len(), 3);
+        for change in ["receipt", "payload"] {
+            let mut conflicting = manifest.clone();
+            let preparation = conflicting.preparation.as_mut().unwrap();
+            if change == "receipt" {
+                preparation.expected_receipt = test_receipt(99);
+            } else {
+                preparation.start.hot_config_hash = "f".repeat(64);
+            }
+            assert!(start_financial_era(&conflicting, &config, &financial_config_rows()).is_err());
+        }
+        // A first-era manifest retains its original receipt verdict after a successor exists.
+        let frames = scan_paper_log(&manifest.paths.paper_log).unwrap();
+        let (first_receipt, first_start) = crate::paper_recovery::paper_generation(frames)
+            .start
+            .unwrap();
+        let mut original = manifest.clone();
+        original.predecessor_start = None;
+        original.preparation = Some(FinancialEraPreparation {
+            start: first_start.as_ref().clone(),
+            expected_receipt: first_receipt,
+        });
+        assert_eq!(
+            serde_json::from_str::<AppendReceipt>(
+                &start_financial_era(&original, &config, &financial_config_rows()).unwrap()
+            )
+            .unwrap(),
+            first_receipt
+        );
+        let original: serde_json::Value =
+            serde_json::from_str(&rollback_check_financial_era(&original, &config).unwrap())
+                .unwrap();
+        assert_eq!(
+            original["receipt"],
+            serde_json::to_value(first_receipt).unwrap()
+        );
+        assert!(original.get("source_continuity").is_none());
+    }
+
+    #[test]
+    fn financial_successor_rollback_repairs_partial_start_despite_stale_status() {
+        use std::io::Write as _;
+        let temp = tempfile::tempdir().unwrap();
+        let (mut manifest, config) = successor_fixture(temp.path());
+        guard_successor(&mut manifest, &config);
+        let prepared_len = fs::metadata(&manifest.paths.paper_log).unwrap().len();
+        let expected = manifest.preparation.as_ref().unwrap().expected_receipt;
+        PaperStateDb::open(&manifest.paths.paper_state)
+            .unwrap()
+            .reset_financial_era(
+                expected,
+                manifest.fresh_bankroll,
+                manifest.predecessor_start,
+            )
+            .unwrap();
+        fs::write(
+            &config.status_path,
+            br#"{"live":{"stale":true,"pending_dispatch_seeds":99,"ready_dispatch_seeds":99}}"#,
+        )
+        .unwrap();
+        let absent: serde_json::Value =
+            serde_json::from_str(&rollback_check_financial_era(&manifest, &config).unwrap())
+                .unwrap();
+        assert_eq!(absent["complete_start"], false);
+        assert_eq!(absent["start_state"], "absent");
+        assert_eq!(absent["source_continuity"]["authenticated"], true);
+        let mut unguarded = manifest.clone();
+        unguarded.preparation = None;
+        let unguarded: serde_json::Value =
+            serde_json::from_str(&rollback_check_financial_era(&unguarded, &config).unwrap())
+                .unwrap();
+        assert!(unguarded.get("source_continuity").is_none());
+
+        // Make the exact successor suffix with the real writer, then tear its final byte.
+        let preparation = manifest.preparation.as_ref().unwrap();
+        Writer::open(&manifest.paths.paper_log)
+            .unwrap()
+            .append_synced(start_envelope(&preparation.start, manifest.start_unix).unwrap())
+            .unwrap();
+        let complete_len = fs::metadata(&manifest.paths.paper_log).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&manifest.paths.paper_log)
+            .unwrap()
+            .set_len(complete_len - 1)
+            .unwrap();
+        let partial: serde_json::Value =
+            serde_json::from_str(&rollback_check_financial_era(&manifest, &config).unwrap())
+                .unwrap();
+        assert_eq!(partial["start_state"], "partial");
+        assert_eq!(partial["repaired"], true);
+        assert_eq!(
+            fs::metadata(&manifest.paths.paper_log).unwrap().len(),
+            prepared_len
+        );
+        fs::write(&config.status_path, br#"{"live":{"stale":false,"pending_dispatch_seeds":0,"ready_dispatch_seeds":0,"accounts":[]}}"#).unwrap();
+        start_financial_era(&manifest, &config, &financial_config_rows()).unwrap();
+        fs::remove_file(&config.status_path).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&manifest.paths.paper_log)
+            .unwrap()
+            .write_all(&[0])
+            .unwrap();
+        let torn_after_start = fs::metadata(&manifest.paths.paper_log).unwrap().len();
+        let complete: serde_json::Value =
+            serde_json::from_str(&rollback_check_financial_era(&manifest, &config).unwrap())
+                .unwrap();
+        assert_eq!(complete["complete_start"], true);
+        assert_eq!(complete["start_state"], "complete");
+        assert_eq!(complete["receipt"], serde_json::to_value(expected).unwrap());
+        assert_eq!(
+            fs::metadata(&manifest.paths.paper_log).unwrap().len(),
+            torn_after_start
+        );
+    }
+
+    #[test]
+    fn financial_successor_source_continuity_survives_retention_advance_and_rejects_tamper() {
+        for started in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut manifest, config) = successor_fixture(temp.path());
+            retain_successor_sources(&manifest.paths.source_log, 3, 1);
+            guard_successor(&mut manifest, &config);
+            let anchor = manifest
+                .preparation
+                .as_ref()
+                .unwrap()
+                .start
+                .source_prefix
+                .clone();
+            if started {
+                start_financial_era(&manifest, &config, &financial_config_rows()).unwrap();
+            }
+            // Append after guarding, then retire even the frame at the guarded tail.
+            append_unreferenced_source_frames(&manifest.paths.source_log, 3);
+            retain_successor_sources(&manifest.paths.source_log, 7, 2);
+            let result: serde_json::Value =
+                serde_json::from_str(&rollback_check_financial_era(&manifest, &config).unwrap())
+                    .unwrap();
+            assert_eq!(result["complete_start"], started);
+            assert_eq!(
+                result["source_continuity"]["anchor"]["sequence"],
+                serde_json::to_value(anchor.last_sequence).unwrap()
+            );
+            assert_eq!(
+                result["source_continuity"]["anchor"]["hash"],
+                anchor.last_hash
+            );
+            assert_eq!(
+                result["source_continuity"]["anchor"]["end_offset"],
+                anchor.physical_tail
+            );
+            for change in ["hash", "offset", "sequence"] {
+                let mut tampered = manifest.clone();
+                let binding = &mut tampered.preparation.as_mut().unwrap().start.source_prefix;
+                match change {
+                    "hash" => binding.last_hash = "f".repeat(64),
+                    "offset" => binding.physical_tail += 1,
+                    "sequence" => binding.last_sequence = Some(EventSeq(99)),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    rollback_check_financial_era(&tampered, &config).is_err(),
+                    "{change}"
+                );
+            }
+        }
+    }
+
     fn store_read_decision(
         state: &PaperStateDb,
         continuation: &DecisionContinuationV3,
