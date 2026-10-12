@@ -724,6 +724,10 @@ end $$;
 SQL
 pass_step
 
+start_step "the driver's read-only Financial15 helper accepts the candidate schema"
+verify_financial_service_contract
+pass_step
+
 start_step "prepare the successor through the Rust owner with the generation seal"
 # This explicit ignored test writes only the recorded fixture seal with the production PaperLog
 # encoder. Prepare, reset and Start below use the same service binary as the first-era flow.

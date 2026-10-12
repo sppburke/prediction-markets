@@ -115,7 +115,7 @@ begin
     raise exception 'Financial15 role attributes differ';
   end if;
   if exists (
-    select signature from unnest(expected_functions) signature
+    select expected from unnest(expected_functions) expected
     except select p.oid::regprocedure::text from pg_proc p
       where p.pronamespace='public'::regnamespace and p.proname in
         ('commit_fill','commit_fill_v2','apply_resolution','apply_resolution_v2',
@@ -125,7 +125,7 @@ begin
       where p.pronamespace='public'::regnamespace and p.proname in
         ('commit_fill','commit_fill_v2','apply_resolution','apply_resolution_v2',
          'seed_financial_start','service_watchlist_replace_v1','account_set_effective_mode')
-    except select signature from unnest(expected_functions) signature
+    except select expected from unnest(expected_functions) expected
   ) then raise exception 'Financial15 callable inventory differs'; end if;
   foreach signature in array expected_functions loop
     foreach role_name in array array['anon','authenticated','service_role'] loop
