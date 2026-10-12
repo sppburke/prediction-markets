@@ -148,8 +148,15 @@ containers="pe-successor-$(printf '%s' "$run_root" | sha256sum | cut -c1-12)" un
 remove_containers() {
   docker ps -aq --filter "name=^$containers-$1" | xargs -r docker rm -f >/dev/null 2>&1 || true
 }
+# A regular unit file, like the production unit: `disable` on a linked unit would also remove the link.
+user_units="$HOME/.config/systemd/user"
+remove_unit() {
+  systemctl --user disable --now "$1" >/dev/null 2>&1 || true
+  rm -f "$user_units/$1"
+  systemctl --user daemon-reload
+}
 cleanup() {
-  if [[ -n "$unit" ]]; then systemctl --user disable --now "$unit" >/dev/null 2>&1 || true; fi
+  if [[ -n "$unit" ]]; then remove_unit "$unit"; fi
   remove_containers ''
 }
 trap cleanup EXIT
@@ -300,7 +307,9 @@ launcher.write_text("#!/usr/bin/env bash\nset -euo pipefail\nexec env -i PATH=/u
 shim=root/"bin/systemctl"
 shim.write_text("#!/usr/bin/env bash\nset -euo pipefail\nif [[ $1 == is-enabled ]]; then\n  status=0; state=$(/usr/bin/systemctl --user is-enabled "+shlex.quote(sys.argv[2])+") || status=$?\n  if [[ $state == linked ]]; then echo disabled; exit 1; fi\n  printf '%s\\n' \"$state\"; exit \"$status\"\nfi\nargs=()\nfor arg in \"$@\"; do\n  [[ $arg != pe-service ]] || arg="+shlex.quote(sys.argv[2])+"\n  args+=(\"$arg\")\ndone\nexec /usr/bin/systemctl --user \"${args[@]}\"\n"); shim.chmod(0o700)
 PY
-  systemctl --user link "$branch_root/$unit" >/dev/null
+  mkdir -p "$user_units"
+  install -m 0644 "$branch_root/$unit" "$user_units/$unit"
+  systemctl --user daemon-reload
   systemctl --user enable --now "$unit" >/dev/null
   wait_ready
   # Old boot validates membership using the Rust owner. Quiesce again before comparing stores.
@@ -443,7 +452,7 @@ PY
     run_driver || die "fresh attempt verification failed"
   fi
   [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$branch_root/pe-financial-era.json") == verified ]] || die "branch was not verified"
-  systemctl --user disable --now "$unit" >/dev/null
+  remove_unit "$unit"
   unit=
   remove_containers "gw-$branch"; remove_containers "rest-$branch"
   SUPABASE_DB_URL="postgres://rehearsal:$(cat "$run_root/pg-password")@127.0.0.1:$pg_port/postgres"
