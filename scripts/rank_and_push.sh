@@ -259,11 +259,11 @@ fi
 # Load secrets up front so EVERY stage (incl. the push + verify, which read SUPABASE_URL /
 # SUPABASE_SECRET_KEY from the environment) sees them. Sourcing only before the verify step
 # would leave the push stage without credentials.
-set -a; source .env; set +a
+set -a; source ./.env; set +a
 MIN_TTR_SECS=60
 
 # Neutralize PE_BOOTSTRAP_FETCH_RESOLUTIONS for the `backfill` stage (issue #383). `.env` sets
-# it =1 (.env:30) and the `set -a; source .env` above exports it GLOBALLY, so without this unset
+# it =1 (.env:30) and the `set -a; source ./.env` above exports it GLOBALLY, so without this unset
 # the `backfill` stage's gate (backfill.rs:98 `if config.fetch_resolutions`) fires and runs the
 # entire CLOB→Gamma resolutions/schedules refresh — which the explicit `resolutions` stage then
 # runs AGAIN unconditionally (main.rs:199), doubling a multi-hour pipeline. Unsetting here makes
@@ -777,7 +777,7 @@ refresh_data() {
     run_refresh_stage "events" "$PE_BOOTSTRAP_BIN" events "${BOOTSTRAP_CONFIG_ARGS[@]}"
     # The explicit `resolutions` subcommand runs the CLOB→Gamma resolutions+schedules pipeline
     # UNCONDITIONALLY (main.rs:199) — it does NOT gate on PE_BOOTSTRAP_FETCH_RESOLUTIONS. `backfill`
-    # above runs trades-only because the var was unset right after `source .env` (issue #383); THAT
+    # above runs trades-only because the var was unset right after `source ./.env` (issue #383); THAT
     # top-level unset is what prevents the double refresh, not the export below. The export is kept
     # only as a docs/26 canonical-invocation parity signal (operator "explicit env" preference) and
     # is bounded by the matching unset so it never leaks past this stage. fetch_resolutions_and_schedules
