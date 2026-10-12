@@ -1576,7 +1576,6 @@ fn derive_golden_start(
         start_receipt: None,
         started_unix: None,
         predecessor_start: None,
-        guarded_source_prefix: None,
     };
     let manifest_path = dir.join("financial-era.json");
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();

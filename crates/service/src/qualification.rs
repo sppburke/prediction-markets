@@ -5590,8 +5590,6 @@ pub struct FinancialEraManifest {
     #[serde(default)]
     pub guarded_logs: Option<BTreeMap<String, FinancialEraLogIdentity>>,
     #[serde(default)]
-    pub guarded_source_prefix: Option<TailBinding>,
-    #[serde(default)]
     pub start_receipt: Option<AppendReceipt>,
     #[serde(default)]
     pub started_unix: Option<i64>,
@@ -6281,11 +6279,17 @@ fn rollback_check_financial_era(
     } else {
         crate::paper_recovery::paper_generation(frames)
     };
+    // The preparation recorded at `guarded` holds the authenticated source anchor.
     let continuity = if successor {
         manifest
-            .guarded_source_prefix
+            .preparation
             .as_ref()
-            .map(|anchor| verify_financial_source_continuity(&manifest.paths.source_log, anchor))
+            .map(|preparation| {
+                verify_financial_source_continuity(
+                    &manifest.paths.source_log,
+                    &preparation.start.source_prefix,
+                )
+            })
             .transpose()?
     } else {
         None
@@ -12559,7 +12563,6 @@ mod tests {
             backup: None,
             remote_census: None,
             guarded_logs: None,
-            guarded_source_prefix: None,
             start_receipt: None,
             started_unix: None,
         };
@@ -13457,7 +13460,6 @@ mod tests {
             backup: None,
             remote_census: None,
             guarded_logs: None,
-            guarded_source_prefix: None,
             start_receipt: None,
             started_unix: None,
         };
@@ -13584,7 +13586,6 @@ mod tests {
             backup: None,
             remote_census: None,
             guarded_logs: None,
-            guarded_source_prefix: None,
             start_receipt: None,
             started_unix: None,
         };
@@ -13750,7 +13751,6 @@ mod tests {
     fn guard_successor(manifest: &mut FinancialEraManifest, config: &ServiceConfig) {
         let preparation =
             prepare_financial_era(manifest, config, &financial_config_rows()).unwrap();
-        manifest.guarded_source_prefix = Some(preparation.start.source_prefix.clone());
         manifest.preparation = Some(preparation);
         manifest.state = "guarded".to_owned();
     }
@@ -13921,13 +13921,8 @@ mod tests {
         );
         let mut legacy = serde_json::to_value(&manifest).unwrap();
         legacy.as_object_mut().unwrap().remove("predecessor_start");
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("guarded_source_prefix");
         let legacy: FinancialEraManifest = serde_json::from_value(legacy).unwrap();
         assert!(legacy.predecessor_start.is_none());
-        assert!(legacy.guarded_source_prefix.is_none());
     }
 
     #[test]
@@ -14109,7 +14104,6 @@ mod tests {
             .unwrap();
         let mut original = manifest.clone();
         original.predecessor_start = None;
-        original.guarded_source_prefix = None;
         original.preparation = Some(FinancialEraPreparation {
             start: first_start.as_ref().clone(),
             expected_receipt: first_receipt,
@@ -14159,7 +14153,6 @@ mod tests {
         assert_eq!(absent["start_state"], "absent");
         assert_eq!(absent["source_continuity"]["authenticated"], true);
         let mut unguarded = manifest.clone();
-        unguarded.guarded_source_prefix = None;
         unguarded.preparation = None;
         let unguarded: serde_json::Value =
             serde_json::from_str(&rollback_check_financial_era(&unguarded, &config).unwrap())
@@ -14217,7 +14210,13 @@ mod tests {
             let (mut manifest, config) = successor_fixture(temp.path());
             retain_successor_sources(&manifest.paths.source_log, 3, 1);
             guard_successor(&mut manifest, &config);
-            let anchor = manifest.guarded_source_prefix.clone().unwrap();
+            let anchor = manifest
+                .preparation
+                .as_ref()
+                .unwrap()
+                .start
+                .source_prefix
+                .clone();
             if started {
                 start_financial_era(&manifest, &config, &financial_config_rows()).unwrap();
             }
@@ -14242,7 +14241,7 @@ mod tests {
             );
             for change in ["hash", "offset", "sequence"] {
                 let mut tampered = manifest.clone();
-                let binding = tampered.guarded_source_prefix.as_mut().unwrap();
+                let binding = &mut tampered.preparation.as_mut().unwrap().start.source_prefix;
                 match change {
                     "hash" => binding.last_hash = "f".repeat(64),
                     "offset" => binding.physical_tail += 1,

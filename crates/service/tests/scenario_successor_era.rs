@@ -781,6 +781,31 @@ async fn successor_retained_boot_copy_settlement_duplicates_membership_and_midni
         floor_cash
     );
     h.shutdown().await;
+    // Two restarts after new-era fills and settlements recover the same cash, holdings,
+    // frontier and Start.
+    let book = state.financial_snapshot(MIDNIGHT + 3).unwrap();
+    assert!(book.last_prepared_seq.is_some());
+    for _ in 0..2 {
+        let membership = replay_membership(
+            &paper_generation(scan_paper_log(&dir.path().join("paper.log")).unwrap()),
+            initial.clone(),
+            &source_path,
+        )
+        .unwrap()
+        .unwrap();
+        golden::BracketFinancialHarness::boot_existing(
+            dir.path(),
+            state.clone(),
+            membership.watchlist,
+            runtime.clone(),
+            false,
+            MIDNIGHT + 4,
+        )
+        .await
+        .shutdown()
+        .await;
+        assert_eq!(state.financial_snapshot(MIDNIGHT + 3).unwrap(), book);
+    }
     retention(
         dir.path(),
         state.clone(),
