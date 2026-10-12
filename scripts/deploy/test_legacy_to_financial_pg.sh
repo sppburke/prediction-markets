@@ -727,8 +727,9 @@ pass_step
 start_step "prepare the successor through the Rust owner with the generation seal"
 # This explicit ignored test writes only the recorded fixture seal with the production PaperLog
 # encoder. Prepare, reset and Start below use the same service binary as the first-era flow.
-PE_SUCCESSOR_PG_FIXTURE="$financial_fixture" cargo test -p pe-service --features scenario \
-  --test scenario_successor_era postgres_successor_generation_seal_fixture -- --ignored --exact
+(cd "$REPO_ROOT" && PE_SUCCESSOR_PG_FIXTURE="$financial_fixture" cargo test -p pe-service \
+  --features scenario --test scenario_successor_era postgres_successor_generation_seal_fixture \
+  -- --ignored --exact)
 psql_service_db -v ON_ERROR_STOP=1 -Atc \
   "select coalesce(json_agg(json_build_object('key',key,'value',value,'value_type',value_type) order by key),'[]'::json)::text from service_config;" \
   > "$financial_config_rows"
