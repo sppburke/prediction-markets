@@ -854,7 +854,6 @@ psql_service_db -v ON_ERROR_STOP=1 \
   -v successor_seq="$successor_seq" -v successor_hash="$successor_hash" \
   -v predecessor_seq="$start_seq" -v predecessor_hash="$start_hash" <<'SQL'
 begin;
-set local role service_role;
 select set_config('pe.successor_seq', :'successor_seq', true);
 select set_config('pe.successor_hash', :'successor_hash', true);
 select set_config('pe.predecessor_seq', :'predecessor_seq', true);
