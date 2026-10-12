@@ -13777,7 +13777,8 @@ const PUBLICATION_PRINT_WALLET: &str = "0x55555555555555555555555555555555555555
 fn publication_dataset(now: i64, quiet: &str) -> (Vec<Value>, Vec<Value>) {
     let mut rows = Vec::new();
     let mut markets = Vec::new();
-    let old = now - 40 * 86_400;
+    // Whole hours keep each entry clear of the same-day horizon's floor before UTC midnight.
+    let old = (now - 40 * 86_400).div_euclid(3_600) * 3_600;
     for index in 0..20 {
         let market = format!("0x{:064x}", index + 100);
         let token = (1000 + 2 * index).to_string();
