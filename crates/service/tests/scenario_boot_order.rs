@@ -409,6 +409,7 @@ impl RestartFixture {
             .reset_financial_era(
                 start_receipt,
                 CollateralAmount::from_decimal_exact(CASH).unwrap(),
+                None,
             )
             .unwrap();
         let mut writer = Writer::open(dir.path().join("source.log")).unwrap();

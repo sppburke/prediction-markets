@@ -675,6 +675,7 @@ async fn active_fill_crash_matrix_converges_once() {
             .reset_financial_era(
                 start,
                 CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+                None,
             )
             .unwrap();
         let authority = FakeSupabaseState::prepared(dec!(10), start);
@@ -1036,6 +1037,7 @@ async fn resumed_legacy_checkpoints_keep_financial_terminal_bytes() {
                 .reset_financial_era(
                     start,
                     CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+                    None,
                 )
                 .unwrap();
             let mut wire = support::legacy_continuation_wire(version);

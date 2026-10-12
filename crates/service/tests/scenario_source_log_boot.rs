@@ -1460,6 +1460,7 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
         .reset_financial_era(
             start,
             CollateralAmount::from_decimal_exact(local_reset).unwrap(),
+            None,
         )
         .unwrap();
     let mut authority_progress =
@@ -3680,6 +3681,7 @@ async fn hourly_checkpoint_matches_staged_preparation() {
                 .reset_financial_era(
                     start,
                     CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+                    None,
                 )
                 .unwrap();
         }
@@ -4792,6 +4794,7 @@ async fn progressive_boot_skips_waves_after_membership_record() {
             .reset_financial_era(
                 start,
                 CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+                None,
             )
             .unwrap();
         if post_start_record {
@@ -5984,6 +5987,7 @@ async fn retention_completed_pairs_reproject_old_frame_admission_and_frontier_wi
             .reset_financial_era(
                 start,
                 CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+                None,
             )
             .unwrap();
         install_mixed_current_open_continuations(&paper, &paths.source_log, start);

@@ -462,7 +462,11 @@ impl Harness {
         drop(writer);
         if financial_semantic_version != 0 {
             paper
-                .reset_financial_era(start, CollateralAmount::from_decimal_exact(CASH).unwrap())
+                .reset_financial_era(
+                    start,
+                    CollateralAmount::from_decimal_exact(CASH).unwrap(),
+                    None,
+                )
                 .unwrap();
         }
         let sink = SourceEventSink::open(dir.path().join("source.log")).unwrap();

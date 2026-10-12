@@ -394,6 +394,7 @@ async fn quiet_boundary_records_no_causal_prepared_prefix() {
         .reset_financial_era(
             start,
             CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
+            None,
         )
         .unwrap();
     let boundary_payload = serde_json::to_vec(&serde_json::json!({
@@ -470,6 +471,7 @@ async fn acknowledged_pre_cutoff_websocket_fill_survives_late_final_and_replay()
         .reset_financial_era(
             start,
             CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
+            None,
         )
         .unwrap();
 

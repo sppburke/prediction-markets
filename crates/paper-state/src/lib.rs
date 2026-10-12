@@ -4560,18 +4560,17 @@ impl PaperStateDb {
     /// Only the five financial tables and their replay-version metadata are reset. Source
     /// decisions, leader state, fences, anchors, dispatch evidence, and every append-only log
     /// remain untouched. An equal retry is idempotent only when the reset is already complete;
-    /// a different Start is always a conflict.
+    /// a different stored Start must equal the explicitly authorized predecessor.
     pub fn reset_financial_era(
         &self,
         start: AppendReceipt,
         starting_bankroll: CollateralAmount,
+        predecessor: Option<AppendReceipt>,
     ) -> Result<(), PaperStateError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
-        if let Some(stored) = tx_financial_start(&tx)? {
-            if stored != start {
-                return Err(PaperStateError::FinancialStartConflict);
-            }
+        let stored = tx_financial_start(&tx)?;
+        if stored == Some(start) {
             let cash = tx_read_bankroll(&tx)?;
             let empty = tx.query_row(
                 "SELECT (SELECT COUNT(*) FROM fills) + \
@@ -4591,6 +4590,9 @@ impl PaperStateDb {
             return Err(PaperStateError::FinancialConflict(
                 "financial-era reset retry differs from stored state".to_owned(),
             ));
+        }
+        if stored != predecessor {
+            return Err(PaperStateError::FinancialStartConflict);
         }
 
         tx.execute("DELETE FROM fill_market_snapshots", [])?;
@@ -10790,8 +10792,8 @@ mod tests {
 
         let start = append_receipt(10, 7);
         let bankroll = CollateralAmount::from_decimal_exact(dec!(100)).unwrap();
-        db.reset_financial_era(start, bankroll).unwrap();
-        db.reset_financial_era(start, bankroll).unwrap();
+        db.reset_financial_era(start, bankroll, None).unwrap();
+        db.reset_financial_era(start, bankroll, None).unwrap();
 
         let snapshot = db.financial_snapshot(1_000).unwrap();
         assert_eq!(snapshot.cash, dec!(100));
@@ -10804,9 +10806,54 @@ mod tests {
         assert!(db.wallet_history_complete(&wallet).unwrap());
 
         assert!(matches!(
-            db.reset_financial_era(append_receipt(11, 8), bankroll),
+            db.reset_financial_era(append_receipt(11, 8), bankroll, None),
             Err(PaperStateError::FinancialStartConflict)
         ));
+    }
+
+    #[test]
+    fn financial_era_successor_reset_requires_current_predecessor_and_pristine_retry() {
+        let (_dir, db) = db();
+        let predecessor = append_receipt(10, 7);
+        let successor = append_receipt(20, 8);
+        let bankroll = CollateralAmount::from_decimal_exact(dec!(100)).unwrap();
+        assert!(matches!(
+            db.reset_financial_era(successor, bankroll, Some(predecessor)),
+            Err(PaperStateError::FinancialStartConflict)
+        ));
+        db.reset_financial_era(predecessor, bankroll, None).unwrap();
+        db.set_cursor(&wallet(), 77).unwrap();
+        db.lock()
+            .execute("UPDATE bankroll SET bankroll_str = '25'", [])
+            .unwrap();
+        assert!(matches!(
+            db.reset_financial_era(successor, bankroll, Some(append_receipt(9, 6))),
+            Err(PaperStateError::FinancialStartConflict)
+        ));
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(25)));
+        db.reset_financial_era(successor, bankroll, Some(predecessor))
+            .unwrap();
+        db.reset_financial_era(successor, bankroll, Some(predecessor))
+            .unwrap();
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(100)));
+        assert_eq!(db.financial_start().unwrap(), Some(successor));
+        assert_eq!(db.cursor(&wallet()).unwrap(), Some(77));
+        assert!(matches!(
+            db.seed_financial_start(predecessor),
+            Err(PaperStateError::FinancialStartConflict)
+        ));
+        assert!(matches!(
+            db.reset_financial_era(append_receipt(30, 9), bankroll, Some(predecessor)),
+            Err(PaperStateError::FinancialStartConflict)
+        ));
+        db.lock()
+            .execute("UPDATE bankroll SET bankroll_str = '99'", [])
+            .unwrap();
+        assert!(matches!(
+            db.reset_financial_era(successor, bankroll, Some(predecessor)),
+            Err(PaperStateError::FinancialConflict(_))
+        ));
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(99)));
     }
 
     #[test]

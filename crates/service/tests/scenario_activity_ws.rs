@@ -1572,6 +1572,7 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
         .reset_financial_era(
             start,
             CollateralAmount::from_decimal_exact(dec!(10_000)).unwrap(),
+            None,
         )
         .unwrap();
 
@@ -1934,6 +1935,7 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
         .reset_financial_era(
             start,
             CollateralAmount::from_decimal_exact(dec!(10_000)).unwrap(),
+            None,
         )
         .unwrap();
 

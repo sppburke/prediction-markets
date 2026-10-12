@@ -5688,6 +5688,7 @@ mod tests {
             .reset_financial_era(
                 start,
                 CollateralAmount::from_decimal_exact(dec!(1_000)).unwrap(),
+                None,
             )
             .unwrap();
         StartedSealFixture {
@@ -7542,6 +7543,7 @@ mod tests {
             .reset_financial_era(
                 start,
                 CollateralAmount::from_decimal_exact(dec!(1_000)).unwrap(),
+                None,
             )
             .unwrap();
         let mut orchestrator = test_orchestrator(
@@ -7666,6 +7668,7 @@ mod tests {
             .reset_financial_era(
                 start,
                 CollateralAmount::from_decimal_exact(dec!(1_000)).unwrap(),
+                None,
             )
             .unwrap();
         let mut source_writer = Writer::open(&source_path).unwrap();

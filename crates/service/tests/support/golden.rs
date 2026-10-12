@@ -1559,6 +1559,8 @@ fn derive_golden_start(
         guarded_logs: None,
         start_receipt: None,
         started_unix: None,
+        predecessor_start: None,
+        guarded_source_prefix: None,
     };
     let manifest_path = dir.join("financial-era.json");
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -1751,6 +1753,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
         .reset_financial_era(
             start_receipt,
             CollateralAmount::from_decimal_exact(STARTING_BANKROLL).unwrap(),
+            None,
         )
         .unwrap();
     let authority = GoldenAuthority::new(start_receipt);
@@ -2982,6 +2985,7 @@ impl BracketFinancialHarness {
             .reset_financial_era(
                 start,
                 CollateralAmount::from_decimal_exact(STARTING_BANKROLL).unwrap(),
+                None,
             )
             .unwrap();
         let authority = GoldenAuthority::new(start);

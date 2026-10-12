@@ -1933,6 +1933,7 @@ mod paper_log_tests {
             .reset_financial_era(
                 receipt(20),
                 CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
+                None,
             )
             .unwrap();
         assert_eq!(paper_state.decision_pending_history().unwrap().len(), 1);
