@@ -362,15 +362,18 @@ if list(map(int,sys.argv[2].split()))!=[census[key] for key in ("paper_fills","s
     raise SystemExit("successor archive differs from guarded census")
 ' "$branch_root/pe-financial-era.json" "$census"
 }
+# systemd unloads a disabled, inactive unit, so its own stop timestamp reads zero; use the journal's.
 stop_origin() {
-  stop_origin_us=$(systemctl --user show "$unit" -p InactiveEnterTimestampMonotonic --value)
+  stop_origin_us=$(journalctl --user -u "$unit" -o json --no-pager | python3 -c 'import json,sys
+stops=[int(e["__REALTIME_TIMESTAMP"]) for e in map(json.loads,sys.stdin) if str(e.get("MESSAGE","")).startswith("Stopped ")]
+print(stops[-1] if stops else "")')
   [[ "$stop_origin_us" =~ ^[1-9][0-9]*$ ]] || die "private unit lacks a stop timestamp"
   stop_previous_ns=$((stop_origin_us * 1000))
 }
 
 record_stop_phase() {
   local phase=$1 now
-  now=$(python3 -c 'import time; print(time.monotonic_ns())')
+  now=$(date +%s%N)
   (( now >= stop_previous_ns )) || die "private stop clock moved backwards"
   printf '%s|%s|%s\n' "$phase" "$((now-stop_previous_ns))" "$((now-stop_origin_us*1000))" >> "$branch_root/stop-durations.tsv"
   stop_previous_ns=$now
