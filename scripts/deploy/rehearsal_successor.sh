@@ -92,7 +92,8 @@ root=pathlib.Path(sys.argv[1]); receipt=json.loads((root/"pe-financial-era.json"
 def rows(name): return list(csv.DictReader((root/"authority"/(name+".csv")).open()))
 remote=rows("paper_bankroll")
 if len(remote)!=1 or int(remote[0]["start_seq"])!=receipt["sequence"] or remote[0]["start_hash"]!=receipt["this_hash"]: raise SystemExit("authority predecessor differs")
-db=sqlite3.connect("file:"+str(root/"state/paper_state.db")+"?mode=ro",uri=True); db.execute("BEGIN")
+# immutable: the quiesced capture has no sidecars and nobody has it open; never create them here.
+db=sqlite3.connect("file:"+str(root/"state/paper_state.db")+"?mode=ro&immutable=1",uri=True); db.execute("BEGIN")
 def meta(key):
     row=db.execute("select value from meta where key=?",(key,)).fetchone()
     if row is None: return None
