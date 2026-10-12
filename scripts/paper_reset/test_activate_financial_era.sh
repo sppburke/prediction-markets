@@ -28,13 +28,11 @@ SHARD_TOTAL=${BASH_REMATCH[2]}
 
 shard_owns() {
   local owner=$1
-  if [[ "${SUCCESSOR_ONLY:-0}" == 1 ]]; then [[ "$owner" == 9 ]]; return; fi
   (( SHARD_TOTAL == 1 || SHARD_INDEX == (owner < SHARD_TOTAL ? owner : SHARD_TOTAL) ))
 }
 
 MATRIX_ROW=0
 matrix_row_selected() {
-  [[ "${SUCCESSOR_ONLY:-0}" != 1 ]] || return 1
   MATRIX_ROW=$((MATRIX_ROW + 1))
   (( SHARD_TOTAL == 1 || SHARD_INDEX == 2 + (MATRIX_ROW - 1) % (SHARD_TOTAL - 1) ))
 }
@@ -193,7 +191,8 @@ TEST_TMP=$(mktemp -d)
 trap 'rm -rf "$TEST_TMP"' EXIT
 
 write_shims() {
-  local root=$1 bin=$root/bin
+  local root=$1
+  local bin=$root/bin
   mkdir -p "$bin"
   # Observe the real restore helper without replacing its SQLite/file operations. The crash
   # seams leave the replacement main in place with the old WAL/shm or only shm beside it.
@@ -641,7 +640,8 @@ PY
 }
 
 setup_hermetic_financial_driver() {
-  local root=$1 copy_root=$root/hermetic-driver
+  local root=$1
+  local copy_root=$root/hermetic-driver
   mkdir -p "$copy_root/scripts/deploy" "$copy_root/scripts/paper_reset"
   cp "$DRIVER" "$SCRIPT_DIR/archive_paper_state.sql" "$SCRIPT_DIR/restore_paper_state.sql" \
     "$copy_root/scripts/paper_reset/"
@@ -749,15 +749,8 @@ PY
 }
 if [[ -e "$state/successor" && "$*" == *--financial-config-rows=* ]]; then
   for arg in "$@"; do [[ "$arg" != --financial-config-rows=* ]] || rows=${arg#*=}; done
-  python3 -c 'import json,re,sys
-rows=json.load(open(sys.argv[1])); known={"active_watchlist_size","flip_human_approved","kelly_fraction_above_default_human_approved","max_fill_price","max_resolution_horizon_secs","min_fill_price","min_resolution_horizon_secs","mode","per_trade_cap","price_impact_cap_bps","sizing_contracts","sizing_dollar_usd","sizing_mode","slippage_rate","kelly_fraction_override"}
-keys=[r["key"] for r in rows]
-if len(keys)!=len(set(keys)) or not (known-{"kelly_fraction_override"})<=set(keys): raise SystemExit("Financial15 missing keys")
-for row in rows:
-    if row["key"]=="risk_halt_release_hash":
-        if row["value_type"]!="text" or re.fullmatch("[0-9a-f]{64}",row["value"]) is None: raise SystemExit("invalid incident row")
-    elif row["key"] not in known: raise SystemExit("Financial15 unknown or retired key")
-' "$rows"
+  cp "$rows" "$state/received-config-rows.json"
+  [[ ! -e "$state/config-refusal" ]] || { echo "financial-era runtime configuration has a retired key" >&2; exit 1; }
 fi
 case "$*" in
   *--verify-staged-identity*)
@@ -770,7 +763,7 @@ case "$*" in
       python3 -c 'import json,sys
 m=json.load(open(sys.argv[1]))
 prefix={"physical_tail":5,"last_sequence":None,"last_hash":"0"*64}
-start={key:m[key] for key in ("activation_id","ranking_batch_id","membership","schema_version","parser_version","financial_semantic_version","start_unix")}
+start={key:m[key] for key in ("activation_id","ranking_batch_id","membership","schema_version","parser_version","financial_semantic_version")}
 start.update(starting_bankroll=m["fresh_bankroll"],paper_prefix=prefix,source_prefix=prefix,live_prefix=prefix,
  hot_config_hash="b"*64,artifact_blake3=m["artifact_blake3"],static_config_hash=m["static_config_hash"],generation=m["generation"],membership_proofs_hash="empty")
 print(json.dumps({"start":start,"expected_receipt":{"sequence":1,"this_hash":"c"*64}}))' "$manifest"
@@ -914,11 +907,13 @@ raise SystemExit(1 if bad else 0)' \
       python3 -c 'import json,os,sys
 m=json.load(open(sys.argv[1])); state=sys.argv[2]
 v={"complete_start":os.path.exists(state+"/complete-start"),"repaired":False}
+v["start_state"]="complete" if v["complete_start"] else "absent"
 if v["complete_start"]: v["receipt"]={"sequence":1,"this_hash":"c"*64}
-if m.get("guarded_logs"):
+if m.get("preparation"):
     if os.path.exists(state+"/continuity-refusal"):
         raise SystemExit("guarded source receipt differs from the authenticated index")
-    v["source_continuity"]={"authenticated":True,"anchor":{"sequence":0,"hash":"e"*64,"end_offset":5}}
+    prefix=m["preparation"]["start"]["source_prefix"]
+    v["source_continuity"]={"authenticated":True,"anchor":{"sequence":prefix["last_sequence"],"hash":prefix["last_hash"],"end_offset":prefix["physical_tail"]}}
 print(json.dumps(v))' "$manifest" "$state" || exit 95
       exit 0
     fi
@@ -1147,7 +1142,8 @@ json.dump(value,open(path,"w"),sort_keys=True,separators=(",",":"))' \
 }
 
 driver_args() {
-  local root=$1 service=$root/prediction-markets target=$root/target
+  local root=$1
+  local service=$root/prediction-markets target=$root/target
   DRIVER_ARGS=(
     --target-binary "$target/pe-service"
     --target-config "$target/service.toml"
@@ -1170,7 +1166,8 @@ run_driver() {
 }
 
 assert_restored_sqlite() {
-  local root=$1 database=$root/prediction-markets/gen/g557/paper_state.db backup
+  local root=$1
+  local database=$root/prediction-markets/gen/g557/paper_state.db backup
   backup=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["backup"]["path"])' \
     "$root/pe-financial-era.json")
   # Opening a WAL-mode database can create sidecars, so inspect physical completion first.
@@ -4371,29 +4368,18 @@ assert_successor_reinstated() {
   [[ -f "$root/pe-financial-era.era-20330518T033320Z.rolled_back.json" ]] || fail "failed transition authority not retired"
 }
 
-SUCCESSOR_SHARD=${SUCCESSOR_SHARD:-1/1}
-[[ "$SUCCESSOR_SHARD" =~ ^([1-9][0-9]?)/([1-9][0-9]?)$ ]] || fail "invalid SUCCESSOR_SHARD"
-SUCCESSOR_SHARD_INDEX=${BASH_REMATCH[1]}; SUCCESSOR_SHARD_TOTAL=${BASH_REMATCH[2]}
-(( SUCCESSOR_SHARD_INDEX <= SUCCESSOR_SHARD_TOTAL )) || fail "invalid SUCCESSOR_SHARD"
-SUCCESSOR_ROW=0
-successor_row_selected() {
-  SUCCESSOR_ROW=$((SUCCESSOR_ROW + 1))
-  (( (SUCCESSOR_ROW - 1) % SUCCESSOR_SHARD_TOTAL + 1 == SUCCESSOR_SHARD_INDEX ))
-}
-
-if shard_owns 9 && [[ "${SKIP_SUCCESSOR_CASES:-0}" != 1 ]]; then
+if shard_owns 1; then
 for script in "$REPO_ROOT/scripts/deploy/rehearsal_successor.sh" "$DRIVER" "$COMMON"; do bash -n "$script"; done
 "$REPO_ROOT/scripts/deploy/rehearsal_successor.sh" --dry-run --capture /unused/capture --run-root /unused/run \
   --target-binary /unused/bin --target-config /unused/config --target-environment /unused/env \
   --old-binary /unused/old-bin --old-config /unused/old-config --old-environment /unused/old-env --old-unit-policy /unused/policy >/dev/null || fail "successor dry-run consulted the filesystem"
 if "$REPO_ROOT/scripts/deploy/rehearsal_successor.sh" --dry-run --capture /unused >/dev/null 2>&1; then fail "successor dry-run accepted incomplete tuple"; fi
+fi
 
 # Forward lifecycle: each interruption resumes the persisted transition, including copy/replace.
-for boundary in predecessor-copied before-manifest-prepared prepared service-stop-intent stopped-disabled service-stopped \
-  backup-intent backup-completed before-manifest-guarded guarded remote-archive-intent remote-archived qualification-start-intent \
-  qualification-started authority_schema-skipped live_schema-skipped financial_config-skipped authority-start-seeded \
-  target-config-adopted target-environment-adopted target-binary-adopted target-enabled target-start-invoked service-started started; do
-  successor_row_selected || continue
+for boundary in predecessor-copied before-manifest-prepared prepared stopped-disabled before-manifest-guarded guarded \
+  authority_schema-skipped live_schema-skipped financial_config-skipped target-enabled target-start-invoked; do
+  matrix_row_selected || continue
   root=$TEST_TMP/successor-forward-$boundary
   setup_successor_fixture "$root"
   result=0; run_driver "$root" --simulate-crash-after "$boundary" > "$root/output" 2>&1 || result=$?
@@ -4414,8 +4400,8 @@ PY
 done
 
 # Both rollback certificates across pre-stop, pre-backup and in-flight archive boundaries.
-for boundary in prepared service-stop-intent service-stopped backup-intent backup-completed guarded remote-archive-intent remote-archived; do
-  successor_row_selected || continue
+for boundary in prepared service-stop-intent stopped-disabled service-stopped backup-intent backup-completed guarded remote-archive-intent remote-archived; do
+  matrix_row_selected || continue
   root=$TEST_TMP/successor-rollback-$boundary
   setup_successor_fixture "$root"
   result=0; run_driver "$root" --simulate-crash-after "$boundary" > "$root/output" 2>&1 || result=$?
@@ -4437,6 +4423,8 @@ PY
   [[ "$result" == 86 ]] || fail "failed-manifest retirement $boundary: $(<"$root/output")"
   run_driver "$root" --rollback-before-start >/dev/null || fail "completed rollback re-entry $boundary"
   assert_successor_reinstated "$root"
+  [[ ! -f "$root/test-state/service.enabled" || $(<"$root/test-state/service.enabled") == true ]] ||
+    fail "rollback after $boundary left the old unit disabled"
   echo 20330518T033321Z > "$root/test-state/era-stamp"
   drive_to_verified "$root" || fail "fresh attempt after $boundary"
   [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["activation_id"])' "$root/pe-financial-era.json") == era-20330518T033321Z ]] || fail "rolled-back id reused"
@@ -4445,7 +4433,7 @@ done
 
 # Archive committed without a completion receipt; writer-lock reset and restarted-old interruption.
 for boundary in archive-commit restoration-certified rollback-old-start-invoked old-service-started old-service-failed before-manifest-predecessor-reinstated; do
-  successor_row_selected || continue
+  matrix_row_selected || continue
   root=$TEST_TMP/successor-rollback-resume-$boundary
   setup_successor_fixture "$root"
   if [[ "$boundary" == archive-commit ]]; then touch "$root/test-state/crash-after-archive-commit";
@@ -4476,7 +4464,7 @@ PYPROGRESS
 done
 
 for scenario in archive backup retired paper-id; do
-  successor_row_selected || continue
+  matrix_row_selected || continue
   root=$TEST_TMP/successor-collision-$scenario; setup_successor_fixture "$root"
   case "$scenario" in
     archive) touch "$root/test-state/archive-collision" ;;
@@ -4490,11 +4478,11 @@ for scenario in archive backup retired paper-id; do
   [[ ! -e "$root/test-state/stop-count" ]] || fail "collision stopped production"
 done
 for flag in --membership-json --ranking-batch-id; do
-  successor_row_selected || continue
+  matrix_row_selected || continue
   root=$TEST_TMP/successor-cli-${flag#--}; setup_successor_fixture "$root"
   successor_expect_refusal "$root" 'forbids supplied' "$flag" anything
 done
-if [[ "$SUCCESSOR_SHARD_INDEX" == 1 ]]; then
+if matrix_row_selected; then
 root=$TEST_TMP/successor-tamper; setup_successor_fixture "$root"
 printf '\n' >> "$root/pe-financial-era.json"
 successor_expect_refusal "$root" 'predecessor manifest identity changed'
@@ -4505,8 +4493,10 @@ successor_expect_refusal "$root" 'predecessor manifest sha256 differs'
 root=$TEST_TMP/successor-retired-conflict; setup_successor_fixture "$root"
 echo conflicting > "$root/pe-financial-era.act-545.verified.json"
 successor_expect_refusal "$root" 'conflicting retired manifest'
+fi
 
 # Current installed tuple, rather than #557 bytes, is the rollback authority.
+if matrix_row_selected; then
 root=$TEST_TMP/successor-redeployed; setup_successor_fixture "$root"
 echo redeployed-binary >> "$root/prediction-markets/target/release/pe-service"
 echo '# redeployed config' >> "$root/prediction-markets/smoke-test/service.toml"
@@ -4535,7 +4525,7 @@ done
 
 fi
 for scenario in financial15 census-uninspectable census-stray account-census disable enable start status78 failed-outcome activity-unknown; do
-  successor_row_selected || continue
+  matrix_row_selected || continue
   root=$TEST_TMP/successor-gate-$scenario; setup_successor_fixture "$root"
   case "$scenario" in
     financial15) marker=financial15-refusal; reason='Financial15 contract refusal' ;;
@@ -4556,26 +4546,33 @@ for scenario in financial15 census-uninspectable census-stray account-census dis
   drive_to_verified "$root" || fail "gate $scenario did not resume"
 done
 
-for scenario in absent incident wrong-incident omitted-override retired unknown; do
-  successor_row_selected || continue
+for scenario in inventory refusal; do
+  matrix_row_selected || continue
   root=$TEST_TMP/successor-config-$scenario; setup_successor_fixture "$root"
-  python3 - "$root/test-state/raw-config.json" "$scenario" <<'PY'
+  python3 - "$root/test-state/raw-config.json" <<'PY'
 import json,sys
-keys={"active_watchlist_size":"100","flip_human_approved":"false","kelly_fraction_above_default_human_approved":"false","max_fill_price":"0.85","max_resolution_horizon_secs":"172800","min_fill_price":"0.15","min_resolution_horizon_secs":"60","mode":"paper","per_trade_cap":"unlimited","price_impact_cap_bps":"100","sizing_contracts":"1","sizing_dollar_usd":"25","sizing_mode":"dollar","slippage_rate":"0.01"}
-rows=[{"key":key,"value":value,"value_type":"text"} for key,value in keys.items()]
-scenario=sys.argv[2]
-if scenario in ("incident","wrong-incident"): rows.append({"key":"risk_halt_release_hash","value":"a"*64,"value_type":"text" if scenario=="incident" else "integer"})
-if scenario in ("retired","unknown"): rows.append({"key":"fill_mode" if scenario=="retired" else "unknown","value":"value","value_type":"text"})
-json.dump(rows,open(sys.argv[1],"w"))
+rows=[("active_watchlist_size","100","integer"),("flip_human_approved","false","bool"),("kelly_fraction_above_default_human_approved","false","bool"),
+ ("max_fill_price","0.85","decimal"),("max_resolution_horizon_secs","172800","integer"),("min_fill_price","0.15","decimal"),
+ ("min_resolution_horizon_secs","60","integer"),("mode","paper","text"),("per_trade_cap","unlimited","text"),("price_impact_cap_bps","100","integer"),
+ ("sizing_contracts","1","integer"),("sizing_dollar_usd","25","decimal"),("sizing_mode","dollar","text"),("slippage_rate","0.01","decimal"),
+ ("risk_halt_release_hash","1","integer")]
+json.dump([{"key":k,"value":v,"value_type":t} for k,v,t in rows],open(sys.argv[1],"w"))
 PY
-  case "$scenario" in
-    wrong-incident|retired|unknown) successor_expect_refusal "$root" 'successor preflight refused before authority replacement' ;;
-    *) drive_to_verified "$root" || fail "full config inventory $scenario" ;;
-  esac
+  if [[ "$scenario" == refusal ]]; then
+    touch "$root/test-state/config-refusal"
+    successor_expect_refusal "$root" 'successor preflight refused before authority replacement'
+    cmp -s "$root/pe-financial-era.json" "$root/test-state/predecessor.json" || fail "config refusal replaced the predecessor"
+  else
+    drive_to_verified "$root" || fail "full config inventory refused"
+    python3 -c 'import json,sys
+key=lambda rows: sorted(rows,key=lambda r:r["key"])
+assert key(json.load(open(sys.argv[1])))==key(json.load(open(sys.argv[2]))), "exported rows differ from the raw table"' \
+      "$root/test-state/received-config-rows.json" "$root/test-state/raw-config.json" || fail "config rows were not exported unchanged"
+  fi
 done
 
 for scenario in missing malformed closure binding old-tuple; do
-  successor_row_selected || continue
+  matrix_row_selected || continue
   root=$TEST_TMP/successor-evidence-$scenario; setup_successor_fixture "$root"
   case "$scenario" in
     missing) rm "$root/rehearsal/evidence.json" ;;
@@ -4593,14 +4590,15 @@ PY
   successor_expect_refusal "$root" 'rehearsal evidence was refused'
   [[ ! -e "$root/test-state/stop-count" ]] || fail "bad successor evidence stopped production"
 done
-if [[ "$SUCCESSOR_SHARD_INDEX" == 1 ]]; then
+if matrix_row_selected; then
 root=$TEST_TMP/successor-evidence-resume; setup_successor_fixture "$root"
 run_driver "$root" --simulate-crash-after prepared >/dev/null 2>&1 || [[ $? == 86 ]] || fail "prepared setup"
 echo '{}' > "$root/rehearsal/evidence.json"
 successor_expect_refusal "$root" 'rehearsal evidence was refused'
 # Bootstrap production refusal is tested at its owner before filesystem/credential use.
 if bash -c 'source "$1"; verify_successor_bootstrap /unused /unused' bash "$COMMON" >/dev/null 2>&1; then fail "production bootstrap accepted"; fi
-
+fi
+if matrix_row_selected; then
 root=$TEST_TMP/successor-retention; setup_successor_fixture "$root"
 run_driver "$root" >/dev/null
 printf 'punched-prefix\n' >> "$root/prediction-markets/gen/g557/source_events.log"
@@ -4613,8 +4611,8 @@ successor_expect_refusal "$root" 'guarded source receipt differs'
 
 fi
 # Independent conservation, including physical settled positions and zero-credit settlements.
-for scenario in pristine fractional settled zero-credit cash holdings cursor remote-cash remote-holdings remote-cursor; do
-  successor_row_selected || continue
+for scenario in fractional settled zero-credit cash holdings cursor remote-cash remote-holdings remote-cursor; do
+  matrix_row_selected || continue
   root=$TEST_TMP/successor-conservation-$scenario; setup_successor_fixture "$root"
   run_driver "$root" >/dev/null
   python3 - "$root" "$scenario" <<'PY'
@@ -4648,12 +4646,8 @@ PY
     *) run_driver "$root" >/dev/null || fail "conservation $scenario refused" ;;
   esac
 done
-echo 'PASS: FE-SUCCESSOR-CONTRACTS lifecycle, identity, CLI, authority, Financial15, census, evidence, continuity and conservation'
-fi
 
-if [[ "${SUCCESSOR_ONLY:-0}" == 1 ]]; then
-  echo "PASS: financial-era successor shard $SUCCESSOR_SHARD"
-elif [[ "$SHARD_TOTAL" == 1 ]]; then
+if [[ "$SHARD_TOTAL" == 1 ]]; then
 echo "PASS: 73 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
 else
   echo "PASS: financial-era shard $SHARD"

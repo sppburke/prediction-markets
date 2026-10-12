@@ -40,7 +40,7 @@ if [[ "$dry_run" == true ]]; then
     'evidence_contract=successor-rehearsal-evidence-v1'
   exit 0
 fi
-for command in python3 b3sum zstd psql initdb pg_ctl postgrest nginx systemctl curl flock sha256sum; do
+for command in python3 psql docker systemctl curl flock sha256sum; do
   command -v "$command" >/dev/null || die "$command is required for successor rehearsal"
 done
 capture=$(realpath "$capture"); run_root=$(realpath -m "$run_root")
@@ -84,44 +84,11 @@ for key,path in zip(("binary","config","environment_template","unit_policy"),sys
 if not metadata.get("environment_transformations") or not re.fullmatch("[0-9a-f]{64}",metadata["old_tuple"]["environment_sha256"]):
     raise SystemExit("capture lacks original environment identity/normalization provenance")
 PY
-# Authenticate the paper chain and completed frontier before launching either tuple.
+# Cross-check the two stores against the predecessor Start before launching either tuple. The Rust owners
+# validate the paper chain and membership: the old binary's boot and the successor preflight.
 python3 - "$capture" <<'PY'
-import binascii,csv,decimal,json,pathlib,sqlite3,struct,subprocess,sys
-root=pathlib.Path(sys.argv[1]); predecessor=json.loads((root/"pe-financial-era.json").read_text())
-receipt=predecessor["start_receipt"]; pending={}; completed=[]; latest=None; members=None; prior="0"*64; sequence=0
-with (root/"state/paper.log").open("rb") as source:
-    if source.read(5)!=b"EDGE\x01": raise SystemExit("invalid captured paper header")
-    while True:
-        length=source.read(4)
-        if not length: break
-        if len(length)!=4: raise SystemExit("torn paper frame")
-        size=struct.unpack("<I",length)[0]; compressed=source.read(size); crc=source.read(4)
-        if len(compressed)!=size or len(crc)!=4 or binascii.crc32(compressed)!=struct.unpack("<I",crc)[0]: raise SystemExit("paper CRC differs")
-        envelope=json.loads(subprocess.run(["zstd","-d","-q","-c"],input=compressed,stdout=subprocess.PIPE,check=True).stdout)
-        payload=bytes(envelope["payload"])
-        def blake(data): return subprocess.run(["b3sum","--no-names"],input=data,stdout=subprocess.PIPE,check=True).stdout.decode().strip()
-        canonical={key:envelope[key] for key in ("content_type","observed_at","parser_version","prev_hash","raw_payload_hash","received_at","schema_version","seq","source_id")}
-        if envelope["seq"]!=sequence or envelope["prev_hash"]!=prior or blake(payload)!=envelope["raw_payload_hash"] or blake(bytes.fromhex(prior)+json.dumps(canonical,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()+payload)!=envelope["this_hash"]:
-            raise SystemExit("paper chain differs")
-        prior=envelope["this_hash"]; sequence+=1
-        if envelope["schema_version"]==1: continue
-        record=json.loads(payload); kind=record["record"]; frame={"sequence":envelope["seq"],"this_hash":prior}
-        if kind=="qualification_started":
-            if pending: raise SystemExit("unmatched Prepared before Start")
-            latest=frame; completed=[]
-            if members is None: members=set(record["membership"])
-        elif kind=="financial_prepared":
-            if latest is None or record["expected_authority"]["qualification_start_receipt"]!=latest: raise SystemExit("Prepared belongs to another era")
-            pending[frame["sequence"]]=frame
-        elif kind=="financial_final":
-            prepared=record["prepared_receipt"]
-            if pending.pop(prepared["sequence"],None)!=prepared: raise SystemExit("Final has no matching Prepared")
-            completed.append(prepared["sequence"])
-        elif kind=="membership_changed":
-            removed=set(record["removed"]); added=set(record["added"])
-            if members is None or not removed<=members or added & (members-removed): raise SystemExit("captured membership cannot replay")
-            members=(members-removed)|added
-if latest!=receipt or pending: raise SystemExit("captured predecessor or completed frontier differs")
+import csv,decimal,json,pathlib,sqlite3,sys
+root=pathlib.Path(sys.argv[1]); receipt=json.loads((root/"pe-financial-era.json").read_text())["start_receipt"]
 def rows(name): return list(csv.DictReader((root/"authority"/(name+".csv")).open()))
 remote=rows("paper_bankroll")
 if len(remote)!=1 or int(remote[0]["start_seq"])!=receipt["sequence"] or remote[0]["start_hash"]!=receipt["this_hash"]: raise SystemExit("authority predecessor differs")
@@ -131,19 +98,16 @@ def meta(key):
     if row is None: return None
     return row[0].decode() if isinstance(row[0],bytes) else str(row[0])
 if meta("financial_start_seq")!=str(receipt["sequence"]) or meta("financial_start_hash")!=receipt["this_hash"]: raise SystemExit("SQLite predecessor differs")
-frontier=max(completed) if completed else None
 local_cursor=None if meta("financial_last_prepared_seq") is None else int(meta("financial_last_prepared_seq"))
 remote_cursor=None if not remote[0]["last_prepared_seq"] else int(remote[0]["last_prepared_seq"])
-local_rows=[r[0] for r in db.execute("select prepared_seq from fills union all select prepared_seq from settled_markets")]
-remote_rows=[int(r["prepared_seq"]) for name in ("paper_fills","settled_markets") for r in rows(name)]
-if local_cursor!=frontier or remote_cursor!=frontier or sorted(local_rows)!=sorted(remote_rows) or set(local_rows)!=set(completed): raise SystemExit("captured completed Prepared frontier differs")
+local_rows=sorted(r[0] for r in db.execute("select prepared_seq from fills union all select prepared_seq from settled_markets"))
+remote_rows=sorted(int(r["prepared_seq"]) for name in ("paper_fills","settled_markets") for r in rows(name))
+if local_cursor!=remote_cursor or local_rows!=remote_rows or local_cursor!=(local_rows[-1] if local_rows else None): raise SystemExit("captured completed Prepared frontier differs")
 cash=db.execute("select bankroll_str from bankroll").fetchall()
 if len(cash)!=1 or decimal.Decimal(cash[0][0])!=decimal.Decimal(remote[0]["bankroll_str"]): raise SystemExit("captured cash differs")
 local={(r[0],r[1]):(decimal.Decimal(r[2]),decimal.Decimal(r[3])) for r in db.execute("select market_id,outcome_id,long_str,short_str from positions")}
 authority={(r["market_id"],int(r["outcome_id"])):(decimal.Decimal(r["long_contracts"]),decimal.Decimal(r["short_contracts"])) for r in rows("paper_positions")}
 if local!=authority: raise SystemExit("captured holdings differ")
-def wallet(value): return value.lower().removeprefix("0x")
-if not {wallet(r["wallet_hex"]) for r in rows("service_watchlist")}<={wallet(w) for w in members or ()}: raise SystemExit("authority membership cannot replay")
 PY
 
 mkdir -m 700 -p "$run_root"
@@ -176,19 +140,28 @@ def token(role):
 (root/"pg-password").write_text(password)
 for path in root.iterdir(): path.chmod(0o600)
 PY
-pg_started=false postgrest_pid= proxy_pid= unit=
+# The authority runs in pinned local images on the host network, bound to loopback only. Secrets reach
+# the containers through mode-0600 env files, never argv.
+containers="pe-successor-$(printf '%s' "$run_root" | sha256sum | cut -c1-12)" unit=
+remove_containers() {
+  docker ps -aq --filter "name=^$containers-$1" | xargs -r docker rm -f >/dev/null 2>&1 || true
+}
 cleanup() {
   if [[ -n "$unit" ]]; then systemctl --user disable --now "$unit" >/dev/null 2>&1 || true; fi
-  if [[ -n "$proxy_pid" ]]; then kill "$proxy_pid" 2>/dev/null || true; wait "$proxy_pid" 2>/dev/null || true; fi
-  if [[ -n "$postgrest_pid" ]]; then kill "$postgrest_pid" 2>/dev/null || true; wait "$postgrest_pid" 2>/dev/null || true; fi
-  [[ "$pg_started" == false ]] || pg_ctl -D "$run_root/postgres" -m fast -w stop >/dev/null 2>&1 || true
+  remove_containers ''
 }
 trap cleanup EXIT
-initdb -D "$run_root/postgres" -U rehearsal --auth-local=trust --auth-host=scram-sha-256 \
-  --pwfile="$run_root/pg-password" > "$run_root/initdb.log"
-printf "listen_addresses = '127.0.0.1'\nport = %s\nunix_socket_directories = '%s'\n" "$pg_port" "$run_root" >> "$run_root/postgres/postgresql.conf"
-pg_ctl -D "$run_root/postgres" -l "$run_root/postgres.log" -w start >/dev/null
-pg_started=true
+private_env() {
+  (umask 077; printf '%s\n' "${@:2}" > "$run_root/$1")
+}
+private_env postgres.env POSTGRES_USER=rehearsal "POSTGRES_PASSWORD=$(cat "$run_root/pg-password")"
+docker run -d --name "$containers-pg" --network host --env-file "$run_root/postgres.env" postgres:16 \
+  -c listen_addresses=127.0.0.1 -c port="$pg_port" >/dev/null
+for attempt in {1..60}; do
+  docker exec "$containers-pg" pg_isready -q -h 127.0.0.1 -p "$pg_port" -U rehearsal && break
+  sleep 1
+done
+docker exec "$containers-pg" pg_isready -q -h 127.0.0.1 -p "$pg_port" -U rehearsal || die "private PostgreSQL did not start"
 SUPABASE_DB_URL="postgres://rehearsal:$(cat "$run_root/pg-password")@127.0.0.1:$pg_port/postgres"
 export SUPABASE_DB_URL
 psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
@@ -228,7 +201,7 @@ ARCHIVE_SQL
   python3 - "$capture/authority" <<'PY' | psql_service_db -v ON_ERROR_STOP=1 > "$run_root/load-$branch.log"
 import csv,pathlib,re,sys
 root=pathlib.Path(sys.argv[1]); files=sorted(path for path in root.glob("*.csv") if not path.stem.endswith("_mv"))
-required={"paper_fills","paper_positions","paper_bankroll","settled_markets","fill_market_snapshots","service_config","accounts","account_credentials","service_watchlist","service_runtime","ranking_batches","ranking_entries"}
+required={"paper_fills","paper_positions","paper_bankroll","settled_markets","fill_market_snapshots","service_config","accounts","service_watchlist","service_runtime","ranking_batches","ranking_entries"}
 if not required<={path.stem for path in files}: raise SystemExit("incomplete authority export")
 print("begin;")
 for path in files:
@@ -243,23 +216,18 @@ print("commit;")
 PY
   verify_financial_service_contract
   account_census_receipt >/dev/null
-  python3 - "$run_root/postgrest.conf" "$postgrest_port" <<'PY'
-import os,pathlib,sys
-path=pathlib.Path(sys.argv[1]); secret=(path.parent/"jwt-secret").read_text()
-# Config stays private; no credential-bearing connection URL is placed in argv.
-path.write_text('db-uri = '+repr(os.environ["SUPABASE_DB_URL"]).replace("'",'"')+'\ndb-schemas = "public"\ndb-anon-role = "anon"\njwt-secret = "'+secret+'"\nserver-host = "127.0.0.1"\nserver-port = '+sys.argv[2]+'\n')
-path.chmod(0o600)
-PY
-  postgrest "$run_root/postgrest.conf" > "$run_root/postgrest-$branch.log" 2>&1 & postgrest_pid=$!
-  python3 - "$run_root/nginx.conf" "$http_port" "$postgrest_port" <<'PYCONF'
-import pathlib,sys
-path=pathlib.Path(sys.argv[1]); root=path.parent
-path.write_text('daemon off;\npid '+str(root/'nginx.pid')+';\nerror_log '+str(root/'nginx.log')+';\nevents {}\nhttp { access_log off; client_body_temp_path '+str(root/'nginx-body')+'; proxy_temp_path '+str(root/'nginx-proxy')+'; server { listen 127.0.0.1:'+sys.argv[2]+'; location /rest/v1/ { proxy_pass http://127.0.0.1:'+sys.argv[3]+'/; } } }\n')
-PYCONF
-  nginx -p "$run_root/" -c "$run_root/nginx.conf" > "$run_root/nginx-$branch.log" 2>&1 & proxy_pid=$!
+  private_env "postgrest-$branch.env" "PGRST_DB_URI=$SUPABASE_DB_URL" PGRST_DB_SCHEMAS=public \
+    PGRST_DB_ANON_ROLE=anon "PGRST_JWT_SECRET=$(cat "$run_root/jwt-secret")" \
+    PGRST_SERVER_HOST=127.0.0.1 "PGRST_SERVER_PORT=$postgrest_port"
+  docker run -d --name "$containers-rest-$branch" --network host \
+    --env-file "$run_root/postgrest-$branch.env" postgrest/postgrest:v12.2.3 >/dev/null
+  printf 'events {}\nhttp { access_log off; server { listen 127.0.0.1:%s; location /rest/v1/ { proxy_pass http://127.0.0.1:%s/; } } }\n' \
+    "$http_port" "$postgrest_port" > "$run_root/nginx-$branch.conf"
+  docker run -d --name "$containers-gw-$branch" --network host \
+    -v "$run_root/nginx-$branch.conf:/etc/nginx/nginx.conf:ro" nginx:alpine >/dev/null
   for attempt in {1..60}; do
     curl -fsS "http://127.0.0.1:$http_port/rest/v1/" >/dev/null && return
-    kill -0 "$postgrest_pid" || die "private PostgREST exited"
+    [[ $(docker inspect -f '{{.State.Running}}' "$containers-rest-$branch") == true ]] || die "private PostgREST exited"
     sleep 1
   done
   die "private PostgREST did not listen"
@@ -311,10 +279,8 @@ path.write_text("".join(k+"=\x27"+v+"\x27\n" for k,v in sorted(values.items())))
 import hashlib,json,pathlib,sys
 root=pathlib.Path(sys.argv[1]); service=root/"prediction-markets"; generation=service/"gen/capture"
 identity=json.loads((root/"pe-activation.json").read_text()); predecessor=json.loads((root/"pe-financial-era.json").read_text())
-identity["generation_dir"]=str(generation)
 for key,path in (("binary",service/"target/release/pe-service"),("config",service/"smoke-test/service.toml"),("environment",service/".env")):
     identity["destinations"][key]=str(path); identity["artifacts"][key]={"path":str(path),"sha256":hashlib.sha256(path.read_bytes()).hexdigest()}
-predecessor["generation"]=str(generation)
 predecessor["paths"]={"paper_log":str(generation/"paper.log"),"source_log":str(generation/"source_events.log"),"live_journal":str(generation/"live_journal.log"),"paper_state":str(generation/"paper_state.db")}
 for name,value in (("pe-activation.json",identity),("pe-financial-era.json",predecessor)):
     (root/name).write_text(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n")
@@ -344,7 +310,8 @@ PY
 }
 wait_ready() {
   local attempt
-  for attempt in {1..600}; do
+  # A relocated copy's first boot rebuilds its checkpoint by walking the retained window.
+  for attempt in {1..3600}; do
     if curl -fsS "http://127.0.0.1:$service_port/health/ready" > "$branch_root/readiness.json"; then return; fi
     [[ $(systemctl --user is-active "$unit" || true) == active ]] || die "private service requires recovery"
     sleep 1
@@ -476,8 +443,7 @@ PY
   [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["state"])' "$branch_root/pe-financial-era.json") == verified ]] || die "branch was not verified"
   systemctl --user disable --now "$unit" >/dev/null
   unit=
-  kill "$proxy_pid"; wait "$proxy_pid" || true; proxy_pid=
-  kill "$postgrest_pid"; wait "$postgrest_pid" || true; postgrest_pid=
+  remove_containers "gw-$branch"; remove_containers "rest-$branch"
   SUPABASE_DB_URL="postgres://rehearsal:$(cat "$run_root/pg-password")@127.0.0.1:$pg_port/postgres"
   export SUPABASE_DB_URL
 done

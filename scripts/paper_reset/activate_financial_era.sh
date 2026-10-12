@@ -805,7 +805,7 @@ status=json.load(open(sys.argv[1]))
 def instant(value): return datetime.datetime.fromisoformat(value.replace("Z","+00:00"))
 if observation["projection_count"]!=int(sys.argv[2]) or instant(observation["projection_token"])!=instant(status["watchlist_projection"]["applied"]["token"]):
     raise SystemExit("authority projection has not converged")
-' "$generation/status.json" "$status_size" || die "successor projection convergence refused"
+' "$(dirname "$paper_log")/status.json" "$status_size" || die "successor projection convergence refused"
 }
 
 durable_manifest_copy() {
@@ -927,6 +927,7 @@ finish_unmutated_rollback() {
       [[ "$(systemctl_active_state pe-service)" == true ]] || die "old pe-service did not start"
       manifest_patch_boundary old-service-started '{"old_service_started":true}'
     elif [[ "$was_active" == true && "$current_active" == true ]]; then
+      [[ "$(systemctl_enabled_state pe-service)" == true ]] || "${SERVICE_MUTATE[@]}" enable pe-service
       financial_serving_proof rollback-old-already-running
     elif [[ "$was_active" == false && "$current_active" != false ]]; then
       die "originally inactive service unexpectedly became active"
@@ -1096,7 +1097,10 @@ fi
 if [[ "$rollback_before_start" == true ]]; then
   case "$state" in
     started|verified) die "rollback is forbidden at or after QualificationStarted" ;;
-    rolled_back) certify_completed_rollback; reinstate_predecessor; echo "activation_id=$activation_id state=rolled_back"; exit 0 ;;
+    rolled_back)
+      # A first-era rollback predates restoration certificates; only a successor certifies and reinstates.
+      if [[ "$successor" == true ]]; then certify_completed_rollback; reinstate_predecessor; fi
+      echo "activation_id=$activation_id state=rolled_back"; exit 0 ;;
     prepared|guarded|rolling_back) ;;
     *) die "rollback-before-start is invalid from state $state" ;;
   esac
@@ -1259,7 +1263,10 @@ case "$state" in
       # `verify_legacy_service_contract` is read-only (it queries the database, not the service) and
       # still runs after the stop; this is an early warning, not a replacement. Both it and the rows
       # export are `psql` calls, and both are free here because nothing is stopped yet.
-      if [[ "$current_active" == true ]]; then
+      # A resumed stop that already disabled the unit skips these early warnings (the ownership proof
+      # requires an enabled unit); the post-stop gates below still run.
+      if [[ "$current_active" == true ]] &&
+         ! { manifest_flag service_stop_intent && [[ "$(systemctl_enabled_state pe-service)" == false ]]; }; then
         financial_serving_proof pre-stop
         account_census_receipt >/dev/null || die "authority account census refused before stop"
         verify_mode_contract
@@ -1510,7 +1517,7 @@ if [[ "$state" == started ]]; then
   [[ "$(sha256_file "$SERVICE_BINARY")" == "$(manifest_get target_artifact_sha256)" ]] || die "installed target artifact hash mismatch"
   [[ "$(sha256_file "$SERVICE_CONFIG")" == "$(manifest_get target_config_sha256)" ]] || die "installed target config hash mismatch"
   [[ "$(sha256_file "$SERVICE_ENV")" == "$(manifest_get target_environment_sha256)" ]] || die "installed target environment hash mismatch"
-  [[ -f "$generation/status.json" ]] || die "fresh status proof is not available yet"
+  [[ -f "$(dirname "$paper_log")/status.json" ]] || die "fresh status proof is not available yet"
   hot_config_hash=$(manifest_get preparation.start.hot_config_hash)
   [[ "$hot_config_hash" =~ ^[0-9a-f]{64}$ ]] || die "prepared hot-config identity is invalid"
   verify_guarded_log_prefixes || die "paper/source/live prefixes do not extend their guarded identities"
@@ -1571,7 +1578,7 @@ for account in accounts:
         raise SystemExit("a live account is not off and unarmed")
 if None in identities or len(identities) != len(set(identities)): raise SystemExit("live account inventory is not uniquely identified")
 print(size)' \
-    "$generation/status.json" "$(manifest_get started_unix)" "$target_revision" \
+    "$(dirname "$paper_log")/status.json" "$(manifest_get started_unix)" "$target_revision" \
     "$hot_config_hash" "$fresh_bankroll" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["membership"]))' "$MANIFEST")" "$successor") ||
     die "first fresh health proof is incomplete"
   [[ "$status_watchlist_size" =~ ^[0-9]+$ ]] || die "first fresh health proof is incomplete"

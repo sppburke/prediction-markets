@@ -604,19 +604,22 @@ recovery state only: paper fills and paper-only skips never gate an otherwise ad
 ```
 historical reconstruction
   -> walk-forward backtest passes (LCB_5pct > 0)
-  -> one corrected financial era records exact paper decisions and economics
+  -> the generation's first corrected financial era records exact paper decisions and economics
   -> the first eligible mark synchronizes QualificationSealed
   -> network-free exact replay emits Pass, Fail, or InsufficientEvidence
 ```
 
 The exact quantitative gate is owned by `_GLOSSARY.md`. The observation begins at the first valid
 post-Start mark. Underperformance or inactivity membership demotion moves the anchor to the next
-valid mark; rank rotation and capacity change do not. Paper continues after the seal. A changed
-financial semantic or canonical economic hash seals insufficient before publication. An unrelated
-build with identical semantics does not reset the era.
-The gate classifies a paper measurement report. The semantic-2 paper cutover seals the existing
-semantic-1 Start `InsufficientEvidence` once and continues paper measurement without a second
-current-generation report. A later fresh generation can start its own qualification lifecycle.
+valid mark; rank rotation and capacity change do not. Paper continues after the seal. While the
+generation is unsealed, a changed financial semantic or canonical economic hash seals insufficient
+before publication. An unrelated build with identical semantics does not reset the era.
+
+Qualification measurement and structural membership are generation-scoped; money follows the latest
+financial era, and the generation's seal names its first Start and closes measurement for every
+successor. The #770 reset appends a Start with empty membership, re-pins no members and creates no
+seal or report; later measurement requires a fresh generation, as defined in the
+[glossary](_GLOSSARY.md#paper-qualification-measurement--quantified).
 
 ## Paper measurement criteria
 
