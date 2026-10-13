@@ -117,6 +117,7 @@ async fn main() {
         let mut batch_id: Option<&str> = None;
         let mut audit_csv: Option<std::path::PathBuf> = None;
         let mut wallet_arg: Option<&str> = None;
+        let mut purged_at_arg: Option<&str> = None;
         let mut db_arg: Option<std::path::PathBuf> = None;
         let mut manifest_arg: Option<std::path::PathBuf> = None;
         let mut frozen_payload_arg: Option<std::path::PathBuf> = None;
@@ -194,6 +195,12 @@ async fn main() {
                 wallet_arg = Some(rest[i]);
             } else if let Some(v) = a.strip_prefix("--wallet=") {
                 wallet_arg = Some(v);
+            } else if a == "--purged-at" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                purged_at_arg = Some(rest[i]);
+            } else if let Some(v) = a.strip_prefix("--purged-at=") {
+                purged_at_arg = Some(v);
             } else if a == "--dump-ledgers" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -346,6 +353,29 @@ async fn main() {
             tracing::error!("bootstrap: --create-cache is only supported by all");
             std::process::exit(1);
         }
+
+        let purged_at_unix = if rest
+            .iter()
+            .any(|a| *a == "--purged-at" || a.starts_with("--purged-at="))
+        {
+            if sub != "clear-infra-exclusion" {
+                tracing::error!(
+                    "bootstrap: --purged-at is only supported by clear-infra-exclusion"
+                );
+                std::process::exit(1);
+            }
+            match purged_at_arg.and_then(|value| value.parse::<i64>().ok()) {
+                Some(value) if value >= 0 => Some(value),
+                _ => {
+                    tracing::error!(
+                        "clear-infra-exclusion: --purged-at requires a nonnegative integer value"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            None
+        };
 
         // TOML path: last non-flag positional not consumed as a flag value.
         let toml_arg: Option<std::path::PathBuf> = rest
@@ -1173,24 +1203,49 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-                match cache.clear_infra_exclusion(&normalized) {
-                    Ok(true) => {
-                        tracing::warn!(
-                            wallet = normalized,
-                            "clear-infra-exclusion: exclusion cleared (infra tombstone and/or live is_infra flag)"
-                        );
-                        0
+                if let Some(purged_at_unix) = purged_at_unix {
+                    match cache.clear_infra_exclusion_at(&normalized, purged_at_unix) {
+                        Ok(true) => {
+                            tracing::warn!(
+                                wallet = normalized,
+                                purged_at_unix,
+                                "clear-infra-exclusion: reviewed infra tombstone cleared"
+                            );
+                            0
+                        }
+                        Ok(false) => {
+                            tracing::info!(
+                                wallet = normalized,
+                                purged_at_unix,
+                                "clear-infra-exclusion: reviewed infra tombstone absent"
+                            );
+                            0
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, wallet = normalized, purged_at_unix, "clear-infra-exclusion: fatal");
+                            1
+                        }
                     }
-                    Ok(false) => {
-                        tracing::error!(
-                            wallet = normalized,
-                            "clear-infra-exclusion: no infra tombstone or live is_infra flag for wallet"
-                        );
-                        1
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, wallet = normalized, "clear-infra-exclusion: fatal");
-                        1
+                } else {
+                    match cache.clear_infra_exclusion(&normalized) {
+                        Ok(true) => {
+                            tracing::warn!(
+                                wallet = normalized,
+                                "clear-infra-exclusion: exclusion cleared (infra tombstone and/or live is_infra flag)"
+                            );
+                            0
+                        }
+                        Ok(false) => {
+                            tracing::error!(
+                                wallet = normalized,
+                                "clear-infra-exclusion: no infra tombstone or live is_infra flag for wallet"
+                            );
+                            1
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, wallet = normalized, "clear-infra-exclusion: fatal");
+                            1
+                        }
                     }
                 }
             }

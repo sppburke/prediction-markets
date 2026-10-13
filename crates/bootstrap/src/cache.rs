@@ -3359,6 +3359,20 @@ impl WalletCache {
         Ok(tombstones == 1 || flags == 1)
     }
 
+    /// Clear only the reviewed infra tombstone at this exact second, preserving
+    /// any later tombstone and live `is_infra` flag.
+    pub fn clear_infra_exclusion_at(
+        &self,
+        wallet_hex: &str,
+        purged_at_unix: i64,
+    ) -> Result<bool, BootstrapError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM purged_wallets WHERE wallet_hex = ?1 AND reason = 'infra' AND purged_at_unix = ?2",
+            params![wallet_hex, purged_at_unix],
+        )?;
+        Ok(deleted == 1)
+    }
+
     /// Whether a wallet is currently tombstoned (issue #385).
     pub fn is_purged(&self, wallet_hex: &str) -> Result<bool, BootstrapError> {
         let exists: i64 = self.conn.query_row(
