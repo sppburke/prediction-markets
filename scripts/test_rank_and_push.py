@@ -66,6 +66,9 @@ class RankAndPushScenario(unittest.TestCase):
         (self.root / "scripts").mkdir()
         (self.root / "target" / "release").mkdir(parents=True)
         (self.root / "data" / "eval-results").mkdir(parents=True)
+        self.infra_clears = self.root / "deploy" / "forge" / "reviewed-infra-clears.txt"
+        self.infra_clears.parent.mkdir(parents=True)
+        self.infra_clears.write_text("# No reviewed exclusions in the default fixture.\n")
 
         # The wrapper must own interpreter selection. The sandbox's canonical repo environment
         # logs every invocation, then delegates to the interpreter running this test (CI installs
@@ -1920,6 +1923,91 @@ class RankAndPushScenario(unittest.TestCase):
             handle.write("PE_RANK_SCHEMA_TWO_CUTOVER=prepare\n")
         return fixed
 
+    def _seed_reviewed_infra_clears(self):
+        shutil.copy(WRAPPER.parent.parent / "deploy/forge/reviewed-infra-clears.txt", self.infra_clears)
+        entries = [tuple(line.split(" ")) for line in self.infra_clears.read_text().splitlines()
+                   if line and not line.startswith("#")]
+        self.assertEqual(entries, [
+            ("0x29de3c62b7b49a2d2a062f93b6e659980a4bd9e6", "1784530028"),
+            ("0x2b0949b7a81355c19f833c9019840fe741033408", "1784530028"),
+            ("0x661d589424bc21a094ad4849063a9e375c141d3e", "1784747039"),
+        ])
+        return entries
+
+    def test_reviewed_infra_clears_run_in_order_on_fresh_side_before_discovery(self):
+        for schema in (1, 2):
+            with self.subTest(schema=schema):
+                self.tearDown(); self.setUp()
+                fixed = self._install_candidate_layout(schema=schema)
+                self._install_candidate_stub(two_file=True)
+                with (self.root / ".env").open("a") as handle:
+                    handle.write("PE_RANK_SCHEMA_TWO_CUTOVER=prepare\nBOOTSTRAP_CONFIG=bootstrap.toml\n")
+                entries = self._seed_reviewed_infra_clears()
+                (self.root / "bootstrap.toml").write_text("")
+                before = fixed.read_bytes()
+                result = self._run()
+                self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+                side = next(fixed.parent.glob("*.side.db"))
+                prefix = ["cache-stage-v2"] + (["cache-migrate-v2"] if schema == 1 else [])
+                self.assertEqual(self._bootstrap_ops()[:len(prefix) + 5], prefix + [
+                    "clear-infra-exclusion", "clear-infra-exclusion", "clear-infra-exclusion",
+                    "winner-discovery", "activate-next",
+                ])
+                self.assertEqual([shlex.split(line) for line in self._bootstrap_lines("clear-infra-exclusion")], [
+                    ["clear-infra-exclusion", "--db", str(side), "--wallet", wallet,
+                     "--purged-at", timestamp, "--confirm", "bootstrap.toml"]
+                    for wallet, timestamp in entries
+                ])
+                self.assertEqual(fixed.read_bytes(), before)
+
+    def test_reviewed_infra_clears_skip_retained_side_even_after_list_changes(self):
+        self._prepare_incremental_fixture(two_file=True)
+        self._seed_reviewed_infra_clears()
+        first = self._run(exit_env={"STUB_EXIT_winner_discovery": "75"})
+        self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+        self.assertEqual(len(self._bootstrap_lines("clear-infra-exclusion")), 3)
+        before = len(self._bootstrap_ops())
+        self.infra_clears.write_text("malformed new release list\n")
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 2, resumed.stderr + resumed.stdout)
+        cycle = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
+        self.assertIs(json.loads((cycle / "cache_stage.json").read_text())["resumed"], True)
+        self.assertEqual(self._bootstrap_ops()[before:before + 3],
+                         ["cache-stage-v2", "winner-discovery", "activate-next"])
+        self.assertEqual(len(self._bootstrap_lines("clear-infra-exclusion")), 3)
+
+    def test_failing_reviewed_infra_clear_stops_before_discovery(self):
+        self._prepare_incremental_fixture(two_file=True)
+        self._seed_reviewed_infra_clears()
+        result = self._run(exit_env={"STUB_EXIT_clear_infra_exclusion": "1"})
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertEqual(self._bootstrap_ops(),
+                         ["cache-stage-v2", "cache-migrate-v2", "clear-infra-exclusion"])
+        self.assertIn("[infra-clear] FATAL exit 1", result.stderr)
+        self.assertIsNone(self._log("rank.log"))
+
+    def test_malformed_reviewed_infra_list_stops_before_any_clear(self):
+        wallet = "0x29de3c62b7b49a2d2a062f93b6e659980a4bd9e6"
+        for malformed in ("0xabc 10", f"{wallet} -1", f"{wallet}\t10",
+                          f"{wallet}  10", f"{wallet} 10 extra", f"{wallet} 10 ",
+                          f"0x{'g' * 40} 10"):
+            with self.subTest(line=malformed):
+                self.tearDown(); self.setUp()
+                self._prepare_incremental_fixture(two_file=True)
+                self.infra_clears.write_text(f"# fixture\n\n{wallet} 10\n{malformed}\n")
+                result = self._run()
+                self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+                self.assertIn("FATAL: malformed reviewed infra clear", result.stderr)
+                self.assertEqual(self._bootstrap_ops(), ["cache-stage-v2", "cache-migrate-v2"])
+                self.assertIsNone(self._log("rank.log"))
+
+    def test_missing_reviewed_infra_list_clears_nothing(self):
+        self._prepare_incremental_fixture(two_file=True)
+        self.infra_clears.unlink()
+        result = self._run()
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        self.assertNotIn("clear-infra-exclusion", self._bootstrap_ops())
+
     def test_fresh_finalize_without_record_resumes_to_record_before_pass_two(self):
         self._prepare_incremental_fixture(two_file=True)
         stopped = self._run(exit_env={"STUB_EXIT_rank": "75"})
@@ -2075,6 +2163,7 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
 
     def test_bulk_root_transient_exit_resumes_without_repeating_setup(self):
         fixed = self._prepare_incremental_fixture()
+        self._seed_reviewed_infra_clears()
         before = fixed.read_bytes()
         first = self._run(exit_env={"STUB_FAIL_ACTIVITY_GENERATION": "1"})
         self.assertEqual(first.returncode, 75, first.stderr)
@@ -2084,6 +2173,8 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
         pointer = self.root / "data/eval-results/rank_and_push.cycle"
         cycle = pointer.read_bytes()
         operations = self._bootstrap_ops()
+        self.assertEqual(operations.count("clear-infra-exclusion"), 3)
+        self.infra_clears.write_text("malformed new release list\n")
         resumed = self._run()
         self.assertEqual(resumed.returncode, 2, resumed.stderr)
         self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
@@ -2270,9 +2361,12 @@ finally:
 
     def test_durable_request_without_pointer_recovers_before_discovery_for_both_entries(self):
         fixed = self._prepare_incremental_fixture()
+        self._seed_reviewed_infra_clears()
         prepared = self._run()
         self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", prepared.stdout, prepared.stderr)
         before = self._bootstrap_ops()
+        self.assertEqual(before.count("clear-infra-exclusion"), 3)
+        self.infra_clears.write_text("malformed new release list\n")
         fixed_bytes = fixed.read_bytes()
         pending = self.root / "data/eval-results/rank_and_push.pending"
         request = pending.read_text()
@@ -2285,6 +2379,21 @@ finally:
             self.assertEqual(pending.read_text(), request)
             self.assertEqual(self._bootstrap_ops(), before)
             self.assertEqual(fixed.read_bytes(), fixed_bytes)
+
+    def test_reviewed_infra_clears_skip_pending_request_resume(self):
+        self._prepare_incremental_fixture(two_file=True)
+        self._seed_reviewed_infra_clears()
+        prepared = self._run()
+        self.assertEqual(prepared.returncode, 2, prepared.stderr + prepared.stdout)
+        before = self._bootstrap_ops()
+        self.assertEqual(before.count("clear-infra-exclusion"), 3)
+        self.infra_clears.write_text("malformed new release list\n")
+        for args in ((), ("--resume-pending",)):
+            with self.subTest(args=args):
+                resumed = self._run(*args)
+                self.assertEqual(resumed.returncode, 2, resumed.stderr + resumed.stdout)
+                self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
+                self.assertEqual(self._bootstrap_ops(), before)
 
     def test_missing_pointer_recovery_publishes_and_runs_retention_for_both_entries(self):
         for args in [(), ("--resume-pending",)]:

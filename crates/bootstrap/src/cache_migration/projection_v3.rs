@@ -462,6 +462,7 @@ pub(super) fn rebuild_ranker_projection(
     proof: &incremental::HistoryProof,
     chunk: usize,
 ) -> Result<(u64, String, SpoolCommitment, ClassificationReport), BootstrapError> {
+    let started = Instant::now();
     let path = spool_path(cache_path);
     remove_uncommitted_spools(&path)?;
     let temp = atomic_write_temp_path(&path);
@@ -615,11 +616,14 @@ pub(super) fn rebuild_ranker_projection(
         for _ in output {}
         pass
     })?;
+    phase_completed("verified_pass", started);
+    let started = Instant::now();
     writer.flush()?;
     writer.get_ref().sync_all()?;
     drop(writer);
     std::fs::rename(&temp, &path).map_err(map_rename_error)?;
     sync_parent(&path)?;
+    phase_completed("spool_sync", started);
     let spool = SpoolCommitment {
         path_name: path
             .file_name()
@@ -777,7 +781,13 @@ pub(super) fn recorded_inputs(
     Ok(serde_json::from_str(&json)?)
 }
 
+fn phase_completed(phase: &'static str, started: Instant) {
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(phase, elapsed_ms, "cache finalize phase completed");
+}
+
 pub(super) fn open_finalize(cache_path: &Path) -> Result<(Connection, i64, i64), BootstrapError> {
+    let started = Instant::now();
     let connection = open_existing_rw(cache_path)?;
     connection.pragma_update(None, "cache_size", -1_048_576_i64)?;
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
@@ -789,6 +799,7 @@ pub(super) fn open_finalize(cache_path: &Path) -> Result<(Connection, i64, i64),
         "generation",
     )?;
     verify_payout_coverage(&connection, payout_generation)?;
+    phase_completed("open_checks", started);
     Ok((connection, sealed_generation, payout_generation))
 }
 
@@ -844,6 +855,7 @@ fn finalize_with_chunk(
     generations: (i64, i64),
     chunk: usize,
 ) -> Result<(Option<CacheFinalStageRecord>, Option<ClassificationReport>), BootstrapError> {
+    let started = Instant::now();
     let (sealed_generation, payout_generation) = generations;
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -862,6 +874,8 @@ fn finalize_with_chunk(
     .ok_or_else(|| BootstrapError::Invalid {
         message: "format-three finalize requires sealed activity coverage".to_owned(),
     })?;
+    phase_completed("history_preflight", started);
+    let started = Instant::now();
     let phase: String = transaction.query_row(
         "SELECT phase FROM cache_v2_migration_state WHERE singleton = 1",
         [],
@@ -888,6 +902,8 @@ fn finalize_with_chunk(
             return invalid("format-three finalized classifier is not current".to_owned());
         }
         let count = to_u64(count, "ranker projection count")?;
+        phase_completed("input_binding", started);
+        let started = Instant::now();
         verify_spool(
             cache_path,
             recorded
@@ -896,8 +912,10 @@ fn finalize_with_chunk(
                 .ok_or(BootstrapError::Internal)?,
             count,
         )?;
+        phase_completed("spool_verification", started);
         (count, digest, None)
     } else {
+        phase_completed("input_binding", started);
         let (count, digest, spool, report) = rebuild_ranker_projection(
             &transaction,
             cache_path,
@@ -906,7 +924,9 @@ fn finalize_with_chunk(
             chunk,
         )?;
         inputs.projection_spool = Some(spool);
+        let started = Instant::now();
         inputs.certificate_digest = Some(digests::certificate_digest(&transaction)?);
+        phase_completed("certificate_digest", started);
         transaction.execute("UPDATE cache_v2_migration_state SET phase = 'finalized', ranker_projection_count = ?1,
             ranker_projection_digest = ?2, ranker_classifier_version = ?3, ranker_projection_inputs_json = ?4,
             updated_at_unix = ?5 WHERE singleton = 1",
@@ -914,26 +934,37 @@ fn finalize_with_chunk(
         tracing::info!(report = %canonical_json(&report)?, count, "classifier 6 verified pass finalized");
         (count, digest, Some(report))
     };
+    let started = Instant::now();
     let export = export_manifest
         .map(|path| read_export_manifest(&transaction, path, &inputs, count, &digest))
         .transpose()?;
+    if export_manifest.is_some() {
+        phase_completed("export_verification", started);
+    }
     if stage_record_path.is_some() && export.is_none() {
         return invalid("history-format-three stage record requires --export-manifest".to_owned());
     }
+    let started = Instant::now();
     drop(authorization);
     transaction.commit()?;
     checkpoint_truncate(&connection)?;
     connection.close().map_err(|(_, error)| error)?;
     reject_nonempty_sidecars(cache_path)?;
     sync_file_and_parent(cache_path)?;
+    phase_completed("commit_checkpoint_sync", started);
     let Some(stage_record_path) = stage_record_path else {
         return Ok((None, report));
     };
     let (export_sha256, export_projection) = export.ok_or(BootstrapError::Internal)?;
+    let started = Instant::now();
+    let canonical_cache_path = std::fs::canonicalize(cache_path)?;
+    let cache_sha256 = sha256_file(cache_path)?;
+    phase_completed("cache_hash", started);
+    let started = Instant::now();
     let record = CacheFinalStageRecord {
         version: FINAL_STAGE_RECORD_VERSION,
-        cache_path: std::fs::canonicalize(cache_path)?,
-        cache_sha256: sha256_file(cache_path)?,
+        cache_path: canonical_cache_path,
+        cache_sha256,
         schema_version: CACHE_SCHEMA_VERSION_V2,
         sealed_generation: to_u64(sealed_generation, "sealed generation")?,
         activity_coverage_generation: identity.generation,
@@ -946,6 +977,7 @@ fn finalize_with_chunk(
         classification_report: report.clone(),
     };
     atomic_write_json(stage_record_path, &record)?;
+    phase_completed("stage_record", started);
     Ok((Some(record), report))
 }
 

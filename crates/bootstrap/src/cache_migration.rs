@@ -5829,7 +5829,7 @@ fn quick_check(connection: &Connection, role: &str, path: &Path) -> Result<(), B
     let file_size_bytes = std::fs::metadata(path).ok().map(|metadata| metadata.len());
     let started = Instant::now();
     #[cfg(target_os = "linux")]
-    let (result, prefetch) = if role == "activation_candidate" {
+    let (result, prefetch) = if matches!(role, "activation_candidate" | "staging_fixed") {
         let (result, prefetch) = walk_prefetch::quick_check(connection, path);
         (result, Some(prefetch))
     } else {

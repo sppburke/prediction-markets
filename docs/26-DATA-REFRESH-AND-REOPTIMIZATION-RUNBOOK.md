@@ -903,6 +903,9 @@ no frozen reference narrows it. Classifier 6 never finalizes a format-2 head.
 pe-bootstrap cache-stage-v2 --db "$FIXED_PHYSICAL" --prior "$PRIOR" --side "$SIDE" \
   --manifest "$CACHE_BUILD_MANIFEST"
 pe-bootstrap cache-migrate-v2 --db "$SIDE" --manifest "$CACHE_BUILD_MANIFEST"   # unsealed candidate only
+# Fresh copy only (cache_stage.json "resumed": false), once per line of
+# deploy/forge/reviewed-infra-clears.txt, in file order (docs/37 §7):
+pe-bootstrap clear-infra-exclusion --db "$SIDE" --wallet "$WALLET" --purged-at "$PURGED_AT" --confirm
 pe-bootstrap winner-discovery --db "$SIDE" --defer-activation
 pe-bootstrap activate-next --db "$SIDE" --batch-id "$BATCH" --audit-csv "$AUDIT"
 pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N"
@@ -1084,17 +1087,21 @@ that unchecked history stayed intact. Rankings and publication inputs use only t
 With `RUST_LOG=info` (or `pe_bootstrap::cache_migration=info`) in the loop environment,
 each completed check emits one JSON event to stderr, inherited by the loop journal
 (`journalctl --user -u pe-rank-loop`), with `role`, `path`, `file_size_bytes`, integer
-`elapsed_ms` and `success`. The activation candidate's event also carries
+`elapsed_ms` and `success`. The `activation_candidate` and `staging_fixed` events also carry
 `prefetch` (`done`, `cancelled`, or `unavailable`); an unavailable event includes
-the advice error. Its duration includes prefetch setup, the pragma, and the worker
+the advice error. Their duration includes prefetch setup, the pragma, and the worker
 join. Other roles measure only the pragma. A check returning an error still emits
 an event with `success = false`; only a killed process emits none. Duration excludes
 copying, hashing, collection and ranking. Staging stdout remains the single report in
 `$OUT_DIR/cache_stage.json`; `$OUT_DIR/cache_build_manifest.json` and
 `$OUT_DIR/cache_stage_record.json` keep their existing hash-bound contracts.
-The plain-check timing is a measured baseline. [#694](https://github.com/sppburke/prediction-markets/issues/694)
-records the local prefetch measurement; the first Forge activation-candidate check
-will establish its host duration. Neither establishes a total freshness bound.
+[#694](https://github.com/sppburke/prediction-markets/issues/694) records the measured check
+durations; none establishes a total freshness bound. `cache-finalize-v2` logs one
+`cache finalize phase completed` event per phase it runs, with `phase` and integer `elapsed_ms`:
+`open_checks`, `history_preflight` and `input_binding`; then `verified_pass`, `spool_sync` and
+`certificate_digest` when it builds the projection, or `spool_verification` when it reuses the
+committed one; `export_verification` when bound to an export; `commit_checkpoint_sync`; and
+`cache_hash` and `stage_record` when it writes a stage record.
 
 Install and roll back through the [release procedure](#forge-release-deployment-and-rollback).
 Resume the same cycle with its fixed/prior/candidate paths, committed WAL, identities, receipts,

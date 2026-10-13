@@ -867,6 +867,236 @@ fn clear_infra_exclusion_cli_requires_confirmation_and_exact_reason() {
 }
 
 #[test]
+fn clear_infra_exclusion_cli_purged_at_matches_only_reviewed_tombstone() {
+    let dir = TempDir::new().unwrap();
+    let cache_path = dir.path().join("cache.db");
+    let infra = wallet_hex(0x61);
+    let wrong_reason = wallet_hex(0x62);
+    let other = wallet_hex(0x63);
+    {
+        let cache = WalletCache::open(&cache_path).unwrap();
+        for (wallet, reason) in [
+            (&infra, "infra"),
+            (&wrong_reason, "proven_loser"),
+            (&other, "infra"),
+        ] {
+            cache
+                .raw_conn_for_test()
+                .execute(
+                    "INSERT INTO purged_wallets VALUES (?1, 10, ?2)",
+                    [wallet.as_str(), reason],
+                )
+                .unwrap();
+        }
+        cache
+            .raw_conn_for_test()
+            .execute(
+                "INSERT INTO wallets (wallet_hex, is_active, is_infra) VALUES (?1, 1, 1)",
+                [&infra],
+            )
+            .unwrap();
+    }
+
+    let unconfirmed = run_cli(
+        dir.path(),
+        &cache_path,
+        &[
+            "clear-infra-exclusion",
+            "--wallet",
+            &infra,
+            "--purged-at",
+            "10",
+        ],
+    );
+    assert_eq!(unconfirmed.status.code(), Some(1));
+    for wallet in [&infra, &wrong_reason] {
+        let absent = run_cli_with_env(
+            dir.path(),
+            &cache_path,
+            &[
+                "clear-infra-exclusion",
+                "--wallet",
+                wallet,
+                "--purged-at=11",
+                "--confirm",
+            ],
+            &[("RUST_LOG", "info")],
+        );
+        assert_eq!(absent.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&absent.stderr);
+        let log: serde_json::Value = stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|entry| {
+                entry["fields"]["message"]
+                    == "clear-infra-exclusion: reviewed infra tombstone absent"
+            })
+            .unwrap();
+        assert_eq!(log["level"], "INFO");
+    }
+    let wrong = run_cli(
+        dir.path(),
+        &cache_path,
+        &[
+            "clear-infra-exclusion",
+            "--wallet",
+            &wrong_reason,
+            "--purged-at",
+            "10",
+            "--confirm",
+        ],
+    );
+    assert_eq!(wrong.status.code(), Some(0));
+    {
+        let cache = WalletCache::open_read_only(&cache_path).unwrap();
+        assert!(
+            cache.is_purged(&infra).unwrap(),
+            "different second survives"
+        );
+        assert!(cache.is_purged(&wrong_reason).unwrap());
+    }
+
+    let cleared = run_cli_with_env(
+        dir.path(),
+        &cache_path,
+        &[
+            "clear-infra-exclusion",
+            "--wallet",
+            &infra,
+            "--purged-at",
+            "10",
+            "--confirm",
+        ],
+        &[("RUST_LOG", "info")],
+    );
+    assert_eq!(cleared.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&cleared.stderr);
+    let log: serde_json::Value = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|entry| {
+            entry["fields"]["message"] == "clear-infra-exclusion: reviewed infra tombstone cleared"
+        })
+        .unwrap();
+    assert_eq!(log["level"], "WARN");
+    let again = run_cli(
+        dir.path(),
+        &cache_path,
+        &[
+            "clear-infra-exclusion",
+            "--wallet",
+            &infra,
+            "--purged-at=10",
+            "--confirm",
+        ],
+    );
+    assert_eq!(again.status.code(), Some(0));
+    let cache = WalletCache::open_read_only(&cache_path).unwrap();
+    assert!(!cache.is_purged(&infra).unwrap());
+    assert!(cache.is_purged(&wrong_reason).unwrap());
+    assert!(cache.is_purged(&other).unwrap(), "other wallet survives");
+    assert!(cache.conn_for_test_is_infra(&infra), "live flag survives");
+    let active: i64 = cache
+        .raw_conn_for_test()
+        .query_row(
+            "SELECT is_active FROM wallets WHERE wallet_hex = ?1",
+            [&infra],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active, 1);
+}
+
+#[test]
+fn clear_infra_exclusion_cli_purged_at_rejects_invalid_values() {
+    let dir = TempDir::new().unwrap();
+    let cache_path = dir.path().join("cache.db");
+    let infra = wallet_hex(0x61);
+    {
+        let cache = WalletCache::open(&cache_path).unwrap();
+        cache
+            .raw_conn_for_test()
+            .execute(
+                "INSERT INTO purged_wallets VALUES (?1, 10, 'infra')",
+                [&infra],
+            )
+            .unwrap();
+    }
+    let separate = |value: &str| vec!["--purged-at".to_owned(), value.to_owned()];
+    let joined = |value: &str| vec![format!("--purged-at={value}")];
+    for flag_args in [
+        separate("bad"),
+        joined("-1"),
+        vec!["--purged-at".to_owned()],
+    ] {
+        let mut args = vec!["clear-infra-exclusion", "--wallet", &infra, "--confirm"];
+        args.extend(flag_args.iter().map(String::as_str));
+        let output = run_cli(dir.path(), &cache_path, &args);
+        assert_eq!(output.status.code(), Some(1), "args={args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("--purged-at requires a nonnegative integer value")
+        );
+    }
+    let other = run_cli(dir.path(), &cache_path, &["watchlist", "--purged-at=10"]);
+    assert_eq!(other.status.code(), Some(1));
+    assert!(
+        WalletCache::open_read_only(&cache_path)
+            .unwrap()
+            .is_purged(&infra)
+            .unwrap()
+    );
+}
+
+#[test]
+fn clear_infra_exclusion_cli_purged_at_db_selects_cache_and_mutation_lock() {
+    let dir = TempDir::new().unwrap();
+    let fixed = dir.path().join("fixed.db");
+    let side = dir.path().join("side.db");
+    let infra = wallet_hex(0x61);
+    for path in [&fixed, &side] {
+        let cache = WalletCache::open(path).unwrap();
+        cache
+            .raw_conn_for_test()
+            .execute(
+                "INSERT INTO purged_wallets VALUES (?1, 10, 'infra')",
+                [&infra],
+            )
+            .unwrap();
+    }
+    let args = [
+        "clear-infra-exclusion",
+        "--db",
+        side.to_str().unwrap(),
+        "--wallet",
+        &infra,
+        "--purged-at",
+        "10",
+        "--confirm",
+    ];
+    let fixed_lock = CacheMutationLock::acquire(&fixed).unwrap();
+    let cleared = run_cli(dir.path(), &fixed, &args);
+    assert_eq!(cleared.status.code(), Some(0));
+    drop(fixed_lock);
+    let _side_lock = CacheMutationLock::acquire(&side).unwrap();
+    let blocked = run_cli(dir.path(), &fixed, &args);
+    assert_eq!(blocked.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("cache mutation lock failed"));
+    assert!(
+        WalletCache::open_read_only(&fixed)
+            .unwrap()
+            .is_purged(&infra)
+            .unwrap()
+    );
+    assert!(
+        !WalletCache::open_read_only(&side)
+            .unwrap()
+            .is_purged(&infra)
+            .unwrap()
+    );
+}
+
+#[test]
 fn fresh_generation_cli_refuses_malformed_values_and_legacy_flag_mixes() {
     let dir = TempDir::new().unwrap();
     let cache_path = dir.path().join("candidate.db");

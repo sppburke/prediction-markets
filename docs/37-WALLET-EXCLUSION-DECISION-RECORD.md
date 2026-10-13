@@ -234,6 +234,15 @@ Operator actions the record supports (each is separately authorized, idempotent,
 4. Rollback: revert the PR. A cleared never-fetched wallet that proves dense is re-flagged by its
    first fetch;
    one that is not dense but unwanted needs an explicit operator exclusion (row under the lock).
+5. Reviewed clears without editing the installed cache (#694): add `wallet purged_at_unix` to
+   `deploy/forge/reviewed-infra-clears.txt` in a reviewed pull request. Each fresh cycle
+   (`cache_stage.json` `"resumed": false`) runs `clear-infra-exclusion --db <candidate> --wallet <hex>
+   --purged-at <unix> --confirm` per line on its private copy, after staging and before discovery.
+   It deletes only that exact tombstone, exits 0 when the row is already gone, and never touches a
+   live `is_infra` flag; a later tombstone at another second survives. The installed cache keeps the
+   bytes its accepted activation installed, so staging keeps its quick-check skip. The wallet returns
+   only through step 2. A retained cycle applies no clears; a list change applies at the next fresh
+   cycle. Rollback does not restore a cleared tombstone.
 
 Deferred to #592 (multi-owner behavior change; measured impact today nil, §5): apply one
 infra/tombstone predicate at Parquet export, both pass-1 universe sources and engines, publication

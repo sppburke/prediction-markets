@@ -137,7 +137,9 @@ behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
   report-only while `PE_BOOTSTRAP_PURGE_ENABLED=false`. Exceptional reclassification requires
   the explicit operator-only `clear-infra-exclusion --wallet <hex> --confirm` command; it
   removes the infra tombstone and clears a live flag, and does not recreate or activate the
-  wallet. A cleared active wallet with no fetch stamp (the cold-probe shape) becomes due for
+  wallet. With `--purged-at <unix>` it removes only the tombstone stamped at that second and no
+  flag; the wrapper runs that form for each line of `deploy/forge/reviewed-infra-clears.txt`
+  on each fresh cycle's private copy (`docs/37` §7). A cleared active wallet with no fetch stamp (the cold-probe shape) becomes due for
   backfill at once and is probed again on its newest page; a wallet flagged after ingestion
   resumes incremental backfill once its stamp is stale, without a new probe.
 - **`CacheMutationLock`** is a persistent-inode, kernel-held lock acquired before

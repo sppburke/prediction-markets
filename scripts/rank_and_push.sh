@@ -866,6 +866,32 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
         --manifest "$build_manifest" "${BOOTSTRAP_CONFIG_ARGS[@]}"
     fi
 
+    local stage_resumed
+    stage_resumed="$("$PYTHON_BIN" -c 'import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["resumed"])' "$stage_json")"
+    # Reviewed clears edit only a fresh private copy: the installed cache keeps the bytes its
+    # accepted activation installed (staging keeps its skip), and a retained cycle keeps the
+    # exclusions it started with. A checkout without the list clears nothing.
+    local infra_clear_list="deploy/forge/reviewed-infra-clears.txt"
+    if [[ "$stage_resumed" == "False" && -f "$infra_clear_list" ]]; then
+      local -a infra_clears=()
+      local line
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*$ || "$line" == \#* ]] && continue
+        [[ "$line" =~ ^0x[0-9a-fA-F]{40}\ [0-9]+$ ]] || {
+          echo "FATAL: malformed reviewed infra clear: $line" >&2
+          exit 1
+        }
+        infra_clears+=("$line")
+      done < "$infra_clear_list"
+      local clear_wallet clear_time
+      for line in "${infra_clears[@]}"; do
+        read -r clear_wallet clear_time <<< "$line"
+        run_refresh_stage "infra-clear" "$PE_BOOTSTRAP_BIN" clear-infra-exclusion \
+          --db "$side" --wallet "$clear_wallet" --purged-at "$clear_time" --confirm "${BOOTSTRAP_CONFIG_ARGS[@]}"
+      done
+    fi
+
     export PE_BOOTSTRAP_CACHE_PATH="$side"
     run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation "${BOOTSTRAP_CONFIG_ARGS[@]}"
     run_refresh_stage "activate-next" "$PE_BOOTSTRAP_BIN" activate-next \

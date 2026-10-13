@@ -1,0 +1,7 @@
+# Format: wallet purged_at_unix (0x + 40 hex digits, one space, decimal Unix seconds).
+# Each line is an owner-reviewed decision, applied on each fresh cycle's private copy
+# after staging (#694 phase 3).
+# Decision: owner, 10/12 3:42 PM CT, "Wait; clear on the copy", for #757's three breadth_pass.csv wallets.
+0x29de3c62b7b49a2d2a062f93b6e659980a4bd9e6 1784530028
+0x2b0949b7a81355c19f833c9019840fe741033408 1784530028
+0x661d589424bc21a094ad4849063a9e375c141d3e 1784747039
