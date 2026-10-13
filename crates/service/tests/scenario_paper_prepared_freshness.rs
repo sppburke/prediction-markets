@@ -4,7 +4,7 @@
 
 mod support;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -45,7 +45,7 @@ use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::mark_prices::HistoricalMarkAdapter;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig, ScenarioHooks};
-use pe_service::orchestrator_control::OrchestratorControl;
+use pe_service::orchestrator_control::{DailyBoundaryError, OrchestratorControl};
 use pe_service::paper_recovery::{
     CanonicalFillResult, CanonicalResolutionResult, ExpectedAuthority, FinancialPayload,
     FinancialResult, PaperLogFrame, PaperLogRecord, QualificationStarted, TailBinding,
@@ -345,6 +345,7 @@ struct Harness {
     authority: Authority,
     live: LiveAccounts,
     admission_builder: Option<LiveAdmissionBuilder>,
+    mark_base_url: Option<String>,
     control: Option<mpsc::Sender<OrchestratorControl>>,
     task:
         Option<tokio::task::JoinHandle<Result<(), pe_service::orchestrator::OrchestratorRunError>>>,
@@ -532,6 +533,7 @@ impl Harness {
             identity_gate: Arc::new(PriceGate::default()),
             watchlist: LiveWatchlist::new(membership),
             admission_builder: None,
+            mark_base_url: None,
             control: None,
             task: None,
             coordinator,
@@ -877,7 +879,9 @@ impl Harness {
                     }),
                     Arc::new(HistoricalMarkAdapter::new(
                         reqwest::Client::new(),
-                        "http://unused.invalid",
+                        self.mark_base_url
+                            .as_deref()
+                            .unwrap_or("http://unused.invalid"),
                         self.source.clone(),
                     )),
                     self.index.clone(),
@@ -1802,6 +1806,184 @@ async fn paper_fill_and_daily_mark_do_not_scan_source_log() {
     );
     let report = h.qualify_one_fill().await;
     assert!(report.replay.exact, "{:?}", report.reasons);
+}
+
+async fn serve_mark_history(h: &mut Harness, bodies: Vec<Vec<u8>>) -> tokio::task::JoinHandle<()> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    h.mark_base_url = Some(format!("http://{}", listener.local_addr().unwrap()));
+    let bodies = Arc::new(Mutex::new(VecDeque::from(bodies)));
+    let router = axum::Router::new()
+        .route(
+            "/prices-history",
+            axum::routing::get(
+                |axum::extract::State(bodies): axum::extract::State<
+                    Arc<Mutex<VecDeque<Vec<u8>>>>,
+                >| async move { bodies.lock().unwrap().pop_front().unwrap() },
+            ),
+        )
+        .with_state(bodies);
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    })
+}
+
+/// PASS: unreadable history defers without a mark; the same boundary then records exactly one
+/// valid mark bound to the complete reply, and sealed replay verifies it with both replies retained.
+#[tokio::test]
+async fn daily_boundary_unreadable_history_recovers_and_qualifies_same_receipt() {
+    let mut h = Harness::new().await;
+    h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+    let recorded = h
+        .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
+        .await;
+    let cutoff = EPOCH - EPOCH.rem_euclid(86_400) + 86_400;
+    let malformed = format!(r#"{{"history":[{{"t":{cutoff},"p":"0."#).into_bytes();
+    let complete = serde_json::to_vec(&json!({"history":[{"t":cutoff,"p":"0.50"}]})).unwrap();
+    let server = serve_mark_history(&mut h, vec![malformed.clone(), complete.clone()]).await;
+    h.arm();
+    h.attempt(&recorded, at());
+    h.start(true);
+    h.poll(&recorded).await;
+    assert_eq!(
+        h.terminal(&recorded).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    assert_eq!(h.paper.open_positions().unwrap().len(), 1);
+    assert!(h.hooks.boundary_mark_prices.lock().unwrap().is_empty());
+    let boundary = h.append_daily_boundary(cutoff).await;
+    h.hooks.financial_clock_unix.store(cutoff, Ordering::SeqCst);
+
+    let result = h.publish_daily_boundary(cutoff, boundary).await;
+    assert!(
+        matches!(result, Err(DailyBoundaryError::Retryable(ref reason))
+            if reason.contains("reply is not one complete JSON document")),
+        "{result:?}"
+    );
+    let paper_path = h.dir.path().join("paper.log");
+    assert!(scan_paper_log(&paper_path).unwrap().iter().all(|frame| {
+        !matches!(
+            frame.frame,
+            PaperLogFrame::Record(PaperLogRecord::PortfolioMark(_))
+        )
+    }));
+    let source_path = h.dir.path().join("source.log");
+    let history = Reader::replay(&source_path)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|(_, envelope)| envelope.source_id.0 == "pe-service.clob-prices-history")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        history.len(),
+        1,
+        "zero-retry adapter records its failed response"
+    );
+    assert_eq!(history[0].1.payload, malformed);
+    let malformed_receipt = AppendReceipt {
+        sequence: history[0].0,
+        this_hash: history[0].1.this_hash,
+    };
+
+    assert_eq!(h.publish_daily_boundary(cutoff, boundary).await, Ok(()));
+    let marks = scan_paper_log(&paper_path)
+        .unwrap()
+        .into_iter()
+        .filter_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::PortfolioMark(mark)) => Some(mark.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(marks.len(), 1);
+    let mark = &marks[0];
+    assert_eq!(mark.cutoff_unix, cutoff);
+    assert_eq!(mark.boundary_receipt, boundary);
+    assert!(mark.invalid.is_none());
+    assert_eq!(mark.prices.len(), 1);
+    assert_eq!(
+        mark.prices[0].price,
+        Some(pe_core_types::Price::new(dec!(0.50)).unwrap())
+    );
+    assert_eq!(mark.prices[0].sample_unix, Some(cutoff));
+    assert!(mark.prices[0].invalid.is_none());
+    let history = Reader::replay(&source_path)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|(_, envelope)| envelope.source_id.0 == "pe-service.clob-prices-history")
+        .collect::<Vec<_>>();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].1.payload, malformed);
+    assert_eq!(history[1].1.payload, complete);
+    assert_eq!(
+        mark.prices[0].receipt,
+        Some(AppendReceipt {
+            sequence: history[1].0,
+            this_hash: history[1].1.this_hash,
+        })
+    );
+    assert_ne!(mark.prices[0].receipt, Some(malformed_receipt));
+
+    let report = h.qualify_mark_at_cutoff(cutoff).await;
+    assert!(report.replay.exact, "{:?}", report.reasons);
+    assert_eq!(report.replay.fills, 1);
+    assert_eq!(report.marks.len(), 1);
+    assert_eq!(report.first_valid_mark_unix, Some(cutoff));
+    assert_eq!(source_envelope(&h, malformed_receipt).payload, malformed);
+    server.abort();
+    let _ = server.await;
+}
+
+/// PASS: complete JSON with a schema-invalid history acknowledges success and appends one
+/// invalid mark, retaining the existing schema-failure behavior.
+#[tokio::test]
+async fn daily_boundary_wrong_history_shape_keeps_invalid_mark() {
+    let mut h = Harness::new().await;
+    h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+    let recorded = h
+        .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
+        .await;
+    let body = br#"{"history":"x"}"#.to_vec();
+    let server = serve_mark_history(&mut h, vec![body.clone()]).await;
+    h.arm();
+    h.attempt(&recorded, at());
+    h.start(true);
+    h.poll(&recorded).await;
+    assert_eq!(
+        h.terminal(&recorded).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    assert_eq!(h.paper.open_positions().unwrap().len(), 1);
+    assert!(h.hooks.boundary_mark_prices.lock().unwrap().is_empty());
+    let cutoff = EPOCH - EPOCH.rem_euclid(86_400) + 86_400;
+    let boundary = h.append_daily_boundary(cutoff).await;
+    h.hooks.financial_clock_unix.store(cutoff, Ordering::SeqCst);
+    assert_eq!(h.publish_daily_boundary(cutoff, boundary).await, Ok(()));
+    let marks = scan_paper_log(&h.dir.path().join("paper.log"))
+        .unwrap()
+        .into_iter()
+        .filter_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::PortfolioMark(mark)) => Some(mark.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(marks.len(), 1);
+    let mark = &marks[0];
+    assert_eq!(mark.cutoff_unix, cutoff);
+    assert_eq!(mark.boundary_receipt, boundary);
+    assert!(mark.invalid.is_some());
+    assert_eq!(mark.prices.len(), 1);
+    assert!(mark.prices[0].invalid.is_some());
+    assert!(mark.prices[0].price.is_none());
+    assert!(mark.prices[0].receipt.is_none());
+    assert_eq!(mark.equity, mark.cash);
+    let history = Reader::replay(h.dir.path().join("source.log"))
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|(_, envelope)| envelope.source_id.0 == "pe-service.clob-prices-history")
+        .collect::<Vec<_>>();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].1.payload, body);
+    h.stop().await;
+    server.abort();
+    let _ = server.await;
 }
 
 /// A priced S1 mark remains verifiable when its position resolves before the completion seal.
@@ -3868,13 +4050,9 @@ impl Harness {
         serde_json::from_slice(&std::fs::read(options.output).unwrap()).unwrap()
     }
 
-    async fn qualify_one_fill(&mut self) -> pe_service::qualification::QualificationReport {
-        let source_path = self.dir.path().join("source.log");
-        let scans_before_mark = pe_event_log::scan_metrics::count(&source_path).unwrap();
-        let cutoff = EPOCH - EPOCH.rem_euclid(86_400) + 86_400;
+    async fn append_daily_boundary(&self, cutoff: i64) -> AppendReceipt {
         let timestamp = OffsetDateTime::from_unix_timestamp(cutoff).unwrap();
-        let boundary = self
-            .source
+        self.source
             .append(EnvelopeIn {
                 source_id: SourceId("pe-service.boundary".to_owned()),
                 schema_version: 1,
@@ -3888,7 +4066,34 @@ impl Harness {
                 .unwrap(),
             })
             .await
+            .unwrap()
+    }
+
+    async fn publish_daily_boundary(
+        &self,
+        cutoff: i64,
+        boundary: AppendReceipt,
+    ) -> Result<(), DailyBoundaryError> {
+        let (acknowledged, receiver) = tokio::sync::oneshot::channel();
+        self.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::DailyBoundary {
+                cutoff_unix: cutoff,
+                boundary_receipt: boundary,
+                acknowledged,
+            })
+            .await
             .unwrap();
+        receiver.await.unwrap()
+    }
+
+    async fn qualify_one_fill(&mut self) -> pe_service::qualification::QualificationReport {
+        let source_path = self.dir.path().join("source.log");
+        let scans_before_mark = pe_event_log::scan_metrics::count(&source_path).unwrap();
+        let cutoff = EPOCH - EPOCH.rem_euclid(86_400) + 86_400;
+        let timestamp = OffsetDateTime::from_unix_timestamp(cutoff).unwrap();
+        let boundary = self.append_daily_boundary(cutoff).await;
         let position_count = self.paper.open_positions().unwrap().len();
         for _ in 0..position_count {
             let price = self
@@ -3916,18 +4121,7 @@ impl Harness {
         self.hooks
             .financial_clock_unix
             .store(cutoff, Ordering::SeqCst);
-        let (acknowledged, receiver) = tokio::sync::oneshot::channel();
-        self.control
-            .as_ref()
-            .unwrap()
-            .send(OrchestratorControl::DailyBoundary {
-                cutoff_unix: cutoff,
-                boundary_receipt: boundary,
-                acknowledged,
-            })
-            .await
-            .unwrap();
-        receiver.await.unwrap().unwrap();
+        self.publish_daily_boundary(cutoff, boundary).await.unwrap();
         assert_eq!(
             pe_event_log::scan_metrics::count(&source_path).unwrap(),
             scans_before_mark
@@ -3949,6 +4143,14 @@ impl Harness {
             serde_json::to_vec(&*mark).unwrap(),
             serde_json::to_vec(&verified_mark).unwrap()
         );
+        self.qualify_mark_at_cutoff(cutoff).await
+    }
+
+    async fn qualify_mark_at_cutoff(
+        &mut self,
+        cutoff: i64,
+    ) -> pe_service::qualification::QualificationReport {
+        let timestamp = OffsetDateTime::from_unix_timestamp(cutoff).unwrap();
         self.stop().await;
         let paper_path = self.dir.path().join("paper.log");
         let source_path = self.dir.path().join("source.log");

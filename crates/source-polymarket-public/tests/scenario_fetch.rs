@@ -8,6 +8,8 @@
 //!   5. exhaust_retries        — always 500, max_retries=2 → Transient; 3 total requests.
 //!   6. retry_on_408           — 408×2 then 200 → success; 3 total requests. (issue #159)
 //!   7. exhaust_retries_408    — always 408, max_retries=2 → Transient; 3 total requests. (issue #159)
+//!   8. unreadable_reply      — incomplete JSON retries, retains responses, and shares the retry budget.
+//!   9. unexpected_json_shape — complete JSON passes through unchanged.
 
 #![cfg(feature = "scenario")]
 #![allow(
@@ -25,8 +27,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use pe_core_types::RawHttpAttempt;
 use pe_source_core::SourceError;
-use pe_source_polymarket_public::{PageFetcher, ReqwestFetcher};
+use pe_source_polymarket_public::{HttpRequestContext, PageFetcher, ReqwestFetcher};
 
 // ── Mock server helpers ───────────────────────────────────────────────────────
 
@@ -45,12 +48,30 @@ fn make_fetcher() -> ReqwestFetcher {
     ReqwestFetcher::new(reqwest::Client::new()).with_initial_backoff_ms(1)
 }
 
+async fn start_reply_server(bodies: Vec<&'static [u8]>) -> (String, Arc<AtomicU32>) {
+    let hits = Arc::new(AtomicU32::new(0));
+    let router = Router::new()
+        .route(
+            "/data",
+            get(
+                |State((hits, bodies)): State<(Arc<AtomicU32>, Vec<&'static [u8]>)>| async move {
+                    let hit =
+                        usize::try_from(hits.fetch_add(1, Ordering::SeqCst)).expect("hit index");
+                    (StatusCode::OK, bodies[hit.min(bodies.len() - 1)].to_vec())
+                },
+            ),
+        )
+        .with_state((hits.clone(), bodies));
+    (start_mock_server(router).await, hits)
+}
+
 // ── Scenario 1: happy_path ────────────────────────────────────────────────────
 
+/// PASS: a complete JSON success body is returned unchanged.
 #[tokio::test]
 async fn scenario_happy_path() {
     async fn handler() -> impl IntoResponse {
-        (StatusCode::OK, b"hello world".to_vec())
+        (StatusCode::OK, b"[1]".to_vec())
     }
 
     let router = Router::new().route("/data", get(handler));
@@ -62,7 +83,7 @@ async fn scenario_happy_path() {
         .await
         .expect("expected Ok");
 
-    assert_eq!(bytes, b"hello world");
+    assert_eq!(bytes, b"[1]");
 }
 
 // ── Scenario 2: retry_on_5xx ─────────────────────────────────────────────────
@@ -70,6 +91,7 @@ async fn scenario_happy_path() {
 // PASS: fetch_page returns Ok after 3 total requests (2 × 500, 1 × 200).
 // FAIL: fewer or more than 3 requests, or fetch_page returns an error.
 
+/// PASS: two 500 replies retry to a complete JSON body after exactly three requests.
 #[tokio::test]
 async fn scenario_retry_on_5xx() {
     #[derive(Clone)]
@@ -82,7 +104,7 @@ async fn scenario_retry_on_5xx() {
         if prev < 2 {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         } else {
-            (StatusCode::OK, b"ok".to_vec()).into_response()
+            (StatusCode::OK, b"[1]".to_vec()).into_response()
         }
     }
 
@@ -101,7 +123,7 @@ async fn scenario_retry_on_5xx() {
         .await
         .expect("expected Ok after retries");
 
-    assert_eq!(bytes, b"ok");
+    assert_eq!(bytes, b"[1]");
     assert_eq!(
         count_ref.load(Ordering::SeqCst),
         3,
@@ -219,6 +241,7 @@ async fn scenario_exhaust_retries() {
 // PASS: fetch_page returns Ok after two 408s, exactly 3 total requests.
 // FAIL: any error, or a request count other than 3.
 
+/// PASS: two 408 replies retry to a complete JSON body after exactly three requests.
 #[tokio::test]
 async fn scenario_retry_on_408() {
     #[derive(Clone)]
@@ -231,7 +254,7 @@ async fn scenario_retry_on_408() {
         if prev < 2 {
             StatusCode::REQUEST_TIMEOUT.into_response()
         } else {
-            (StatusCode::OK, b"ok".to_vec()).into_response()
+            (StatusCode::OK, b"[1]".to_vec()).into_response()
         }
     }
 
@@ -250,7 +273,7 @@ async fn scenario_retry_on_408() {
         .await
         .expect("408s must be retried until success");
 
-    assert_eq!(bytes, b"ok");
+    assert_eq!(bytes, b"[1]");
     assert_eq!(
         count_ref.load(Ordering::SeqCst),
         3,
@@ -304,4 +327,119 @@ async fn scenario_exhaust_retries_408() {
         3,
         "expected 3 total requests (initial + 2 retries)"
     );
+}
+
+// ── Scenario 8: unreadable_reply ──────────────────────────────────────────────
+
+/// PASS: a cut JSON string retries once and both 200 responses are observed in order.
+#[tokio::test]
+async fn scenario_unreadable_reply_retries_and_observes_both_responses() {
+    let cut = br#"[{"x":"cut"#;
+    let complete = br#"[{"x":"complete"}]"#;
+    let (base, hits) = start_reply_server(vec![cut, complete]).await;
+    let mut attempts = Vec::new();
+    let bytes = make_fetcher()
+        .with_max_retries(1)
+        .with_min_interval_ms(0)
+        .fetch_page_observed(
+            &format!("{base}/data"),
+            HttpRequestContext {
+                source_id: "test-server",
+                endpoint_kind: "unreadable-reply",
+            },
+            |attempt| {
+                attempts.push(attempt);
+                Ok(())
+            },
+        )
+        .await
+        .expect("complete reply after retry");
+
+    assert_eq!(bytes, complete);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    let [
+        RawHttpAttempt::Response(first),
+        RawHttpAttempt::Response(second),
+    ] = attempts.as_slice()
+    else {
+        panic!("expected two responses, got {attempts:?}");
+    };
+    assert_eq!(first.body, cut);
+    assert_eq!(second.body, complete);
+    assert_eq!((first.status, first.attempt_ordinal), (200, 1));
+    assert_eq!((second.status, second.attempt_ordinal), (200, 2));
+}
+
+/// PASS: every unreadable 200 exhausts one retry as Transient after exactly two requests.
+#[tokio::test]
+async fn scenario_unreadable_replies_exhaust_retry_budget() {
+    let cases: [(&str, &[u8]); 5] = [
+        ("cut string", br#"[{"x":"cut"#),
+        ("invalid UTF-8", b"[{\"x\":\"\xff\"}]"),
+        ("trailing document", b"[] []"),
+        ("empty", b""),
+        ("HTML", b"<html>unavailable</html>"),
+    ];
+    for (case, body) in cases {
+        let (base, hits) = start_reply_server(vec![body]).await;
+        let result = make_fetcher()
+            .with_max_retries(1)
+            .with_min_interval_ms(0)
+            .fetch_page(&format!("{base}/data"))
+            .await;
+        assert!(
+            matches!(result, Err(SourceError::Transient { ref message }) if message.contains("reply is not one complete JSON document")),
+            "{case}: expected unreadable-reply Transient, got {result:?}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "{case}");
+    }
+}
+
+/// PASS: zero retries returns Transient after one unreadable 200 and retains its Response.
+#[tokio::test]
+async fn scenario_unreadable_reply_zero_retries_observes_response() {
+    let cut = br#"[{"x":"cut"#;
+    let (base, hits) = start_reply_server(vec![cut]).await;
+    let mut attempts = Vec::new();
+    let result = make_fetcher()
+        .with_max_retries(0)
+        .fetch_page_observed(
+            &format!("{base}/data"),
+            HttpRequestContext {
+                source_id: "test-server",
+                endpoint_kind: "unreadable-reply",
+            },
+            |attempt| {
+                attempts.push(attempt);
+                Ok(())
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(SourceError::Transient { ref message }) if message.contains("reply is not one complete JSON document")),
+        "expected unreadable-reply Transient, got {result:?}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let [RawHttpAttempt::Response(response)] = attempts.as_slice() else {
+        panic!("expected one response, got {attempts:?}");
+    };
+    assert_eq!(response.body, cut);
+    assert_eq!((response.status, response.attempt_ordinal), (200, 1));
+}
+
+// ── Scenario 9: unexpected_json_shape ─────────────────────────────────────────
+
+/// PASS: valid JSON of an unexpected shape is returned unchanged after one request.
+#[tokio::test]
+async fn scenario_unexpected_json_shape_passes_through() {
+    let body = br#"{"not":"an array"}"#;
+    let (base, hits) = start_reply_server(vec![body]).await;
+    let bytes = make_fetcher()
+        .fetch_page(&format!("{base}/data"))
+        .await
+        .expect("valid JSON passes through");
+
+    assert_eq!(bytes, body);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
 }

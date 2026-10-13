@@ -21,6 +21,22 @@ use crate::paper_recovery::{HaltState, MembershipChange, RiskHaltOwner};
 use crate::position_seeder::AnchorInstall;
 use crate::watchlist_maintenance::MembershipCommit;
 
+/// Why a daily boundary published no mark.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DailyBoundaryError {
+    /// A historical-mark read failed retryably; the poller publishes the boundary again later.
+    #[error("{0}")]
+    Retryable(String),
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for DailyBoundaryError {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
+}
+
 /// Exact single-owner ledger capture used by the causal bracket.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdmissionLedgerCapture {
@@ -105,7 +121,7 @@ pub enum OrchestratorControl {
     DailyBoundary {
         cutoff_unix: i64,
         boundary_receipt: AppendReceipt,
-        acknowledged: oneshot::Sender<Result<(), String>>,
+        acknowledged: oneshot::Sender<Result<(), DailyBoundaryError>>,
     },
     /// Qualification seal producer handoff. Lane F owns the verifier semantics.
     SealCheck {

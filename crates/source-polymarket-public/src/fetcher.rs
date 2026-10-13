@@ -46,11 +46,13 @@ const UNOBSERVED_CONTEXT: HttpRequestContext = HttpRequestContext {
 /// returned future is `Send` so the same contract can back spawned source and
 /// admission workers.
 pub trait PageFetcher {
-    /// Fetch a page from `url`. Returns raw response bytes.
+    /// Fetch a page from `url`. Returns the raw bytes of a success reply that is one complete
+    /// JSON document.
     ///
     /// - Returns [`SourceError::RateLimited`] on HTTP 429 with the `Retry-After` value (an
     ///   opted-in instance first retries short waits within its budget).
-    /// - Returns [`SourceError::Transient`] on 5xx or network errors (retried internally).
+    /// - Returns [`SourceError::Transient`] on 5xx, network errors or a success reply that is
+    ///   not one complete JSON document (retried internally).
     /// - Returns [`SourceError::Fatal`] on 4xx (non-429) errors.
     fn fetch_page(
         &self,
@@ -99,8 +101,9 @@ impl RateGate {
 /// A [`PageFetcher`] backed by a [`reqwest::Client`].
 ///
 /// - Per-request timeout: `polymarket_request_timeout_secs = 10`.
-/// - Retry with exponential backoff for network errors and 5xx responses
-///   (`polymarket_max_retries = 3` retries; 4 total attempts).
+/// - Retry with exponential backoff for network errors, 5xx responses and success replies
+///   that are not one complete JSON document (`polymarket_max_retries = 3` retries; 4 total
+///   attempts).
 /// - Rate limiting: enforces ≤ 1 / `min_interval_ms` req/ms (defaults to ≤ 20 req/s
 ///   at 50 ms) by reserving a future slot before each call. The reservation is
 ///   shared via [`RateGate`] so concurrent callers all observe the serial gate.
@@ -346,23 +349,34 @@ impl ReqwestFetcher {
                         }
                         return Err(SourceError::RateLimited { retry_after_secs });
                     }
-                    if is_retryable_status(status) {
-                        if transient_retries >= self.max_retries {
-                            return Err(SourceError::Transient {
-                                message: format!("HTTP {status}"),
-                            });
-                        }
-                        transient_retries += 1;
-                        tokio::time::sleep(backoff(self.initial_backoff_ms, transient_retries))
-                            .await;
-                        continue;
-                    }
-                    if status >= 400 {
+                    // A cleanly framed success reply can still hold a cut-off document (#703), so
+                    // one that is not complete JSON retries like a transient status.
+                    let transient = if is_retryable_status(status) {
+                        format!("HTTP {status}")
+                    } else if status >= 400 {
                         return Err(SourceError::Fatal {
                             message: format!("HTTP {status}"),
                         });
+                    } else if let Err(error) =
+                        serde_json::from_slice::<&serde_json::value::RawValue>(&body)
+                    {
+                        tracing::warn!(
+                            path = %path,
+                            status,
+                            bytes = body.len(),
+                            attempt,
+                            %error,
+                            "venue reply is not one complete JSON document"
+                        );
+                        format!("reply is not one complete JSON document: {error}")
+                    } else {
+                        return Ok(body);
+                    };
+                    if transient_retries >= self.max_retries {
+                        return Err(SourceError::Transient { message: transient });
                     }
-                    return Ok(body);
+                    transient_retries += 1;
+                    tokio::time::sleep(backoff(self.initial_backoff_ms, transient_retries)).await;
                 }
             }
         }
@@ -626,14 +640,19 @@ mod tests {
         );
     }
 
+    /// PASS: short 429s leave one shared retry budget for 502s and unreadable 200 replies.
     #[tokio::test]
     async fn short_429_does_not_reset_or_consume_the_transient_budget() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        for (opted_in, max_retries, expected_hits) in
-            [(false, None, 2), (true, None, 5), (true, Some(1), 3)]
-        {
+        for (opted_in, max_retries, expected_hits, unreadable) in [
+            (false, None, 2, false),
+            (true, None, 5, false),
+            (true, Some(1), 3, false),
+            (true, None, 5, true),
+            (true, Some(1), 3, true),
+        ] {
             let hits = Arc::new(AtomicUsize::new(0));
             let counter = hits.clone();
             let app = axum::Router::new().route(
@@ -641,12 +660,15 @@ mod tests {
                 axum::routing::get(move || {
                     let counter = counter.clone();
                     async move {
-                        let status = if counter.fetch_add(1, Ordering::SeqCst) == 1 {
-                            axum::http::StatusCode::TOO_MANY_REQUESTS
+                        let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                        let (status, body) = if attempt == 1 {
+                            (axum::http::StatusCode::TOO_MANY_REQUESTS, "{}")
+                        } else if unreadable && attempt >= 2 {
+                            (axum::http::StatusCode::OK, r#"[{"x":"cut"#)
                         } else {
-                            axum::http::StatusCode::BAD_GATEWAY
+                            (axum::http::StatusCode::BAD_GATEWAY, "{}")
                         };
-                        (status, [("retry-after", "1")], "{}")
+                        (status, [("retry-after", "1")], body)
                     }
                 }),
             );

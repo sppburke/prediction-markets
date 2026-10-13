@@ -52,7 +52,7 @@ use crate::bucket_commit::{
 };
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
-use crate::orchestrator_control::OrchestratorControl;
+use crate::orchestrator_control::{DailyBoundaryError, OrchestratorControl};
 use crate::risk_inputs::SourceReceiptIndex;
 use crate::runtime_config::LiveRuntimeConfig;
 use crate::watchlist_admission::{
@@ -1176,7 +1176,7 @@ enum Completion {
         tokio::time::Instant,
     ),
     BoundaryInstalled(Result<PendingBoundary, TradePollerOwnerError>),
-    BoundaryPublished(PendingBoundary, Result<(), TradePollerOwnerError>),
+    BoundaryPublished(PendingBoundary, Result<(), DailyBoundaryError>),
 }
 
 /// Bounded scenario-only completion barriers; production has no observer channel.
@@ -1350,6 +1350,8 @@ impl TradePoller {
         let mut stopping = false;
         let mut shutdown_requested = false;
         let mut failure = None;
+        // A boundary whose mark read failed retryably waits one poll interval before republishing.
+        let mut boundary_retry_at = None::<tokio::time::Instant>;
         loop {
             // Poll shutdown before admitting work, including at startup.
             // A stop seen here (between two select polls) cancels started operations exactly
@@ -1459,6 +1461,8 @@ impl TradePoller {
                             .retain(|wallet| !busy_wallets.contains(wallet));
                     }
                     let operation = self.operation();
+                    let boundary_due =
+                        boundary_retry_at.is_none_or(|at| tokio::time::Instant::now() >= at);
                     match round.stage {
                         RoundStage::Boundary => {
                             round.stage = RoundStage::Wallets;
@@ -1553,7 +1557,9 @@ impl TradePoller {
                                 + Duration::from_secs(self.config.poll_interval_secs);
                             #[cfg(feature = "scenario")]
                             self.report_progress(PollerProgress::RoundCompleted);
-                            if let Some(boundary) = self.obligations.take_ready_boundary() {
+                            if boundary_due
+                                && let Some(boundary) = self.obligations.take_ready_boundary()
+                            {
                                 tasks.spawn(async move {
                                     Completion::BoundaryPublished(
                                         boundary,
@@ -1564,7 +1570,9 @@ impl TradePoller {
                             }
                         }
                         RoundStage::Done => {
-                            if let Some(boundary) = self.obligations.take_ready_boundary() {
+                            if boundary_due
+                                && let Some(boundary) = self.obligations.take_ready_boundary()
+                            {
                                 tasks.spawn(async move {
                                     Completion::BoundaryPublished(
                                         boundary,
@@ -1801,7 +1809,16 @@ impl TradePoller {
                             backstop_busy = false;
                             match result {
                                 Ok(()) => self.obligations.set_boundary_anchor(boundary.cutoff_unix),
-                                Err(error) => { self.obligations.install_boundary(boundary); failure = Some(error); }
+                                Err(error) => {
+                                    self.obligations.install_boundary(boundary);
+                                    match error {
+                                        DailyBoundaryError::Retryable(reason) => {
+                                            warn!(cutoff_unix = boundary.cutoff_unix, %reason, "daily boundary mark read failed; publishing again after the poll interval");
+                                            boundary_retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(self.config.poll_interval_secs));
+                                        }
+                                        DailyBoundaryError::Failed(reason) => failure = Some(TradePollerOwnerError::DailyBoundary(reason)),
+                                    }
+                                }
                             }
                         }
                         // Cancelled by shutdown: the operation's durable prefix stands on its own.
@@ -2177,10 +2194,7 @@ impl WalletOperation {
         })
     }
 
-    async fn publish_boundary(
-        &self,
-        boundary: PendingBoundary,
-    ) -> Result<(), TradePollerOwnerError> {
+    async fn publish_boundary(&self, boundary: PendingBoundary) -> Result<(), DailyBoundaryError> {
         let (acknowledged, received) = oneshot::channel();
         self.control_tx
             .send(OrchestratorControl::DailyBoundary {
@@ -2190,18 +2204,11 @@ impl WalletOperation {
             })
             .await
             .map_err(|_| {
-                TradePollerOwnerError::DailyBoundary(
-                    "orchestrator control channel closed".to_owned(),
-                )
+                DailyBoundaryError::Failed("orchestrator control channel closed".to_owned())
             })?;
-        received
-            .await
-            .map_err(|_| {
-                TradePollerOwnerError::DailyBoundary(
-                    "daily boundary acknowledgement closed".to_owned(),
-                )
-            })?
-            .map_err(TradePollerOwnerError::DailyBoundary)
+        received.await.map_err(|_| {
+            DailyBoundaryError::Failed("daily boundary acknowledgement closed".to_owned())
+        })?
     }
 
     async fn reconcile_wallet(
