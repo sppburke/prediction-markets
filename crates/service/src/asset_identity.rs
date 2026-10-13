@@ -1944,6 +1944,36 @@ mod tests {
         }
     }
 
+    /// PASS: a cut Gamma reply retries to a verified identity after exactly two HTTP requests.
+    #[tokio::test(start_paused = true)]
+    async fn bracket_unreadable_gamma_reply_recovers() {
+        use axum::http::StatusCode;
+        let complete = r#"[{"conditionId":"condition-a","clobTokenIds":["token-a"]}]"#;
+        let (_dir, path, _sink, resolver, hits, server) = http_resolver(vec![
+            (StatusCode::OK, r#"[{"conditionId":"condition"#),
+            (StatusCode::OK, complete),
+        ])
+        .await;
+        let resolved = resolve_http(&resolver).await.unwrap();
+        let token = PolymarketTokenId("token-a".to_owned());
+
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(resolved.verified.len(), 1);
+        assert_eq!(resolved.verified[&token].condition_id.0, "condition-a");
+        assert_eq!(resolved.verified[&token].outcome, OutcomeId(0));
+        assert!(resolved.unverified.is_empty());
+        let pages = Reader::replay(path)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(pages.len(), 1);
+        let (sequence, page) = &pages[0];
+        assert_eq!(page.payload, complete.as_bytes());
+        assert_eq!(resolved.provenance[&token].source_log_sequence, sequence.0);
+        server.abort();
+    }
+
+    /// PASS: schema, recording, fatal HTTP and exhausted 429 failures keep their terminal behavior.
     #[tokio::test(start_paused = true)]
     async fn bracket_non_transient_failures_not_retried() {
         use axum::http::StatusCode;
@@ -1956,7 +1986,7 @@ mod tests {
         ] {
             let response = match case {
                 "fatal" => (StatusCode::FORBIDDEN, "{}"),
-                "parse" | "record_error" => (StatusCode::OK, "not-json"),
+                "parse" | "record_error" => (StatusCode::OK, r#"{"not":"an array"}"#),
                 "rate_limit" => (StatusCode::TOO_MANY_REQUESTS, "{}"),
                 _ => (
                     StatusCode::OK,

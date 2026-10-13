@@ -79,6 +79,7 @@ struct HttpState {
     now: i64,
     ranked_wallets: usize,
     full_history_requests: Mutex<Vec<String>>,
+    cut_full_history_replies: std::sync::atomic::AtomicUsize,
     start: Mutex<Option<pe_event_log::AppendReceipt>>,
     authority: Mutex<Authority>,
     activity: Mutex<HashMap<String, Vec<Value>>>,
@@ -110,6 +111,7 @@ pub async fn boundary_mark() {
         now: 0,
         ranked_wallets: 0,
         full_history_requests: Mutex::new(Vec::new()),
+        cut_full_history_replies: AtomicUsize::new(0),
         start: Mutex::new(None),
         authority: Mutex::new(Authority::default()),
         activity: Mutex::new(HashMap::new()),
@@ -160,7 +162,7 @@ async fn serve(
     State(state): State<Arc<HttpState>>,
     OriginalUri(uri): OriginalUri,
     bytes: Bytes,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     use std::sync::atomic::Ordering;
     let url = reqwest::Url::parse(&format!("http://localhost{uri}")).unwrap();
     let q = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
@@ -205,7 +207,25 @@ async fn serve(
                     .is_some_and(|at| at >= start && at <= end)
             })
             .collect::<Vec<_>>();
-        return (StatusCode::OK, Json(json!(data)));
+        if q.get("start").is_some_and(|start| start == "1")
+            && q.get("offset").is_some_and(|offset| offset == "0")
+            && state
+                .cut_full_history_replies
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            assert_eq!(q["limit"], "500");
+            assert_eq!(q["sortDirection"], "DESC");
+            assert_eq!(q["type"], "TRADE,SPLIT,MERGE,REDEEM,CONVERSION");
+            assert!(q["end"].parse::<i64>().is_ok());
+            let mut body = serde_json::to_string(&data).unwrap();
+            // Retain a strict prefix of the actual reply, ending inside its first string value.
+            body.truncate(body.find("\":\"").unwrap() + 4);
+            return (StatusCode::OK, [("content-type", "application/json")], body).into_response();
+        }
+        return (StatusCode::OK, Json(json!(data))).into_response();
     }
     if path == "/positions" {
         let data = state
@@ -220,7 +240,7 @@ async fn serve(
             })
             .cloned()
             .collect::<Vec<_>>();
-        return (StatusCode::OK, Json(json!(data)));
+        return (StatusCode::OK, Json(json!(data))).into_response();
     }
     if path == "/markets" {
         let token = q
@@ -238,7 +258,8 @@ async fn serve(
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error":"isolated Gamma outage"})),
-            );
+            )
+                .into_response();
         }
         let mut v: Value = serde_json::from_slice(include_bytes!(
             "../fixtures/golden_stream_v1/gamma_long.json"
@@ -258,7 +279,7 @@ async fn serve(
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap()
             .into();
-        return (StatusCode::OK, Json(v));
+        return (StatusCode::OK, Json(v)).into_response();
     }
     if let Some(c) = path.strip_prefix("/markets/") {
         let market = usize::from_str_radix(c.trim_start_matches("0x"), 16).unwrap();
@@ -277,7 +298,7 @@ async fn serve(
             .into();
         v["tokens"][0]["token_id"] = (market * 2 + 101).to_string().into();
         v["tokens"][1]["token_id"] = (market * 2 + 102).to_string().into();
-        return (StatusCode::OK, Json(v));
+        return (StatusCode::OK, Json(v)).into_response();
     }
     if let Some(c) = path.strip_prefix("/clob-markets/") {
         let market = usize::from_str_radix(c.trim_start_matches("0x"), 16).unwrap();
@@ -288,10 +309,10 @@ async fn serve(
         v["c"] = c.into();
         v["t"][0]["t"] = (market * 2 + 101).to_string().into();
         v["t"][1]["t"] = (market * 2 + 102).to_string().into();
-        return (StatusCode::OK, Json(v));
+        return (StatusCode::OK, Json(v)).into_response();
     }
     if path == "/prices-history" {
-        return (StatusCode::OK, Json(prices_history(&q)));
+        return (StatusCode::OK, Json(prices_history(&q))).into_response();
     }
     if path == "/book" {
         let token = q["token_id"].parse::<usize>().unwrap();
@@ -301,7 +322,8 @@ async fn serve(
             Json(
                 json!({"market":condition(market),"asset_id":token.to_string(),"timestamp":OffsetDateTime::now_utc().unix_timestamp_nanos().checked_div(1_000_000).unwrap().to_string(),"min_order_size":"5","tick_size":"0.01","neg_risk":false,"bids":[{"price":"0.50","size":"100000"}],"asks":[{"price":"0.50","size":"100000"}]}),
             ),
-        );
+        )
+        .into_response();
     }
     let body: Value = if bytes.is_empty() {
         Value::Null
@@ -337,7 +359,7 @@ async fn serve(
         },
         other=>panic!("unexpected production request {other}: {body}"),
     };
-    (StatusCode::OK, Json(answer))
+    (StatusCode::OK, Json(answer)).into_response()
 }
 pub struct Child {
     process: std::process::Child,
@@ -539,6 +561,7 @@ async fn run_case(boot_waves: bool) {
         now,
         ranked_wallets: if boot_waves { 5 } else { 4 },
         full_history_requests: Mutex::new(Vec::new()),
+        cut_full_history_replies: std::sync::atomic::AtomicUsize::new(0),
         start: Mutex::new(None),
         authority: Mutex::new(Authority {
             cash: dec!(10000),
@@ -1192,6 +1215,7 @@ impl CheckpointFixture {
             now,
             ranked_wallets: 1,
             full_history_requests: Mutex::new(Vec::new()),
+            cut_full_history_replies: std::sync::atomic::AtomicUsize::new(0),
             start: Mutex::new(None),
             authority: Mutex::new(Authority {
                 cash: dec!(10000),
@@ -1355,6 +1379,12 @@ impl CheckpointFixture {
                 [self.state.now - 4000],
             )
             .unwrap();
+    }
+    /// Cut the next full-history page-zero replies inside a string, leaving ordinary polls intact.
+    pub fn cut_full_history_replies(&self, count: usize) {
+        self.state
+            .cut_full_history_replies
+            .store(count, std::sync::atomic::Ordering::SeqCst);
     }
     pub fn mirror_positions(&self) {
         *self.state.positions.lock().unwrap() = self.paper.leader_positions().unwrap().into_iter().map(|position| json!({"proxyWallet": position.wallet, "conditionId": position.market_id.0.0, "asset":"103", "outcomeIndex":position.outcome_id.0, "size":position.long_contracts.to_decimal().to_string(), "negativeRisk":false, "redeemable":false})).collect();

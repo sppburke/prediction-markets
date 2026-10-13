@@ -98,6 +98,16 @@
 > The short-429 policy remains grounded in the reported Forge responses, with
 > unchanged request pacing and a separate bounded retry budget (see `_GLOSSARY.md`).
 
+> **Reply completeness (#703), Last checked: 2026-10-13; re-verify by 2026-12-12.** The official
+> [activity](https://docs.polymarket.com/api-reference/core/get-user-activity),
+> [positions](https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user),
+> [markets](https://docs.polymarket.com/api-reference/markets/list-markets) and
+> [prices-history](https://docs.polymarket.com/api-reference/markets/get-prices-history) references document their
+> success replies as `200 application/json`. A live HTTP/1.1 `/activity` read on 2026-10-13 (the service's protocol)
+> was `Transfer-Encoding: chunked` with no `Content-Length`, through Cloudflare, so a cleanly terminated reply can still
+> hold a cut-off document. The shared fetcher retries a success reply that is not one complete JSON document (see
+> `polymarket_max_retries` in `_GLOSSARY.md`).
+
 > **SUPERSEDED (2026-08-25, issue #530 re-verification): RTDS DOES carry attributed trades.**
 > The 2026-06-03 conclusion below no longer holds for `wss://ws-live-data.polymarket.com`:
 > subscribing `{"action":"subscribe","subscriptions":[{"topic":"activity","type":"trades"}]}`
@@ -329,19 +339,19 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/api-reference/relayer/get-relayer-address-and-nonce | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/relayer/get-a-transaction-by-id | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-10-10 | 2026-12-09 |
-| https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-09-16 | 2026-11-15 |
+| https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-10-13 | 2026-12-12 |
 | https://docs.polymarket.com/api-reference/feeds/list-account-activity | 2026-09-10 | 2026-11-09 |
 | https://docs.polymarket.com/api-reference/service/get-data-freshness | 2026-09-10 | 2026-11-09 |
 | https://docs.polymarket.com/api-reference/data-api/migrating-from-v1 | 2026-09-10 | 2026-11-09 |
 | https://clob.polymarket.com/markets?closed=true | 2026-10-09 | 2026-12-08 |
-| https://docs.polymarket.com/api-reference/markets/list-markets | 2026-10-09 | 2026-12-08 |
+| https://docs.polymarket.com/api-reference/markets/list-markets | 2026-10-13 | 2026-12-12 |
 | https://docs.polymarket.com/api-reference/events/list-events | 2026-07-28 | 2026-09-26 |
 | https://docs.polymarket.com/api-reference/markets/get-market-by-id | 2026-09-27 | 2026-11-26 |
 | https://docs.polymarket.com/api-reference/markets/get-clob-market-info | 2026-09-27 | 2026-11-26 |
 | https://docs.polymarket.com/api-reference/market-data/get-order-book | 2026-09-27 | 2026-11-26 |
 | https://docs.polymarket.com/api-reference/trade/get-user-orders | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/trade/get-trades | 2026-07-17 | 2026-09-15 |
-| https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-09-03 | 2026-11-01 |
+| https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-10-13 | 2026-12-12 |
 | https://docs.polymarket.com/concepts/resolution | 2026-09-01 | 2026-10-31 |
 | https://docs.polygon.technology/pos/reference/rpc-endpoints | 2026-09-05 | 2026-12-04 |
 | https://docs.polygon.technology/pos/concepts/finality/finality | 2026-09-05 | 2026-12-04 |
@@ -354,7 +364,7 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://clob.polymarket.com/book?token_id={tokenId} | 2026-07-18 | 2026-09-16 |
 | https://clob.polymarket.com/prices-history?market={tokenId} | 2026-09-01 | 2026-10-31 |
 | https://clob.polymarket.com/prices-history?market={tokenId}&startTs={start}&endTs={cutoff}&fidelity=1 | 2026-09-18 | 2026-11-17 |
-| https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-09-01 | 2026-10-31 |
+| https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-10-13 | 2026-12-12 |
 | https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-07-18 | 2026-09-16 |
 | https://gamma-api.polymarket.com/markets?clob_token_ids={token}&closed=true | 2026-09-02 | 2026-11-01 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |

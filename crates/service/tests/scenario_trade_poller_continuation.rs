@@ -23,7 +23,7 @@ use pe_service::asset_identity::AssetIdentityResolver;
 use pe_service::bucket_commit::{BucketCommitEngine, BucketDecisionContext, FrozenDecisionBasis};
 use pe_service::health::new_shared_health_with_ws;
 use pe_service::live_watchlist::LiveWatchlist;
-use pe_service::orchestrator_control::OrchestratorControl;
+use pe_service::orchestrator_control::{DailyBoundaryError, OrchestratorControl};
 use pe_service::paper_recovery::build_leader_ledger;
 use pe_service::runtime_config::{LiveRuntimeConfig, RuntimeConfig};
 use pe_service::source_event_sink::SourceEventSink;
@@ -889,6 +889,8 @@ enum ControlCompletion {
     FinalCapture,
 }
 
+type BoundaryReply = Option<Result<(), DailyBoundaryError>>;
+
 struct RunningPoll {
     health: pe_service::health::SharedHealth,
     anchor_ack_gate: Arc<tokio::sync::Semaphore>,
@@ -897,6 +899,8 @@ struct RunningPoll {
     append_ack_arrived: Arc<tokio::sync::Notify>,
     bucket_ack_gate: Arc<tokio::sync::Semaphore>,
     boundary_ack_gate: Arc<tokio::sync::Semaphore>,
+    boundary_results: Arc<Mutex<VecDeque<BoundaryReply>>>,
+    boundary_publications: Arc<Mutex<Vec<(i64, pe_event_log::AppendReceipt)>>>,
     final_capture_gate: Arc<tokio::sync::Semaphore>,
     control_tx: mpsc::WeakSender<OrchestratorControl>,
     controls: mpsc::Receiver<ControlCompletion>,
@@ -1118,11 +1122,15 @@ fn start_recorded_poller_with_completion_stop(
     let append_ack_arrived = Arc::new(tokio::sync::Notify::new());
     let bucket_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let boundary_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let boundary_results = Arc::new(Mutex::new(VecDeque::new()));
+    let boundary_publications = Arc::new(Mutex::new(Vec::new()));
     let final_capture_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let anchor_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let anchor_ack_drop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let actor_ack_gate = bucket_ack_gate.clone();
     let actor_boundary_gate = boundary_ack_gate.clone();
+    let actor_boundary_results = boundary_results.clone();
+    let actor_boundary_publications = boundary_publications.clone();
     let actor_anchor_gate = anchor_ack_gate.clone();
     let actor_anchor_drop = anchor_ack_drop.clone();
     let actor_capture_gate = final_capture_gate.clone();
@@ -1222,13 +1230,25 @@ fn start_recorded_poller_with_completion_stop(
                 OrchestratorControl::DailyBoundary {
                     acknowledged,
                     cutoff_unix,
-                    ..
+                    boundary_receipt,
                 } => {
+                    actor_boundary_publications
+                        .lock()
+                        .unwrap()
+                        .push((cutoff_unix, boundary_receipt));
                     let _ = control_events
                         .send(ControlCompletion::Boundary(cutoff_unix))
                         .await;
                     let _permit = actor_boundary_gate.acquire().await.unwrap();
-                    let _ = acknowledged.send(Ok(()));
+                    // None drops the acknowledgement; an exhausted script preserves success.
+                    let result = actor_boundary_results
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(Some(Ok(())));
+                    if let Some(result) = result {
+                        let _ = acknowledged.send(result);
+                    }
                 }
                 OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
                     let _ = acknowledged.send(());
@@ -1389,6 +1409,8 @@ fn start_recorded_poller_with_completion_stop(
             append_ack_arrived,
             bucket_ack_gate,
             boundary_ack_gate,
+            boundary_results,
+            boundary_publications,
             final_capture_gate,
             control_tx: test_control_tx,
             controls,
@@ -2615,6 +2637,193 @@ async fn uncertain_anchor_install_stops_before_releasing_wallet_to_urgent() {
     drop(running.triggers);
     running.ingest.await.unwrap();
     running.control.await.unwrap();
+}
+
+/// PASS: a retryable mark read keeps the anchor, waits thirty seconds, and republishes the same
+/// cutoff and receipt; only the successful acknowledgement advances the anchor.
+#[tokio::test(start_paused = true)]
+async fn daily_boundary_retry_waits_one_poll_interval_and_preserves_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let cutoff = EPOCH.div_euclid(86_400) * 86_400;
+    let anchor = cutoff - 86_400;
+    let (mut running, _) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, false, Some(anchor));
+    running
+        .boundary_results
+        .lock()
+        .unwrap()
+        .push_back(Some(Err(DailyBoundaryError::Retryable(
+            "unreadable history".to_owned(),
+        ))));
+    let gate = running.boundary_ack_gate.clone();
+    let held = gate.acquire().await.unwrap();
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    assert!(matches!(
+        running.controls.recv().await.unwrap(),
+        ControlCompletion::Boundary(value) if value == cutoff
+    ));
+    let first = running.boundary_publications.lock().unwrap()[0];
+    running.clear_waits();
+    let retry_started = tokio::time::Instant::now();
+    drop(held);
+    let waiting = running.waiting().await;
+    assert_eq!(waiting.obligations.boundary_anchor(), Some(anchor));
+    assert_eq!(
+        waiting.obligations.pending_boundary().unwrap().receipt,
+        first.1
+    );
+    assert!(!running.poller.is_finished());
+    assert_eq!(tokio::time::Instant::now(), retry_started);
+
+    running.now.store(EPOCH + 29, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(29)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        running.controls.try_recv().is_err(),
+        "no early boundary retry"
+    );
+    assert!(running.requests.try_recv().is_err());
+    assert_eq!(running.boundary_publications.lock().unwrap().len(), 1);
+    assert!(!running.poller.is_finished());
+
+    let held = gate.acquire().await.unwrap();
+    running.now.store(EPOCH + 30, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    assert!(matches!(
+        running.controls.recv().await.unwrap(),
+        ControlCompletion::Boundary(value) if value == cutoff
+    ));
+    assert_eq!(
+        *running.boundary_publications.lock().unwrap(),
+        vec![first, first]
+    );
+    assert!(tokio::time::Instant::now() >= retry_started + std::time::Duration::from_secs(30));
+    running.clear_waits();
+    drop(held);
+    let waiting = running.waiting().await;
+    assert_eq!(waiting.obligations.boundary_anchor(), Some(cutoff));
+    assert!(waiting.obligations.pending_boundary().is_none());
+    running.finish().await;
+    assert_eq!(
+        source_frames(&dir.path().join("source.log"))
+            .iter()
+            .filter(|envelope| envelope.source_id.0 == "pe-service.boundary")
+            .count(),
+        1,
+        "retry must reuse the recorded boundary"
+    );
+}
+
+/// PASS: shutdown during a retryable boundary's poll-interval wait returns Ok immediately,
+/// without advancing the anchor or publishing another boundary.
+#[tokio::test(start_paused = true)]
+async fn shutdown_while_daily_boundary_retry_waits_exits_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let cutoff = EPOCH.div_euclid(86_400) * 86_400;
+    let anchor = cutoff - 86_400;
+    let (mut running, _) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, false, Some(anchor));
+    running
+        .boundary_results
+        .lock()
+        .unwrap()
+        .push_back(Some(Err(DailyBoundaryError::Retryable(
+            "unreadable history".to_owned(),
+        ))));
+    let gate = running.boundary_ack_gate.clone();
+    let held = gate.acquire().await.unwrap();
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    assert!(matches!(
+        running.controls.recv().await.unwrap(),
+        ControlCompletion::Boundary(value) if value == cutoff
+    ));
+    running.clear_waits();
+    drop(held);
+    let waiting = running.waiting().await;
+    assert_eq!(waiting.obligations.boundary_anchor(), Some(anchor));
+    assert!(waiting.obligations.pending_boundary().is_some());
+    assert!(!running.poller.is_finished());
+    let publications = running.boundary_publications.clone();
+    let stopped_at = tokio::time::Instant::now();
+    running.finish().await;
+    assert_eq!(tokio::time::Instant::now(), stopped_at);
+    assert_eq!(publications.lock().unwrap().len(), 1);
+}
+
+/// PASS: an explicitly failed mark and a dropped acknowledgement both retain the fatal
+/// DailyBoundary owner error rather than scheduling a retry (preserving behavior).
+#[tokio::test(start_paused = true)]
+async fn daily_boundary_failed_or_dropped_acknowledgement_ends_owner() {
+    for (reply, expected) in [
+        (
+            Some(Err(DailyBoundaryError::Failed("mark failed".to_owned()))),
+            "mark failed",
+        ),
+        (None, "daily boundary acknowledgement closed"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let cutoff = EPOCH.div_euclid(86_400) * 86_400;
+        let (mut running, _) = start_recorded_poller_with_anchors(
+            &dir,
+            &[wallet()],
+            false,
+            false,
+            Some(cutoff - 86_400),
+        );
+        running.boundary_results.lock().unwrap().push_back(reply);
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(b"[]".to_vec())
+            .unwrap();
+        running.round_completed().await;
+        assert!(matches!(
+            running.controls.recv().await.unwrap(),
+            ControlCompletion::Boundary(value) if value == cutoff
+        ));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut running.poller)
+            .await
+            .expect("failed boundary must stop the owner")
+            .unwrap();
+        assert!(
+            matches!(result, Err(pe_service::trade_poller::TradePollerOwnerError::DailyBoundary(ref reason))
+                if reason == expected),
+            "{result:?}"
+        );
+        assert_eq!(running.boundary_publications.lock().unwrap().len(), 1);
+        drop(running.source);
+        drop(running.triggers);
+        running.ingest.await.unwrap();
+        running.control.await.unwrap();
+    }
 }
 
 /// PASS: holding boundary publication beyond the cadence leaves no expired wake armed; a trigger

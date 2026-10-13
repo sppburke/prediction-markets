@@ -4241,6 +4241,101 @@ async fn previous_binary_rollback_matrix() {
     }
 }
 
+/// PASS: the real service defers an exhausted unreadable refresh without moving its anchor,
+/// then accepts a one-reply interruption on restart; both phases WARN and exit zero on SIGINT.
+#[tokio::test]
+async fn routine_refresh_retries_unreadable_activity_replies_without_owner_exit() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    let binary = Path::new(env!("CARGO_BIN_EXE_pe-service"));
+    let wallet = fixture.wallet();
+    let child = checkpoint_rollout::Child::start_checkpoint(&fixture.config_path, binary, &[]);
+    fixture.wait_log("pe-service listening").await;
+    fixture.copy();
+    fixture.wait_copy().await;
+    let output = child.finish_checkpoint(Some("-INT")).await;
+    assert!(output.status.success(), "fixture: {output:?}");
+    fixture.mirror_positions();
+
+    // The service's shared reconciliation fetcher allows three retries (four attempts).
+    // A full-history refresh starts at page zero with start=1; ordinary polls start at the cursor.
+    for (cuts, expected_outcome) in [(4, "source.transient"), (1, "accepted")] {
+        fixture.stale_anchors();
+        fixture.clear_logs();
+        let before = fixture.paper.wallet_coverage(&wallet).unwrap();
+        let anchors_before = fixture.paper.position_anchors(&wallet).unwrap();
+        fixture.cut_full_history_replies(cuts);
+        let child = checkpoint_rollout::Child::start_checkpoint(&fixture.config_path, binary, &[]);
+        fixture.wait_log("wallet bracket completed").await;
+        let logs = fixture.logs();
+        let events = logs
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect::<Vec<_>>();
+        assert!(
+            events.iter().any(|event| {
+                let fields = event.get("fields").unwrap_or(event);
+                fields["message"] == "boot anchor selection census"
+                    && fields["reused"] == 1
+                    && fields["walked"] == 0
+            }),
+            "refresh must use the reusable boot anchor: {logs}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                let fields = event.get("fields").unwrap_or(event);
+                fields["message"] == "wallet bracket completed"
+                    && fields["wallet"] == wallet.to_string()
+                    && fields["outcome"] == expected_outcome
+            }),
+            "{expected_outcome} refresh: {logs}"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event.get("fields").unwrap_or(event)["outcome"] == "activity.json"
+            }),
+            "{logs}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    let fields = event.get("fields").unwrap_or(event);
+                    event["level"] == "WARN"
+                        && fields["message"] == "venue reply is not one complete JSON document"
+                        && fields["status"] == 200
+                        && fields["error"]
+                            .as_str()
+                            .is_some_and(|error| error.starts_with("EOF while parsing a string"))
+                })
+                .count(),
+            cuts,
+            "{logs}"
+        );
+        if expected_outcome == "accepted" {
+            checkpoint_until(|| {
+                fixture.paper.wallet_coverage(&wallet).unwrap().anchor_seq != before.anchor_seq
+            })
+            .await;
+        }
+        let output = child.finish_checkpoint(Some("-INT")).await;
+        assert!(
+            output.status.success(),
+            "{expected_outcome} refresh: {output:?}"
+        );
+        let after = fixture.paper.wallet_coverage(&wallet).unwrap();
+        if expected_outcome == "source.transient" {
+            assert_eq!(after, before);
+            assert_eq!(
+                fixture.paper.position_anchors(&wallet).unwrap(),
+                anchors_before
+            );
+        } else {
+            assert!(after.anchor_seq.unwrap() > before.anchor_seq.unwrap());
+            assert!(after.anchored_at_unix.unwrap() > before.anchored_at_unix.unwrap());
+        }
+    }
+}
+
 /// PASS: on a genuine refresh proof rewritten into the re-entry tail shape, the previous binary
 /// serves but rejects the tail anchor, re-bracketing or deferring the wallet without changing
 /// finances, gate history or decisions; the new binary reuses it.

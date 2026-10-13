@@ -898,17 +898,24 @@ fn validator_from_fetcher(fetcher: Arc<QueueFetcher>) -> CausalPositionValidator
 fn validator_from_reconciliation(
     fetcher: Arc<dyn ReconciliationFetcher>,
 ) -> CausalPositionValidator {
+    validator_from_reconciliation_at(fetcher, BASE)
+}
+
+fn validator_from_reconciliation_at(
+    fetcher: Arc<dyn ReconciliationFetcher>,
+    base: &str,
+) -> CausalPositionValidator {
     let dir = tempfile::tempdir().unwrap();
     let source_log = Arc::new(tokio::sync::Mutex::new(
         SourceEventSink::open(dir.path().join("source.log")).unwrap(),
     ));
     let asset_identity = Arc::new(AssetIdentityResolver::new(
         Arc::clone(&fetcher),
-        BASE.to_owned(),
+        base.to_owned(),
         GAMMA_BATCH_SIZE,
         source_log,
     ));
-    CausalPositionValidator::new(fetcher, BASE, "source-generation-test", asset_identity)
+    CausalPositionValidator::new(fetcher, base, "source-generation-test", asset_identity)
         .with_clock(Arc::new(|| END))
 }
 
@@ -6263,6 +6270,77 @@ async fn negative_share_amount_defers_only_that_wallet_and_promotes_only_seeded_
             corrupt_history
         );
     }
+}
+
+/// PASS: exhausted unreadable replies defer only that wallet as a transient fetch failure;
+/// the same boot validation call accepts and installs the healthy wallet's anchor.
+#[tokio::test]
+async fn unreadable_activity_reply_defers_only_that_wallet_at_boot() {
+    use axum::{Router, extract::OriginalUri, http::StatusCode};
+    use pe_source_polymarket_public::ReqwestFetcher;
+
+    let unreadable = wallet(0x75);
+    let healthy = wallet(0x74);
+    let (_dir, paper, mut engine) = fresh(&[unreadable, healthy]);
+    let pages = Arc::new(QueueFetcher::new(stable_responses(&[(
+        healthy, 1, "1.000000",
+    )])));
+    let mut cut = serde_json::to_vec(&vec![activity(unreadable, 2, "1", "0xcut", 10)]).unwrap();
+    let inside_string = cut.windows(5).position(|bytes| bytes == b"0xcut").unwrap() + 3;
+    cut.truncate(inside_string);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let requested = Arc::clone(&hits);
+    let router = Router::new().fallback(move |OriginalUri(uri): OriginalUri| {
+        let pages = Arc::clone(&pages);
+        let requested = Arc::clone(&requested);
+        let cut = cut.clone();
+        async move {
+            let url = format!("{BASE}{uri}");
+            let body = if uri.path() == "/activity" && url.contains(&unreadable.to_string()) {
+                requested.fetch_add(1, Ordering::SeqCst);
+                cut
+            } else {
+                pages.fetch_page(&url).await.unwrap()
+            };
+            (StatusCode::OK, [("content-type", "application/json")], body)
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(axum::serve(listener, router).into_future());
+    let fetcher = Arc::new(
+        ReqwestFetcher::new(reqwest::Client::new())
+            .with_max_retries(1)
+            .with_initial_backoff_ms(0)
+            .with_min_interval_ms(0),
+    );
+    let outcome = validator_from_reconciliation_at(fetcher, &base)
+        .validate_direct_with_deferrals(&[unreadable, healthy], &mut engine, &paper)
+        .await
+        .unwrap();
+    server.abort();
+
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(outcome.accepted.len(), 1);
+    assert_eq!(outcome.accepted[0].wallet, healthy);
+    assert_eq!(outcome.deferred.len(), 1);
+    let (wallet, error) = &outcome.deferred[0];
+    assert_eq!(*wallet, unreadable);
+    assert!(matches!(
+        error,
+        CausalPositionError::Activity {
+            source: ActivityReadError::Fetch {
+                source: SourceError::Transient { message },
+                ..
+            },
+            ..
+        } if message.starts_with("reply is not one complete JSON document: EOF while parsing a string")
+    ));
+    assert!(is_deferred_causal_position_error(error));
+    assert!(paper.position_anchors(&unreadable).unwrap().is_empty());
+    assert!(paper.position_validation(&unreadable).unwrap().is_none());
+    assert_eq!(paper.position_anchors(&healthy).unwrap().len(), 1);
+    assert!(paper.position_validation(&healthy).unwrap().is_some());
 }
 
 #[tokio::test]

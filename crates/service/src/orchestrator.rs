@@ -47,7 +47,7 @@ use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
 use crate::mark_prices::HistoricalMarkAdapter;
 use crate::mid_price_cache::MidPriceCache;
-use crate::orchestrator_control::OrchestratorControl;
+use crate::orchestrator_control::{DailyBoundaryError, OrchestratorControl};
 use crate::paper_recovery::{
     PAPER_LOG_SCHEMA_VERSION, PaperLogRecord, PaperMarkPrice, PortfolioMark, QualificationSealed,
     SealReason, TailBinding,
@@ -1365,12 +1365,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .then_some(SealReason::Complete)
     }
 
-    /// Build and synchronize the one paper mark for an acknowledged source boundary.
+    /// Build and synchronize the one paper mark for an acknowledged source boundary. A retryable
+    /// historical-price read appends no mark; the poller publishes the boundary again later.
     async fn mark_at_boundary(
         &mut self,
         cutoff_unix: i64,
         boundary_receipt: pe_event_log::AppendReceipt,
-    ) -> Result<(), String> {
+    ) -> Result<(), DailyBoundaryError> {
         self.reconcile_oldest_financial_prepared().await?;
         let (_paper_log_path, _source_log_path) =
             self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
@@ -1408,7 +1409,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .map_err(|error| error.to_string())?;
         let expected_last = completed.iter().copied().max_by_key(|sequence| sequence.0);
         if snapshot.last_prepared_seq != expected_last {
-            return Err("daily boundary financial prefix differs from local projection".to_owned());
+            return Err(
+                "daily boundary financial prefix differs from local projection"
+                    .to_owned()
+                    .into(),
+            );
         }
         let token_by_position = era
             .frames
@@ -1480,7 +1485,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         invalid: None,
                     });
                 }
-                Err(BoundaryMarkError::Retryable(reason)) => return Err(reason),
+                Err(BoundaryMarkError::Retryable(reason)) => {
+                    return Err(DailyBoundaryError::Retryable(reason));
+                }
                 Err(error) => {
                     let reason = error.to_string();
                     invalid.get_or_insert_with(|| reason.clone());
@@ -1524,7 +1531,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             || last_frame.this_hash != source_tail.last_hash
         {
             return Err(
-                "daily boundary source receipt index tail differs from log frame".to_owned(),
+                "daily boundary source receipt index tail differs from log frame"
+                    .to_owned()
+                    .into(),
             );
         }
         let mark = PortfolioMark {
