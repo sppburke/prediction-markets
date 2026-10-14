@@ -90,7 +90,7 @@ export function WalletTable({
 }: {
   rows: WalletLiveStats[];
   /** Lowercase wallet → unrealized P&L (USD). When provided (Watched tab), an Unrealized column is
-   * appended; absent for the Historical/Bench tabs. */
+   * appended; absent for the Historical tab. */
   unrealized?: Map<string, number>;
 }) {
   const [sortKey, setSortKey] = useState<string>("live_realized_pnl");
