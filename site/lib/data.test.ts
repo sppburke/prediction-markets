@@ -349,7 +349,8 @@ describe("overview shows the followed set and paper results, not the ranked univ
     expect(tabs).toContain("Watched (2)");
     expect(tabs).toContain("Historical (1)");
     expect(tabs).not.toContain("Bench");
-    expect(tabs).toContain("Unrealized");
+    // The column header itself, not the always-rendered "Unrealized P&L" KPI.
+    expect(tabs).toMatch(/<th\b[^>]*><span[^>]*>Unrealized<\/span>/);
     expect(new Set(links(tabs))).toEqual(new Set([followed, openOnly]));
     expect(links(tabs)).not.toContain(settledOnly);
     expect(links(tabs)).not.toContain(rankedOnly);
