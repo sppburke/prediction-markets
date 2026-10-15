@@ -274,7 +274,7 @@ async fn serve(
         .into();
         v[0]["outcomePrices"] = "[\"0.50\",\"0.50\"]".into();
         v[0]["feesEnabled"] = true.into();
-        v[0]["endDate"] = OffsetDateTime::from_unix_timestamp(state.now + 7200)
+        v[0]["endDate"] = OffsetDateTime::from_unix_timestamp(last_second_of_day(state.now))
             .unwrap()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap()
@@ -291,7 +291,7 @@ async fn serve(
         };
         let mut v: Value = serde_json::from_slice(fixture).unwrap();
         v["condition_id"] = c.into();
-        v["end_date_iso"] = OffsetDateTime::from_unix_timestamp(state.now + 7200)
+        v["end_date_iso"] = OffsetDateTime::from_unix_timestamp(last_second_of_day(state.now))
             .unwrap()
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap()
@@ -492,6 +492,21 @@ async fn until(mut predicate: impl FnMut() -> bool) {
     .await
     .expect("production observation exceeded its bound");
 }
+/// A rollout fixture lives inside one UTC day (#778): its markets end in the day's last second, and its Start,
+/// recorded at `now - 5`, must not fall on the previous day. The latest accepted start leaves 241 seconds until
+/// 23:59:00, where the inclusive 60-second floor is reached; copying must finish within that headroom.
+async fn fixture_now() -> i64 {
+    loop {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        if (5..86_100).contains(&now.rem_euclid(86_400)) {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+fn last_second_of_day(unix: i64) -> i64 {
+    unix - unix.rem_euclid(86_400) + 86_399
+}
 fn envelope(payload: Vec<u8>, source: &str, at: i64, schema: u32, parser: u32) -> EnvelopeIn {
     let at = OffsetDateTime::from_unix_timestamp(at).unwrap();
     EnvelopeIn {
@@ -518,7 +533,7 @@ async fn run_case(boot_waves: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let now = fixture_now().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let bind = std::net::TcpListener::bind("127.0.0.1:0")
@@ -1180,7 +1195,7 @@ impl CheckpointFixture {
         use std::sync::atomic::AtomicBool;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let now = fixture_now().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let cfg = ServiceConfig {
