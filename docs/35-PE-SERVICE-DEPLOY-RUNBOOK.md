@@ -991,8 +991,10 @@ Prepared/Final work. Version, bankroll, predecessor and generation-seal mismatch
 The driver repeats preflight immediately after stopping, before the backup.
 
 The stopped driver takes and integrity-checks the complete backup
-`/home/sean/prediction-markets/financial-era-<transition-id>-paper-state.db`, records remote census
-and immutable log hashes, then calls read-only `prepare`. Preparation rebuilds the source index
+`/home/sean/prediction-markets/financial-era-<transition-id>-paper-state.db` (`integrity_check` with
+a 3 GiB SQLite cache; with 256 MiB it took 32 of the 10/14 reset's 53 stopped minutes; run it only
+while the service is stopped: the VPS has about 7.3 GB available then and no swap), records remote
+census and immutable log hashes, then calls read-only `prepare`. Preparation rebuilds the source index
 with `SourceReceiptIndex::replay`, authenticating retention authority, durable receipts, pins and
 retained window, and binds its verified tail. Thus damaged retained source evidence refuses at
 prepare **after stop and backup, before any archive/reset**. Start fully recomputes preparation,

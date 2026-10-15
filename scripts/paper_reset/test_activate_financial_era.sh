@@ -4177,8 +4177,8 @@ echo "PASS: FE-STREAMHASH-63"
 # through any cursor — so the assertion does not depend on enumerating Python execution APIs. At
 # each `integrity_check` the effective `cache_size` is read back from that same connection, so a
 # later reset, a reset inside a script, or a second untuned check cannot pass. Whether the raised
-# cache actually shortens the check is an operational measurement against the real 4.28 GB copy,
-# recorded in the PR — never asserted here.
+# cache actually shortens the check is an operational measurement (the 3 GiB value: against a
+# 12 GB copy under a 7 GiB cap, recorded in its PR) — never asserted here.
 sh64_root=$TEST_TMP/backupcache
 mkdir -p "$sh64_root/tracer"
 cat > "$sh64_root/tracer/sitecustomize.py" <<'TRACER'
@@ -4221,13 +4221,13 @@ con.commit(); con.close()
 SEED
 
 # ONE evaluator, shared by the positive path and every negative control: a trace is "tuned" only
-# when it contains at least one observation and every observation reports -262144.
+# when it contains at least one observation and every observation reports -3145728.
 cat > "$sh64_root/evaluate.py" <<'EVAL'
 import sys
 rows = [l.rstrip("\n").split("\t", 1) for l in open(sys.argv[1]) if "\t" in l]
 if not rows:
     print("none"); raise SystemExit(0)
-print("tuned" if all(v.strip() == "-262144" for _, v in rows) else "untuned")
+print("tuned" if all(v.strip() == "-3145728" for _, v in rows) else "untuned")
 EVAL
 sh64_eval() { python3 "$sh64_root/evaluate.py" "$1"; }
 
@@ -4271,27 +4271,27 @@ sh64_reject() {                      # <label> <python body>
 sh64_reject no-pragma 'import sqlite3,sys
 c=sqlite3.connect(sys.argv[1]); c.execute("pragma integrity_check"); c.close()'
 sh64_reject cursor-override 'import sqlite3,sys
-c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-262144")
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-3145728")
 c.cursor().execute("pragma cache_size=-2000"); c.execute("pragma integrity_check"); c.close()'
 sh64_reject reset-before-check 'import sqlite3,sys
-c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-262144")
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-3145728")
 c.execute("pragma cache_size=-2000"); c.execute("pragma integrity_check"); c.close()'
 sh64_reject reopened-connection 'import gc,sqlite3,sys
-a=sqlite3.connect(sys.argv[1]); a.execute("pragma cache_size=-262144"); a.close(); del a; gc.collect()
+a=sqlite3.connect(sys.argv[1]); a.execute("pragma cache_size=-3145728"); a.close(); del a; gc.collect()
 b=sqlite3.connect(sys.argv[1]); b.execute("pragma integrity_check"); b.close()'
 sh64_reject second-untuned-check 'import sqlite3,sys
-a=sqlite3.connect(sys.argv[1]); a.execute("pragma cache_size=-262144"); a.execute("pragma integrity_check")
+a=sqlite3.connect(sys.argv[1]); a.execute("pragma cache_size=-3145728"); a.execute("pragma integrity_check")
 b=sqlite3.connect(sys.argv[1]); b.execute("pragma integrity_check"); a.close(); b.close()'
 sh64_reject cursor-issued-check 'import sqlite3,sys
 c=sqlite3.connect(sys.argv[1]); c.cursor().execute("pragma integrity_check"); c.close()'
 sh64_reject script-reset-then-check 'import sqlite3,sys
-c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-262144")
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-3145728")
 c.executescript("pragma cache_size=-2000; pragma integrity_check;"); c.close()'
 sh64_reject script-two-checks 'import sqlite3,sys
-c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-262144")
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-3145728")
 c.executescript("pragma integrity_check; pragma cache_size=-2000; pragma integrity_check;"); c.close()'
 sh64_reject shortcut-cursor-check 'import sqlite3,sys
-c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-262144"); c.execute("pragma integrity_check")
+c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-3145728"); c.execute("pragma integrity_check")
 cur=c.execute("select 1"); c.execute("pragma cache_size=-2000")
 cur.execute("pragma integrity_check").fetchone(); c.close()'
 echo "PASS: FE-BACKUPCACHE-64"
