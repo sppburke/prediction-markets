@@ -365,7 +365,8 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://clob.polymarket.com/prices-history?market={tokenId} | 2026-09-01 | 2026-10-31 |
 | https://clob.polymarket.com/prices-history?market={tokenId}&startTs={start}&endTs={cutoff}&fidelity=1 | 2026-09-18 | 2026-11-17 |
 | https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-10-13 | 2026-12-12 |
-| https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-07-18 | 2026-09-16 |
+| https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-10-15 | 2026-12-14 |
+| https://docs.polymarket.com/api-spec/gamma-openapi.yaml (`Market.events`, `Event.series`, `Series.recurrence`) | 2026-10-15 | 2026-12-14 |
 | https://gamma-api.polymarket.com/markets?clob_token_ids={token}&closed=true | 2026-09-02 | 2026-11-01 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 
@@ -436,6 +437,15 @@ Treat as research inspiration; not a production decision input unless an authori
 | https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
+
+- 2026-10-15 (copy-scope gate F, #779 follow-up): the official Gamma OpenAPI
+  (`/api-spec/gamma-openapi.yaml`) documents `Market.events` → `Event.series` →
+  `Series.recurrence` (string, nullable), and List markets returns `Market` rows. Live probes:
+  all 2,497 series (`/series?exclude_events=true`, paged) carry recurrence `15m` on exactly eight,
+  `{bnb,btc,doge,eth,hype,sol,xrp,zec}-up-or-down-15m`; admission-shaped
+  `/markets?condition_ids=…&include_tag=true` replies for 15-minute, 5-minute, hourly, 4-hour,
+  daily, weekly, monthly, sports and weather markets each carried one event with one series. The
+  undocumented `cryptoMarketConfig.duration` is null on older window markets and is not used.
 
 - 2026-10-05 (#739/#588, supplied source-pass evidence): CLOB `/markets` neg-risk fields and group
   identity, plus the official negative-risk conversion/augmented-event semantics. The 2026-10-06

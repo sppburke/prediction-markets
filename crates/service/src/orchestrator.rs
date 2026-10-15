@@ -84,6 +84,9 @@ const CLOB_BOOK_HOT_PATH_TIMEOUT_SECS: u64 = 2;
 const LOCAL_COMMIT_RETRIES: u32 = 3;
 const LOCAL_COMMIT_RETRY_DELAY_MS: u64 = 100;
 
+/// Copy-scope gate F (docs/19): the only Gamma series recurrence whose markets are copied (#782).
+const COPY_SERIES_RECURRENCE: &str = "15m";
+
 /// Outcome of the enabled price-impact gate for one admitted signal (#508).
 enum GatePlan {
     /// The budget planner produced a within-band plan (quantity/VWAP/limit).
@@ -3854,6 +3857,35 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             return;
         }
 
+        // Gate F (docs/19): copy only markets whose Gamma series recurs every 15 minutes.
+        if !already_staged
+            && admission.market.series_recurrence.as_deref() != Some(COPY_SERIES_RECURRENCE)
+        {
+            let recurrence = admission
+                .market
+                .series_recurrence
+                .as_deref()
+                .unwrap_or("none");
+            info!(
+                reason = "series_recurrence",
+                market = %signal.market_id,
+                recurrence,
+                "signal did not produce order",
+            );
+            drop(early_book);
+            self.no_fill_or_rollback(
+                &trade,
+                &leader_row,
+                None,
+                &format!("series_recurrence:{recurrence}"),
+                &rb,
+                Some(&signal.market_id),
+                decision_evidence.as_ref(),
+            )
+            .await;
+            return;
+        }
+
         // Resolution-horizon gate uses the scheduled end already carried by admission; no second
         // Gamma request or dashboard cache participates in economics.
         if self.max_resolution_horizon_secs > 0 || self.min_resolution_horizon_secs > 0 {
@@ -5187,6 +5219,7 @@ mod tests {
                     ],
                     neg_risk: false,
                     neg_risk_market_id: None,
+                    series_recurrence: Some("15m".to_owned()),
                     minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
                     minimum_order_size: ShareAmount::from_whole(5).unwrap(),
                     scheduled_end_unix: None,
@@ -5415,8 +5448,13 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
-        async fn admission_and_horizon_refusals_drop_stalled_book_immediately() {
-            for admission_failure in [true, false] {
+        async fn admission_and_gate_refusals_drop_stalled_book_immediately() {
+            for (admission_failure, recurrence, reason) in [
+                (true, "15m", "market_admission_unavailable"),
+                (false, "15m", "market resolution time unknown"),
+                // Gate F refuses before gate C would.
+                (false, "5m", "series_recurrence:5m"),
+            ] {
                 let mut harness = Harness::new(TradeProvenance::ActivityWs, true, true);
                 if admission_failure {
                     harness
@@ -5425,9 +5463,9 @@ mod tests {
                         .store(true, Ordering::SeqCst);
                 } else {
                     harness.change_config(|config| config.min_resolution_horizon_secs = 60);
-                    harness.hooks.admission_artifacts.lock().unwrap()[0]
-                        .market
-                        .scheduled_end_unix = None;
+                    let market = &mut harness.hooks.admission_artifacts.lock().unwrap()[0].market;
+                    market.scheduled_end_unix = None;
+                    market.series_recurrence = Some(recurrence.to_owned());
                 }
                 let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
                 assert!(futures::poll!(&mut decision).is_pending());
@@ -5446,6 +5484,7 @@ mod tests {
                     serde_json::from_str(&row.post_commit_inputs_json).unwrap();
                 assert!(evidence.body.book.is_none());
                 assert!(evidence.body.market_price.is_none());
+                assert_eq!(evidence.body.terminal.reason, reason);
             }
         }
 
@@ -7914,6 +7953,7 @@ mod tests {
                 ],
                 neg_risk: false,
                 neg_risk_market_id: None,
+                series_recurrence: Some("15m".to_owned()),
                 minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
                 minimum_order_size: ShareAmount::from_whole(5).unwrap(),
                 scheduled_end_unix: Some(86400),
