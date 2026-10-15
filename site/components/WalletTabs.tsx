@@ -1,13 +1,13 @@
 "use client";
 
-// Watched / Historical / Bench wallet tabs (#398 WS3, #508 Phase C terminology) + the portfolio
+// Watched / Historical wallet tabs (#398 WS3, #508 Phase C terminology) + the portfolio
 // Unrealized-P&L KPI. On mount this fetches current marks for every open fill from /api/marks and computes
 // per-wallet + portfolio unrealized P&L = Σ side_sign × (mark − fill_price) × contracts.
 //
 // Tab membership (predicates may overlap by design):
 //   Watched    = watched by pe-service OR has open fills (+ an Unrealized column)
 //   Historical = has any settled fill
-//   Bench      = not Watched and never settled
+// Ranked wallets that are neither are not listed: the overview shows the followed set and paper results.
 // An unavailable watchlist remains visibly unavailable; it is never interpreted as empty.
 import { useEffect, useMemo, useState } from "react";
 
@@ -16,7 +16,7 @@ import type { PaperFill, WalletLiveStats } from "@/lib/types";
 import { Stat } from "./Stat";
 import { WalletTable } from "./WalletTable";
 
-type TabKey = "live" | "historical" | "bench";
+type TabKey = "live" | "historical";
 
 export function WalletTabs({
   rows,
@@ -69,17 +69,13 @@ export function WalletTabs({
     };
   }, [openFills]);
 
-  const { live, historical, bench } = useMemo(() => {
+  const { live, historical } = useMemo(() => {
     const isLive = (r: WalletLiveStats) =>
       watched !== null &&
       (watched.has(r.wallet.toLowerCase()) || (toNum(r.live_open_fills) ?? 0) > 0);
     return {
       live: rows.filter(isLive),
       historical: rows.filter((r) => (toNum(r.live_settled_count) ?? 0) > 0),
-      bench:
-        watched === null
-          ? []
-          : rows.filter((r) => !isLive(r) && (toNum(r.live_settled_count) ?? 0) === 0),
     };
   }, [rows, watched]);
 
@@ -91,7 +87,6 @@ export function WalletTabs({
   const tabs: { key: TabKey; label: string; rows: WalletLiveStats[] }[] = [
     { key: "live", label: watched === null ? "Watched (—)" : `Watched (${live.length})`, rows: live },
     { key: "historical", label: `Historical (${historical.length})`, rows: historical },
-    { key: "bench", label: watched === null ? "Bench (—)" : `Bench (${bench.length})`, rows: bench },
   ];
   const active = tabs.find((t) => t.key === tab) ?? tabs[0];
 
@@ -122,7 +117,7 @@ export function WalletTabs({
           </button>
         ))}
       </div>
-      {(tab === "live" || tab === "bench") && watched === null ? (
+      {tab === "live" && watched === null ? (
         <p className="rounded border border-border p-4 text-sm text-muted">
           Watchlist projection unavailable. Retry after the service publishes a consistent snapshot.
         </p>

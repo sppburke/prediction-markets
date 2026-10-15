@@ -7,9 +7,8 @@ import { Stat } from "./Stat";
  * Portfolio-level KPIs aggregated from the per-wallet view rows.
  *
  * `watched` is pe-service's current paper watchlist size (the wallets it actually copies),
- * published to `service_runtime`; `null` until the service has published once. It is the
- * headline because the view's row count is the far larger *ranked* universe — shown as
- * context, not as the followed set.
+ * published to `service_runtime`; `null` until the service has published once. The view's row
+ * count is the ranked universe, not the followed set, so it is not shown.
  */
 export function KpiCards({
   rows,
@@ -41,7 +40,7 @@ export function KpiCards({
         <Stat
           label="Watched"
           value={watched === null ? "—" : formatInt(watched)}
-          sub={`${formatInt(tradedWallets)} traded · ${formatInt(rows.length)} ranked`}
+          sub={`${formatInt(tradedWallets)} traded`}
         />
         <Stat label="Realized P&L" value={formatUsd(realized, { sign: true })} tone="signed" signOf={realized} />
         <Stat label="Settled fills" value={formatInt(settled)} />

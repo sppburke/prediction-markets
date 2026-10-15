@@ -197,7 +197,8 @@ describe("dashboard pagination (#757)", () => {
     expect(renderedWallets[0]).toBe(wallet(1001));
 
     const kpis = renderToStaticMarkup(createElement(KpiCards, { rows, watched: watched.count }));
-    expect(kpis).toContain("1,001 traded · 1,001 ranked");
+    expect(kpis).toContain("1,001 traded");
+    expect(kpis).not.toContain("ranked");
     expect(kpis).toContain("+$1,005.00");
     expect(kpis).toMatch(/Settled fills<\/div><div[^>]*>2,002<\/div>/);
     expect(kpis).toMatch(/Open fills<\/div><div[^>]*>1,001<\/div>/);
@@ -314,5 +315,63 @@ describe("dashboard pagination (#757)", () => {
       status: "unavailable", reason: "count_mismatch",
     });
     expect(pages).toBe(2);
+  });
+});
+
+describe("overview shows the followed set and paper results, not the ranked universe", () => {
+  const followed = wallet(1);
+  const openOnly = wallet(2);
+  const settledOnly = wallet(3);
+  const rankedOnly = wallet(4);
+  const row = (index: number, fills: { total: number; settled: number; open: number }): WalletLiveStats => ({
+    ...statsRow(index),
+    live_total_fills: fills.total,
+    live_settled_count: fills.settled,
+    live_open_fills: fills.open,
+    live_wins: 0,
+    live_realized_pnl: "0",
+  });
+  const rows = [
+    row(1, { total: 0, settled: 0, open: 0 }),
+    row(2, { total: 1, settled: 0, open: 1 }),
+    row(3, { total: 2, settled: 2, open: 0 }),
+    row(4, { total: 0, settled: 0, open: 0 }),
+  ];
+  const links = (markup: string) =>
+    [...markup.matchAll(/href="\/wallet\/(0x[0-9a-f]+)"/g)].map((match) => match[1]);
+
+  it("lists followed and open-fill wallets under Watched and has no Bench tab", () => {
+    const tabs = renderToStaticMarkup(createElement(WalletTabs, {
+      rows,
+      watchedSet: [followed],
+      openFills: [],
+    }));
+    expect(tabs).toContain("Watched (2)");
+    expect(tabs).toContain("Historical (1)");
+    expect(tabs).not.toContain("Bench");
+    // The column header itself, not the always-rendered "Unrealized P&L" KPI.
+    expect(tabs).toMatch(/<th\b[^>]*><span[^>]*>Unrealized<\/span>/);
+    expect(new Set(links(tabs))).toEqual(new Set([followed, openOnly]));
+    expect(links(tabs)).not.toContain(settledOnly);
+    expect(links(tabs)).not.toContain(rankedOnly);
+  });
+
+  it("keeps an unavailable watchlist visibly unavailable", () => {
+    const tabs = renderToStaticMarkup(createElement(WalletTabs, {
+      rows,
+      watchedSet: null,
+      openFills: [],
+    }));
+    expect(tabs).toContain("Watched (—)");
+    expect(tabs).toContain("Watchlist projection unavailable");
+    expect(tabs).not.toContain("Bench");
+    expect(links(tabs)).toEqual([]);
+  });
+
+  it("shows the followed count with traded wallets and no ranked count", () => {
+    const kpis = renderToStaticMarkup(createElement(KpiCards, { rows, watched: 1 }));
+    expect(kpis).toMatch(/Watched<\/div><div[^>]*>1<\/div>/);
+    expect(kpis).toContain("2 traded");
+    expect(kpis).not.toContain("ranked");
   });
 });
