@@ -4615,6 +4615,85 @@ async fn sibling_group_yes_is_skipped_before_staging() {
 }
 
 #[tokio::test]
+async fn only_fifteen_minute_series_is_copied() {
+    for (recurrence, refusal) in [
+        (Some("15m"), None),
+        (Some("5m"), Some("series_recurrence:5m")),
+        (None, Some("series_recurrence:none")),
+    ] {
+        let mut h = Harness::new().await;
+        let mut recorded = h.record(1).await;
+        recorded.admission.market.series_recurrence = recurrence.map(str::to_owned);
+        h.freeze(&recorded, true).await;
+        h.set_continuation_version(&recorded, 7);
+        h.attempt(&recorded, at());
+        h.arm();
+        h.start(true);
+        h.barrier().await;
+        h.stop().await;
+        let row = h.terminal(&recorded);
+        let replay = replay_decision_pending(&row).unwrap();
+        let terminal = &replay.post_boundary.body.terminal;
+        if let Some(reason) = refusal {
+            assert_eq!(row.terminal_disposition.as_deref(), Some("no_fill"));
+            assert_eq!(terminal.reason, reason);
+            assert_eq!(terminal.dispatch_id, None);
+        } else {
+            assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
+            assert!(terminal.dispatch_id.is_some());
+        }
+        let copied = usize::from(refusal.is_none());
+        assert_eq!(h.prepared_count(), copied);
+        assert_eq!(h.paper.list_fills().unwrap().len(), copied);
+        assert_eq!(h.authority.inner.lock().unwrap().fills.len(), copied);
+        let seeds: usize = rusqlite::Connection::open(h.dir.path().join("paper.db"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM dispatch_seeds", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(seeds, copied);
+    }
+}
+
+#[tokio::test]
+async fn staged_decision_keeps_admission_when_series_is_not_fifteen_minutes() {
+    let mut h = Harness::new().await;
+    let held = h.record(1).await;
+    h.freeze(&held, true).await;
+    h.set_continuation_version(&held, 7);
+    h.attempt(&held, at());
+    h.start(true);
+    h.barrier().await;
+    h.stop().await;
+    let second = h.record(2).await;
+    h.freeze(&second, true).await;
+    h.set_continuation_version(&second, 7);
+    h.arm();
+    h.attempt(&second, at() + time::Duration::seconds(1));
+    *h.prices.gate.market.lock().unwrap() = Some(held.admission.market.condition_id.0.clone());
+    h.prices.gate.blocked.store(true, Ordering::SeqCst);
+    h.start(true);
+    h.prices.gate.started.notified().await;
+    h.stop().await;
+    assert_eq!(h.terminal(&second).state, DecisionPendingState::Open);
+    let seed = h.paper.pending_dispatch_seeds().unwrap().remove(0);
+    let mut resumed = second.clone();
+    resumed.admission.market.series_recurrence = Some("5m".to_owned());
+    h.prices.gate.blocked.store(false, Ordering::SeqCst);
+    h.attempt(&resumed, at() + time::Duration::seconds(1));
+    h.start(true);
+    h.barrier().await;
+    h.stop().await;
+    let terminal = h.terminal(&second);
+    assert_eq!(terminal.terminal_disposition.as_deref(), Some("fill"));
+    let replay = replay_decision_pending(&terminal).unwrap();
+    assert_eq!(
+        replay.post_boundary.body.terminal.dispatch_id.as_deref(),
+        Some(seed.dispatch_id.as_str())
+    );
+    assert_eq!(h.prepared_count(), 2);
+}
+
+#[tokio::test]
 async fn staged_decision_keeps_admission_when_sibling_maps_later() {
     let other = WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
     let mut h = Harness::new_with_leaders(3, runtime(), vec![wallet(), other]).await;

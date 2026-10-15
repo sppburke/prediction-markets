@@ -1688,6 +1688,8 @@ compiled. The previous rules are in docs/32 "Rules before #757".
 
 **#752 group YES gate:** no forward-only boundary; pre-#752 builds such as `7e43d59` read `meta` by exact key, decode the new reason and ignore the group mappings.
 
+**#782 15-minute gate F:** no forward-only boundary; earlier builds ignore the Gamma series field and decode the new reason. Gate F changes neither the financial semantic nor the canonical hash, so release it, or roll it back, only while the current generation is sealed.
+
 **Release-2 retention prerequisite:** fix forward. Once the fence is installed, 6e09b86 cannot
 use/publish a checkpoint; after the first punch it refuses the source log. Never reverse to that
 binary or restore stale state. Preserve all retained evidence, durable receipt commitments, compact

@@ -21,6 +21,8 @@ pub struct LiveMarketEvidence {
     pub ordered_outcome_token_ids: [PolymarketTokenId; 2],
     pub neg_risk: bool,
     pub neg_risk_market_id: Option<String>,
+    /// Gamma `events[0].series[0].recurrence` (for example `15m`); absent or malformed is `None`.
+    pub series_recurrence: Option<String>,
     pub minimum_tick_size: Price,
     pub minimum_order_size: ShareAmount,
     pub scheduled_end_unix: Option<i64>,
@@ -225,6 +227,7 @@ fn validate_market(
         ordered_outcome_token_ids,
         neg_risk: gamma_neg_risk,
         neg_risk_market_id: clob.neg_risk_market_id,
+        series_recurrence: series_recurrence(gamma_raw, expected_condition),
         minimum_tick_size: gamma_tick,
         minimum_order_size: gamma_minimum,
         scheduled_end_unix,
@@ -233,6 +236,18 @@ fn validate_market(
         parser_version: LIVE_MARKET_PARSER_VERSION,
         freshness_window_secs,
     })
+}
+
+/// Best-effort second read: replay re-runs the validators on every recorded reply, so any surprise
+/// here yields `None` (no copy) and never a new admission or replay failure.
+fn series_recurrence(gamma_raw: &[u8], condition: &PolymarketConditionId) -> Option<String> {
+    let rows: Vec<Value> = serde_json::from_slice(gamma_raw).ok()?;
+    let row = rows
+        .iter()
+        .find(|row| row.get("conditionId").and_then(Value::as_str) == Some(condition.0.as_str()))?;
+    let event = row.get("events")?.as_array()?.first()?;
+    let series = event.get("series")?.as_array()?.first()?;
+    series.get("recurrence")?.as_str().map(str::to_owned)
 }
 
 fn validate_state(
@@ -379,6 +394,39 @@ mod tests {
         row["neg_risk_market_id"] = json!("0xgroup");
         let evidence = validate(&gamma(true), &row).unwrap();
         assert_eq!(evidence.neg_risk_market_id.as_deref(), Some("0xgroup"));
+    }
+
+    #[test]
+    fn series_recurrence_is_carried_and_never_refuses() {
+        let evidence = validate(&gamma(false), &clob(false)).unwrap();
+        assert_eq!(evidence.series_recurrence, None);
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        let clob = serde_json::to_vec(&clob(false)).unwrap();
+        for (events, expected) in [
+            (r#"[{"series":[{"recurrence":"15m"}]}]"#, Some("15m")),
+            (r#"[{"series":[{"recurrence":"5m"}]}]"#, Some("5m")),
+            ("null", None),
+            (r#"{"series":[]}"#, None),
+            (r#"{"0":{"series":[{"recurrence":"15m"}]}}"#, None),
+            (r#"[{"series":{"0":{"recurrence":"15m"}}}]"#, None),
+            (r#"[{"series":null}]"#, None),
+            (r#"[{"series":[{"recurrence":15}]}]"#, None),
+            (
+                r#"[{"series":[{"recurrence":"15m","volume":1e400}]}]"#,
+                None,
+            ),
+            (deep.as_str(), None),
+        ] {
+            let mut gamma = gamma(false);
+            gamma[0]["events"] = json!("EVENTS");
+            let gamma = serde_json::to_string(&gamma)
+                .unwrap()
+                .replace("\"EVENTS\"", events);
+            for validator in [validate_live_market, validate_paper_market] {
+                let evidence = validator(gamma.as_bytes(), &clob, &condition(), 1_000, 30).unwrap();
+                assert_eq!(evidence.series_recurrence.as_deref(), expected, "{events}");
+            }
+        }
     }
 
     #[test]

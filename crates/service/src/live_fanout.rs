@@ -9377,6 +9377,84 @@ mod tests {
         }
     }
 
+    /// PASS: gate F reads Gamma `events` best-effort, so a 15-minute series, 200-deep nesting or
+    /// an out-of-range number leaves source-backed replay and the recomposed record unchanged.
+    #[test]
+    fn gamma_events_never_change_economic_replay() {
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        for events in [
+            r#"[{"series":[{"recurrence":"15m"}]}]"#,
+            r#"[{"volume":1e400}]"#,
+            deep.as_str(),
+        ] {
+            let mut economic = finality_prepared().economic.clone();
+            economic.admission.market.observed_at_unix = 20;
+            economic.admission.settlement.observed_at_unix = 20;
+            economic.risk.snapshot.per_trade_cap_bps = 10_000;
+            economic.version = pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION;
+            economic.balance.chase_ceiling = Price::ONE;
+            let mut payloads = economic_source_payloads(&economic.market.condition_id.0);
+            let mut gamma: serde_json::Value = serde_json::from_slice(&payloads[0]).unwrap();
+            gamma[0]["events"] = serde_json::json!("EVENTS");
+            payloads[0] = gamma.to_string().replace("\"EVENTS\"", events).into_bytes();
+            let sources = [
+                economic.admission.receipts.gamma,
+                economic.admission.receipts.clob_long,
+                economic.admission.receipts.clob_compact,
+                economic.book_receipt,
+            ]
+            .into_iter()
+            .zip([
+                GAMMA_MARKETS_SOURCE_ID,
+                CLOB_LONG_MARKET_SOURCE_ID,
+                CLOB_COMPACT_MARKET_SOURCE_ID,
+                CLOB_BOOK_SOURCE_ID,
+            ])
+            .zip(payloads)
+            .map(|((receipt, source_id), payload)| {
+                (
+                    receipt,
+                    RecordedEconomicSource {
+                        payload,
+                        observed_at: SourceTimestamp(source_time_from_millis(20_100).unwrap()),
+                        received_at: ReceivedAt(source_time_from_millis(20_100).unwrap()),
+                        source_id: source_id.to_owned(),
+                        schema_version: 1,
+                        parser_version: 1,
+                        content_type: ContentType::Json,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+            let replayed = replay_source_backed_economic(
+                &economic,
+                21_000,
+                CollateralAmount::from_atomic(10_000_000),
+                None,
+                |receipt| {
+                    sources
+                        .iter()
+                        .find(|(candidate, _)| *candidate == receipt)
+                        .map(|(_, source)| source.clone())
+                        .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
+                },
+            )
+            .unwrap();
+            let recomposed = replayed
+                .recompose(
+                    &economic,
+                    economic.risk.clone(),
+                    economic.applied_configuration_hash.clone(),
+                )
+                .unwrap();
+            assert_eq!(recomposed, economic);
+            assert_eq!(
+                recomposed.core_hash().unwrap(),
+                economic.core_hash().unwrap()
+            );
+        }
+    }
+
     #[test]
     fn paper_partial_policy_is_not_live_wire_two() {
         for frame_authority in [false, true] {
