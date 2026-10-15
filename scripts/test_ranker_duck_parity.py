@@ -157,12 +157,47 @@ def build_parity_cache(path: str) -> None:
     conn.close()
 
 
+
+def write_market_scope(path, condition_ids, *, end_date_min=0, completed_at=2**62) -> str:
+    """A minimal valid `pe-bootstrap market-scope` file (#784) listing `condition_ids`."""
+    ids = sorted(set(condition_ids))
+    proof = {"request_cursor": None, "returned_next_cursor": None, "raw_sha256": "0" * 64,
+             "observed_at_unix": 0, "received_at_unix": 0, "source_at_unix": None}
+    value = {
+        "version": 1, "source_id": "polymarket-gamma", "schema_version": 1, "parser_version": 1,
+        "recurrence": "15m", "end_date_min_unix": end_date_min, "started_at_unix": 0,
+        "completed_at_unix": completed_at, "series": [{"id": "1", "slug": None}],
+        "pages": [{**proof, "ordinal": 0, "kind": "series", "series_id": None, "rows": 1,
+                   "url": "https://gamma/series?exclude_events=true&limit=50&offset=0"},
+                  {**proof, "ordinal": 1, "kind": "events", "series_id": "1", "rows": len(ids),
+                   "url": "https://gamma/events/keyset?series_id=1"}],
+        "condition_ids": ids, "count": len(ids),
+        "digest": hashlib.sha256("\n".join(ids).encode()).hexdigest(),
+    }
+    Path(path).write_text(json.dumps(value))
+    return str(path)
+
+
+def all_markets_scope(db: str, path) -> str:
+    """A scope listing every market in a fixture cache, so a test scores what it did before #784."""
+    ids = set()
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as conn:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for table, column in (("trades", "market_id"), ("activity_groups_v2", "condition_id"),
+                              ("clob_payout_evidence_v2", "market_id")):
+            if table in tables:
+                ids |= {row[0] for row in conn.execute(f"SELECT DISTINCT {column} FROM {table}") if row[0]}
+    # A real scope is never empty, so a market-less fixture gets one id no entry uses.
+    return write_market_scope(path, ids or {"no-market"})
+
 def run_pass1(db: str, out_dir: str, engine: str, parquet_dir: str, max_age_hours: str = "0", min_active_months: str = "2") -> int:
+    os.makedirs(out_dir, exist_ok=True)
     argv = ["rank_72hr_buyandhold.py", "--db", db, "--out-dir", out_dir,
             "--universe-from-trades",
             "--win-start", WIN_START_ISO, "--win-end", WIN_END_ISO, "--as-of", AS_OF_ISO,
             "--min-avg-per-month", "1", "--min-active-months", min_active_months,
-            "--target-n", "5", "--floor-tstat", "0.0", "--scheduled-only"]
+            "--target-n", "5", "--floor-tstat", "0.0", "--scheduled-only",
+            "--market-scope", all_markets_scope(db, Path(out_dir) / "market_scope.json")]
     env = {"PE_RANKER_ENGINE": engine, "PE_RANKER_PARQUET_DIR": parquet_dir,
            "PE_RANKER_PARQUET_MAX_AGE_HOURS": max_age_hours}
     with mock.patch.dict(os.environ, env), mock.patch.object(sys, "argv", argv):
@@ -524,10 +559,11 @@ def assert_certified_deferred_publication_equivalence(
             _export_certified_cache(db, str(parquet))
             snapshot = root / f"cycle-{index}.json"
             snapshot.write_text(json.dumps(cycle.snapshot(Path(db), day, versions, {})))
+            scope = all_markets_scope(db, root / f"scope-{index}.json")
             argv = ["rank", "--db", db, "--out-dir", str(out), "--universe-from-trades",
                     "--as-of", str(process_now), "--win-end", day, "--scheduled-only",
                     "--min-trl", "20", "--min-avg-per-month", "0", "--min-active-months", "0",
-                    "--floor-tstat", "2.0", "--ttr-hours", "48"]
+                    "--floor-tstat", "2.0", "--ttr-hours", "48", "--market-scope", scope]
             with mock.patch.dict(os.environ, {"PE_RANKER_ENGINE": "duck",
                                               "PE_RANKER_PARQUET_DIR": str(parquet),
                                               "PE_RANKER_PARQUET_MAX_AGE_HOURS": "0"}), \
@@ -540,7 +576,7 @@ def assert_certified_deferred_publication_equivalence(
                     "--floor-tstat", "3.0",
                     "--ttr-max-secs", "86400", "--before-ranking-json", str(root / "before.json"),
                     "--cycle-manifest-file", str(snapshot), "--cache-stage-record", record,
-                    "--pipeline-versions-file", str(root / "versions.json")]
+                    "--pipeline-versions-file", str(root / "versions.json"), "--market-scope", scope]
             with mock.patch.dict(os.environ, {"PE_RANKER_PARQUET_DIR": str(parquet)}), mock.patch.object(sys, "argv", argv):
                 assert latency.main() == 0
             manifest_path = out / "oracle_manifest.json"
@@ -743,7 +779,8 @@ class DuckParityTest(unittest.TestCase):
                         "--before-ranking-json", str(root / "before.json"),
                         "--cycle-manifest-file", str(root / "cycle.json"),
                         "--cache-stage-record", str(root / "stage.json"),
-                        "--pipeline-versions-file", str(root / "versions.json")]
+                        "--pipeline-versions-file", str(root / "versions.json"),
+                        "--market-scope", str(out / "market_scope.json")]
                 with mock.patch.dict(os.environ, {"PE_RANKER_PARQUET_DIR": str(pq)}), mock.patch.object(sys, "argv", argv):
                     self.assertEqual(latency.main(), 0)
                 with mock.patch.object(sys, "argv", ["push", "--ranked-csv", str(out / "latency_shift_ranked.csv"),
@@ -1550,13 +1587,93 @@ class BulkRootFence(unittest.TestCase):
             import subprocess
             for script, args in (
                 ("export_trades_parquet.py", ["--out-dir", str(Path(tmp) / "export")]),
-                ("rank_72hr_buyandhold.py", ["--out-dir", str(Path(tmp) / "rank"), "--universe-from-trades"]),
-                ("latency_shift_rerank.py", ["--out-dir", str(Path(tmp) / "rerank"), "--ranked-csv", "unused.csv", "--positions-csv", "unused.csv"]),
+                ("rank_72hr_buyandhold.py", ["--out-dir", str(Path(tmp) / "rank"), "--universe-from-trades",
+                                             "--market-scope", write_market_scope(Path(tmp) / "scope.json", ["0xa"])]),
+                ("latency_shift_rerank.py", ["--out-dir", str(Path(tmp) / "rerank"), "--ranked-csv", "unused.csv",
+                                             "--positions-csv", "unused.csv", "--market-scope", "unused.json"]),
             ):
                 result = subprocess.run([sys.executable, str(Path(__file__).with_name(script)), "--db", str(db), *args], capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("unfinished bulk root", result.stderr)
 
+
+
+class MarketScopeLoad(unittest.TestCase):
+    """`ranker_duck.load_market_scope` accepts only a complete, self-consistent scope file (#784)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "scope.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def two_series(self) -> dict:
+        """Two series; the second walks two pages linked by a cursor."""
+        value = json.loads(Path(write_market_scope(self.path, ["0xb", "0xa"])).read_text())
+        series, events = value["pages"]
+        value["series"] = [{"id": "2", "slug": None}, {"id": "11", "slug": None}]
+        value["pages"] = [series,
+                          {**events, "ordinal": 1, "series_id": "2"},
+                          {**events, "ordinal": 2, "series_id": "11", "returned_next_cursor": "c1"},
+                          {**events, "ordinal": 3, "series_id": "11", "request_cursor": "c1"}]
+        return value
+
+    def load(self, value: dict):
+        self.path.write_text(json.dumps(value))
+        return ranker_duck.load_market_scope(str(self.path))
+
+    def test_valid_scope_returns_ids_and_summary(self):
+        ids, summary = self.load(self.two_series())
+        self.assertEqual(ids, frozenset({"0xa", "0xb"}))
+        self.assertEqual(summary, {"recurrence": "15m", "count": 2, "digest": hashlib.sha256(b"0xa\n0xb").hexdigest(),
+                                   "end_date_min_unix": 0, "completed_at_unix": 2**62})
+
+    def test_every_broken_part_is_refused(self):
+        def ids(value, new):
+            value["condition_ids"] = new
+            value["count"] = len(new)
+            value["digest"] = hashlib.sha256("\n".join(new).encode()).hexdigest()
+        cases = {
+            "version": lambda v: v.update(version=2),
+            "boolean version": lambda v: v.update(version=True),
+            "float ordinal": lambda v: v["pages"][1].update(ordinal=1.0),
+            "no listing": lambda v: [v["pages"].pop(0)] and [p.update(ordinal=i) for i, p in enumerate(v["pages"])],
+            "listing too long": lambda v: v["pages"][0].update(rows=51),
+            "negative rows": lambda v: v["pages"][0].update(rows=-1),
+            "missing cursor field": lambda v: v["pages"][3].pop("returned_next_cursor"),
+            "recurrence": lambda v: v.update(recurrence="5m"),
+            "times": lambda v: v.update(started_at_unix=2**63),
+            "count": lambda v: v.update(count=3),
+            "digest": lambda v: v.update(digest="0" * 64),
+            "unsorted": lambda v: ids(v, ["0xb", "0xa"]),
+            "duplicate": lambda v: ids(v, ["0xa", "0xa"]),
+            "empty id": lambda v: ids(v, ["", "0xa"]),
+            "no ids": lambda v: ids(v, []),
+            "series order": lambda v: v["series"].reverse(),
+            "page hash": lambda v: v["pages"][1].update(raw_sha256="xyz"),
+            "page time": lambda v: v["pages"][1].pop("observed_at_unix"),
+            "ordinal gap": lambda v: v["pages"][2].update(ordinal=7),
+            "listing unfinished": lambda v: v["pages"][0].update(rows=50),
+            "listing offset": lambda v: v["pages"][0].update(url="https://gamma/series?offset=50"),
+            "chain cursor": lambda v: v["pages"][3].update(request_cursor="other"),
+            "chain unfinished": lambda v: v["pages"][3].update(returned_next_cursor="c2"),
+            "missing chain": lambda v: v["pages"].pop(1) and [p.update(ordinal=i) for i, p in enumerate(v["pages"])],
+            "extra page": lambda v: v["pages"].append({**v["pages"][1], "ordinal": 4}),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name):
+                value = self.two_series()
+                mutate(value)
+                with self.assertRaises(ranker_duck.MarketScopeError):
+                    self.load(value)
+
+    def test_coverage_needs_a_day_of_floor_and_a_later_acquisition(self):
+        summary = {"end_date_min_unix": 1_000, "completed_at_unix": 5_000}
+        ranker_duck.require_scope_coverage(summary, 1_000 + 86_400, 5_000)
+        for first, last in ((1_000 + 86_399, 5_000), (1_000 + 86_400, 5_001)):
+            with self.subTest(first=first, last=last), self.assertRaises(ranker_duck.MarketScopeError):
+                ranker_duck.require_scope_coverage(summary, first, last)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

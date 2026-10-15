@@ -31,6 +31,11 @@ import rank_cycle_manifest  # noqa: E402
 
 HOUR = 3600
 NOW = 1_700_000_000  # fixed clock — determinism (no time.time() in assertions)
+# The 15-minute market scope every new publication's oracle manifest carries (#784).
+SCOPED = {"oracle_version": 8,
+          "market_scope": {"recurrence": "15m", "count": 1, "digest": "d" * 64,
+                           "end_date_min_unix": 0, "completed_at_unix": 1},
+          "inputs": {"market_scope_sha256": "e" * 64}}
 
 
 def _make_cache(
@@ -633,6 +638,7 @@ class PublishRequestTest(unittest.TestCase):
             )
             manifest_path = csv_path.with_name("oracle_manifest.json")
             manifest_path.write_text(json.dumps({
+                **SCOPED,
                 "price_band": {"minimum_inclusive": 0.15, "maximum_exclusive": 0.85},
                 "scheduled_horizon": {"minimum_secs": 10, "maximum_secs_exclusive": 172800},
                 "latency_shift_secs": 2.0,
@@ -676,6 +682,7 @@ class PublishRequestTest(unittest.TestCase):
             csv_path.write_text("wallet,tstat_net_ls\n0xaaa,2.5\n", encoding="utf-8")
             manifest_path = csv_path.with_name("oracle_manifest.json")
             manifest_path.write_text(json.dumps({
+                **SCOPED,
                 "price_band": {"minimum_inclusive": 0.15, "maximum_exclusive": 0.85},
                 "scheduled_horizon": {"minimum_secs": 10, "maximum_secs_exclusive": 172800},
                 "latency_shift_secs": 2.0,
@@ -711,6 +718,7 @@ class PublishRequestTest(unittest.TestCase):
             )
             manifest_path = csv_path.with_name("oracle_manifest.json")
             manifest_path.write_text(json.dumps({
+                **SCOPED,
                 "price_band": {"minimum_inclusive": 0.15, "maximum_exclusive": 0.85},
                 "scheduled_horizon": {"minimum_secs": 10, "maximum_secs_exclusive": 172800},
                 "latency_shift_secs": 2.0,
@@ -975,6 +983,7 @@ class ManifestBindingTest(unittest.TestCase):
         digest = _hashlib.sha256(ranked.read_bytes()).hexdigest()
         manifest = root / "oracle_manifest.json"
         manifest.write_text(_json.dumps({
+            **SCOPED,
             "price_band": {"minimum_inclusive": 0.15, "maximum_exclusive": 0.85},
             "scheduled_horizon": {"minimum_secs": 10, "maximum_secs_exclusive": 172800},
             "latency_shift_secs": 2.0,
@@ -993,6 +1002,35 @@ class ManifestBindingTest(unittest.TestCase):
         req = pr.prepare_publish_request(self._prep(tamper=False), 1_700_000_000)
         self.assertIsNotNone(req["batch"]["config_hash"])
         print("PASS: matching manifest digest -> config_hash populated")
+
+    def test_new_publication_requires_the_15_minute_scope(self) -> None:
+        def drop(key):
+            return lambda value: value["market_scope"].pop(key)
+        cases = {
+            "version 7": lambda value: value.update(oracle_version=7),
+            "no scope": lambda value: value.pop("market_scope"),
+            "5m scope": lambda value: value["market_scope"].update(recurrence="5m"),
+            "zero count": lambda value: value["market_scope"].update(count=0),
+            "bad digest": lambda value: value["market_scope"].update(digest="x"),
+            "no floor": drop("end_date_min_unix"),
+            "no acquisition": drop("completed_at_unix"),
+            "no file hash": lambda value: value["inputs"].pop("market_scope_sha256"),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name):
+                a = self._prep(tamper=False)
+                value = json.loads(Path(a.manifest_file).read_text())
+                mutate(value)
+                Path(a.manifest_file).write_text(json.dumps(value))
+                with self.assertRaisesRegex(ValueError, "lacks the 15-minute market scope"):
+                    pr.prepare_publish_request(a, NOW)
+        # A request saved before the manifest changed resumes untouched: resumption never re-prepares.
+        a = self._prep(tamper=False)
+        request = pr.prepare_publish_request(a, NOW)
+        saved = Path(a.manifest_file).with_name("ranking_publish_request.json")
+        pr.save_publish_request(str(saved), request)
+        Path(a.manifest_file).write_text("{}")
+        self.assertEqual(pr.load_publish_request(str(saved)), request)
 
     def test_mismatched_manifest_refuses_to_publish(self) -> None:
         with self.assertRaises(ValueError) as ctx:
@@ -1066,7 +1104,7 @@ class FormatThreePublicationTest(unittest.TestCase):
         self.ranked = self.root / "latency_shift_ranked.csv"
         self.ranked.write_text(f"wallet,survives,tstat_net_ls\n{self.a},True,3\n{self.excluded},True,4\n")
         self.manifest = self.root / "oracle_manifest.json"
-        self.value = {"price_band": {"minimum_inclusive": 0.15, "maximum_exclusive": 0.85},
+        self.value = {**SCOPED, "price_band": {"minimum_inclusive": 0.15, "maximum_exclusive": 0.85},
                       "scheduled_horizon": {"minimum_secs": 10.0, "maximum_secs_exclusive": 172800.0},
                       "latency_shift_secs": 2.0,
                       "outputs": {"latency_shift_ranked_sha256": hashlib.sha256(self.ranked.read_bytes()).hexdigest()}}

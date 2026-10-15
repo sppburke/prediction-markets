@@ -134,6 +134,11 @@ published batch 86. From the first format-3 preparation onward, keep a format-3-
 fix forward. Never downgrade a format-3 cache in place. Supabase's additive objects remain installed;
 `cache-restore-prior` is paused integrity recovery, not release rollback.
 
+For #784, install at a clean publication boundary (no cycle pointer or request). While still paused,
+run the installed `market-scope` once into a scratch file and record Forge's duration, retries and
+peak memory. Rollback reinstalls the recorded prior pair; its next cycle ranks every market at the
+5% fee again, so follow the oracle-rollback note below to publish a newer batch.
+
 For #747, install on Forge only after pe-service runs a build containing #747: an older service
 classes a copied listing's `CausalAmbiguity` as a shared failure and aborts the admission attempt
 (`watchlist_admission.rs`), so record the running service revision in the deployment record first.
@@ -573,18 +578,25 @@ trade-recency, current-eligibility and schema-one completeness filters without d
 schedule `end_date`s, then audits and repairs every traded, scheduled past-end
 market still missing a terminal row. The subcommand runs the full
 `fetch_resolutions_and_schedules`, so no separate `schedules` stage is needed
-(#383/#519). **Stage 1** ranks the full trade
-universe (`--universe-from-trades` — have-data ⇒ in-universe). Schema two exports every
+(#383/#519). Every ranking run, resumes included, then resolves the window end once (the UTC
+date, unless `--win-end` is given; it also defaults the decay anchor) and runs
+`pe-bootstrap market-scope`: Gamma's 15-minute series and their events ending at or after the
+window start minus one day, about 1,350 requests at ≤ 2/s (14 min on the dev box), written to
+`market_scope.json` in the run directory ([`ranker_market_scope`](_GLOSSARY.md#ranker-market-scope),
+#784). **Stage 1** ranks the full trade universe (`--universe-from-trades` — have-data ⇒
+in-universe), scoring only first entries in the scope's markets. Schema two exports every
 certified first-entry position in the ranking window without a leader-price, horizon or
 statistical pre-gate. **Stage 2** waits for candidate capture, then runs export-bound
 `cache-finalize-v2 --stage-record` before pass two. Pass two prices the first eligible
 fee-paying first-entry print second on each market/outcome, using the highest price in that
-second, the canonical cushion and scoring fee. Horizon uses the scheduled marker's next UTC
+second, the canonical cushion and the 15-minute taker fee. Horizon uses the scheduled marker's next UTC
 midnight; band, horizon and survival limits are the [glossary contracts](_GLOSSARY.md#ranking-copy-price).
-Maker share counts the unfiltered window entries; coverage is published rather than gated.
+Maker share counts the unfiltered window entries in scope markets; coverage is published rather
+than gated. Pass two refuses any row outside the scope or a scope that does not cover its entries.
 No print yields `no_print`; outside the band/horizon yields the corresponding disposition.
 Pass two writes `hit_rate`, `maker_share`, per-position `oracle_outcomes.csv`, and the versioned
-`oracle_manifest.json` whose canonical hash is `ranking_batches.config_hash`; **Stage 3** record
+`oracle_manifest.json` (oracle 8, recording the scope and the scope file's SHA-256) whose canonical
+hash is `ranking_batches.config_hash`; **Stage 3** record
 the exact publication request, atomically publish it through the idempotent
 `publish_ranking_batch_v2` RPC (classifier 6; historical requests belong to their prior release),
 verify that exact batch is `latest_ranking`, and write the
@@ -651,7 +663,8 @@ Latency shift uses the canonical print window; deterministic first-entry order r
 - `--skip-discovery` / `--skip-backfill` — skip Step-0 stages. Every backfill
   launched through this wrapper still defers global activation;
   `--skip-discovery` also skips `activate-next`, so it activates no new wallet.
-- `--skip-rank` — reuse existing CSVs in `--out-dir`; just (re-)push.
+- `--skip-rank` — reuse existing CSVs in `--out-dir`; just (re-)push. Preparing the request
+  refuses an oracle manifest without the 15-minute market scope (#784).
 - `--skip-purge` — backward-compatible no-op; automatic wallet deletion is retired.
 - Pure re-push: `--skip-discovery --skip-backfill --skip-rank --out-dir <prior run>`.
 
@@ -911,6 +924,7 @@ pe-bootstrap activate-next --db "$SIDE" --batch-id "$BATCH" --audit-csv "$AUDIT"
 pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N"
 pe-bootstrap cache-populate-payout-v2 --db "$SIDE"         # skip only when candidate-targets --after-collection returns 1 as field three
 pe-bootstrap cache-finalize-v2 --db "$SIDE"                # certify, checkpoint and sync without a stage record
+pe-bootstrap market-scope --out "$RUN_DIR/market_scope.json" --end-date-min "$FLOOR"   # every ranking run (#784)
 ```
 
 `--fresh-generation N` records the versioned acquisition identity specified in
@@ -1615,7 +1629,7 @@ directory deterministically owns that cycle's activation batch ID. A direct
 zero-argument invocation and the supervisor both honor an existing recovery
 pointer rather than allocating a new run.
 
-Exit 75 means a bounded transient operation exhausted its in-process retries or
+Exit 75 means a bounded transient operation (including the `market-scope` sweep, #784) exhausted its in-process retries or
 the resolution audit was blocked (`blocked > 0 || clipped > 0`: a market whose
 available venue truth could not be recorded — fetch failure, identity mismatch,
 contradictory payload, unrecordable terminal state — or a repair-cap clip). The
@@ -1756,7 +1770,7 @@ not a run28-backed N choice.
 
 ## Output artifacts
 
-`rank_and_push.sh` writes each run's ranked CSVs and
+`rank_and_push.sh` writes each run's ranked CSVs, `market_scope.json` and
 `ranking_publish_request.json` under an auto-timestamped
 `data/eval-results/cron-<UTC>/` (override with `--out-dir`). The request records
 the exact batch provenance, filtered entries, retention value, and content hash

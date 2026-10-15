@@ -39,6 +39,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rank_72hr_buyandhold as rk  # noqa: E402
+from test_ranker_duck_parity import all_markets_scope, write_market_scope  # noqa: E402
 
 WA = "0x" + "a" * 40
 WB = "0x" + "b" * 40
@@ -149,6 +150,9 @@ def build_messy_cache(path: str) -> None:
 
 
 def run_ranker(db: str, out_dir: str, *extra: str) -> int:
+    """Pass one over `db`; unless the test passes its own, the scope lists every fixture market."""
+    if "--market-scope" not in extra:
+        extra = (*extra, "--market-scope", all_markets_scope(db, Path(db).with_suffix(".scope.json")))
     argv = ["rank_72hr_buyandhold.py", "--db", db, "--out-dir", out_dir,
             "--win-start", WIN_START_ISO, "--win-end", WIN_END_ISO, "--as-of", AS_OF_ISO,
             "--min-avg-per-month", "1", "--min-active-months", "2",
@@ -292,7 +296,9 @@ class PositionsOutcomeIdTest(unittest.TestCase):
                             "--win-start", WIN_START_ISO, "--win-end", WIN_END_ISO,
                             "--as-of", AS_OF_ISO, "--half-life-days", "0",
                             "--min-avg-per-month", "1", "--min-active-months", "2", "--floor-tstat", "0",
-                            "--slip-cents", str(slip * 100)]):
+                            "--slip-cents", str(slip * 100),
+                            "--market-scope", write_market_scope(Path(tmp) / "scope.json",
+                                {r["market_id"] for r in raw} | {"zero-0.0", "zero-1.0"})]):
                         prm = rk.parse_args()
                     positions = {w: [dict(market_id=r["market_id"], outcome_id=int(r["outcome_id"]),
                         entry_ts=int(r["entry_ts"]), ttr=int(r["ttr_secs"]), price=float(r["price"]),
@@ -374,8 +380,10 @@ class UniverseFromTradesTest(unittest.TestCase):
 
 class UniverseMutualExclusionTest(unittest.TestCase):
     def _parse(self, *argv: str):
-        with mock.patch.object(sys, "argv", ["rank_72hr_buyandhold.py", *argv]):
-            return rk.parse_args()
+        with tempfile.TemporaryDirectory() as tmp:
+            scope = write_market_scope(Path(tmp) / "scope.json", ["MA1"])
+            with mock.patch.object(sys, "argv", ["rank_72hr_buyandhold.py", *argv, "--market-scope", scope]):
+                return rk.parse_args()
 
     def test_both_errors(self) -> None:
         with self.assertRaises(SystemExit):
@@ -528,6 +536,42 @@ class WalletGroupsStreamingTest(unittest.TestCase):
         self.assertEqual(list(rk.wallet_groups([])), [])
         self.assertEqual(list(rk.wallet_groups([ordered.iloc[:0]])), [])
 
+
+
+class MarketScopeFilterTest(unittest.TestCase):
+    """Only first entries in scope markets reach the positions CSV and every statistic (#784)."""
+
+    def test_out_of_scope_entries_never_reach_csv_or_statistics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "cache.db")
+            build_core_cache(db)
+            runs = {}
+            for name, markets in (("all", None), ("scoped", ["MA1", "MA3", "MA4", "MB1", "MB2", "MB3", "MB4"])):
+                out = str(Path(tmp) / name)
+                scope = (all_markets_scope(db, Path(tmp) / f"{name}.json") if markets is None
+                         else write_market_scope(Path(tmp) / f"{name}.json", markets))
+                self.assertEqual(run_ranker(db, out, "--universe-from-trades", "--half-life-days", "0",
+                                            "--floor-tstat", "0", "--market-scope", scope), 0)
+                runs[name] = (read_csv_rows(str(Path(out) / "qualifying_positions_72hr.csv")),
+                              {r["wallet"]: r for r in read_csv_rows(str(Path(out) / "ranked_72hr_buyandhold.csv"))})
+            positions, ranked = runs["scoped"]
+            self.assertEqual(sorted(r["market_id"] for r in positions if r["wallet"] == WA), ["MA1", "MA3", "MA4"])
+            self.assertEqual((ranked[WA]["n"], runs["all"][1][WA]["n"]), ("3", "5"))
+            # Every WA statistic now comes from MA1, MA3 and MA4 alone (all three won).
+            nets = [(1.0 - (p + SLIP)) / (p + SLIP) for p in (0.50, 0.60, 0.30)]
+            self.assertAlmostEqual(float(ranked[WA]["mean_net"]), legacy_stats(nets)[0], places=9)
+            self.assertEqual(ranked[WB], runs["all"][1][WB])
+
+    def test_a_scope_that_does_not_cover_the_window_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "cache.db")
+            build_core_cache(db)
+            late_floor = write_market_scope(Path(tmp) / "late.json", ["MA1"],
+                                            end_date_min=int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp()))
+            stale = write_market_scope(Path(tmp) / "stale.json", ["MA1"], completed_at=0)
+            for scope in (late_floor, stale):
+                with self.subTest(scope=scope), self.assertRaises(ValueError):
+                    run_ranker(db, str(Path(tmp) / "out"), "--universe-from-trades", "--market-scope", scope)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

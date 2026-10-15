@@ -14532,6 +14532,13 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         rows.push(ignored);
     }
     let fixture_markets = markets.clone();
+    // #784: one 15-minute series holds every full-length fixture market, so the scope keeps the ranking.
+    let scope_events = markets
+        .iter()
+        .filter_map(|market| market["condition_id"].as_str())
+        .filter(|id| id.len() == 66)
+        .map(|id| serde_json::json!({"series":[{"id":"7","recurrence":"15m"}],"markets":[{"conditionId":id}]}))
+        .collect::<Vec<_>>();
     let activity_rows = Arc::new(Mutex::new(rows));
     let server_rows = Arc::clone(&activity_rows);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -14622,6 +14629,11 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                     "200 OK",
                     serde_json::json!({"data":markets,"next_cursor":"LTE="}),
                 ),
+                "/series" => (
+                    "200 OK",
+                    serde_json::json!([{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"}]),
+                ),
+                "/events/keyset" => ("200 OK", serde_json::json!({"events":scope_events})),
                 "/rest/v1/rpc/publish_ranking_batch_v2" => {
                     let payload: Value =
                         serde_json::from_slice(&request[header_end..header_end + content_length])

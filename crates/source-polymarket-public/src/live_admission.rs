@@ -238,6 +238,19 @@ fn validate_market(
     })
 }
 
+/// The Gamma series recurrence copied by gate F (#782) and scored by the ranker (#784).
+pub const FIFTEEN_MINUTE_RECURRENCE: &str = "15m";
+
+/// A Gamma event's recurrence: its first series' `recurrence` string, `None` for any other shape.
+pub fn event_series_recurrence(event: &Value) -> Option<&str> {
+    event
+        .get("series")?
+        .as_array()?
+        .first()?
+        .get("recurrence")?
+        .as_str()
+}
+
 /// Best-effort second read: replay re-runs the validators on every recorded reply, so any surprise
 /// here yields `None` (no copy) and never a new admission or replay failure.
 fn series_recurrence(gamma_raw: &[u8], condition: &PolymarketConditionId) -> Option<String> {
@@ -246,8 +259,7 @@ fn series_recurrence(gamma_raw: &[u8], condition: &PolymarketConditionId) -> Opt
         .iter()
         .find(|row| row.get("conditionId").and_then(Value::as_str) == Some(condition.0.as_str()))?;
     let event = row.get("events")?.as_array()?.first()?;
-    let series = event.get("series")?.as_array()?.first()?;
-    series.get("recurrence")?.as_str().map(str::to_owned)
+    event_series_recurrence(event).map(str::to_owned)
 }
 
 fn validate_state(

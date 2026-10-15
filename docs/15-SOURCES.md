@@ -367,6 +367,8 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-10-13 | 2026-12-12 |
 | https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-10-15 | 2026-12-14 |
 | https://docs.polymarket.com/api-spec/gamma-openapi.yaml (`Market.events`, `Event.series`, `Series.recurrence`) | 2026-10-15 | 2026-12-14 |
+| https://gamma-api.polymarket.com/series?exclude_events=true&limit=50&offset={k} | 2026-10-15 | 2026-12-14 |
+| https://gamma-api.polymarket.com/events/keyset?series_id={id}&end_date_min={iso}&limit=100&after_cursor={cursor} (documented in gamma-openapi.yaml) | 2026-10-15 | 2026-12-14 |
 | https://gamma-api.polymarket.com/markets?clob_token_ids={token}&closed=true | 2026-09-02 | 2026-11-01 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 
@@ -446,6 +448,19 @@ Treat as research inspiration; not a production decision input unless an authori
   `/markets?condition_ids=…&include_tag=true` replies for 15-minute, 5-minute, hourly, 4-hour,
   daily, weekly, monthly, sports and weather markets each carried one event with one series. The
   undocumented `cryptoMarketConfig.duration` is null on older window markets and is not used.
+- 2026-10-15 (ranker 15-minute scope, #784): the OpenAPI documents `GET /events/keyset` with
+  `series_id` (integer array), `end_date_min`, `limit` (maximum 100), `after_cursor` and a
+  `next_cursor` reply field; `offset` is rejected. `/events` itself does not document `series_id`,
+  and the `/series` and `/events` `recurrence` filters reject `15m` (422). Live probes (about 50
+  GETs, plus a full sweep): `/series?exclude_events=true` caps pages at 50 rows (47 at offset 2,450,
+  0 at 2,497); `closed=true` lists none, so the default listing is complete. Keyset pages hold at
+  most 100 events (`limit=101` capped), honor an ISO `end_date_min` exactly, return open and closed
+  events (175 = 79 closed + 96 open, matching separate queries), keep their head and cursor across
+  new events, end with a page without `next_cursor`, return zero events for an unknown series and
+  422 for an invalid cursor. Every 15-minute event's first series was the requested one with
+  recurrence `15m` and one market; events exist about 24 hours before their window ends. A full
+  sweep back to 2026-04-17 took 1,352 pages (8 series), 14 min at 2 requests/s, and labeled
+  129,822 markets.
 
 - 2026-10-05 (#739/#588, supplied source-pass evidence): CLOB `/markets` neg-risk fields and group
   identity, plus the official negative-risk conversion/augmented-event semantics. The 2026-10-06

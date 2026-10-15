@@ -6584,7 +6584,7 @@ fn atomic_write_temp_path(path: &Path) -> PathBuf {
     ))
 }
 
-fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<(), BootstrapError> {
+pub(crate) fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<(), BootstrapError> {
     let parent = path
         .parent()
         .filter(|value| !value.as_os_str().is_empty())

@@ -59,7 +59,7 @@ import sqlite3
 from partial_backfill_wallets import partial_backfill_wallets
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -70,9 +70,8 @@ from ranker_decay import (
     DEFAULT_WINDOW_DAYS,
     decay_weights,
     parse_as_of,
-    today_midnight_unix,
     weighted_stats,
-    window_start_unix,
+    window_bounds,
 )
 
 SECS_PER_DAY = 86_400
@@ -105,6 +104,7 @@ class Params:
     price_max: float        # entry-price band upper bound (inclusive)
     half_life_days: float   # recency-decay half-life in days; <= 0 disables decay (flat = legacy)
     as_of: int              # decay age anchor (unix); trades older than this decay, future clip to weight 1.0
+    market_scope: frozenset = field(repr=False)  # condition ids scored (#784); everything else is dropped
 
 
 def parse_args() -> Params:
@@ -158,6 +158,9 @@ def parse_args() -> Params:
                    help="entry-price band lower bound (inclusive); first-buys below are dropped")
     p.add_argument("--price-max", type=float, default=0.85,
                    help="entry-price band upper bound (inclusive); first-buys above are dropped")
+    p.add_argument("--market-scope", required=True,
+                   help="pe-bootstrap market-scope file: only first entries in its 15-minute-series "
+                        "markets are scored (#784)")
     a = p.parse_args()
 
     # Exactly one universe source. --universe defaults to None so argparse can tell an
@@ -165,16 +168,12 @@ def parse_args() -> Params:
     if (a.universe is not None) == bool(a.universe_from_trades):
         p.error("provide exactly one of --universe <file> or --universe-from-trades")
 
-    def to_unix(d: str) -> int:
-        return int(pd.Timestamp(d, tz="UTC").timestamp())
-
-    # Relative window defaults (overridable): win_end -> today UTC-midnight;
-    # win_start -> win_end - DEFAULT_WINDOW_DAYS. Anchor decay at as_of (default win_end).
-    win_end = to_unix(a.win_end) if a.win_end else today_midnight_unix()
-    win_start = to_unix(a.win_start) if a.win_start else window_start_unix(win_end, DEFAULT_WINDOW_DAYS)
+    win_start, win_end = window_bounds(a.win_start, a.win_end)
     as_of = parse_as_of(a.as_of)
     if as_of is None:
         as_of = win_end
+    market_scope, scope_summary = ranker_duck.load_market_scope(a.market_scope)
+    ranker_duck.require_scope_coverage(scope_summary, win_start, win_end)
 
     return Params(
         db=a.db, universe=a.universe, universe_from_trades=a.universe_from_trades,
@@ -194,6 +193,7 @@ def parse_args() -> Params:
         price_max=a.price_max,
         half_life_days=a.half_life_days,
         as_of=as_of,
+        market_scope=market_scope,
     )
 
 
@@ -342,7 +342,9 @@ def process_wallet_positions(w, positions, prm, writer, summaries, floor_pos):
     already filtered. Returns the number of positions scored.
 
     # Precondition: positions are pre-filtered (window / ttr / resolved / price / band).
+    Only markets in the 15-minute scope are scored (#784): one rule for every engine.
     """
+    positions = [p for p in positions if p["market_id"] in prm.market_scope]
     if not positions:
         return 0
     nets: list[float] = []

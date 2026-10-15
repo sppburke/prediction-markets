@@ -134,6 +134,86 @@ def _load_v2_export_manifest(parquet_dir: str) -> dict:
     return value
 
 
+
+# The 15-minute market scope (#784): `pe-bootstrap market-scope` writes it into the cycle
+# directory; pass one scores only its markets and pass two re-checks it.
+MARKET_SCOPE_RECURRENCE = "15m"
+_SCOPE_SERIES_PAGE_ROWS = 50
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+class MarketScopeError(ValueError):
+    """The market scope file is malformed or does not cover the ranked entries."""
+
+
+def load_market_scope(path: str) -> tuple[frozenset[str], dict]:
+    """Validate a scope file, including its page proof, and return (condition ids, summary)."""
+    with open(path, encoding="utf-8") as source:
+        value = json.load(source)
+
+    def need(ok, what: str) -> None:
+        if not ok:
+            raise MarketScopeError(f"market scope {path}: {what}")
+
+    need(isinstance(value, dict), "not an object")
+    need(all(type(value.get(key)) is int for key in ("version", "schema_version", "parser_version"))
+         and (value["version"], value.get("source_id"), value["schema_version"], value["parser_version"],
+              value.get("recurrence")) == (1, "polymarket-gamma", 1, 1, MARKET_SCOPE_RECURRENCE), "identity")
+    need(all(type(value.get(key)) is int for key in
+             ("end_date_min_unix", "started_at_unix", "completed_at_unix", "count"))
+         and value["started_at_unix"] <= value["completed_at_unix"], "times or count")
+    ids = value.get("condition_ids")
+    # `market-scope` enforces the condition-id form at acquisition; here the digest proves integrity.
+    need(isinstance(ids, list) and all(isinstance(i, str) and i for i in ids), "condition ids")
+    need(0 < len(ids) == value["count"] and ids == sorted(set(ids)), "ids not sorted, unique and counted")
+    need(hashlib.sha256("\n".join(ids).encode()).hexdigest() == value.get("digest"), "digest")
+    series = value.get("series")
+    need(isinstance(series, list) and series
+         and all(isinstance(s, dict) and isinstance(s.get("id"), str) and s["id"].isdigit() for s in series)
+         and [int(s["id"]) for s in series] == sorted({int(s["id"]) for s in series}), "series")
+
+    pages = value.get("pages")
+    need(isinstance(pages, list) and pages, "pages")
+    for ordinal, page in enumerate(pages):
+        need(isinstance(page, dict) and type(page.get("ordinal")) is int and page["ordinal"] == ordinal
+             and {"series_id", "request_cursor", "returned_next_cursor", "source_at_unix"} <= page.keys()
+             and page.get("kind") in ("series", "events") and isinstance(page.get("url"), str)
+             and isinstance(page.get("raw_sha256"), str) and _SHA256_HEX.fullmatch(page["raw_sha256"])
+             and all(type(page.get(key)) is int
+                     for key in ("rows", "observed_at_unix", "received_at_unix"))
+             and (page.get("source_at_unix") is None or type(page["source_at_unix"]) is int),
+             f"page {ordinal}")
+    listing = [page for page in pages if page["kind"] == "series"]
+    need(listing and pages[:len(listing)] == listing and all(
+        page["series_id"] is None and page["request_cursor"] is None
+        and page["returned_next_cursor"] is None
+        and page["url"].endswith(f"&offset={index * _SCOPE_SERIES_PAGE_ROWS}")
+        and (page["rows"] == _SCOPE_SERIES_PAGE_ROWS if index < len(listing) - 1
+             else 0 <= page["rows"] < _SCOPE_SERIES_PAGE_ROWS)
+        for index, page in enumerate(listing)), "series listing incomplete")
+    walk = iter(pages[len(listing):])
+    for listed in series:
+        cursor = None
+        while True:
+            page = next(walk, None)
+            need(page is not None and page["series_id"] == listed["id"]
+                 and page["request_cursor"] == cursor, f"series {listed['id']} events chain")
+            cursor = page["returned_next_cursor"]
+            if cursor is None:
+                break
+            need(isinstance(cursor, str) and cursor, f"series {listed['id']} cursor")
+    need(next(walk, None) is None, "pages after the last events chain")
+    return frozenset(ids), {key: value[key] for key in
+                            ("recurrence", "count", "digest", "end_date_min_unix", "completed_at_unix")}
+
+
+def require_scope_coverage(summary: dict, first_entry: int, last_entry: int) -> None:
+    """Entries in [first, last] are covered: the floor is a day before the first, acquired after the last."""
+    if summary["end_date_min_unix"] > first_entry - 86_400 or summary["completed_at_unix"] < last_entry:
+        raise MarketScopeError(
+            f"market scope (floor {summary['end_date_min_unix']}, acquired {summary['completed_at_unix']}) "
+            f"does not cover entries {first_entry}..{last_entry}")
+
 def _snapshot_state(parquet_dir: str, max_age_hours: float,
                     required=REQUIRED_PARQUET) -> tuple[bool, str]:
     """Return (usable, reason). Usable iff every required Parquet file exists and —

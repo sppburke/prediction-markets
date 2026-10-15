@@ -24,7 +24,8 @@ from itertools import groupby
 
 import pandas as pd
 
-from ranker_duck import get_engine, limit_memory, duck_first_entry_prints_v2
+from ranker_duck import (duck_first_entry_prints_v2, get_engine, limit_memory, load_market_scope,
+                         require_scope_coverage)
 
 from ranker_decay import (
     DEFAULT_HALF_LIFE_DAYS,
@@ -35,8 +36,9 @@ from ranker_decay import (
 
 # The projection's oracle_version=6 identifies its format, independently of pricing.
 ORACLE_NAME = "first-entry-taker-print"
-ORACLE_VERSION = 7
-TAKER_FEE_RATE = 0.05
+ORACLE_VERSION = 8
+# Only 15-minute crypto markets are scored (#784); their taker rate is `crypto_fees_v2_rate`.
+TAKER_FEE_RATE = 0.07
 MAKER_SHARE_CAP = 0.5
 
 
@@ -88,6 +90,8 @@ def parse_args():
                    help="code revision recorded in the run manifest (the wrapper passes it)")
     p.add_argument("--pipeline-versions-file", required=False,
                    help="JSON emitted by pe-bootstrap pipeline-versions; required when writing the run manifest")
+    p.add_argument("--market-scope", required=True,
+                   help="the pe-bootstrap market-scope file pass one scored against (#784)")
     return p.parse_args()
 
 
@@ -256,6 +260,17 @@ def load_positions(con, a):
         "force_not_null=['wallet','market_id','outcome_id','entry_ts','ttr_secs','resolved_at','payoff'])",
         [a.positions_csv],
     )
+    # Every pass-one row must be in the 15-minute scope pass one used (#784), checked before any
+    # count, maker share or failed row is formed.
+    scope, a.market_scope_summary = load_market_scope(a.market_scope)
+    markets = con.execute("SELECT DISTINCT market_id FROM raw_positions WHERE wallet != ''").fetchall()
+    outside = [market for (market,) in markets if market not in scope]
+    if outside:
+        raise ValueError(f"{len(outside)} pass-one market(s) outside the market scope, e.g. {outside[0]}")
+    first, last = con.execute("SELECT MIN(CAST(entry_ts AS BIGINT)), MAX(CAST(entry_ts AS BIGINT)) "
+                              "FROM raw_positions WHERE wallet != ''").fetchone()
+    if first is not None:
+        require_scope_coverage(a.market_scope_summary, first, last)
     con.execute("SET preserve_insertion_order=false")
     load_survivable_wallets(con, a)
     con.execute(
@@ -483,6 +498,7 @@ def rerank(con, a, schema_version):
         "schema_version": schema_version,
         "price_band": {"minimum_inclusive": a.price_min,
                        "maximum_exclusive": a.price_max},
+        "market_scope": a.market_scope_summary,
         "scheduled_horizon": {"minimum_secs": a.min_ttr_secs,
                               "maximum_secs_exclusive": a.ttr_max_secs},
         "git_sha": a.git_sha,
@@ -502,6 +518,7 @@ def rerank(con, a, schema_version):
             "cache_stage_record_sha256": (
                 sha256_file(a.cache_stage_record) if a.cache_stage_record else None
             ),
+            "market_scope_sha256": sha256_file(a.market_scope),
         },
         "outputs": {
             "latency_shift_ranked_sha256": sha256_file(ranked_path),

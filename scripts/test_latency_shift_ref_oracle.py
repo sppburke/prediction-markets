@@ -15,6 +15,7 @@ from unittest import mock
 import duckdb
 
 import latency_shift_rerank as ranker
+from test_ranker_duck_parity import all_markets_scope, write_market_scope
 
 WALLET = '0x' + '1' * 40
 DAY = 1_776_384_000 // 86400 * 86400
@@ -32,6 +33,7 @@ def first_entry(row, px=.4, *, fee=True, wallet=None, second=None):
 
 def args(root, **overrides):
     result = SimpleNamespace(positions_csv=str(root / 'positions.csv'), min_trl=0,
+                             market_scope=str(root / 'market_scope.json'),
                              min_ttr_secs=60, ttr_max_secs=86400, latency_shift_secs=2.,
                              fill_window_secs=120., slip_cents=.5, price_min=.15, price_max=.65,
                              floor_tstat=3., half_life_days=0., schema_two=True)
@@ -54,11 +56,16 @@ class PrintOracle(unittest.TestCase):
         self.con.close()
         self.tmp.cleanup()
 
-    def run_pipeline(self, positions, prints, **overrides):
+    def write_positions(self, positions, scope=None):
         with open(self.root / 'positions.csv', 'w', newline='') as file:
             writer = csv.writer(file)
             writer.writerow(FIELDS)
             writer.writerows(positions)
+        write_market_scope(self.root / 'market_scope.json',
+                           scope if scope is not None else {row[1] for row in positions})
+
+    def run_pipeline(self, positions, prints, **overrides):
+        self.write_positions(positions)
         self.con.executemany('INSERT INTO entries VALUES (?,?,?,?,?,?,?)',
                              [first_entry(row) for row in positions] + prints)
         a = args(self.root, **overrides)
@@ -94,7 +101,7 @@ class PrintOracle(unittest.TestCase):
             self.assertEqual(results[market], ('no_print', None, None, None))
         self.assertEqual(results['tie'][0:3], ('repriced', DAY + 102, .6))
         eff = .605
-        self.assertAlmostEqual(results['tie'][3], 1 / (eff * (1 + .05 * (1 - eff))) - 1)
+        self.assertAlmostEqual(results['tie'][3], 1 / (eff * (1 + .07 * (1 - eff))) - 1)
 
     def test_fee_threshold_is_strict_and_does_not_stop_the_first_print_search(self):
         positions = [position('a'), position('b')]
@@ -124,7 +131,7 @@ class PrintOracle(unittest.TestCase):
         results = self.outcomes()
         self.assertEqual({key: value[0] for key, value in results.items()},
                          {'floor': 'repriced', 'below': 'price_band', 'ceiling': 'price_band', 'inside': 'repriced'})
-        self.assertAlmostEqual(results['floor'][3], .5 / (.15 * (1 + .05 * .85)) - 1)
+        self.assertAlmostEqual(results['floor'][3], .5 / (.15 * (1 + .07 * .85)) - 1)
         row = next(ranker.ranked_rows(self.con))
         self.assertEqual(row['fill_rate'], '1.0')
         self.assertEqual(row['n_total'], 4)
@@ -133,8 +140,7 @@ class PrintOracle(unittest.TestCase):
     def test_maker_denominator_precedes_scope_price_pair_and_pricing_filters(self):
         positions = [position('priced'), position('missing'), position('band'),
                      position('horizon', DAY + 86400 - 61)]
-        with open(self.root / 'positions.csv', 'w', newline='') as file:
-            writer = csv.writer(file); writer.writerow(FIELDS); writer.writerows(positions)
+        self.write_positions(positions)
         entries = [first_entry(row, fee=index < 2) for index, row in enumerate(positions)]
         entries += [first_entry(positions[0], wallet='other', second=DAY + 102),
                     first_entry(positions[2], .9, wallet='other', second=DAY + 102),
@@ -174,15 +180,31 @@ class PrintOracle(unittest.TestCase):
                 self.assertEqual((result['eligible'], result['survives']), (eligible, survives))
 
     def test_manifest_identity_and_removed_flags(self):
-        with mock.patch.object(sys, 'argv', ['rank', '--ranked-csv', 'r', '--positions-csv', 'p']):
+        with mock.patch.object(sys, 'argv', ['rank', '--ranked-csv', 'r', '--positions-csv', 'p',
+                                             '--market-scope', 's']):
             a = ranker.parse_args()
         self.assertEqual((a.slip_cents, a.floor_tstat, a.min_ttr_secs, a.ttr_max_secs, a.price_max),
                          (.5, 3., 60, 86400, .65))
         self.assertEqual((ranker.ORACLE_NAME, ranker.ORACLE_VERSION, ranker.TAKER_FEE_RATE, ranker.MAKER_SHARE_CAP),
-                         ('first-entry-taker-print', 7, .05, .5))
+                         ('first-entry-taker-print', 8, .07, .5))
         self.assertIn('maker_share', ranker.RANKED_FIELDS)
         for removed in ('emit_targets', 'min_fill_rate', 'min_active_months', 'min_avg_per_month'):
             self.assertFalse(hasattr(a, removed))
+
+    def test_every_pass_one_row_must_be_in_the_scope_it_covers(self):
+        other = '0x' + '2' * 40
+        # The out-of-scope row belongs to a wallet that could never survive (one entry, MinTRL 20).
+        positions = [position('in'), (other, 'out', '0', DAY + 100, -100, DAY, 1)]
+        self.write_positions(positions, scope=['in'])
+        with self.assertRaisesRegex(ValueError, '1 pass-one market\\(s\\) outside the market scope'):
+            ranker.load_positions(self.con, args(self.root, min_trl=20))
+        for floor, completed in ((DAY + 100 - 86_399, 2**62), (0, DAY + 99)):
+            with self.subTest(floor=floor, completed=completed):
+                self.write_positions(positions[:1])
+                write_market_scope(self.root / 'market_scope.json', ['in'],
+                                   end_date_min=floor, completed_at=completed)
+                with self.assertRaisesRegex(ValueError, 'does not cover'):
+                    ranker.load_positions(duckdb.connect(), args(self.root))
 
 
 class ManifestRun(unittest.TestCase):
@@ -217,10 +239,11 @@ class ManifestRun(unittest.TestCase):
                                                 clob_resolution_parser=2, cache_schema=2, configuration=1)))
             out = root / 'out'; out.mkdir()
             unrelated = out / 'pass2-unrelated'; unrelated.mkdir(); (unrelated / 'keep').write_text('retained')
+            scope = all_markets_scope(str(db), root / 'scope.json')
             argv = ['rank', '--db', str(db), '--ranked-csv', str(ranked), '--positions-csv', str(positions),
                     '--out-dir', str(out), '--as-of', '2026-04-01', '--before-ranking-json', str(before),
                     '--cycle-manifest-file', str(cycle), '--cache-stage-record', str(stage),
-                    '--pipeline-versions-file', str(versions)]
+                    '--pipeline-versions-file', str(versions), '--market-scope', scope]
             manifests = []
             for _ in range(2):
                 spill = out / 'pass2-spill'; spill.mkdir(); (spill / 'stale').write_text('old')
@@ -233,7 +256,11 @@ class ManifestRun(unittest.TestCase):
             manifest = json.loads(manifests[0])
             self.assertEqual((manifest['oracle'], manifest['oracle_version'], manifest['slip'],
                               manifest['fee_rate'], manifest['fill_window_secs'], manifest['maker_share_cap']),
-                             ('first-entry-taker-print', 7, .005, .05, 120., .5))
+                             ('first-entry-taker-print', 8, .005, .07, 120., .5))
+            scope_bytes = Path(scope).read_bytes()
+            self.assertEqual(manifest['inputs']['market_scope_sha256'], hashlib.sha256(scope_bytes).hexdigest())
+            self.assertEqual(manifest['market_scope'], {key: json.loads(scope_bytes)[key] for key in
+                             ('recurrence', 'count', 'digest', 'end_date_min_unix', 'completed_at_unix')})
             for key in ('fidelity_minutes','parser_version','lookup','min_coverage','min_active_months','min_avg_per_month'):
                 self.assertNotIn(key, manifest)
             self.assertNotIn('oracle_parser', manifest['versions'])
@@ -257,7 +284,7 @@ class Horizon(unittest.TestCase):
         # A zero shift would let a wallet's own first entry be its copy print.
         for flag in ('--latency-shift-secs', '--fill-window-secs'):
             argv = ['latency_shift_rerank.py', '--ranked-csv', 'unused.csv', '--positions-csv', 'unused.csv',
-                    flag, '0']
+                    '--market-scope', 'unused.json', flag, '0']
             with self.subTest(flag=flag), mock.patch.object(sys, 'argv', argv):
                 self.assertEqual(ranker.main(), 1)
 

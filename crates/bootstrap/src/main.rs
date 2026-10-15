@@ -83,6 +83,7 @@ async fn main() {
                 | "cache-restore-prior"
                 | "cache-stage-v2"
                 | "pipeline-versions"
+                | "market-scope"
         )
     );
 
@@ -144,6 +145,8 @@ async fn main() {
         let mut fresh_generation_arg: Option<Result<u64, String>> = None;
         let mut prior_arg: Option<std::path::PathBuf> = None;
         let mut side_arg: Option<std::path::PathBuf> = None;
+        let mut out_arg: Option<std::path::PathBuf> = None;
+        let mut end_date_min_arg: Option<i64> = None;
         let mut flag_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
         let mut i = 0;
@@ -345,6 +348,18 @@ async fn main() {
                 stage = Some(rest[i]);
             } else if let Some(v) = a.strip_prefix("--stage=") {
                 stage = Some(v);
+            } else if a == "--out" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                out_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--out=") {
+                out_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--end-date-min" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                end_date_min_arg = rest[i].parse().ok();
+            } else if let Some(v) = a.strip_prefix("--end-date-min=") {
+                end_date_min_arg = v.parse().ok();
             }
             i += 1;
         }
@@ -704,6 +719,46 @@ async fn main() {
                     std::process::exit(error.exit_code());
                 }
             }
+        }
+
+        // `market-scope` (#784) reads only Gamma and writes one file: no cache
+        // lock or open.
+        if sub == "market-scope" {
+            let exit = match (out_arg.as_deref(), end_date_min_arg) {
+                (Some(out), Some(end_date_min)) => {
+                    match pe_bootstrap::market_scope::run_market_scope(
+                        &bootstrap_config,
+                        out,
+                        end_date_min,
+                    )
+                    .await
+                    {
+                        Ok(scope) => {
+                            tracing::info!(
+                                series = scope.series.len(),
+                                pages = scope.pages.len(),
+                                markets = scope.count,
+                                "market-scope: complete"
+                            );
+                            0
+                        }
+                        Err(e) => {
+                            let exit_code = e.exit_code();
+                            if exit_code == BootstrapError::TEMPFAIL_EXIT_CODE {
+                                tracing::warn!(error = %e, exit_code, "market-scope: temporary failure");
+                            } else {
+                                tracing::error!(error = %e, exit_code, "market-scope: fatal");
+                            }
+                            exit_code
+                        }
+                    }
+                }
+                _ => {
+                    tracing::error!("market-scope requires --out and an integer --end-date-min");
+                    1
+                }
+            };
+            std::process::exit(exit);
         }
 
         // Reclamation evidence is read-only but deliberately excludes all

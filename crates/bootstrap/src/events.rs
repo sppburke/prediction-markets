@@ -324,7 +324,7 @@ impl<F: PageFetcher + Send + Sync> GammaEventsFetcher<F> {
     }
 }
 
-fn events_retry_backoff(base: Duration, retry: u32) -> Duration {
+pub(crate) fn events_retry_backoff(base: Duration, retry: u32) -> Duration {
     let multiplier = 1u32 << retry.min(10);
     base.saturating_mul(multiplier).min(Duration::from_secs(30))
 }
