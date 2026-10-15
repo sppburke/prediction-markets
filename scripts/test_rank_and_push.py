@@ -103,6 +103,7 @@ class RankAndPushScenario(unittest.TestCase):
         shutil.copy(WRAPPER, self.wrapper)
         shutil.copy(WRAPPER.parent / "rank_cycle_manifest.py", self.root / "scripts")
         shutil.copy(WRAPPER.parent / "partial_backfill_wallets.py", self.root / "scripts")
+        shutil.copy(WRAPPER.parent / "ranker_decay.py", self.root / "scripts")
 
         # The fake publisher below does not contact this syntactically valid endpoint.
         (self.root / ".env").write_text(
@@ -187,6 +188,8 @@ class RankAndPushScenario(unittest.TestCase):
             '             "price_band": {"minimum_inclusive": float(a[a.index("--price-min") + 1]), "maximum_exclusive": float(a[a.index("--price-max") + 1])},\n'
             '             "scheduled_horizon": {"minimum_secs": int(a[a.index("--min-ttr-secs") + 1]), "maximum_secs_exclusive": int(a[a.index("--ttr-max-secs") + 1])},\n'
             '             "latency_shift_secs": float(a[a.index("--latency-shift-secs") + 1]),\n'
+            '             "oracle_version": 8, "inputs": {"market_scope_sha256": "e" * 64},\n'
+            '             "market_scope": {"recurrence": "15m", "count": 1, "digest": "d" * 64, "end_date_min_unix": 0, "completed_at_unix": 1},\n'
             '             "outputs": {"latency_shift_ranked_sha256": hashlib.sha256(ranked).hexdigest()}}))\n'
             "    return 0\n"
             'if __name__ == "__main__":\n'
@@ -405,6 +408,42 @@ class RankAndPushScenario(unittest.TestCase):
             "failed preflight created a run output directory",
         )
 
+    def test_market_scope_failure_stops_before_export_and_ranking(self):
+        for code in ("75", "1"):
+            with self.subTest(code=code):
+                self.tearDown(); self.setUp()
+                result = self._run(exit_env={"STUB_EXIT_market_scope": code})
+                self.assertEqual(result.returncode, int(code), result.stdout + result.stderr)
+                self.assertEqual(self._bootstrap_ops()[-1], "market-scope")
+                for log in ("export.log", "rank.log", "rerank.log", "push.log"):
+                    self.assertIsNone(self._log(log), log)
+
+    def test_refresh_crossing_utc_midnight_moves_window_end_scope_and_anchor_together(self):
+        sys.path.insert(0, str(WRAPPER.parent))
+        from ranker_decay import window_bounds
+        real_date = shutil.which("date")
+        for explicit in (None, "2026-02-27"):
+            with self.subTest(explicit=explicit):
+                self.tearDown(); self.setUp()
+                # The clock reads 2026-03-01 until the refresh finishes, then 2026-03-02.
+                shim = self.root / "shim"; shim.mkdir()
+                _write_exec(shim / "date", "#!/usr/bin/env bash\nday=2026-03-01\n"
+                            "[[ -f crossed ]] && day=2026-03-02\n"
+                            f'exec {real_date} -d "$day 23:59:00 UTC" "$@"\n')
+                boot = self.root / "target/release/pe-bootstrap"
+                boot.write_text(boot.read_text().replace(
+                    'sub="$1"', 'if [[ "$1" == "resolutions" ]]; then touch crossed; fi\nsub="$1"'))
+                result = self._run(*(("--as-of", explicit) if explicit else ()),
+                                   exit_env={"PATH": f"{shim}:{os.environ['PATH']}"})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                rank, rerank = self._log("rank.log").split(), self._log("rerank.log").split()
+                self.assertEqual(rank[rank.index("--win-end") + 1], "2026-03-02")
+                for args in (rank, rerank):
+                    self.assertEqual(args[args.index("--as-of") + 1], explicit or "2026-03-02")
+                scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
+                self.assertEqual(scope[scope.index("--end-date-min") + 1],
+                                 str(window_bounds(None, "2026-03-02")[0] - 86_400))
+
     def test_happy_path_default_universe_and_step0_order(self):
         r = self._run()
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
@@ -420,6 +459,7 @@ class RankAndPushScenario(unittest.TestCase):
                 "backfill",
                 "events",
                 "resolutions",
+                "market-scope",
             ],
             "refresh/rank stages ran out of canonical purge-free order",
         )
@@ -432,6 +472,22 @@ class RankAndPushScenario(unittest.TestCase):
         rank = self._log("rank.log")
         self.assertIn("--universe-from-trades", rank)
         self.assertNotIn("--universe ", rank)  # never the curated-file form by default
+
+        # #784: one resolved window end feeds the scope floor, pass one and the default anchor,
+        # and both passes read the run's scope file.
+        sys.path.insert(0, str(WRAPPER.parent))
+        from ranker_decay import window_bounds
+        rank_args, rerank_args = rank.split(), self._log("rerank.log").split()
+        win_end = rank_args[rank_args.index("--win-end") + 1]
+        self.assertEqual(rank_args[rank_args.index("--as-of") + 1], win_end)
+        self.assertNotIn("--win-start", rank_args)
+        scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
+        out_dir = (self.root / "data" / "eval-results").glob("cron-*")
+        scope_file = str(next(out_dir).relative_to(self.root) / "market_scope.json")
+        self.assertEqual(scope, ["market-scope", "--out", scope_file,
+                                 "--end-date-min", str(window_bounds(None, win_end)[0] - 86_400)])
+        for args in (rank_args, rerank_args):
+            self.assertEqual(args[args.index("--market-scope") + 1], scope_file)
 
         # Auto-timestamped out-dir was created.
         crons = list((self.root / "data" / "eval-results").glob("cron-*"))
@@ -1012,7 +1068,7 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(
             self._bootstrap_ops(),
             ["cache-stage-v2", "winner-discovery", "activate-next", "cache-populate-activity-v2",
-             "cache-populate-payout-v2", "cache-finalize-v2", "cache-finalize-v2",
+             "cache-populate-payout-v2", "cache-finalize-v2", "market-scope", "cache-finalize-v2",
              "cache-activate"],
             "a schema-two prior is not sealed again",
         )
@@ -1201,7 +1257,7 @@ class RankAndPushScenario(unittest.TestCase):
         operations = [line.split()[0] for line in bootstrap]
         self.assertEqual(
             operations,
-            ["cache-finalize-v2", "cache-activate"],
+            ["market-scope", "cache-finalize-v2", "cache-activate"],
         )
         print("PASS: schema-two request preparation precedes activation and exact resume")
 
@@ -1552,6 +1608,7 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
         self.assertIsNone(self._log("ionice.log"), "re-push invoked ionice")
         self.assertIsNotNone(self._log("push.log"), "re-push did not push")
+        self.assertNotIn("market-scope", self._bootstrap_ops(), "re-push fetched a market scope")
         print("PASS: absent ionice allows a purge-free re-push")
 
     def test_ionice_failure_injection_cannot_reach_retired_infra_purge(self):
@@ -2026,7 +2083,7 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
         self.assertEqual(self._bootstrap_ops()[before:],
                          ["cache-stage-v2", "winner-discovery", "activate-next",
-                          "cache-finalize-v2", "cache-finalize-v2"])
+                          "cache-finalize-v2", "market-scope", "cache-finalize-v2"])
         finalizes = [shlex.split(line) for line in self._bootstrap_lines("cache-finalize-v2")]
         self.assertEqual(len(finalizes), 3)
         self.assertTrue(all("--stage-record" not in args for args in finalizes[:2]))
@@ -2182,7 +2239,7 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
         self.assertEqual(fixed.read_bytes(), before)
         self.assertEqual(self._bootstrap_ops()[len(operations):], [
             "cache-populate-activity-v2", "cache-populate-payout-v2", "cache-finalize-v2",
-            "cache-finalize-v2",
+            "market-scope", "cache-finalize-v2",
         ])
         for line in self._bootstrap_lines("cache-populate-activity-v2"):
             self.assertIn("--bulk-root", line)
@@ -2708,7 +2765,7 @@ finally:
             self._bootstrap_ops(),
             ["cache-stage-v2", "cache-migrate-v2", "winner-discovery", "activate-next",
              "cache-populate-activity-v2", "cache-populate-payout-v2", "cache-finalize-v2",
-             "cache-finalize-v2", "cache-activate"],
+             "market-scope", "cache-finalize-v2", "cache-activate"],
         )
         self.assertNotIn("backfill", result.stdout)
         side = f"{self.root}/phys/wallet_cache.{cycle}.side.db"
@@ -2748,7 +2805,7 @@ finally:
             later_ops,
             ["cache-stage-v2", "winner-discovery", "activate-next", "cache-populate-activity-v2",
              "cache-populate-payout-v2", "cache-finalize-v2",
-             "cache-finalize-v2", "cache-activate"],
+             "market-scope", "cache-finalize-v2", "cache-activate"],
         )
         self.assertIn("--fresh-generation 2", self._bootstrap_lines("cache-populate-activity-v2")[-1])
         cycles = sorted((self.root / "data/eval-results").glob("cron-*"))
@@ -3034,8 +3091,11 @@ if Path("stop_after_two").exists() and count >= 2:
     Path("data/eval-results/rank_and_push.loop").write_text("stop\\n")
 ''')
         boot = self.root / "target/release/pe-bootstrap"
+        from test_ranker_duck_parity import all_markets_scope
+        scope = all_markets_scope(str(db), self.root / "fixture_scope.json")
         boot.write_text(boot.read_text().replace('sub="$1"',
-            f'if [[ "$1" == "backfill" ]]; then {shlex.quote(sys.executable)} scripts/fixture_refresh.py; fi\nsub="$1"'))
+            f'if [[ "$1" == "backfill" ]]; then {shlex.quote(sys.executable)} scripts/fixture_refresh.py; fi\n'
+            f'if [[ "$1" == "market-scope" ]]; then cp {shlex.quote(scope)} "$3"; fi\nsub="$1"'))
         if case.startswith("publish") or case == "integrity":
             # Keep the upstream ranking fakes; publication preparation below is real.
             publisher = scripts / "push_ranking_to_supabase.py"
@@ -3052,7 +3112,7 @@ if "--ranked-csv" in args:
     path.write_text("wallet,survives,tstat_net_ls,hit_rate,n_filled\\n{WA},True,4,0.8,40\\n{WB},True,3,0.8,40\\n")
     if "--manifest-file" in args:
         manifest=Path(args[args.index("--manifest-file")+1])
-        manifest.write_text(json.dumps({{"price_band":{{"minimum_inclusive":0.15,"maximum_exclusive":0.85}},"scheduled_horizon":{{"minimum_secs":10,"maximum_secs_exclusive":172800}},"latency_shift_secs":2.0,"outputs":{{"latency_shift_ranked_sha256":hashlib.sha256(path.read_bytes()).hexdigest()}}}}))
+        manifest.write_text(json.dumps({{"oracle_version":8,"market_scope":{{"recurrence":"15m","count":1,"digest":"d"*64,"end_date_min_unix":0,"completed_at_unix":1}},"inputs":{{"market_scope_sha256":"e"*64}},"price_band":{{"minimum_inclusive":0.15,"maximum_exclusive":0.85}},"scheduled_horizon":{{"minimum_secs":10,"maximum_secs_exclusive":172800}},"latency_shift_secs":2.0,"outputs":{{"latency_shift_ranked_sha256":hashlib.sha256(path.read_bytes()).hexdigest()}}}}))
 entries=[]
 config_hash=None
 def transport(method,url,key,body=None,**kwargs):

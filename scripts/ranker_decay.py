@@ -163,3 +163,15 @@ def today_midnight_unix() -> int:
 def window_start_unix(win_end: int, window_days: int) -> int:
     """Window start = `window_days` before `win_end` (both unix seconds)."""
     return int(win_end) - int(window_days) * SECS_PER_DAY
+
+
+def window_bounds(win_start: str | None, win_end: str | None) -> tuple[int, int]:
+    """The ranker's entry window [start, end) in unix seconds; both parse like `--as-of`.
+
+    End defaults to today's UTC midnight, start to `DEFAULT_WINDOW_DAYS` before the end. The
+    wrapper sizes the 15-minute market scope with this same rule (#784).
+    """
+    end = parse_as_of(win_end)
+    end = today_midnight_unix() if end is None else end
+    start = parse_as_of(win_start)
+    return (window_start_unix(end, DEFAULT_WINDOW_DAYS) if start is None else start), end

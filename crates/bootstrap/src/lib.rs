@@ -26,6 +26,7 @@ pub mod gamma;
 pub mod infra_probe;
 pub mod leaderboard_discovery;
 pub mod lock;
+pub mod market_scope;
 pub mod migrate;
 pub mod pile;
 pub mod polymarket;

@@ -231,6 +231,15 @@ class RelativeDefaultTest(unittest.TestCase):
         tm = rd.today_midnight_unix()
         self.assertEqual(tm % SECS_PER_DAY, 0)  # midnight property holds every calendar day
 
+    def test_window_bounds_parse_like_as_of_with_relative_defaults(self) -> None:
+        end = int(datetime(2026, 4, 1, tzinfo=timezone.utc).timestamp())
+        start = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(rd.window_bounds(None, "2026-04-01"),
+                         (end - rd.DEFAULT_WINDOW_DAYS * SECS_PER_DAY, end))
+        self.assertEqual(rd.window_bounds("2026-01-01", "2026-04-01"), (start, end))
+        self.assertEqual(rd.window_bounds(str(start), str(end)), (start, end))
+        self.assertEqual(rd.window_bounds(None, None)[1], rd.today_midnight_unix())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

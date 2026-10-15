@@ -24,7 +24,7 @@ use pe_kelly_sizer::{KellyInput, size_contracts};
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb, PendingTerminalEvidence};
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{EquityInputs, RiskSnapshot, TradingMode, current_equity};
-use pe_source_polymarket_public::PageFetcher;
+use pe_source_polymarket_public::{FIFTEEN_MINUTE_RECURRENCE, PageFetcher};
 use pe_strategy_winner_follow::{ExecutionMode, SizingMode, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use pe_venue_polymarket::{BuySizing, LadderError, LadderPlan, ladder_is_stale, plan_sized_buy};
@@ -83,9 +83,6 @@ const CLOB_BOOK_HOT_PATH_TIMEOUT_SECS: u64 = 2;
 /// silent log-and-continue). Restart recovery remains the durable backstop.
 const LOCAL_COMMIT_RETRIES: u32 = 3;
 const LOCAL_COMMIT_RETRY_DELAY_MS: u64 = 100;
-
-/// Copy-scope gate F (docs/19): the only Gamma series recurrence whose markets are copied (#782).
-const COPY_SERIES_RECURRENCE: &str = "15m";
 
 /// Outcome of the enabled price-impact gate for one admitted signal (#508).
 enum GatePlan {
@@ -3859,7 +3856,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
         // Gate F (docs/19): copy only markets whose Gamma series recurs every 15 minutes.
         if !already_staged
-            && admission.market.series_recurrence.as_deref() != Some(COPY_SERIES_RECURRENCE)
+            && admission.market.series_recurrence.as_deref() != Some(FIFTEEN_MINUTE_RECURRENCE)
         {
             let recurrence = admission
                 .market

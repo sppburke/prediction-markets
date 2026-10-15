@@ -68,6 +68,10 @@ class TransientRetriesExhausted(Exception):
     """A retryable Supabase request exhausted its bounded retry budget."""
 
 
+def _is_sha256_hex(value) -> bool:
+    return isinstance(value, str) and len(value) == 64 and set(value) <= set("0123456789abcdef")
+
+
 def _newest_resolution_fetch(con: sqlite3.Connection) -> int | None:
     """Global resolution-content heartbeat from the active cache generation."""
     if _cache_schema(con) >= 2:
@@ -687,6 +691,17 @@ def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
             f"manifest binds ranking {str(declared)[:16]}… but --ranked-csv digests "
             f"{actual[:16]}… — mixed or stale run directory; refusing to publish"
         )
+    # #784: a new publication, re-pushes included, must come from a 15-minute-scoped ranking.
+    scope = manifest.get("market_scope")
+    if not (type(manifest.get("oracle_version")) is int and manifest["oracle_version"] >= 8
+            and isinstance(scope, dict) and scope.get("recurrence") == "15m"
+            and type(scope.get("count")) is int and scope["count"] > 0
+            and _is_sha256_hex(scope.get("digest"))
+            and type(scope.get("end_date_min_unix")) is int
+            and type(scope.get("completed_at_unix")) is int
+            and _is_sha256_hex(manifest.get("inputs", {}).get("market_scope_sha256"))):
+        raise ValueError("oracle manifest lacks the 15-minute market scope (oracle 8, #784); "
+                         "refusing to publish")
     config_hash = hashlib.sha256(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()

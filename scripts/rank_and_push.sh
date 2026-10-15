@@ -663,7 +663,7 @@ fi
 
 # Universe source: explicit --universe <file>, else the production default --universe-from-trades
 # (every wallet with trade history; #370). The ranker enforces "exactly one of these", so pass
-# exactly one (mirror the WIN_ARGS conditional-array pattern below).
+# exactly one.
 UNIVERSE_ARGS=()
 if [[ -n "$UNIVERSE" ]]; then
   UNIVERSE_ARGS+=(--universe "$UNIVERSE")
@@ -674,19 +674,6 @@ fi
 # Optional BootstrapConfig TOML positional, threaded to every Step-0 pe-bootstrap stage.
 BOOTSTRAP_CONFIG_ARGS=()
 [[ -n "$BOOTSTRAP_CONFIG" ]] && BOOTSTRAP_CONFIG_ARGS+=("$BOOTSTRAP_CONFIG")
-
-# Window args only when explicitly overridden (mirror FILTER_ARGS below); empty => the Python
-# ranker's relative defaults apply. Pass the IDENTICAL conditional set to both passes.
-WIN_ARGS=()
-[[ -n "$WIN_START" ]] && WIN_ARGS+=(--win-start "$WIN_START")
-[[ -n "$WIN_END" ]] && WIN_ARGS+=(--win-end "$WIN_END")
-
-# Resolve a concrete shared decay anchor once and thread it to BOTH passes so they weight every
-# trade against the identical as_of: explicit --as-of wins; else an explicit --win-end; else
-# UTC-midnight today (= the ranker's relative win_end via today_midnight_unix()).
-if [[ -z "$AS_OF" ]]; then
-  AS_OF="${WIN_END:-$(date -u +%Y-%m-%d)}"
-fi
 
 # ── Step 0: data refresh ─────────────────────────────────────────────────────────────────
 # Run one pe-bootstrap stage with the shared exit-code vocabulary
@@ -970,6 +957,26 @@ elif [[ "$CUTOVER_MODE" == "1" ]]; then
 else
   refresh_data
 fi
+if [[ "$SKIP_RANK" == "0" ]]; then
+  # Rank only first entries in markets whose Gamma series recurs every 15 minutes, the markets
+  # gate F copies (#782, #784). Resolve the window end once, here, so the scope, pass one and the
+  # default decay anchor share it; an explicit --as-of still wins.
+  RANK_WIN_END="${WIN_END:-$(date -u +%Y-%m-%d)}"
+  AS_OF="${AS_OF:-$RANK_WIN_END}"
+  RANK_WIN_ARGS=(--win-end "$RANK_WIN_END")
+  [[ -z "$WIN_START" ]] || RANK_WIN_ARGS+=(--win-start "$WIN_START")
+  MARKET_SCOPE_FILE="$OUT_DIR/market_scope.json"
+  scope_floor="$("$PYTHON_BIN" - "$WIN_START" "$RANK_WIN_END" <<'PY'
+import sys
+sys.path.insert(0, "scripts")
+from ranker_decay import window_bounds
+print(window_bounds(sys.argv[1] or None, sys.argv[2])[0] - 86_400)
+PY
+)" || exit $?
+  echo "── Market scope: 15-minute series markets from Gamma → $MARKET_SCOPE_FILE ──"
+  run_refresh_stage "market-scope" "$PE_BOOTSTRAP_BIN" market-scope --out "$MARKET_SCOPE_FILE" \
+    --end-date-min "$scope_floor" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+fi
 if [[ "$CUTOVER_MODE" == "1" ]]; then
   require_cutover_inputs
   if [[ "$SKIP_RANK" == "0" ]]; then
@@ -1014,7 +1021,7 @@ if [[ "$SKIP_RANK" == "0" ]]; then
   echo "── Stage 1/3: pass-1 edge-floor ranking ──────────────────────────────────────"
   run_ranking_stage "pass-1" "$PYTHON_BIN" scripts/rank_72hr_buyandhold.py \
     --db "$DB" "${UNIVERSE_ARGS[@]}" --out-dir "$OUT_DIR" \
-    "${WIN_ARGS[@]}" --ttr-hours "$TTR_HOURS" \
+    "${RANK_WIN_ARGS[@]}" --market-scope "$MARKET_SCOPE_FILE" --ttr-hours "$TTR_HOURS" \
     --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
     --target-n "$TARGET_N" --price-min "$PRICE_MIN" --price-max "$PRICE_MAX" \
     --min-trl "$MIN_TRL" --min-avg-per-month "$MIN_AVG_PER_MONTH" \
@@ -1050,7 +1057,7 @@ print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' "$EXPORT_MANIF
     --min-ttr-secs "$MIN_TTR_SECS" --ttr-max-secs "$TTR_MAX_SECS" \
     --price-min "$PRICE_MIN" --price-max "$PRICE_MAX" \
     --floor-tstat "$FLOOR_TSTAT" --git-sha "$GIT_SHA" \
-    --pipeline-versions-file "$PIPELINE_VERSIONS_FILE" \
+    --pipeline-versions-file "$PIPELINE_VERSIONS_FILE" --market-scope "$MARKET_SCOPE_FILE" \
     "${RERANK_CACHE_ARGS[@]}"
 else
   echo "── Stages 1-2 skipped (--skip-rank); reusing $LATENCY_CSV ──"
