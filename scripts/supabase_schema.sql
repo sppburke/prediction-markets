@@ -374,17 +374,17 @@ create table if not exists service_config (
 -- `seed_reconstructs_boot_strategy`.
 insert into service_config (key, value, value_type, description) values
   ('active_watchlist_size',                 '0',      'integer', 'Maximum top-ranked wallets pe-service actively follows; hot-reloaded every 30 seconds (0 = every survivor, 1..200 caps)'),
-  ('mode',                                  'paper',  'text',    'Trading mode: paper | shadow | live_tiny | promoted'),
+  ('mode',                                  'paper',  'text',    'Shared strategy mode: paper | shadow. live_tiny and promoted are rejected here; live trading is set per account'),
   ('max_fill_price',                        '0.65',   'decimal', 'Skip BUYs at or above this current price'),
   ('min_fill_price',                        '0.15',   'decimal', 'Skip BUYs below this current price (run28 band lower bound; 0 disables)'),
-  ('min_resolution_horizon_secs',           '60',     'integer', 'Min time-to-resolution copy floor (seconds)'),
-  ('max_resolution_horizon_secs',           '86400',  'integer', 'Exclusive copy horizon to next UTC midnight (seconds)'),
-  ('price_impact_cap_bps',                  '100',    'integer', 'Mandatory price-impact cap (bps of best ask), the sole policy size limit (#508); valid 1..=10000'),
-  ('flip_human_approved',                   'false',  'bool',    'Approval flag: allow Flip trades (admin-editable, audit-logged)'),
+  ('min_resolution_horizon_secs',           '60',     'integer', 'Copy only if the UTC midnight ending the day of the order-book end date is at least this many seconds away (0 disables)'),
+  ('max_resolution_horizon_secs',           '86400',  'integer', 'Copy only if the UTC midnight ending the day of the order-book end date is less than this many seconds away (0 disables)'),
+  ('price_impact_cap_bps',                  '100',    'integer', 'Mandatory price-impact cap: a BUY may take asks up to this many bps above the best ask (1..=10000)'),
+  ('flip_human_approved',                   'false',  'bool',    'Approval flag for Flip trades (admin-editable, audit-logged); the copy path admits first entries only, so Flips are not copied'),
   ('kelly_fraction_above_default_human_approved', 'false', 'bool', 'Approval flag: allow a Kelly fraction above the mode default'),
-  ('per_trade_cap',                         'mode_default', 'text', 'Per-trade cap: mode_default | unlimited | bps:N (#508); the safe boot seed — production flips to unlimited via the predicated A4 UPDATE only'),
-  ('slippage_rate',                         '0.01',   'decimal', 'Expected fill slippage rate added to c'),
-  ('sizing_mode',                           'dollar', 'text',    'Shared PAPER sizing mode: kelly | dollar | contract (#398 WS2). Reaches ordinary-live only as the fallback when accounts.live_sizing_mode is NULL'),
+  ('per_trade_cap',                         'mode_default', 'text', 'Per-trade cap on the all-in debit (principal plus fee reserve) as a share of the sizing bankroll: mode_default (25 bps) | unlimited | bps:N (1..=10000)'),
+  ('slippage_rate',                         '0.01',   'decimal', 'Expected BUY slippage: sizing multiplies the all-in cost per share (price plus fee) by 1 + this rate (0..=1)'),
+  ('sizing_mode',                           'dollar', 'text',    'Shared PAPER sizing mode: kelly | dollar | contract | cash_fraction:f (0 < f < 1: that share of cash per copy, kept above the cash floor). Reaches ordinary-live only as the fallback when accounts.live_sizing_mode is NULL'),
   ('sizing_dollar_usd',                     '25',     'decimal', 'USD per PAPER trade when sizing_mode=dollar. Live accounts size from accounts.live_sizing_dollar_usd; this value reaches live only via the NULL live_sizing_mode fallback'),
   ('sizing_contracts',                      '1',      'integer', 'Contracts per trade when sizing_mode=contract (parked default)')
   on conflict (key) do nothing;
