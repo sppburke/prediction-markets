@@ -880,7 +880,21 @@ print(json.load(open(sys.argv[1], encoding="utf-8"))["resumed"])' "$stage_json")
     fi
 
     export PE_BOOTSTRAP_CACHE_PATH="$side"
-    run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    # Discovery runs once per cycle: on a retry, the committed activation batch proves
+    # discovery and activation already finished, and rerunning discovery cannot change
+    # that cohort (#788). activate-next still runs to validate and reload it.
+    local batch_recorded
+    batch_recorded="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py activation-batch \
+      --db "$side" --batch-id "$ACTIVATION_BATCH_ID")" || {
+      echo "FATAL: could not read activation batch $ACTIVATION_BATCH_ID from the candidate" >&2; exit 2;
+    }
+    if [[ "$batch_recorded" == "1" ]]; then
+      echo "   [winner-discovery] skipped: activation batch $ACTIVATION_BATCH_ID already recorded"
+    elif [[ "$batch_recorded" == "0" ]]; then
+      run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    else
+      echo "FATAL: unexpected activation batch probe output: $batch_recorded" >&2; exit 2
+    fi
     run_refresh_stage "activate-next" "$PE_BOOTSTRAP_BIN" activate-next \
       --batch-id "$ACTIVATION_BATCH_ID" --audit-csv "$ACTIVATION_AUDIT_CSV" \
       "${BOOTSTRAP_CONFIG_ARGS[@]}"

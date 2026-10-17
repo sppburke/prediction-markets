@@ -705,6 +705,22 @@ def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collect
         return targets(generation)
 
 
+def activation_batch_recorded(side_path: Path, batch_id: str) -> bool:
+    """Whether the side cache already records this cycle's activation batch (#788).
+
+    `activate-next` commits the batch row and its cohort in one transaction, so the row
+    proves this cycle's discovery and activation finished; a retried cycle can skip
+    discovery. A cache without the table has recorded none. Other errors propagate.
+    """
+    with sqlite3.connect(f"file:{side_path}?mode=ro", uri=True) as side:
+        side.execute("PRAGMA query_only=ON")
+        if not _one(side, "SELECT EXISTS(SELECT 1 FROM sqlite_master "
+                          "WHERE type = 'table' AND name = 'wallet_activation_batches')"):
+            return False
+        return bool(_one(side, "SELECT EXISTS(SELECT 1 FROM wallet_activation_batches "
+                               "WHERE batch_id = ?)", (batch_id,)))
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -731,6 +747,10 @@ def parse_args():
     targets.add_argument("--max-staleness-hours", type=int)
     targets.add_argument("--include-bulk-root", action="store_true",
                          help="append bulk eligibility and activity completion (0/1); default output stays three lines")
+    batch = subparsers.add_parser("activation-batch",
+                                  help="print 1 when the side cache records the activation batch, else 0")
+    batch.add_argument("--db", type=Path, required=True)
+    batch.add_argument("--batch-id", required=True)
     return parser.parse_args()
 
 
@@ -748,6 +768,9 @@ def main() -> int:
                                        max_staleness_hours=args.max_staleness_hours,
                                        include_bulk_root=args.include_bulk_root):
             print(value)
+        return 0
+    if args.command == "activation-batch":
+        print(int(activation_batch_recorded(args.db, args.batch_id)))
         return 0
     if args.command == "capture":
         versions = json.loads(args.versions_file.read_text(encoding="utf-8"))

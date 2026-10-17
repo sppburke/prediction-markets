@@ -53,6 +53,16 @@ use time::OffsetDateTime;
 const RESOLUTION_AUDIT_REPAIR_LIMIT: usize = 5_000;
 const RESOLUTION_AUDIT_END_BUFFER_SECS: i64 = 3_600;
 
+/// Request timeout for the payout walk's CLOB `/markets?closed=true` pages: on 2026-10-16
+/// two pages took 50-107 s at the origin, so the shared 10 s timeout could never complete
+/// them (#788). Canonical default `clob_payout_request_timeout_secs` in `docs/_GLOSSARY.md`.
+const CLOB_PAYOUT_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+/// Fetcher-internal retries for the payout walk: none, because each one re-issues the same
+/// slow query; the walk's own page retries (`clob_page_max_retries`) still apply (#788).
+/// Canonical default `clob_payout_fetch_retries` in `docs/_GLOSSARY.md`.
+const CLOB_PAYOUT_FETCH_RETRIES: u32 = 0;
+
 /// Outcome of [`fetch_resolutions_and_schedules`] (issue #201).
 ///
 /// The optional Gamma stages (schedules/liquidity, null-rewrite,
@@ -187,8 +197,7 @@ pub async fn populate_clob_payout_v2(
             message: "CLOB payout v2 population requires a schema-v2 side cache".to_owned(),
         });
     }
-    let fetcher = build_clob_fetcher(config)?;
-    fetcher
+    build_clob_payout_fetcher(config)?
         .fetch_closed_markets(cache)
         .await?
         .coverage_manifest
@@ -203,15 +212,32 @@ pub async fn populate_clob_payout_v2(
 fn build_clob_fetcher(
     config: &BootstrapConfig,
 ) -> Result<clob::ClobFetcher<pe_source_polymarket_public::ReqwestFetcher>, BootstrapError> {
-    use pe_source_polymarket_public::ReqwestFetcher;
+    Ok(clob::ClobFetcher::new(
+        config.clob_base_url.clone(),
+        clob_page_fetcher()?,
+    ))
+}
+
+/// The payout walk's CLOB fetcher: its own request timeout and no retries inside
+/// the fetcher, so a slow page is waited out once rather than re-requested (#788).
+fn build_clob_payout_fetcher(
+    config: &BootstrapConfig,
+) -> Result<clob::ClobFetcher<pe_source_polymarket_public::ReqwestFetcher>, BootstrapError> {
+    Ok(clob::ClobFetcher::new(
+        config.clob_base_url.clone(),
+        clob_page_fetcher()?
+            .with_timeout(CLOB_PAYOUT_REQUEST_TIMEOUT_SECS)
+            .with_max_retries(CLOB_PAYOUT_FETCH_RETRIES),
+    ))
+}
+
+/// The CLOB page fetcher with the shared request defaults and CLOB pacing.
+fn clob_page_fetcher() -> Result<pe_source_polymarket_public::ReqwestFetcher, BootstrapError> {
     let clob_client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(15))
         .build()
         .map_err(|_| BootstrapError::Internal)?;
-    Ok(clob::ClobFetcher::new(
-        config.clob_base_url.clone(),
-        ReqwestFetcher::new(clob_client).with_min_interval_ms(200),
-    ))
+    Ok(pe_source_polymarket_public::ReqwestFetcher::new(clob_client).with_min_interval_ms(200))
 }
 
 async fn run_clob_closed_markets<F: PageFetcher + Send + Sync>(
@@ -586,6 +612,19 @@ pub(crate) fn unresolved_market_ids(all: &[String], resolved: &HashSet<String>) 
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    // #788: the payout walk's CLOB fetcher waits up to 120 s and never retries
+    // inside the fetcher; the legacy `resolutions` walk's keeps 10 s and 3.
+    #[test]
+    fn payout_and_legacy_clob_fetchers_keep_their_own_policies() {
+        let config = BootstrapConfig::default();
+        let payout = build_clob_payout_fetcher(&config).unwrap();
+        let legacy = build_clob_fetcher(&config).unwrap();
+        assert_eq!(payout.page_fetcher().timeout(), Duration::from_secs(120));
+        assert_eq!(payout.page_fetcher().max_retries(), 0);
+        assert_eq!(legacy.page_fetcher().timeout(), Duration::from_secs(10));
+        assert_eq!(legacy.page_fetcher().max_retries(), 3);
+    }
 
     fn seed_audit_trade(cache: &WalletCache, id: &str, market_id: &str) {
         cache

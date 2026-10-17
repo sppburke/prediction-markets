@@ -10,7 +10,8 @@ import sys
 import tempfile
 import unittest
 
-from rank_cycle_manifest import TOP_UP_RESERVE_HOURS, _fresh_identity, candidate_targets
+from rank_cycle_manifest import (TOP_UP_RESERVE_HOURS, _fresh_identity, activation_batch_recorded,
+                                 candidate_targets)
 import test_rank_and_push as wrapper_tests
 
 
@@ -398,6 +399,56 @@ class CandidateTargetsTest(unittest.TestCase):
             payout_generation=2, fresh_identity=None)))
         self.assertEqual(candidate_targets(None, self.side, after_collection=True,
                                            now=100, max_staleness_hours=24), (1, 2, 0))
+
+class ActivationBatchTest(unittest.TestCase):
+    """The probe that lets a retried cycle skip finished discovery (#788)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.side = Path(self.tmp.name) / "side.db"
+
+    def record(self, *rows):
+        with sqlite3.connect(self.side) as c:
+            c.execute("CREATE TABLE IF NOT EXISTS wallet_activation_batches (batch_id TEXT PRIMARY KEY NOT NULL, "
+                      "activated_at_unix INTEGER NOT NULL, requested_count INTEGER NOT NULL, "
+                      "activated_count INTEGER NOT NULL)")
+            c.executemany("INSERT INTO wallet_activation_batches VALUES (?, 1, ?, ?)", rows)
+        c.close()
+
+    def cli(self, batch_id):
+        return subprocess.run([sys.executable, str(Path(__file__).with_name("rank_cycle_manifest.py")),
+                               "activation-batch", "--db", str(self.side), "--batch-id", batch_id],
+                              capture_output=True, text=True)
+
+    def test_recorded_batches_including_an_empty_cohort(self):
+        self.record(("run-a", 25, 25), ("run-empty", 25, 0))
+        before = self.side.read_bytes()
+        self.assertTrue(activation_batch_recorded(self.side, "run-a"))
+        self.assertTrue(activation_batch_recorded(self.side, "run-empty"))
+        self.assertFalse(activation_batch_recorded(self.side, "run-b"))
+        for batch_id, expected in (("run-a", "1\n"), ("run-empty", "1\n"), ("run-b", "0\n")):
+            result = self.cli(batch_id)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, expected)
+        self.assertEqual(self.side.read_bytes(), before)
+
+    def test_a_cache_without_the_table_records_none(self):
+        sqlite3.connect(self.side).close()
+        self.assertFalse(activation_batch_recorded(self.side, "run-a"))
+        self.assertEqual(self.cli("run-a").stdout, "0\n")
+
+    def test_missing_or_damaged_cache_fails_closed(self):
+        result = self.cli("run-a")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.side.write_bytes(b"not a database" * 100)
+        with self.assertRaises(sqlite3.DatabaseError):
+            activation_batch_recorded(self.side, "run-a")
+        result = self.cli("run-a")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

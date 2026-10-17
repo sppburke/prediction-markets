@@ -147,6 +147,16 @@ impl ReqwestFetcher {
         self
     }
 
+    /// The per-request timeout; it bounds the whole reply, body included.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Transient-error retries inside one fetch.
+    pub fn max_retries(&self) -> u32 {
+        self.max_retries
+    }
+
     /// Override transient-error retries (default `polymarket_max_retries = 3`).
     pub fn with_max_retries(mut self, n: u32) -> Self {
         self.max_retries = n;

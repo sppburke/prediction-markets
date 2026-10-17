@@ -10,6 +10,7 @@
 //!   7. exhaust_retries_408    — always 408, max_retries=2 → Transient; 3 total requests. (issue #159)
 //!   8. unreadable_reply      — incomplete JSON retries, retains responses, and shares the retry budget.
 //!   9. unexpected_json_shape — complete JSON passes through unchanged.
+//!  10. timeout_bounds_body   — headers at once, body one byte per 400 ms, 5 s timeout → BodyRead, Transient. (#788)
 
 #![cfg(feature = "scenario")]
 #![allow(
@@ -19,15 +20,17 @@
     clippy::arithmetic_side_effects
 )]
 
+use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use pe_core_types::RawHttpAttempt;
+use pe_core_types::{RawHttpAttempt, TransportErrorClass};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{HttpRequestContext, PageFetcher, ReqwestFetcher};
 
@@ -441,5 +444,98 @@ async fn scenario_unexpected_json_shape_passes_through() {
         .expect("valid JSON passes through");
 
     assert_eq!(bytes, body);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+// ── Scenario 10: timeout_bounds_body ──────────────────────────────────────────
+
+/// Reads one request head (a GET carries no body) and reports whether it arrived complete.
+fn read_request_head(stream: &mut std::net::TcpStream) -> bool {
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 1_024];
+    loop {
+        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+            return true;
+        }
+        if head.len() >= 16_384 {
+            return false;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return false,
+            Ok(read) => head.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+/// A raw HTTP/1.1 server that answers each complete request with its headers at
+/// once, then sends `body` one byte every 400 ms; it counts those requests.
+fn start_trickle_server(body: &'static [u8]) -> (String, Arc<AtomicU32>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind failed");
+    let addr = listener.local_addr().expect("local_addr");
+    let hits = Arc::new(AtomicU32::new(0));
+    let counter = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(8) {
+            let Ok(mut stream) = stream else { continue };
+            if !read_request_head(&mut stream) {
+                continue;
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(head.as_bytes()).is_err() {
+                continue;
+            }
+            for byte in body {
+                std::thread::sleep(Duration::from_millis(400));
+                if stream.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// PASS: the request timeout bounds the whole reply, body included: headers
+/// arrive at once but the body takes about 26 s, so a 5 s timeout ends the one
+/// request while its body is being read (a `BodyRead` failure, then Transient).
+/// The margins keep a multi-second scheduling stall from changing the outcome.
+/// FAIL: the fetch returns the page or fails elsewhere, because the timeout
+/// covered only the headers or restarted on every read (the #788 payout
+/// timeout relies on it bounding the body).
+#[tokio::test]
+async fn scenario_timeout_bounds_a_trickling_body() {
+    let (base, hits) =
+        start_trickle_server(br#"{"data":[],"next_cursor":"LTE=","note":"one byte every 400 ms"}"#);
+    let mut attempts = Vec::new();
+    let result = make_fetcher()
+        .with_timeout(5)
+        .with_max_retries(0)
+        .fetch_page_observed(
+            &format!("{base}/data"),
+            HttpRequestContext {
+                source_id: "test-server",
+                endpoint_kind: "trickling-body",
+            },
+            |attempt| {
+                attempts.push(attempt);
+                Ok(())
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(SourceError::Transient { .. })),
+        "expected the timeout to end the trickling reply, got {result:?}"
+    );
+    let [RawHttpAttempt::TransportFailure(failure)] = attempts.as_slice() else {
+        panic!("expected one transport failure, got {attempts:?}");
+    };
+    assert_eq!(failure.error_class, TransportErrorClass::BodyRead);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
