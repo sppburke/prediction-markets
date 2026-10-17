@@ -15,7 +15,7 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -133,24 +133,60 @@ impl PageFetcher for ScriptedFetcher {
     }
 }
 
-/// An in-process HTTP/1.1 server that waits `delay` before answering every
-/// request with `body`. Write failures (an abandoned request) are ignored.
+/// Reads one request head (a GET carries no body), so the reply never races
+/// unread request bytes on close.
+fn read_request_head(stream: &mut TcpStream) {
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1_024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") && head.len() < 16_384 {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(read) => head.extend_from_slice(&chunk[..read]),
+        }
+    }
+}
+
+/// An in-process HTTP/1.1 server that answers every request with its headers
+/// at once, then waits `delay` before sending `body`. Write failures (an
+/// abandoned request) are ignored.
 fn start_slow_server(delay: Duration, body: Vec<u8>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     thread::spawn(move || {
         for stream in listener.incoming().take(64) {
             let Ok(mut stream) = stream else { continue };
-            let mut request = [0u8; 4_096];
-            let _ = stream.read(&mut request);
-            thread::sleep(delay);
+            read_request_head(&mut stream);
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
                  Content-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             let _ = stream.write_all(head.as_bytes());
+            let _ = stream.flush();
+            thread::sleep(delay);
             let _ = stream.write_all(&body);
+        }
+    });
+    format!("http://{address}")
+}
+
+/// An in-process HTTP/1.1 server that counts requests: it answers the first
+/// with 503 and every later one with 429 `Retry-After: 1`.
+fn start_unavailable_server(requests: Arc<AtomicU32>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(64) {
+            let Ok(mut stream) = stream else { continue };
+            read_request_head(&mut stream);
+            let reply = if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            } else {
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            };
+            let _ = stream.write_all(reply.as_bytes());
         }
     });
     format!("http://{address}")
@@ -385,7 +421,7 @@ async fn schema_two_payout_walk_keeps_its_checkpoint_through_retry_exhaustion() 
     println!("PASS: schema-two payout walk kept its checkpoint through exhaustion and resumed");
 }
 
-// PASS: the payout walk completes a page whose reply arrives after the shared
+// PASS: the payout walk completes a page whose body arrives after the shared
 //       10 s request timeout, because it waits up to its own 120 s (#788).
 // FAIL: the walk abandons the slow reply (exhausting its retries), or does not
 //       finish within the 60 s test deadline.
@@ -406,4 +442,47 @@ async fn payout_walk_waits_out_a_reply_slower_than_the_shared_timeout() {
     .expect("the slow page completes");
     assert_eq!(manifest.pages.len(), 1);
     println!("PASS: payout walk completed a reply slower than the shared 10 s timeout");
+}
+
+// PASS: through the production payout fetcher, a failing page is requested
+//       exactly six times (1 initial + 5 page retries) before the walk returns
+//       TransientSource (exit 75): the fetcher itself never retries. The first
+//       reply is a 503, which a fetcher with its own retries would request
+//       again; later replies are 429 `Retry-After: 1`, so the page budget runs
+//       out after ~5 s rather than 31 s of transient backoff.
+// FAIL: the fetcher retries the 503 itself (7 or more requests), or the
+//       exhausted walk maps to another error or exit code (#788).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn payout_walk_sends_one_request_per_page_attempt() {
+    let (dir, mut cache) = open_v2_cache();
+    let requests = Arc::new(AtomicU32::new(0));
+    let config = BootstrapConfig {
+        cache_path: dir.path().join("cache.db"),
+        clob_base_url: start_unavailable_server(Arc::clone(&requests)),
+        ..BootstrapConfig::default()
+    };
+    let err = tokio::time::timeout(
+        Duration::from_secs(60),
+        pe_bootstrap::populate_clob_payout_v2(&config, &mut cache),
+    )
+    .await
+    .expect("the walk finishes within the deadline")
+    .expect_err("every reply fails");
+    assert!(
+        matches!(
+            err,
+            BootstrapError::TransientSource {
+                source_name: "polymarket-clob",
+                ..
+            }
+        ),
+        "expected TransientSource from polymarket-clob, got {err:?}"
+    );
+    assert_eq!(err.exit_code(), BootstrapError::TEMPFAIL_EXIT_CODE);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        6,
+        "1 initial request + 5 page retries, none inside the fetcher"
+    );
+    println!("PASS: payout walk sent one request per page attempt and exited 75 after six");
 }
