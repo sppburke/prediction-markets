@@ -197,13 +197,7 @@ pub async fn populate_clob_payout_v2(
             message: "CLOB payout v2 population requires a schema-v2 side cache".to_owned(),
         });
     }
-    let fetcher = clob::ClobFetcher::new(
-        config.clob_base_url.clone(),
-        clob_page_fetcher()?
-            .with_timeout(CLOB_PAYOUT_REQUEST_TIMEOUT_SECS)
-            .with_max_retries(CLOB_PAYOUT_FETCH_RETRIES),
-    );
-    fetcher
+    build_clob_payout_fetcher(config)?
         .fetch_closed_markets(cache)
         .await?
         .coverage_manifest
@@ -221,6 +215,19 @@ fn build_clob_fetcher(
     Ok(clob::ClobFetcher::new(
         config.clob_base_url.clone(),
         clob_page_fetcher()?,
+    ))
+}
+
+/// The payout walk's CLOB fetcher: its own request timeout and no retries inside
+/// the fetcher, so a slow page is waited out once rather than re-requested (#788).
+fn build_clob_payout_fetcher(
+    config: &BootstrapConfig,
+) -> Result<clob::ClobFetcher<pe_source_polymarket_public::ReqwestFetcher>, BootstrapError> {
+    Ok(clob::ClobFetcher::new(
+        config.clob_base_url.clone(),
+        clob_page_fetcher()?
+            .with_timeout(CLOB_PAYOUT_REQUEST_TIMEOUT_SECS)
+            .with_max_retries(CLOB_PAYOUT_FETCH_RETRIES),
     ))
 }
 
@@ -605,6 +612,20 @@ pub(crate) fn unresolved_market_ids(all: &[String], resolved: &HashSet<String>) 
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    // #788: the payout walk's CLOB fetcher waits up to 120 s and never retries
+    // inside the fetcher; the legacy `resolutions` walk's keeps the shared defaults.
+    #[test]
+    fn payout_and_legacy_clob_fetchers_keep_their_own_policies() {
+        let config = BootstrapConfig::default();
+        let payout = build_clob_payout_fetcher(&config).unwrap();
+        let legacy = build_clob_fetcher(&config).unwrap();
+        let defaults = pe_source_polymarket_public::ReqwestFetcher::new(reqwest::Client::new());
+        assert_eq!(payout.page_fetcher().timeout(), Duration::from_secs(120));
+        assert_eq!(payout.page_fetcher().max_retries(), 0);
+        assert_eq!(legacy.page_fetcher().timeout(), defaults.timeout());
+        assert_eq!(legacy.page_fetcher().max_retries(), defaults.max_retries());
+    }
 
     fn seed_audit_trade(cache: &WalletCache, id: &str, market_id: &str) {
         cache

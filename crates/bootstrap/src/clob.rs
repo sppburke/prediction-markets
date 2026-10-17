@@ -111,6 +111,11 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
         Self { base_url, fetcher }
     }
 
+    #[cfg(test)]
+    pub(crate) fn page_fetcher(&self) -> &F {
+        &self.fetcher
+    }
+
     /// Fetch one response, retrying transient / rate-limited errors with backoff
     /// before giving up (issue #429 follow-up).
     ///
