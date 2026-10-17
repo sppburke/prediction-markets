@@ -10,6 +10,7 @@
 //!   7. exhaust_retries_408    — always 408, max_retries=2 → Transient; 3 total requests. (issue #159)
 //!   8. unreadable_reply      — incomplete JSON retries, retains responses, and shares the retry budget.
 //!   9. unexpected_json_shape — complete JSON passes through unchanged.
+//!  10. timeout_bounds_body   — headers at once, body one byte per 200 ms, 1 s timeout → Transient. (#788)
 
 #![cfg(feature = "scenario")]
 #![allow(
@@ -19,8 +20,10 @@
     clippy::arithmetic_side_effects
 )]
 
+use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
@@ -441,5 +444,59 @@ async fn scenario_unexpected_json_shape_passes_through() {
         .expect("valid JSON passes through");
 
     assert_eq!(bytes, body);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+// ── Scenario 10: timeout_bounds_body ──────────────────────────────────────────
+
+/// A raw HTTP/1.1 server that answers each connection with its headers at once,
+/// then sends `body` one byte every 200 ms; it counts connections.
+fn start_trickle_server(body: &'static [u8]) -> (String, Arc<AtomicU32>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind failed");
+    let addr = listener.local_addr().expect("local_addr");
+    let hits = Arc::new(AtomicU32::new(0));
+    let counter = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(8) {
+            let Ok(mut stream) = stream else { continue };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 4_096];
+            let _ = stream.read(&mut request);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(head.as_bytes()).is_err() {
+                continue;
+            }
+            for byte in body {
+                std::thread::sleep(Duration::from_millis(200));
+                if stream.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// PASS: the request timeout bounds the whole reply, body included: headers
+/// arrive at once but the body takes about 6.6 s, so a 1 s timeout fails the
+/// fetch as Transient after one request.
+/// FAIL: the fetch returns the page, because the timeout covered only the
+/// headers or restarted on every read (the #788 payout timeout relies on it).
+#[tokio::test]
+async fn scenario_timeout_bounds_a_trickling_body() {
+    let (base, hits) = start_trickle_server(br#"{"data":[],"next_cursor":"LTE="}"#);
+    let result = make_fetcher()
+        .with_timeout(1)
+        .with_max_retries(0)
+        .fetch_page(&format!("{base}/data"))
+        .await;
+
+    assert!(
+        matches!(result, Err(SourceError::Transient { .. })),
+        "expected the timeout to end the trickling reply, got {result:?}"
+    );
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 }

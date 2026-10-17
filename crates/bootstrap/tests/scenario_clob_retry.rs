@@ -4,17 +4,21 @@
 //! Scenario: the CLOB closed-markets walk rides through transient fetch errors
 //! instead of aborting the whole pagination (issue #429 follow-up).
 //!
-//! `ReqwestFetcher` retries fast transient blips internally; this guards the
-//! *walk-level* retry that survives sustained flakiness — a single transient
-//! `error decoding response body` on one page previously killed the entire
-//! ~1,457-page re-walk and propagated a fatal exit.
+//! `ReqwestFetcher` retries fast transient blips internally (except in the
+//! payout walk, #788); this guards the *walk-level* retry that survives
+//! sustained flakiness — a single transient `error decoding response body` on
+//! one page previously killed the entire ~1,457-page re-walk and propagated a
+//! fatal exit.
 //!
-//! Deterministic: a custom in-process `PageFetcher` (no network); the retry
-//! backoff sleeps are virtual via `#[tokio::test(start_paused = true)]`, so the
-//! tests assert real retry behaviour without real wall-clock delay.
+//! Most tests use a custom in-process `PageFetcher` (no network), with the
+//! retry backoff virtual via `#[tokio::test(start_paused = true)]`, so they
+//! assert real retry behaviour without wall-clock delay. The #788 tests drive
+//! the production fetchers against an in-process HTTP/1.1 server on loopback
+//! instead, in real time (about 6-11 s each), because the policy under test is
+//! how those fetchers are built.
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -133,15 +137,23 @@ impl PageFetcher for ScriptedFetcher {
     }
 }
 
-/// Reads one request head (a GET carries no body), so the reply never races
-/// unread request bytes on close.
-fn read_request_head(stream: &mut TcpStream) {
+/// Reads one request head (a GET carries no body) and reports whether it
+/// arrived complete, so a server neither counts nor answers a cut-off request.
+fn read_request_head(stream: &mut TcpStream) -> bool {
     let mut head = Vec::new();
     let mut chunk = [0u8; 1_024];
-    while !head.windows(4).any(|window| window == b"\r\n\r\n") && head.len() < 16_384 {
+    loop {
+        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+            return true;
+        }
+        if head.len() >= 16_384 {
+            return false;
+        }
         match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return false,
             Ok(read) => head.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return false,
         }
     }
 }
@@ -155,7 +167,9 @@ fn start_slow_server(delay: Duration, body: Vec<u8>) -> String {
     thread::spawn(move || {
         for stream in listener.incoming().take(64) {
             let Ok(mut stream) = stream else { continue };
-            read_request_head(&mut stream);
+            if !read_request_head(&mut stream) {
+                continue;
+            }
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
                  Content-Length: {}\r\nConnection: close\r\n\r\n",
@@ -170,23 +184,36 @@ fn start_slow_server(delay: Duration, body: Vec<u8>) -> String {
     format!("http://{address}")
 }
 
-/// An in-process HTTP/1.1 server that counts requests: it answers the first
-/// with 503 and every later one with 429 `Retry-After: 1`.
-fn start_unavailable_server(requests: Arc<AtomicU32>) -> String {
+/// An in-process HTTP/1.1 server that counts complete requests and fails each
+/// one: first one of every kind `ReqwestFetcher` may retry itself (a body cut
+/// short of its `Content-Length`, a hang-up before any reply, a 503), then 429
+/// `Retry-After: 1`, which no fetcher retries itself, so a page's retry budget
+/// runs out within seconds.
+fn start_failing_server(requests: Arc<AtomicU32>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     thread::spawn(move || {
         for stream in listener.incoming().take(64) {
             let Ok(mut stream) = stream else { continue };
-            read_request_head(&mut stream);
-            let reply = if requests.fetch_add(1, Ordering::SeqCst) == 0 {
-                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
-                 Connection: close\r\n\r\n"
-            } else {
-                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\n\
-                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            if !read_request_head(&mut stream) {
+                continue;
+            }
+            let reply: &[u8] = match requests.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                      Content-Length: 100\r\nConnection: close\r\n\r\n{\"data\":["
+                }
+                1 => b"",
+                2 => {
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+                       Connection: close\r\n\r\n"
+                }
+                _ => {
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\n\
+                       Content-Length: 0\r\nConnection: close\r\n\r\n"
+                }
             };
-            let _ = stream.write_all(reply.as_bytes());
+            let _ = stream.write_all(reply);
         }
     });
     format!("http://{address}")
@@ -424,8 +451,8 @@ async fn schema_two_payout_walk_keeps_its_checkpoint_through_retry_exhaustion() 
 // PASS: the payout walk completes a page whose body arrives after the shared
 //       10 s request timeout, because it waits up to its own 120 s (#788).
 // FAIL: the walk abandons the slow reply (exhausting its retries), or does not
-//       finish within the 60 s test deadline.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+//       finish within the 110 s test deadline.
+#[tokio::test]
 async fn payout_walk_waits_out_a_reply_slower_than_the_shared_timeout() {
     let (dir, mut cache) = open_v2_cache();
     let config = BootstrapConfig {
@@ -434,7 +461,7 @@ async fn payout_walk_waits_out_a_reply_slower_than_the_shared_timeout() {
         ..BootstrapConfig::default()
     };
     let manifest = tokio::time::timeout(
-        Duration::from_secs(60),
+        Duration::from_secs(110),
         pe_bootstrap::populate_clob_payout_v2(&config, &mut cache),
     )
     .await
@@ -445,20 +472,18 @@ async fn payout_walk_waits_out_a_reply_slower_than_the_shared_timeout() {
 }
 
 // PASS: through the production payout fetcher, a failing page is requested
-//       exactly six times (1 initial + 5 page retries) before the walk returns
-//       TransientSource (exit 75): the fetcher itself never retries. The first
-//       reply is a 503, which a fetcher with its own retries would request
-//       again; later replies are 429 `Retry-After: 1`, so the page budget runs
-//       out after ~5 s rather than 31 s of transient backoff.
-// FAIL: the fetcher retries the 503 itself (7 or more requests), or the
-//       exhausted walk maps to another error or exit code (#788).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+//       exactly six times (1 initial + 5 page retries; ~9 s of backoff) before
+//       the walk returns TransientSource (exit 75): the fetcher never retries
+//       a cut-off body, a hang-up or a 503 itself.
+// FAIL: any of those is retried inside the fetcher (7 or more requests), or
+//       the exhausted walk maps to another error or exit code (#788).
+#[tokio::test]
 async fn payout_walk_sends_one_request_per_page_attempt() {
     let (dir, mut cache) = open_v2_cache();
     let requests = Arc::new(AtomicU32::new(0));
     let config = BootstrapConfig {
         cache_path: dir.path().join("cache.db"),
-        clob_base_url: start_unavailable_server(Arc::clone(&requests)),
+        clob_base_url: start_failing_server(Arc::clone(&requests)),
         ..BootstrapConfig::default()
     };
     let err = tokio::time::timeout(
@@ -485,4 +510,47 @@ async fn payout_walk_sends_one_request_per_page_attempt() {
         "1 initial request + 5 page retries, none inside the fetcher"
     );
     println!("PASS: payout walk sent one request per page attempt and exited 75 after six");
+}
+
+// PASS: the legacy `resolutions` walk keeps the shared fetcher's own retries:
+//       the same replies cost 9 requests (the cut-off body, hang-up and 503
+//       are retried inside the fetcher until a 429 ends that attempt, then 5
+//       page retries) before exit 75; #788 leaves this path unchanged.
+// FAIL: fewer requests (the payout overrides reached the shared fetcher), or
+//       another error or exit code.
+#[tokio::test]
+async fn legacy_resolutions_walk_keeps_the_fetcher_retries() {
+    let (dir, mut cache) = open_cache();
+    let requests = Arc::new(AtomicU32::new(0));
+    let base_url = start_failing_server(Arc::clone(&requests));
+    let config = BootstrapConfig {
+        cache_path: dir.path().join("cache.db"),
+        clob_base_url: base_url.clone(),
+        gamma_base_url: base_url,
+        ..BootstrapConfig::default()
+    };
+    let err = tokio::time::timeout(
+        Duration::from_secs(60),
+        pe_bootstrap::fetch_resolutions_and_schedules(&config, &mut cache, &[]),
+    )
+    .await
+    .expect("the walk finishes within the deadline")
+    .expect_err("every reply fails");
+    assert!(
+        matches!(
+            err,
+            BootstrapError::TransientSource {
+                source_name: "polymarket-clob",
+                ..
+            }
+        ),
+        "expected TransientSource from polymarket-clob, got {err:?}"
+    );
+    assert_eq!(err.exit_code(), BootstrapError::TEMPFAIL_EXIT_CODE);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        9,
+        "3 failures retried inside the fetcher until a 429, then 5 page retries"
+    );
+    println!("PASS: legacy resolutions walk kept the fetcher's own retries (9 requests, exit 75)");
 }
