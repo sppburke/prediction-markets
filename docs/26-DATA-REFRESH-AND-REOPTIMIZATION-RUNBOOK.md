@@ -919,6 +919,8 @@ pe-bootstrap cache-migrate-v2 --db "$SIDE" --manifest "$CACHE_BUILD_MANIFEST"   
 # Fresh copy only (cache_stage.json "resumed": false), once per line of
 # deploy/forge/reviewed-infra-clears.txt, in file order (docs/37 §7):
 pe-bootstrap clear-infra-exclusion --db "$SIDE" --wallet "$WALLET" --purged-at "$PURGED_AT" --confirm
+# Skipped on a retried cycle whose candidate already records $BATCH in wallet_activation_batches
+# (rank_cycle_manifest.py activation-batch; an unreadable probe exits 2) (#788):
 pe-bootstrap winner-discovery --db "$SIDE" --defer-activation
 pe-bootstrap activate-next --db "$SIDE" --batch-id "$BATCH" --audit-csv "$AUDIT"
 pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N"
@@ -1642,7 +1644,10 @@ checking the run flag once per second, then:
 - Otherwise, if `rank_and_push.cycle` exists, the loop invokes the normal
   zero-argument command. The one-shot reuses the pointed run directory and
   deterministic activation batch, so retrying discovery, activation, backfill,
-  events, or ranking cannot admit another activation batch.
+  events, or ranking cannot admit another activation batch. In the schema-two
+  candidate lane a retry skips `winner-discovery` once the candidate records that
+  batch, and `activate-next` still validates and reloads it (#788); the payout walk's
+  slow-page timeout and retries are in the glossary (`clob_payout_request_timeout_secs`).
 - Exit 75 without either pointer is fatal. Any nonzero code other than 75 is a
   permanent failure and stops the loop with the applicable pointer retained for
   diagnosis and an operator-directed retry.

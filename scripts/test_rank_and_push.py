@@ -1739,7 +1739,7 @@ class RankAndPushScenario(unittest.TestCase):
         assert marker in body
         emulate = (
             'case "$1" in cache-stage-v2|cache-migrate-v2|cache-populate-activity-v2'
-            '|cache-populate-payout-v2|cache-finalize-v2|cache-activate)\n'
+            '|cache-populate-payout-v2|cache-finalize-v2|cache-activate|activate-next)\n'
             f'  {shlex.quote(sys.executable)} scripts/_stub_cache_ops.py "$@" || exit $?\n'
             'esac\n'
         )
@@ -1870,6 +1870,12 @@ class RankAndPushScenario(unittest.TestCase):
             "        inputs = dict(activity_generation=generation, oracle_version=6, certificate_digest=hashlib.sha256(json.dumps(certs,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest())\n"
             "        c.execute('UPDATE cache_v2_migration_state SET phase=?, ranker_projection_count = 1, ranker_projection_digest = ?, ranker_classifier_version = 6, ranker_projection_inputs_json=?', ('finalized',f'digest-{generation}',json.dumps(inputs)))\n"
             "    if opt('--stage-record'): json.dump({'cache_path': os.path.abspath(db), 'cache_sha256': sha(db)}, open(opt('--stage-record'), 'w'))\n"
+            "elif sub == 'activate-next':\n"
+            "    # Opt-in: commit the batch row as activate-next does (#788).\n"
+            "    if os.environ.get('STUB_RECORD_ACTIVATION') == '1':\n"
+            "        with sqlite3.connect(os.environ['PE_BOOTSTRAP_CACHE_PATH']) as c:\n"
+            "            c.execute('CREATE TABLE IF NOT EXISTS wallet_activation_batches (batch_id TEXT PRIMARY KEY NOT NULL, activated_at_unix INTEGER NOT NULL, requested_count INTEGER NOT NULL, activated_count INTEGER NOT NULL)')\n"
+            "            c.execute('INSERT OR IGNORE INTO wallet_activation_batches VALUES (?, ?, 0, 0)', (opt('--batch-id'), now))\n"
             "elif sub == 'cache-activate':\n"
             "    fixed, backup = opt('--fixed-db'), opt('--backup')\n"
             "    evidence_path = Path(db).with_suffix('.stage.json')\n"
@@ -2892,6 +2898,59 @@ finally:
         self._assert_lane_record(self.root / "data/eval-results" / out / "accepted_cycle_manifest.json")
         self.assertIn("   [payout] completed walk at or after the activity head; reused", second.stdout)
         print("PASS: recurring lane resumes its own candidate and reuses the completed payout walk")
+
+    def test_payout_retry_skips_discovery_once_the_activation_batch_is_recorded(self):
+        """PASS: after a payout tempfail in the schema-two candidate lane, the retry
+        reuses the run directory and activation batch, skips winner-discovery
+        because the candidate records the batch, and still runs activate-next (#788).
+        FAIL: discovery runs again, activation is skipped, or the directory or
+        batch changes."""
+        self._install_candidate_layout(schema=2)
+        self._install_candidate_stub()
+        env = {"STUB_RECORD_ACTIVATION": "1", "STUB_EXIT_cache_populate_payout_v2": "75"}
+        first = self._run(exit_env=env)
+        self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+        pointer = self.root / "data/eval-results/rank_and_push.cycle"
+        cycle = pointer.read_text()
+        second = self._run(exit_env=env)
+        self.assertEqual(second.returncode, 75, second.stderr + second.stdout)
+        self.assertEqual(pointer.read_text(), cycle)
+        ops = self._bootstrap_ops()
+        self.assertEqual(ops.count("winner-discovery"), 1, "discovery reran for a recorded batch")
+        self.assertEqual(ops.count("cache-populate-payout-v2"), 2)
+        activations = self._bootstrap_lines("activate-next")
+        self.assertEqual(len(activations), 2, "activate-next must still validate the cohort")
+        batch = activations[0].split()[2]
+        self.assertEqual(activations[1].split()[2], batch)
+        self.assertIn(f"   [winner-discovery] skipped: activation batch {batch} already recorded",
+                      second.stdout)
+        print("PASS: a payout retry skips finished discovery and still validates the activation batch")
+
+    def test_payout_retry_runs_discovery_without_a_recorded_batch_and_fails_closed_on_a_probe_error(self):
+        """PASS: a retry whose candidate records no batch runs discovery again, and
+        a batch probe that cannot read the candidate stops the cycle with exit 2
+        before discovery or activation (#788). FAIL: a silent skip, or the cycle
+        continues past an unreadable probe."""
+        fixed = self._install_candidate_layout(schema=2)
+        self._install_candidate_stub()
+        env = {"STUB_EXIT_cache_populate_payout_v2": "75"}
+        first = self._run(exit_env=env)
+        self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+        second = self._run(exit_env=env)
+        self.assertEqual(second.returncode, 75, second.stderr + second.stdout)
+        self.assertEqual(self._bootstrap_ops().count("winner-discovery"), 2)
+        self.assertNotIn("[winner-discovery] skipped", second.stdout)
+        side = next(fixed.parent.glob("wallet_cache.*.side.db"))
+        with sqlite3.connect(side) as connection:
+            connection.execute("CREATE TABLE wallet_activation_batches (unexpected TEXT)")
+        connection.close()
+        third = self._run(exit_env=env)
+        self.assertEqual(third.returncode, 2, third.stderr + third.stdout)
+        self.assertIn("FATAL: could not read activation batch", third.stderr)
+        ops = self._bootstrap_ops()
+        self.assertEqual(ops.count("winner-discovery"), 2)
+        self.assertEqual(ops.count("activate-next"), 2)
+        print("PASS: an unrecorded batch reruns discovery; an unreadable probe fails closed")
 
     def test_lane_is_frozen_with_the_cycle_across_opt_in_changes(self):
         """PASS: a cycle keeps the lane it was created with when the opt-in flips
