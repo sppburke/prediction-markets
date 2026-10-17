@@ -614,17 +614,16 @@ mod tests {
     use std::collections::HashMap;
 
     // #788: the payout walk's CLOB fetcher waits up to 120 s and never retries
-    // inside the fetcher; the legacy `resolutions` walk's keeps the shared defaults.
+    // inside the fetcher; the legacy `resolutions` walk's keeps 10 s and 3.
     #[test]
     fn payout_and_legacy_clob_fetchers_keep_their_own_policies() {
         let config = BootstrapConfig::default();
         let payout = build_clob_payout_fetcher(&config).unwrap();
         let legacy = build_clob_fetcher(&config).unwrap();
-        let defaults = pe_source_polymarket_public::ReqwestFetcher::new(reqwest::Client::new());
         assert_eq!(payout.page_fetcher().timeout(), Duration::from_secs(120));
         assert_eq!(payout.page_fetcher().max_retries(), 0);
-        assert_eq!(legacy.page_fetcher().timeout(), defaults.timeout());
-        assert_eq!(legacy.page_fetcher().max_retries(), defaults.max_retries());
+        assert_eq!(legacy.page_fetcher().timeout(), Duration::from_secs(10));
+        assert_eq!(legacy.page_fetcher().max_retries(), 3);
     }
 
     fn seed_audit_trade(cache: &WalletCache, id: &str, market_id: &str) {

@@ -10,7 +10,7 @@
 //!   7. exhaust_retries_408    — always 408, max_retries=2 → Transient; 3 total requests. (issue #159)
 //!   8. unreadable_reply      — incomplete JSON retries, retains responses, and shares the retry budget.
 //!   9. unexpected_json_shape — complete JSON passes through unchanged.
-//!  10. timeout_bounds_body   — headers at once, body one byte per 200 ms, 2 s timeout → BodyRead, Transient. (#788)
+//!  10. timeout_bounds_body   — headers at once, body one byte per 400 ms, 5 s timeout → BodyRead, Transient. (#788)
 
 #![cfg(feature = "scenario")]
 #![allow(
@@ -470,7 +470,7 @@ fn read_request_head(stream: &mut std::net::TcpStream) -> bool {
 }
 
 /// A raw HTTP/1.1 server that answers each complete request with its headers at
-/// once, then sends `body` one byte every 200 ms; it counts those requests.
+/// once, then sends `body` one byte every 400 ms; it counts those requests.
 fn start_trickle_server(body: &'static [u8]) -> (String, Arc<AtomicU32>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind failed");
     let addr = listener.local_addr().expect("local_addr");
@@ -491,7 +491,7 @@ fn start_trickle_server(body: &'static [u8]) -> (String, Arc<AtomicU32>) {
                 continue;
             }
             for byte in body {
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_millis(400));
                 if stream.write_all(std::slice::from_ref(byte)).is_err() {
                     break;
                 }
@@ -502,18 +502,19 @@ fn start_trickle_server(body: &'static [u8]) -> (String, Arc<AtomicU32>) {
 }
 
 /// PASS: the request timeout bounds the whole reply, body included: headers
-/// arrive at once but the body takes about 13 s, so a 2 s timeout ends the one
+/// arrive at once but the body takes about 26 s, so a 5 s timeout ends the one
 /// request while its body is being read (a `BodyRead` failure, then Transient).
+/// The margins keep a multi-second scheduling stall from changing the outcome.
 /// FAIL: the fetch returns the page or fails elsewhere, because the timeout
 /// covered only the headers or restarted on every read (the #788 payout
 /// timeout relies on it bounding the body).
 #[tokio::test]
 async fn scenario_timeout_bounds_a_trickling_body() {
     let (base, hits) =
-        start_trickle_server(br#"{"data":[],"next_cursor":"LTE=","note":"one byte every 200 ms"}"#);
+        start_trickle_server(br#"{"data":[],"next_cursor":"LTE=","note":"one byte every 400 ms"}"#);
     let mut attempts = Vec::new();
     let result = make_fetcher()
-        .with_timeout(2)
+        .with_timeout(5)
         .with_max_retries(0)
         .fetch_page_observed(
             &format!("{base}/data"),
