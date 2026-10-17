@@ -5282,6 +5282,9 @@ fn validate_installed_candidate(
     if sha256_file(path)? != expected {
         return invalid("version-two side-cache hash changed after finalization".to_owned());
     }
+    if releases_cache_after_hash(phase) {
+        release_cached_pages(path);
+    }
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
     quick_check(&connection, phase, path)?;
     verify_finalized_v2_manifests(
@@ -5292,6 +5295,31 @@ fn validate_installed_candidate(
     )?;
     connection.close().map_err(|(_, error)| error)?;
     Ok(())
+}
+
+/// Whether a validation phase drops the candidate's cached pages after its hash: only normal
+/// two-file activation, whose check runs the walk prefetch (#790). Missing-side recovery and
+/// restoration keep the page cache as it is.
+fn releases_cache_after_hash(phase: &str) -> bool {
+    phase == "activation_candidate"
+}
+
+/// Drops `path`'s clean cached pages (`POSIX_FADV_DONTNEED` over the whole file). A whole-file
+/// hash leaves the file's tail cached, and that cache state undercut the check's prefetch in the
+/// dev-box reproduction (#790). Advisory: a failure only leaves the pages cached.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn release_cached_pages(path: &Path) {
+    #[cfg(target_os = "linux")]
+    match File::open(path) {
+        Ok(file) => {
+            if let Err(error) = rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed) {
+                tracing::debug!(path = %path.display(), %error, "dropping cached pages failed");
+            }
+        }
+        Err(error) => {
+            tracing::debug!(path = %path.display(), %error, "opening the file to drop its cached pages failed");
+        }
+    }
 }
 
 fn activate_two_file_cycle(
@@ -6814,6 +6842,37 @@ fn map_rename_error(error: std::io::Error) -> BootstrapError {
 
 fn invalid<T>(message: String) -> Result<T, BootstrapError> {
     Err(BootstrapError::Invalid { message })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod cache_release_tests {
+    use super::{release_cached_pages, releases_cache_after_hash};
+
+    // #790: only normal activation drops the candidate's cache after its hash; missing-side
+    // recovery and both restoration states validate exactly as before.
+    #[test]
+    fn only_normal_activation_drops_the_candidate_cache_after_its_hash() {
+        assert!(releases_cache_after_hash("activation_candidate"));
+        for phase in [
+            "activation_missing_side",
+            "restore_rejected",
+            "staging_fixed",
+            "",
+        ] {
+            assert!(!releases_cache_after_hash(phase), "{phase} keeps its cache");
+        }
+    }
+
+    #[test]
+    fn dropping_cached_pages_is_advisory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("candidate.db");
+        std::fs::write(&file, vec![7_u8; 1 << 20]).unwrap();
+        release_cached_pages(&file);
+        release_cached_pages(&dir.path().join("missing.db"));
+        assert_eq!(std::fs::read(&file).unwrap(), vec![7_u8; 1 << 20]);
+    }
 }
 
 #[cfg(test)]
