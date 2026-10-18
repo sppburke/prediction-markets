@@ -7,15 +7,22 @@
 //! `--ignored --exact cache_migration::walk_prefetch::bench::quick_check_benchmark --nocapture`.
 //! Set PE_QUICK_CHECK_BENCH_DB and PE_QUICK_CHECK_BENCH_OUT to the fixture and
 //! append-only JSON-lines paths. The fixture is built if absent; its SHA-256 is
-//! written once to <db>.sha256, never computed during a measured run.
+//! written once to <db>.sha256 and computed during a measured run only on request:
+//! PE_QUICK_CHECK_BENCH_HASH=hash runs the production candidate hash (`sha256_file`,
+//! verified against <db>.sha256) between the cold reset and the check, as activation
+//! does, and `hash-release` then drops the file's cached pages as normal activation
+//! does (`release_cached_pages`, #790). The result line records hash_ms, release_ms
+//! and total_ms, from the hash start (or the cold reset) through check completion.
 //! PE_QUICK_CHECK_BENCH_MIB defaults to 8192, PE_QUICK_CHECK_BENCH_LABEL labels every
 //! line, and PE_QUICK_CHECK_BENCH_CACHE_PAGES optionally overrides cache_size (16
 //! for the positional strace diagnostic). The connection is immutable/read-only,
 //! with mmap_size left at its default zero.
 //!
 //! Each invocation advises DONTNEED over the whole fixture. The caller's run script
-//! must independently confirm residency below 1% before each run. Alternate three
-//! main runs and three branch runs on the same fixture, settings and memory cap.
+//! must independently confirm residency below 1% before each run. To compare code
+//! changes, alternate three main runs and three branch runs on the same fixture,
+//! settings and memory cap. To time the release itself (#790), alternate `hash` and
+//! `hash-release` runs from one binary and compare total_ms.
 //! The 2 GiB cap holds the helper's 1 GiB lead while keeping an 8 GiB fixture four
 //! times larger than the available page cache. Record filesystem/read-ahead here;
 //! use strace -f -tt -e trace=pread64,fadvise64 for the separate positional run.
@@ -69,6 +76,29 @@ fn quick_check_benchmark() -> Result<()> {
         .open(output_path)?;
 
     fadvise(&file, 0, None, Advice::DontNeed)?;
+    let hash_mode = env::var("PE_QUICK_CHECK_BENCH_HASH").unwrap_or_default();
+    ensure!(
+        matches!(hash_mode.as_str(), "" | "hash" | "hash-release"),
+        "PE_QUICK_CHECK_BENCH_HASH must be empty, hash or hash-release"
+    );
+    let sequence_started = Instant::now();
+    let (hash_ms, release_ms) = if hash_mode.is_empty() {
+        (None, None)
+    } else {
+        let hash_started = Instant::now();
+        let digest = super::super::sha256_file(&path)?;
+        let hash_ms = hash_started.elapsed().as_millis();
+        ensure!(
+            digest == fixture_sha256,
+            "fixture hash differs from <db>.sha256"
+        );
+        let release_ms = (hash_mode == "hash-release").then(|| {
+            let release_started = Instant::now();
+            super::super::release_cached_pages(&path);
+            release_started.elapsed().as_millis()
+        });
+        (Some(hash_ms), release_ms)
+    };
     let uri = immutable_uri(&path)?;
     let connection = Connection::open_with_flags(
         uri,
@@ -93,7 +123,7 @@ fn quick_check_benchmark() -> Result<()> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(0);
     let (start_tx, start_rx) = mpsc::sync_channel(0);
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let (verdict, outcome, wall_ms) = thread::scope(|scope| -> Result<_> {
+    let (verdict, outcome, wall_ms, total_ms) = thread::scope(|scope| -> Result<_> {
         let output = &mut output;
         let label = &label;
         let sampler = thread::Builder::new()
@@ -126,11 +156,12 @@ fn quick_check_benchmark() -> Result<()> {
         let started = Instant::now();
         let (verdict, outcome) = super::quick_check(&connection, &path);
         let wall_ms = started.elapsed().as_millis();
+        let total_ms = sequence_started.elapsed().as_millis();
         drop(stop_tx);
         sampler
             .join()
             .map_err(|_| anyhow!("benchmark sampler panicked"))??;
-        Ok((verdict, outcome, wall_ms))
+        Ok((verdict, outcome, wall_ms, total_ms))
     })?;
     let (verdict_text, error) = match &verdict {
         Ok(value) => (Some(value.as_str()), None),
@@ -141,7 +172,9 @@ fn quick_check_benchmark() -> Result<()> {
         &json!({
             "kind": "result", "label": label,
             "verdict": verdict_text, "error": error, "prefetch": outcome.status(),
-            "wall_ms": wall_ms, "cache_size": cache_size, "mmap_size": mmap_size,
+            "wall_ms": wall_ms, "hash_mode": hash_mode, "hash_ms": hash_ms,
+            "release_ms": release_ms, "total_ms": total_ms,
+            "cache_size": cache_size, "mmap_size": mmap_size,
             "page_size": page_size, "page_count": page_count,
             "sqlite_version": rusqlite::version(), "kernel": kernel,
             "filesystem": filesystem, "read_ahead_kb": read_ahead_kb,

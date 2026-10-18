@@ -1108,7 +1108,10 @@ each completed check emits one JSON event to stderr, inherited by the loop journ
 the advice error. Their duration includes prefetch setup, the pragma, and the worker
 join. Other roles measure only the pragma. A check returning an error still emits
 an event with `success = false`; only a killed process emits none. Duration excludes
-copying, hashing, collection and ranking. Staging stdout remains the single report in
+copying, hashing, collection and ranking. In normal two-file activation (`activation_candidate`),
+once the candidate's hash matches, its cached pages are dropped (`POSIX_FADV_DONTNEED`, advisory)
+before the check, so the cache state the hash leaves behind does not undercut the check's
+prefetch (#790). Staging stdout remains the single report in
 `$OUT_DIR/cache_stage.json`; `$OUT_DIR/cache_build_manifest.json` and
 `$OUT_DIR/cache_stage_record.json` keep their existing hash-bound contracts.
 [#694](https://github.com/sppburke/prediction-markets/issues/694) records the measured check
