@@ -6,5 +6,11 @@
 # resolves to nothing, so the vulnerable code is never compiled into any artifact.
 # rust_decimal's compatible range is ^0.7 (>=0.8.17 is not reachable by a lockfile
 # update); remove this ignore when rust_decimal moves to rkyv 0.8.
+#
+# RUSTSEC-2026-0381 (webpki-roots < 1.0.10 bundles the distrusted emSign ECC Root CA - G3):
+# webpki-roots 0.26.11 is a semver shim whose only item is `pub use parent::TLS_SERVER_ROOTS`
+# from webpki-roots 1, which Cargo.lock resolves to 1.0.10 (the root removed). tokio-tungstenite
+# 0.28 requires ^0.26 and no fixed 0.26 exists; deny.toml's [bans] keep every other affected
+# webpki-roots version out of Cargo.lock. Remove this ignore when it moves to webpki-roots 1.
 [advisories]
-ignore = ["RUSTSEC-2026-0235"]
+ignore = ["RUSTSEC-2026-0235", "RUSTSEC-2026-0381"]
