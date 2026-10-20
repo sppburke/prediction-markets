@@ -14,8 +14,9 @@ ignore = [
     "RUSTSEC-2026-0374",
     # webpki-roots 0.26.11 is a semver shim whose only item is `pub use parent::TLS_SERVER_ROOTS`
     # from webpki-roots 1, locked at 1.0.10, which drops the emSign root this advisory names.
-    # tokio-tungstenite 0.28 requires ^0.26 and no fixed 0.26 exists. Keep webpki-roots 1 at
-    # >= 1.0.10 in Cargo.lock. Will resolve when tokio-tungstenite moves to webpki-roots 1.
+    # tokio-tungstenite 0.28 requires ^0.26 and no fixed 0.26 exists. The [bans] entries keep
+    # every other affected webpki-roots version out. Will resolve when tokio-tungstenite moves
+    # to webpki-roots 1.
     "RUSTSEC-2026-0381",
 ]
 
@@ -45,6 +46,12 @@ ignore = true
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+deny = [
+    # RUSTSEC-2026-0381 is ignored above only for the 0.26.11 shim; these keep the advisory's
+    # other affected versions (everything below 1.0.10) out of Cargo.lock.
+    { name = "webpki-roots", version = "<0.26.11" },
+    { name = "webpki-roots", version = ">=1.0.0, <1.0.10" },
+]
 
 [sources]
 unknown-registry = "deny"
