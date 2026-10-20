@@ -8,6 +8,10 @@ ignore = [
     # Author confirmed it unmaintained (RUSTSEC-2026-0173); unmaintained notice only,
     # no vulnerability. Will resolve when alloy-sol-macro migrates off it.
     "RUSTSEC-2026-0173",
+    # basic-toml reaches us only through i18n-config, used by age's build-time proc-macros
+    # (i18n-embed-fl, i18n-embed-impl). Unmaintained notice only, no vulnerability, and no
+    # upgrade exists. Will resolve when i18n-config moves to toml.
+    "RUSTSEC-2026-0374",
 ]
 
 [licenses]
