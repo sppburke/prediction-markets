@@ -302,6 +302,12 @@ create table if not exists paper_fills (
   inserted_at     timestamptz not null default now()
 );
 
+-- Exact economics written by the paper financial protocol (scripts/supabase_paper_state_schema.sql adds
+-- the same columns); declared here too so `wallet_live_stats` can use them on a fresh database. Rows
+-- written before that protocol keep both null.
+alter table paper_fills add column if not exists principal numeric;
+alter table paper_fills add column if not exists fee numeric;
+
 create table if not exists settled_markets (
   market_id       text        primary key,
   outcome_prices  jsonb       not null,         -- array of resolved per-outcome prices
@@ -489,34 +495,43 @@ notify pgrst, 'reload schema';
 
 -- Per-wallet historical (ranker) vs live (paper) stats. `security_invoker = true` so the
 -- view executes with the *querying* role's privileges and the anon RLS below applies.
--- Live realized P&L mirrors `crates/paper-pnl` `value_fill`: for a settled fill,
--- realized = side_sign × (resolved_outcome_price − fill_price) × contracts, won iff > 0.
+-- This file is the view's only definition. Live realized P&L is `pe_paper_pnl::realized_edge`
+-- (`crates/paper-pnl`): for a settled fill with recorded economics, BUY = payout − principal − fee
+-- and SELL = principal − payout − fee, where payout = resolved_outcome_price × contracts. A row
+-- written before the paper financial protocol (no principal/fee) keeps the notional
+-- side_sign × (resolved_outcome_price − fill_price) × contracts. A fill is won iff realized > 0.
 -- FULL OUTER join on lower(wallet) so admitted-but-not-yet-traded wallets (ranker only)
 -- and aged-out live wallets (fills only, no longer in latest_ranking) both appear.
 create or replace view wallet_live_stats
   with (security_invoker = true) as
-  with fill_stats as (
+  with fill_rows as (
     select
       lower(f.leader_wallet)                                          as wallet,
-      count(*)                                                        as live_total_fills,
-      count(*) filter (where s.market_id is not null)                 as live_settled_count,
-      count(*) filter (where s.market_id is null)                     as live_open_fills,
-      count(*) filter (
-        where s.market_id is not null
-          and (case f.side when 'buy' then 1 else -1 end)
-            * (coalesce((s.outcome_prices ->> f.outcome_id)::numeric, 0) - f.fill_price)
-            * f.contracts > 0
-      )                                                               as live_wins,
-      coalesce(sum(
-        case when s.market_id is not null then
+      s.market_id is not null                                         as settled,
+      case
+        when f.principal is not null and f.fee is not null then
+          (case f.side when 'buy' then 1 else -1 end)
+            * (coalesce((s.outcome_prices ->> f.outcome_id)::numeric, 0) * f.contracts
+               - f.principal)
+            - f.fee
+        else
           (case f.side when 'buy' then 1 else -1 end)
             * (coalesce((s.outcome_prices ->> f.outcome_id)::numeric, 0) - f.fill_price)
             * f.contracts
-        else 0 end
-      ), 0)                                                           as live_realized_pnl
+      end                                                             as realized
     from paper_fills f
     left join settled_markets s on s.market_id = f.market_id
-    group by lower(f.leader_wallet)
+  ),
+  fill_stats as (
+    select
+      wallet,
+      count(*)                                                        as live_total_fills,
+      count(*) filter (where settled)                                 as live_settled_count,
+      count(*) filter (where not settled)                             as live_open_fills,
+      count(*) filter (where settled and realized > 0)                as live_wins,
+      coalesce(sum(realized) filter (where settled), 0)               as live_realized_pnl
+    from fill_rows
+    group by wallet
   )
   select
     coalesce(fs.wallet, lower(r.wallet_hex))                          as wallet,

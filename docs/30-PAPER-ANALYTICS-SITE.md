@@ -33,9 +33,12 @@ pe-service (Rust)                         Supabase                     site/ (Ne
   uses the service-role secret key (RLS-bypassing), the site the anon key.
 - **`wallet_live_stats` view**: FULL OUTER join of live paper stats
   (`paper_fills` ⋈ `settled_markets`) against historical ranker stats
-  (`latest_ranking`) on `lower(leader_wallet) = lower(wallet_hex)`. Realized P&L uses the exact
-  financial-era cost basis:
-  `payout × exact_quantity − aggregate_principal − aggregate_fee`. The FULL OUTER join keeps both ranking-only and
+  (`latest_ranking`) on `lower(leader_wallet) = lower(wallet_hex)`. `scripts/supabase_schema.sql` holds its only
+  definition. Realized P&L uses each fill's recorded economics, as `pe_paper_pnl::realized_edge` does:
+  BUY `payout × exact_quantity − principal − fee`, SELL `principal − payout × exact_quantity − fee`.
+  A row without principal and fee (written before the paper financial protocol) keeps the notional
+  `side_sign × (payout − fill_price) × contracts`. The site's unrealized P&L nets open fills' entry fees
+  the same way (`site/lib/marks.ts` `unrealizedPnl`). The FULL OUTER join keeps both ranking-only and
   aged-out wallets visible. Since #518 a ranking-only row is a **bench** row: the batch
   keeps every survivor, plus non-survivor bench rows when needed to reach the publisher's
   requested minimum, with a pass/fail `survives` verdict; only survivors are admitted,

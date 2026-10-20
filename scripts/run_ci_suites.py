@@ -117,7 +117,7 @@ def postgres_suites(stack):
     quoted_template = template_name.replace('"', '""')
     suffix = uuid.uuid4().hex
     urls = {}
-    for name in ("multi_account", "ranking"):
+    for name in ("multi_account", "ranking", "wallet_live_stats"):
         database = f"pe_ci_{name}_{suffix}"
         psql(admin, f'CREATE DATABASE "{database}" TEMPLATE "{quoted_template}"')
         stack.callback(psql, admin, f'DROP DATABASE "{database}" WITH (FORCE)')
@@ -137,6 +137,8 @@ def postgres_suites(stack):
                        "scenario", "--test", "pg_parity", "--test-threads", "8"], {}, ROOT),
         ("ranking-publication", [sys.executable, str(ROOT / "scripts/test_ranking_publish_rpc.py")],
          {"PE_TEST_PG_URL": urls["ranking"]}, None),
+        ("wallet-live-stats", ["bash", str(ROOT / "scripts/test_wallet_live_stats_pg.sh"),
+                               urls["wallet_live_stats"]], {}, None),
     ]
 
 

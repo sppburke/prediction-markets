@@ -18,6 +18,7 @@ import type { WalletLiveStats } from "./types";
 
 vi.mock("./supabase", () => ({ getSupabase: vi.fn() }));
 vi.mock("@/lib/format", async () => import("./format"));
+vi.mock("@/lib/marks", async () => import("./marks"));
 
 const runtime = (token: string, count: number) => ({
   updated_at: token,
