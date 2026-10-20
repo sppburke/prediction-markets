@@ -12,6 +12,11 @@ ignore = [
     # (i18n-embed-fl, i18n-embed-impl). Unmaintained notice only, no vulnerability, and no
     # upgrade exists. Will resolve when i18n-config moves to toml.
     "RUSTSEC-2026-0374",
+    # webpki-roots 0.26.11 is a semver shim whose only item is `pub use parent::TLS_SERVER_ROOTS`
+    # from webpki-roots 1, locked at 1.0.10, which drops the emSign root this advisory names.
+    # tokio-tungstenite 0.28 requires ^0.26 and no fixed 0.26 exists. Keep webpki-roots 1 at
+    # >= 1.0.10 in Cargo.lock. Will resolve when tokio-tungstenite moves to webpki-roots 1.
+    "RUSTSEC-2026-0381",
 ]
 
 [licenses]
