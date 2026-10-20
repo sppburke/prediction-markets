@@ -465,60 +465,8 @@ begin
 end;
 $$;
 
--- The public stats view derives realized P&L from exact economics, not fill-price
--- notional. Existing pre-v3 rows remain readable through the legacy expression.
-create or replace view wallet_live_stats
-  with (security_invoker = true) as
-  with fill_stats as (
-    select
-      lower(f.leader_wallet) as wallet,
-      count(*) as live_total_fills,
-      count(*) filter (where s.market_id is not null) as live_settled_count,
-      count(*) filter (where s.market_id is null) as live_open_fills,
-      count(*) filter (
-        where s.market_id is not null
-          and case
-                when f.principal is not null and f.fee is not null then
-                  coalesce((s.outcome_prices ->> f.outcome_id)::numeric, 0)
-                    * f.contracts - f.principal - f.fee
-                else
-                  (case f.side when 'buy' then 1 else -1 end)
-                    * (coalesce((s.outcome_prices ->> f.outcome_id)::numeric, 0)
-                       - f.fill_price) * f.contracts
-              end > 0
-      ) as live_wins,
-      coalesce(sum(
-        case when s.market_id is not null then
-          case
-            when f.principal is not null and f.fee is not null then
-              coalesce((s.outcome_prices ->> f.outcome_id)::numeric, 0)
-                * f.contracts - f.principal - f.fee
-            else
-              (case f.side when 'buy' then 1 else -1 end)
-                * (coalesce((s.outcome_prices ->> f.outcome_id)::numeric, 0)
-                   - f.fill_price) * f.contracts
-          end
-        else 0 end
-      ), 0) as live_realized_pnl
-    from paper_fills f
-    left join settled_markets s on s.market_id = f.market_id
-    group by lower(f.leader_wallet)
-  )
-  select
-    coalesce(fs.wallet, lower(r.wallet_hex)) as wallet,
-    coalesce(fs.live_total_fills, 0) as live_total_fills,
-    coalesce(fs.live_settled_count, 0) as live_settled_count,
-    coalesce(fs.live_open_fills, 0) as live_open_fills,
-    coalesce(fs.live_wins, 0) as live_wins,
-    case when coalesce(fs.live_settled_count, 0) > 0
-         then fs.live_wins::numeric / fs.live_settled_count end as live_win_rate,
-    coalesce(fs.live_realized_pnl, 0) as live_realized_pnl,
-    case when coalesce(fs.live_settled_count, 0) > 0
-         then fs.live_realized_pnl / fs.live_settled_count end as live_edge,
-    r.rank, r.ls_edge, r.ls_tstat, r.fill_rate, r.n_trades, r.hit_rate, r.avg_price,
-    r.last_trade_unix
-  from fill_stats fs
-  full outer join latest_ranking r on fs.wallet = lower(r.wallet_hex);
+-- `wallet_live_stats` derives realized P&L from these exact economics; scripts/supabase_schema.sql
+-- owns its only definition.
 
 alter table paper_bankroll enable row level security;
 drop policy if exists "paper_bankroll_anon_read" on paper_bankroll;

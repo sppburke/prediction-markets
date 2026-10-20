@@ -2,7 +2,8 @@
 
 // Watched / Historical wallet tabs (#398 WS3, #508 Phase C terminology) + the portfolio
 // Unrealized-P&L KPI. On mount this fetches current marks for every open fill from /api/marks and computes
-// per-wallet + portfolio unrealized P&L = Σ side_sign × (mark − fill_price) × contracts.
+// per-wallet + portfolio unrealized P&L = Σ unrealizedPnl(fill, mark) (lib/marks.ts): net of each fill's
+// recorded entry fee, with the same economics as the realized P&L in `wallet_live_stats`.
 //
 // Tab membership (predicates may overlap by design):
 //   Watched    = watched by pe-service OR has open fills (+ an Unrealized column)
@@ -12,6 +13,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { formatUsd, toNum } from "@/lib/format";
+import { unrealizedPnl } from "@/lib/marks";
 import type { PaperFill, WalletLiveStats } from "@/lib/types";
 import { Stat } from "./Stat";
 import { WalletTable } from "./WalletTable";
@@ -51,11 +53,8 @@ export function WalletTabs({
         const byWallet = new Map<string, number>();
         for (const f of openFills) {
           const mark = marks[`${f.market_id}:${f.outcome_id}`];
-          const fillPrice = toNum(f.fill_price);
-          const contracts = toNum(f.contracts);
-          if (mark === undefined || fillPrice === null || contracts === null) continue;
-          const sideSign = f.side === "buy" ? 1 : -1;
-          const u = sideSign * (mark - fillPrice) * contracts;
+          const u = mark === undefined ? null : unrealizedPnl(f, mark);
+          if (u === null) continue;
           const w = f.leader_wallet.toLowerCase();
           byWallet.set(w, (byWallet.get(w) ?? 0) + u);
         }
