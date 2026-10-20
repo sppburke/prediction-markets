@@ -166,8 +166,10 @@ fn receipt_at(index: &SourceReceiptIndex, sequence: EventSeq) -> anyhow::Result<
         .context("retention receipt missing")
 }
 
+/// `current` is the authority in force, loaded once by the calling preparation or commit.
 fn pin_for_receipt(
     index: &SourceReceiptIndex,
+    current: Option<&RetentionAuthority>,
     boundary: RetentionBoundary,
     receipt: AppendReceipt,
     reducer: bool,
@@ -176,8 +178,7 @@ fn pin_for_receipt(
         return Ok(None);
     }
     let tail = index.current_tail_binding()?;
-    let authority = RetentionAuthority::load(&tail.path)?;
-    if let Some(authority) = &authority {
+    if let Some(authority) = current {
         ensure!(
             receipt.sequence >= authority.boundary.sequence
                 || authority.pin(receipt.sequence).is_some(),
@@ -232,14 +233,24 @@ fn pin_for_receipt(
     }))
 }
 
+/// Every entry of `pins` was authenticated against `boundary` by the pin build that owns the map or by the
+/// preparation that produced the commit request, so a receipt already pinned with the same hash is not read
+/// again unless it needs the reducer role.
 fn add_pin(
     pins: &mut BTreeMap<EventSeq, RetentionPin>,
     index: &SourceReceiptIndex,
+    current: Option<&RetentionAuthority>,
     boundary: RetentionBoundary,
     receipt: AppendReceipt,
     reducer: bool,
 ) -> anyhow::Result<()> {
-    if let Some(pin) = pin_for_receipt(index, boundary, receipt, reducer)? {
+    if pins
+        .get(&receipt.sequence)
+        .is_some_and(|pin| pin.hash == receipt.this_hash && (pin.reducer || !reducer))
+    {
+        return Ok(());
+    }
+    if let Some(pin) = pin_for_receipt(index, current, boundary, receipt, reducer)? {
         if let Some(previous) = pins.get_mut(&pin.sequence) {
             ensure!(
                 previous.hash == pin.hash
@@ -524,7 +535,7 @@ mod tests {
             boundary: old_boundary,
             chain_head: retired_economic.this_hash,
             pins: vec![
-                pin_for_receipt(&index, old_boundary, activation_receipt, false)
+                pin_for_receipt(&index, None, old_boundary, activation_receipt, false)
                     .unwrap()
                     .unwrap(),
             ],
@@ -691,6 +702,149 @@ mod tests {
         assert_eq!(replayed.watchlist.entries.len(), 1);
         assert_eq!(replayed.watchlist.entries[0].wallet, first_wallet);
     }
+
+    /// Writes `frames` and one recent frame; returns their receipts, the replayed index and offsets.
+    fn pin_fixture(
+        path: &Path,
+        frames: Vec<EnvelopeIn>,
+    ) -> (Vec<AppendReceipt>, SourceReceiptIndex, Vec<u64>) {
+        let mut writer = Writer::open(path).unwrap();
+        let mut receipts = frames
+            .into_iter()
+            .map(|frame| writer.append_synced(frame).unwrap())
+            .collect::<Vec<_>>();
+        receipts.push(
+            writer
+                .append_synced(input("recent", b"recent".to_vec(), NOW, 1))
+                .unwrap(),
+        );
+        drop(writer);
+        let index = SourceReceiptIndex::replay(path).unwrap();
+        let tail = index.current_tail_binding().unwrap();
+        let offsets = index
+            .checkpoint_suffix(0, receipts.len(), &tail)
+            .unwrap()
+            .iter()
+            .map(|frame| frame.byte_offset.unwrap())
+            .collect();
+        (receipts, index, offsets)
+    }
+
+    fn boundary_at(
+        receipts: &[AppendReceipt],
+        offsets: &[u64],
+        position: usize,
+    ) -> RetentionBoundary {
+        RetentionBoundary {
+            sequence: receipts[position].sequence,
+            offset: offsets[position],
+        }
+    }
+
+    #[test]
+    fn a_pinned_receipt_is_reused_without_rereading_its_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let wallet = WalletAddress([0xab; 20]);
+        let mut activity = input(
+            ACTIVITY_WS_SOURCE_ID,
+            format!(
+                r#"{{"proxyWallet":"0x{}","conditionId":"0x{}","asset":"123","side":"BUY","size":"100","price":"0.50","timestamp":"{OLD}","transactionHash":"0xpinned","outcomeIndex":"0"}}"#,
+                "ab".repeat(20),
+                "11".repeat(32),
+            )
+            .into_bytes(),
+            OLD,
+            pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+        );
+        activity.parser_version = pe_source_polymarket_public::ACTIVITY_PARSER_VERSION;
+        let (receipts, index, offsets) = pin_fixture(
+            &path,
+            vec![activity, input("old", b"plain".to_vec(), OLD, 1)],
+        );
+        let (observed, plain) = (receipts[0], receipts[1]);
+        let boundary = boundary_at(&receipts, &offsets, 2);
+        let mut pins = BTreeMap::new();
+        add_pin(&mut pins, &index, None, boundary, observed, false).unwrap();
+        add_pin(&mut pins, &index, None, boundary, plain, true).unwrap();
+        let pinned = pins.clone();
+
+        // With the log gone, only a request that must read its frame can fail.
+        let moved = dir.path().join("moved.log");
+        std::fs::rename(&path, &moved).unwrap();
+        for (receipt, reducer) in [(plain, true), (plain, false), (observed, false)] {
+            add_pin(&mut pins, &index, None, boundary, receipt, reducer).unwrap();
+        }
+        assert_eq!(pins, pinned);
+        assert!(add_pin(&mut pins, &index, None, boundary, observed, true).is_err());
+        assert_eq!(pins, pinned);
+
+        std::fs::rename(&moved, &path).unwrap();
+        let changed = AppendReceipt {
+            sequence: observed.sequence,
+            this_hash: plain.this_hash,
+        };
+        assert!(add_pin(&mut pins, &index, None, boundary, changed, false).is_err());
+        assert_eq!(pins, pinned);
+        let mut conflicting = pins.clone();
+        conflicting.get_mut(&plain.sequence).unwrap().hash = observed.this_hash;
+        let before = conflicting.clone();
+        let error = add_pin(&mut conflicting, &index, None, boundary, plain, false).unwrap_err();
+        assert_eq!(error.to_string(), "retention pins conflict");
+        assert_eq!(conflicting, before);
+        add_pin(&mut pins, &index, None, boundary, observed, true).unwrap();
+        assert!(pins[&observed.sequence].reducer);
+        assert_eq!(pins[&observed.sequence].wallet, Some(wallet));
+    }
+
+    #[test]
+    fn pin_checks_erasure_against_the_supplied_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let (receipts, index, offsets) = pin_fixture(
+            &path,
+            ["kept", "erased", "newer"]
+                .map(|name| input(name, name.as_bytes().to_vec(), OLD, 1))
+                .into(),
+        );
+        let (kept, erased, newer) = (receipts[0], receipts[1], receipts[2]);
+        let old_boundary = boundary_at(&receipts, &offsets, 2);
+        let boundary = boundary_at(&receipts, &offsets, 3);
+        let expected = |position: usize| {
+            Some(RetentionPin {
+                sequence: receipts[position].sequence,
+                offset: offsets[position],
+                hash: receipts[position].this_hash,
+                predecessor_hash: position
+                    .checked_sub(1)
+                    .map_or(blake3::Hash::from_bytes([0; 32]), |previous| {
+                        receipts[previous].this_hash
+                    }),
+                reducer: false,
+                wallet: None,
+            })
+        };
+        let authority = RetentionAuthority {
+            format_version: 1,
+            epoch: 1,
+            advanced_at: OLD,
+            boundary: old_boundary,
+            chain_head: erased.this_hash,
+            pins: vec![expected(0).unwrap()],
+            retained_tail: TailBinding::from(&index.current_tail_binding().unwrap()),
+            feed: Vec::new(),
+        };
+        let pin = |receipt: AppendReceipt, current: Option<&RetentionAuthority>| {
+            pin_for_receipt(&index, current, boundary, receipt, false)
+        };
+        assert_eq!(pin(kept, Some(&authority)).unwrap(), expected(0));
+        assert_eq!(pin(newer, Some(&authority)).unwrap(), expected(2));
+        assert_eq!(
+            pin(erased, Some(&authority)).unwrap_err().to_string(),
+            "retention input was already erased"
+        );
+        assert_eq!(pin(erased, None).unwrap(), expected(1));
+    }
 }
 
 #[derive(Deserialize)]
@@ -721,6 +875,7 @@ fn reducer_pins(
     frozen: &FrozenCheckpoint,
     context: &RetentionContext,
     index: &SourceReceiptIndex,
+    current: Option<&RetentionAuthority>,
     boundary: RetentionBoundary,
     pins: &mut BTreeMap<EventSeq, RetentionPin>,
 ) -> anyhow::Result<HashSet<EventSeq>> {
@@ -734,12 +889,12 @@ fn reducer_pins(
         .map(|obligation| obligation.receipt)
         .chain(activity.frame_candidates.values().copied())
     {
-        add_pin(pins, index, boundary, receipt, true)?;
+        add_pin(pins, index, current, boundary, receipt, true)?;
     }
     for receipt in activity.binding_commitments {
-        add_pin(pins, index, boundary, receipt, true)?;
+        add_pin(pins, index, current, boundary, receipt, true)?;
         for dependency in commitment_source_receipts(receipt, index)? {
-            add_pin(pins, index, boundary, dependency, false)?;
+            add_pin(pins, index, current, boundary, dependency, false)?;
         }
     }
     if let Some(candidates) = &frozen.reducers.daily_boundary {
@@ -755,7 +910,14 @@ fn reducer_pins(
                 .into_iter()
                 .filter(|candidate| candidate.cutoff_unix > anchor)
             {
-                add_pin(pins, index, boundary, boundary_candidate.receipt, true)?;
+                add_pin(
+                    pins,
+                    index,
+                    current,
+                    boundary,
+                    boundary_candidate.receipt,
+                    true,
+                )?;
             }
         }
     }
@@ -841,12 +1003,13 @@ pub(crate) fn prepare(
     if frozen.tail.physical_tail <= boundary.offset {
         return Ok(PreparedRetention::Deferred("snapshot_behind_boundary"));
     }
+    let current = authority.as_ref();
     let mut pins = BTreeMap::new();
     let mut decision_rows = DecisionPinCache::default();
     let decisions = decision_pins(context, index, cutoff, &mut decision_rows)?;
     for receipt in decisions.receipts {
         cancelled(cancel)?;
-        add_pin(&mut pins, index, boundary, receipt, false)?;
+        add_pin(&mut pins, index, current, boundary, receipt, false)?;
     }
     let activation_sequence = frozen
         .activation
@@ -855,16 +1018,17 @@ pub(crate) fn prepare(
     add_pin(
         &mut pins,
         index,
+        current,
         boundary,
         receipt_at(index, activation_sequence)?,
         false,
     )?;
-    let routed = reducer_pins(frozen, context, index, boundary, &mut pins)?;
+    let routed = reducer_pins(frozen, context, index, current, boundary, &mut pins)?;
     // The running poller may still read what it holds (correlation, retirement, a verified read's
     // bindings) after its group is disposed and the reducer prunes it; keep those frames readable.
     for receipt in held {
         cancelled(cancel)?;
-        add_pin(&mut pins, index, boundary, *receipt, false)?;
+        add_pin(&mut pins, index, current, boundary, *receipt, false)?;
     }
     let mut payload_receipts: HashMap<String, Vec<AppendReceipt>> = HashMap::new();
     if let Some(authority) = &authority {
@@ -875,6 +1039,7 @@ pub(crate) fn prepare(
                 add_pin(
                     &mut pins,
                     index,
+                    current,
                     boundary,
                     AppendReceipt {
                         sequence: envelope.seq,
@@ -940,7 +1105,7 @@ pub(crate) fn prepare(
                     feed.append(offset, envelope.seq, envelope.prev_hash)?;
                 }
                 if routed_artifact(envelope, &routed)? {
-                    add_pin(&mut pins, index, boundary, receipt, true)?;
+                    add_pin(&mut pins, index, current, boundary, receipt, true)?;
                 }
                 if envelope.source_id.0 == crate::clob_book::CLOB_BOOK_SOURCE_ID {
                     payload_receipts
@@ -970,6 +1135,7 @@ pub(crate) fn prepare(
         &payload_receipts,
         &mut pins,
         index,
+        current,
         boundary,
     )?;
     // Receipts must be authentic and durable before an authority can make them retention metadata.
@@ -1017,12 +1183,13 @@ fn add_payload_pins(
     payload_receipts: &HashMap<String, Vec<AppendReceipt>>,
     pins: &mut BTreeMap<EventSeq, RetentionPin>,
     index: &SourceReceiptIndex,
+    current: Option<&RetentionAuthority>,
     boundary: RetentionBoundary,
 ) -> anyhow::Result<()> {
     for hash in hashes {
         if let Some(receipts) = payload_receipts.get(hash) {
             for receipt in receipts {
-                add_pin(pins, index, boundary, *receipt, false)?;
+                add_pin(pins, index, current, boundary, *receipt, false)?;
             }
         }
     }
@@ -1058,7 +1225,9 @@ pub(crate) fn commit(
     let started = std::time::Instant::now();
     let path = request.receipts.current_tail_binding()?.path;
     let _lock = CheckpointLock::acquire(&path)?;
-    if super::retention_epoch(&path)? != request.expected_epoch {
+    // Only this commit writes the authority, under this lock, so one load serves every pin check below.
+    let current = RetentionAuthority::load(&path)?;
+    if current.as_ref().map_or(0, |authority| authority.epoch) != request.expected_epoch {
         return Ok(RetentionCommitOutcome::Deferred("epoch_changed"));
     }
     if let Some(reason) = pause_reason(&request.context)? {
@@ -1091,6 +1260,7 @@ pub(crate) fn commit(
         add_pin(
             &mut pins,
             &request.receipts,
+            current.as_ref(),
             request.authority.boundary,
             receipt,
             false,
@@ -1101,6 +1271,7 @@ pub(crate) fn commit(
         &request.payload_receipts,
         &mut pins,
         &request.receipts,
+        current.as_ref(),
         request.authority.boundary,
     )?;
     request.authority.pins = pins.into_values().collect();
