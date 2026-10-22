@@ -158,23 +158,28 @@ class PrintOracle(unittest.TestCase):
         self.assertEqual(row['fill_rate'], '0.5')
 
     def test_survival_gates_and_coverage_is_reported_without_a_gate(self):
-        positions = [position(str(index)) for index in range(61)]
+        # Ten entry days: survival's t is clustered by day, so one day alone cannot survive.
+        positions = [position(str(index), DAY + index % 10 * 86400 + 100, marker=DAY + index % 10 * 86400)
+                     for index in range(61)]
         self.run_pipeline(positions, [first_entry(row, .3 + index / 1000, wallet='other', second=row[3] + 2)
                                       for index, row in enumerate(positions[:20])], min_trl=20)
         row = next(ranker.ranked_rows(self.con))
         self.assertTrue(row['survives'])
         self.assertEqual(row['n_filled'], '20')
         self.assertEqual(row['fill_rate'], str(round(20 / 61, 4)))
-        for n, maker, t, mean, eligible, survives in (
-            (20, .499, 3., .1, True, True), (20, .5, 4., .1, False, False),
-            (19, 0., 4., .1, False, False), (1, 0., 4., .1, False, False),
-            (20, 0., 2.999, .1, True, False), (20, 0., 3., 0., True, False),
+        for n, maker, t, mean, days, eligible, survives in (
+            (20, .499, 3., .1, 10, True, True), (20, .5, 4., .1, 10, False, False),
+            (19, 0., 4., .1, 10, False, False), (1, 0., 4., .1, 10, False, False),
+            (20, 0., 2.999, .1, 10, True, False), (20, 0., 3., 0., 10, True, False),
+            (20, 0., 4., .1, 9, False, False),
         ):
-            with self.subTest(n=n, maker=maker, t=t, mean=mean):
+            with self.subTest(n=n, maker=maker, t=t, mean=mean, days=days):
                 self.con.execute('DROP VIEW ranked'); self.con.execute('DROP TABLE scores')
                 self.con.execute("UPDATE positions SET outcome=CASE WHEN ordinal <= ? THEN 'repriced' ELSE 'no_print' END", [n])
                 self.con.execute('UPDATE maker_shares SET maker_share=?', [maker])
-                with mock.patch.object(ranker, 'weighted_stats', return_value=(mean, 1., n, t)):
+                # The unclustered t (99) is ignored: survival reads the day-clustered t.
+                with mock.patch.object(ranker, 'weighted_stats', return_value=(mean, 1., n, 99.)), \
+                        mock.patch.object(ranker, 'day_clustered_tstat', return_value=(t, days)):
                     ranker.score_wallets(self.con, args(self.root, min_trl=20), DAY + 86400)
                 result = next(ranker.ranked_rows(self.con))
                 self.assertEqual((result['eligible'], result['survives']), (eligible, survives))
@@ -185,8 +190,8 @@ class PrintOracle(unittest.TestCase):
             a = ranker.parse_args()
         self.assertEqual((a.slip_cents, a.floor_tstat, a.min_ttr_secs, a.ttr_max_secs, a.price_max),
                          (.5, 3., 60, 86400, .65))
-        self.assertEqual((ranker.ORACLE_NAME, ranker.ORACLE_VERSION, ranker.TAKER_FEE_RATE, ranker.MAKER_SHARE_CAP),
-                         ('first-entry-taker-print', 8, .07, .5))
+        self.assertEqual((ranker.ORACLE_NAME, ranker.ORACLE_VERSION, ranker.TAKER_FEE_RATE, ranker.MAKER_SHARE_CAP,
+                          ranker.MIN_ACTIVE_DAYS), ('first-entry-taker-print', 8, .07, .5, 10))
         self.assertIn('maker_share', ranker.RANKED_FIELDS)
         for removed in ('emit_targets', 'min_fill_rate', 'min_active_months', 'min_avg_per_month'):
             self.assertFalse(hasattr(a, removed))
@@ -255,8 +260,9 @@ class ManifestRun(unittest.TestCase):
             self.assertEqual(manifests[0], manifests[1])
             manifest = json.loads(manifests[0])
             self.assertEqual((manifest['oracle'], manifest['oracle_version'], manifest['slip'],
-                              manifest['fee_rate'], manifest['fill_window_secs'], manifest['maker_share_cap']),
-                             ('first-entry-taker-print', 8, .005, .07, 120., .5))
+                              manifest['fee_rate'], manifest['fill_window_secs'], manifest['maker_share_cap'],
+                              manifest['min_active_days']),
+                             ('first-entry-taker-print', 8, .005, .07, 120., .5, 10))
             scope_bytes = Path(scope).read_bytes()
             self.assertEqual(manifest['inputs']['market_scope_sha256'], hashlib.sha256(scope_bytes).hexdigest())
             self.assertEqual(manifest['market_scope'], {key: json.loads(scope_bytes)[key] for key in

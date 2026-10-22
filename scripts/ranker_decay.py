@@ -129,6 +129,26 @@ def weighted_stats(values, weights) -> tuple[float, float, float, float]:
     return (wmean, wstd, n_eff, tstat)
 
 
+def day_clustered_tstat(values, weights, entry_ts) -> tuple[float, int]:
+    """(tstat, days): `weighted_stats`' mean over a standard error clustered by UTC entry day.
+
+    Positions entered on the same UTC day share that day's price moves, so each day is one
+    cluster: `SE² = G/(G−1) · Σ_g (Σ_{i∈g} wᵢ(vᵢ − wmean))² / W²` and `tstat = wmean / SE`, where
+    `G` is the number of distinct days (returned). `G < 2`, an undefined mean, or
+    `SE ≤ _SD_FLOOR` ⇒ NaN: here the floor bounds the standard error, not the dispersion. One
+    position per day at equal weights reproduces `weighted_stats`' t whenever both floors pass.
+    """
+    wmean = weighted_stats(values, weights)[0]
+    _, cluster = np.unique(np.asarray(entry_ts, dtype=np.int64) // SECS_PER_DAY, return_inverse=True)
+    days = int(cluster.max()) + 1 if cluster.size else 0
+    if days < 2 or not math.isfinite(wmean):
+        return (float("nan"), days)
+    w = np.asarray(weights, dtype=float)
+    resid = np.bincount(cluster, weights=w * (np.asarray(values, dtype=float) - wmean))
+    se = math.sqrt(days / (days - 1) * float(resid @ resid)) / float(w.sum())
+    return ((wmean / se) if se > _SD_FLOOR else float("nan"), days)
+
+
 def parse_as_of(s: str | None) -> int | None:
     """Parse `--as-of` (ISO date/datetime OR bare unix epoch) to unix seconds.
 

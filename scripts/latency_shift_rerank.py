@@ -4,8 +4,9 @@
 The highest fee-paying first-entry price at the first eligible second in
 [entry + shift, entry + window] sets the copy price, plus slippage and a taker fee.
 Missing prints stay unpriced;
-coverage is published as fill_rate. Survival uses priced sample size, positive
-mean, the t floor and the wallet's unfiltered window maker share.
+coverage is published as fill_rate. Survival uses priced sample size, distinct entry
+days, positive mean, the day-clustered t floor and the wallet's unfiltered window
+maker share.
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ from ranker_duck import (duck_first_entry_prints_v2, get_engine, limit_memory, l
 
 from ranker_decay import (
     DEFAULT_HALF_LIFE_DAYS,
+    day_clustered_tstat,
     decay_weights,
     parse_as_of,
     weighted_stats,
@@ -40,6 +42,9 @@ ORACLE_VERSION = 8
 # Only 15-minute crypto markets are scored (#784); their taker rate is `crypto_fees_v2_rate`.
 TAKER_FEE_RATE = 0.07
 MAKER_SHARE_CAP = 0.5
+# Survival needs repriced entries on this many distinct UTC days, the clusters of its t
+# (docs/_GLOSSARY ranker_min_active_days; owner decision 2026-10-21).
+MIN_ACTIVE_DAYS = 10
 
 
 def log(msg: str) -> None:
@@ -352,9 +357,12 @@ def score_wallets(con, a, as_of):
         nf, am = len(nets), len(months)
         scope = n_total - n_band
         fr = nf / scope if scope else 0.0
-        mean, _, n_eff, t = weighted_stats(nets, decay_weights(ets, as_of, a.half_life_days))
+        weights = decay_weights(ets, as_of, a.half_life_days)
+        mean, _, n_eff, _ = weighted_stats(nets, weights)
+        t, days = day_clustered_tstat(nets, weights, ets)
         hr = statistics.fmean(payoffs) if payoffs else float("nan")
-        eligible = nf > 1 and nf >= a.min_trl and maker_share < MAKER_SHARE_CAP
+        eligible = (nf > 1 and nf >= a.min_trl and days >= MIN_ACTIVE_DAYS
+                    and maker_share < MAKER_SHARE_CAP)
         survives = eligible and not math.isnan(t) and t >= a.floor_tstat and mean > 0
         batch.append((wallet, n_total, str(nf), str(round(fr, 4)), str(am),
                       str(round(mean, 6)) if not math.isnan(mean) else "",
@@ -495,6 +503,7 @@ def rerank(con, a, schema_version):
         "as_of": as_of,
         "floor_tstat": a.floor_tstat,
         "min_trl": a.min_trl,
+        "min_active_days": MIN_ACTIVE_DAYS,
         "schema_version": schema_version,
         "price_band": {"minimum_inclusive": a.price_min,
                        "maximum_exclusive": a.price_max},
@@ -540,7 +549,8 @@ def rerank(con, a, schema_version):
         log("no candidate positions overlapped the positions CSV — wrote empty ranking")
         return 0
     count_survivors = con.execute("SELECT COUNT(*) FROM ranked WHERE survives").fetchone()[0]
-    log(f"repriced survivors (t>={a.floor_tstat}, mean>0, n>={a.min_trl}, "
+    log(f"repriced survivors (day-clustered t>={a.floor_tstat}, mean>0, n>={a.min_trl}, "
+        f"days>={MIN_ACTIVE_DAYS}, "
         f"maker_share<{MAKER_SHARE_CAP}): {count_survivors}")
     basket_size = a.target_n if a.target_n >= 0 else max(0, count_survivors + a.target_n)
     basket = [r for r in ranked_rows(con) if r["survives"] and r["rank"] <= basket_size]

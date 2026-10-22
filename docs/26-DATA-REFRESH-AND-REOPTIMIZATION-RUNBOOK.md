@@ -609,13 +609,12 @@ or checkpoint stage (#544).
 **Oracle rollback:** reverting the ranker code alone does NOT restore the
 prior ranking — `latest_ranking` always serves the maximum `batch_id`. To roll back
 externally: restore the prior binary/checkout pair through the
-[release procedure](#forge-release-deployment-and-rollback), leaving the loop stopped, run the
-one-shot with a unique
-`--notes "rollback-of=<batch-id>"` (the note is hashed into the content-addressed
-publish key, guaranteeing a NEW batch even same-day with unchanged inputs — a
-same-day revert without it can reproduce an old key and silently fail to advance the
-epoch), then verify a strictly larger `batch_id` is `latest_ranking` and service
-membership converged. #757 removes the prior oracle's writer/reader paths; its two installed
+[release procedure](#forge-release-deployment-and-rollback) at a published boundary and
+reinstate the run intent. The next zero-argument cycle publishes a strictly newer batch under
+the prior rules: each cycle's manifest binds its own `as_of` and input hashes, so its
+content-addressed publish key is new. (Any argument, `--notes` included, makes the wrapper a
+non-production one-shot that skips schema-two candidate setup.) Then verify a strictly larger
+`batch_id` is `latest_ranking` and service membership converged. #757 removes the prior oracle's writer/reader paths; its two installed
 cache tables remain inert. The prior rules and exact code are preserved in
 [Rules before #757](32-RANKER-DECISION-RECORD-AND-FORWARD-BENCH.md#rules-before-757).
 
