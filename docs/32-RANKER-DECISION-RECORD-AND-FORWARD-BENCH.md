@@ -29,6 +29,9 @@ bench ceased to exist at the reset. That decision superseded the former paired c
 composition, paired gate, bootstrap/resampling protocol, interim look, extension, and second
 window.
 
+On 2026-10-21 the owner moved survival to the day-clustered t with at least 10 entry days (#798;
+[`ranker_floor_tstat`, `ranker_min_active_days`](_GLOSSARY.md)). Its supporting study (#779) is descriptive.
+
 Issue #545 preserves that one-system boundary while replacing the old paper economics with one
 exact, replayable financial era:
 

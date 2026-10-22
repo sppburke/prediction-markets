@@ -14130,12 +14130,13 @@ const PUBLICATION_PRINT_WALLET: &str = "0x55555555555555555555555555555555555555
 fn publication_dataset(now: i64, quiet: &str) -> (Vec<Value>, Vec<Value>) {
     let mut rows = Vec::new();
     let mut markets = Vec::new();
-    // Whole hours keep each entry clear of the same-day horizon's floor before UTC midnight.
+    // Whole hours keep each entry clear of the same-day horizon's floor before UTC midnight; ten
+    // days give the survivor the distinct entry days its day-clustered t needs.
     let old = (now - 40 * 86_400).div_euclid(3_600) * 3_600;
     for index in 0..20 {
         let market = format!("0x{:064x}", index + 100);
         let token = (1000 + 2 * index).to_string();
-        let entry = old + index * 3600;
+        let entry = old + (index % 10) * 86_400 + (index / 10) * 3_600;
         let price = format!("0.{:02}", 20 + index);
         let reference = format!("0.{:02}", 25 + index);
         for (wallet, epoch) in [

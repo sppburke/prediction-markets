@@ -189,6 +189,45 @@ class WeightedStatsNaNGuardTest(unittest.TestCase):
         self.assertEqual(n_eff, 0.0)
 
 
+class DayClusteredTstatTest(unittest.TestCase):
+    DAY = rd.SECS_PER_DAY
+
+    def test_hand_computed_weighted_value(self) -> None:
+        # Mean (2·1 − 1 + 2 + 0) / 5 = 0.6; day residual sums 2·0.4 − 1.6, 1.4, −0.6.
+        t, days = rd.day_clustered_tstat([1.0, -1.0, 2.0, 0.0], [2.0, 1.0, 1.0, 1.0],
+                                         [0, 3600, self.DAY, 2 * self.DAY])
+        self.assertEqual(days, 3)
+        self.assertAlmostEqual(t, 0.6 / (math.sqrt(1.5 * (0.8 ** 2 + 1.4 ** 2 + 0.6 ** 2)) / 5), places=12)
+
+    def test_one_position_per_day_reproduces_the_ordinary_t(self) -> None:
+        v = np.random.default_rng(7).normal(0.1, 1.0, 40)
+        t, days = rd.day_clustered_tstat(v, np.ones(40), np.arange(40) * self.DAY + 600)
+        self.assertEqual(days, 40)
+        self.assertAlmostEqual(t, rd.weighted_stats(v, np.ones(40))[3], places=10)
+
+    def test_one_day_is_nan_and_midnight_starts_a_day(self) -> None:
+        t, days = rd.day_clustered_tstat([0.5, 1.0, -0.2], [1.0] * 3, [10, 20, 30])
+        self.assertEqual(days, 1)
+        self.assertTrue(math.isnan(t))
+        self.assertEqual(rd.day_clustered_tstat([1.0, 2.0], [1.0, 1.0], [self.DAY - 1, self.DAY])[1], 2)
+
+    def test_floor_guards_the_clustered_standard_error(self) -> None:
+        # Dispersion just above the floor keeps the unclustered t; the clustered error falls below it.
+        v, w, ts = [1 + 7.5e-10, 1 - 7.5e-10], [1.0, 1.0], [0, self.DAY]
+        self.assertTrue(math.isfinite(rd.weighted_stats(v, w)[3]))
+        self.assertTrue(math.isnan(rd.day_clustered_tstat(v, w, ts)[0]))
+
+    def test_cancelling_days_have_no_dispersion(self) -> None:
+        t, days = rd.day_clustered_tstat([1.0, 0.0, 1.5, -0.5], [1.0] * 4, [0, 1, self.DAY, self.DAY + 1])
+        self.assertEqual(days, 2)
+        self.assertTrue(math.isnan(t))
+
+    def test_undefined_mean_is_nan(self) -> None:
+        t, days = rd.day_clustered_tstat([1.0, 2.0], [1.0, -1.0], [0, self.DAY])
+        self.assertEqual(days, 2)
+        self.assertTrue(math.isnan(t))
+
+
 class ParseAsOfTest(unittest.TestCase):
     def test_none_and_empty(self) -> None:
         self.assertIsNone(rd.parse_as_of(None))
