@@ -49,6 +49,14 @@
 > Re-verify by **2026-12-09**. These dates retain the issue's source-pass provenance;
 > the documentation implementation made no network requests.
 
+> **Data API `/trades` for market participants (#800).** Last checked: **2026-10-23**;
+> re-verify by **2026-12-22**. The [official user-or-markets trades reference](https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets)
+> documents comma-separated condition ids in `market`, `limit` at most 10,000, offsets
+> 0–10,000 (HTTP 400 past the cap), and deeper reads via `start`/`end` time windows.
+> `takerOnly` defaults to true; rows carry `proxyWallet` and `timestamp`. This is the
+> public Data API, separate from authenticated CLOB trades. Participant discovery uses
+> inclusive wire `start=lo&end=hi−1` for each half-open `[lo, hi)` window.
+
 > **CLOB neg-risk groups (#739/#588), Last checked: 2026-10-05; re-verify by
 > 2026-12-04.** The official [long-market schema](https://docs.polymarket.com/api-spec/clob-openapi.yaml)
 > exposes boolean `neg_risk` and string `neg_risk_market_id`. The approved #739 source pass records
@@ -339,6 +347,7 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/api-reference/relayer/get-relayer-address-and-nonce | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/relayer/get-a-transaction-by-id | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-10-10 | 2026-12-09 |
+| https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets | 2026-10-23 | 2026-12-22 |
 | https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-10-13 | 2026-12-12 |
 | https://docs.polymarket.com/api-reference/feeds/list-account-activity | 2026-09-10 | 2026-11-09 |
 | https://docs.polymarket.com/api-reference/service/get-data-freshness | 2026-09-10 | 2026-11-09 |

@@ -1078,6 +1078,9 @@ async fn main() {
                             leaderboard_activated = r.leaderboard_activated,
                             datadash_unique = r.datadash_unique,
                             datadash_activated = r.datadash_activated,
+                            participants_unique = r.participants_unique,
+                            participants_activated = r.participants_activated,
+                            participants_status = r.participants_status,
                             "winner-discovery: complete"
                         );
                         0
@@ -1415,7 +1418,7 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
     }
 
     // Step 1: discover wallets via the Polymarket leaderboard (all categories)
-    // + datadash. Replaces the retired Dune `enumerate` (#335).
+    // + datadash and market participants. Replaces the retired Dune `enumerate` (#335).
     match winner_discovery::run_winner_discovery(config, cache).await {
         Ok(r) => {
             tracing::info!(
@@ -1423,6 +1426,9 @@ async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: b
                 leaderboard_activated = r.leaderboard_activated,
                 datadash_unique = r.datadash_unique,
                 datadash_activated = r.datadash_activated,
+                participants_unique = r.participants_unique,
+                participants_activated = r.participants_activated,
+                participants_status = r.participants_status,
                 "all: winner-discovery complete"
             );
         }

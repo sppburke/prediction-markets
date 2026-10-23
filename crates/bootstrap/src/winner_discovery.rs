@@ -1,5 +1,5 @@
-//! Winner-discovery orchestrator: leaderboard + datadash wallet ingest
-//! (issues #324, #365).
+//! Winner-discovery orchestrator: leaderboard, datadash and market participant ingest
+//! (issues #324, #365, #800).
 //!
 //! `run_winner_discovery` runs all enabled discovery sources in sequence and
 //! returns aggregate counts. The binary owns one central cache mutation lock
@@ -9,8 +9,10 @@
 //! `pe-bootstrap all`). The **datadash** source **soft-fails** — a
 //! [`BootstrapError::Datadash`] is logged and treated as zero counts so a
 //! third-party outage never breaks the run (issue #365 AC9). Non-datadash errors
-//! (e.g. a broken cache) still propagate. (The Radion source was retired once its
-//! upstream `traders/analysis` endpoint was removed.)
+//! (e.g. a broken cache) still propagate. Participant collection errors also soft-fail
+//! with a visible status; participant cache and activation errors remain fatal.
+//! (The Radion source was retired once its upstream `traders/analysis` endpoint
+//! was removed.)
 //!
 use crate::cache::WalletCache;
 use crate::config::BootstrapConfig;
@@ -27,6 +29,9 @@ pub struct WinnerDiscoveryReport {
     pub leaderboard_activated: usize,
     pub datadash_unique: usize,
     pub datadash_activated: usize,
+    pub participants_unique: usize,
+    pub participants_activated: usize,
+    pub participants_status: &'static str,
 }
 
 /// Run all enabled discovery sources in sequence and return aggregate counts.
@@ -38,7 +43,7 @@ pub async fn run_winner_discovery(
 }
 
 /// Winner discovery with an explicit activation policy. The full rank-and-push
-/// wrapper defers both sources to one controlled batch.
+/// wrapper defers all sources to one controlled batch.
 pub async fn run_winner_discovery_with_policy(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
@@ -73,17 +78,31 @@ pub async fn run_winner_discovery_with_policy(
         Err(e) => return Err(e),
     };
 
+    let participants = run_source_discovery_with_policy(
+        WalletDiscoverySource::MarketParticipants,
+        config,
+        cache,
+        activation_policy,
+    )
+    .await?;
+
     let report = WinnerDiscoveryReport {
         leaderboard_unique: lb.unique_wallets,
         leaderboard_activated: lb.activated,
         datadash_unique: dd.unique_wallets,
         datadash_activated: dd.activated,
+        participants_unique: participants.unique_wallets,
+        participants_activated: participants.activated,
+        participants_status: participants.status,
     };
     tracing::info!(
         leaderboard_unique = report.leaderboard_unique,
         leaderboard_activated = report.leaderboard_activated,
         datadash_unique = report.datadash_unique,
         datadash_activated = report.datadash_activated,
+        participants_unique = report.participants_unique,
+        participants_activated = report.participants_activated,
+        participants_status = report.participants_status,
         "winner_discovery: complete"
     );
     Ok(report)

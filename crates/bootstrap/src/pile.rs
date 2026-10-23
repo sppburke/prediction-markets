@@ -15,6 +15,7 @@
 //! | 5 | 0b0100000 | _(removed — was Radion; gap kept, persisted)_ |
 //! | 6 | 0b1000000 | 502-gap |
 //! | 7 | 0b10000000 | datadash.xyz cohorts (#365) |
+//! | 8 | 0b1_0000_0000 | Recent 15-minute market takers (#800) |
 //!
 //! Canonical `wallet_hex` form: `"0x" + 40 lowercase hex chars` (matches
 //! `WalletAddress::Display`). All callers must normalise before inserting.
@@ -63,12 +64,20 @@ pub const SRC_GAP502: i64 = 0b1000000;
 /// the other curation-list sources.
 pub const SRC_DATADASH: i64 = 0b10000000;
 
+/// Taker wallets seen in recent 15-minute markets (#800). Curated like datadash:
+/// preferred activation tier, never lifts a tombstone.
+pub const SRC_MARKET_PARTICIPANT: i64 = 0b1_0000_0000;
+
+/// Curated sources admitted immediately or preferred in a controlled batch.
+pub const PREFERRED_SOURCE_BITS: i64 =
+    SRC_LEADERBOARD | SRC_GAP502 | SRC_DATADASH | SRC_MARKET_PARTICIPANT;
+
 /// Sources whose re-discovery of a tombstoned wallet *lifts* the tombstone and
 /// re-admits it (issue #385): the Polymarket leaderboard only. The lift decision
 /// is read from each `upsert_wallets_bulk` row's own `source_bits` — `bits &
 /// TOMBSTONE_OVERRIDE_SOURCES != 0` lifts (leaderboard 16), any other bit (datadash
-/// 128, 502-gap 64, trades 2, wallet-set-json 1) leaves the tombstone intact
-/// (`bits & 16 == 0`). No caller passes this explicitly; the discrimination is
+/// 128, market-participant 256, 502-gap 64, trades 2, wallet-set-json 1) leaves
+/// the tombstone intact (`bits & 16 == 0`). No caller passes this explicitly; the discrimination is
 /// automatic because each source tags rows with exactly its bit. (The retired
 /// Radion source's bit 32 no longer lifts — existing radion-tagged rows are inert.)
 pub const TOMBSTONE_OVERRIDE_SOURCES: i64 = SRC_LEADERBOARD;
@@ -388,6 +397,33 @@ mod tests {
     }
 
     #[test]
+    fn participant_activation_is_preferred_and_respects_infra() {
+        let (_dir, mut cache) = tmp_cache();
+        cache
+            .upsert_wallet(&hex(1), SRC_TRADES, false, Some(1), None, Some(9900))
+            .unwrap();
+        cache
+            .upsert_wallet(&hex(2), SRC_MARKET_PARTICIPANT, false, Some(2), None, None)
+            .unwrap();
+        cache
+            .upsert_wallet(&hex(3), SRC_MARKET_PARTICIPANT, true, None, None, None)
+            .unwrap();
+        cache
+            .upsert_wallet(&hex(4), SRC_MARKET_PARTICIPANT, false, None, None, None)
+            .unwrap();
+        let batch = cache
+            .activate_next_batch("participants", 1, PILE_ACTIVATION_MIN_TRADES, 100)
+            .unwrap();
+        assert_eq!(batch.wallet_hexes, vec![hex(2)]);
+        assert_eq!(apply_activation_rules(&mut cache).unwrap(), 1);
+        assert_eq!(
+            cache.active_tradeable_wallet_hexes().unwrap(),
+            vec![hex(2), hex(4)]
+        );
+        assert!(cache.conn_for_test_is_infra(&hex(3)));
+    }
+
+    #[test]
     fn retired_radion_bit_no_longer_bypasses_count_gate() {
         // Regression guard for the Radion retirement: bit 32 was SRC_RADION and used
         // to bypass the trade-count activation gate (the `source_bits & 32` clause in
@@ -460,14 +496,17 @@ mod tests {
         cache
             .upsert_wallet(&hex(60), SRC_DATADASH, false, None, None, None)
             .unwrap();
+        cache
+            .upsert_wallet(&hex(60), SRC_MARKET_PARTICIPANT, false, None, None, None)
+            .unwrap();
         let bits = cache.conn_for_test_source_bits(&hex(60));
         assert_eq!(
             bits,
-            SRC_LEADERBOARD | SRC_DATADASH,
-            "expected leaderboard|datadash 0b{:08b}, got 0b{:08b}",
-            SRC_LEADERBOARD | SRC_DATADASH,
-            bits
+            SRC_LEADERBOARD | SRC_DATADASH | SRC_MARKET_PARTICIPANT
         );
+        assert_eq!(SRC_MARKET_PARTICIPANT, 256);
+        assert_eq!(PREFERRED_SOURCE_BITS, 16 | 64 | 128 | 256);
+        assert_eq!(TOMBSTONE_OVERRIDE_SOURCES, 16);
     }
 
     #[test]
@@ -478,6 +517,9 @@ mod tests {
             .unwrap();
         cache
             .upsert_wallet(&hex(7), SRC_LEADERBOARD, false, None, None, None)
+            .unwrap();
+        cache
+            .upsert_wallet(&hex(7), SRC_MARKET_PARTICIPANT, false, None, None, None)
             .unwrap();
         let infra = cache.conn_for_test_is_infra(&hex(7));
         assert!(

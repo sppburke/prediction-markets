@@ -366,8 +366,9 @@ CREATE TABLE IF NOT EXISTS meta (
 -- Wallet pile (issue #166). `wallet_hex` is the canonical form produced by
 -- `WalletAddress::Display`: `\"0x\" + 40 lowercase hex chars`.
 -- `source_bits`: bit0=wallet_set_json, bit1=trades, bit4=leaderboard,
--- bit6=gap502, bit7=datadash. (bit2/bit3 were dune_csv/dune_incr, removed in
--- #335; bit5 was radion, removed on Radion retirement; the gaps are intentional
+-- bit6=gap502, bit7=datadash, bit8=market_participant. (bit2/bit3 were
+-- dune_csv/dune_incr, removed in #335; bit5 was radion, removed on Radion
+-- retirement; the gaps are intentional
 -- — `source_bits` is persisted, do not renumber or reuse.)
 -- `is_active` is sticky 0→1; `is_infra` is also sticky once set.
 CREATE TABLE IF NOT EXISTS wallets (
@@ -4159,7 +4160,8 @@ impl WalletCache {
     ///
     /// Sticky semantics: only `is_active = 0` rows are considered. `is_infra = 0`
     /// gates **every** activation branch — a wallet listed in both the infra CSV
-    /// and a curation list (leaderboard/502-gap/datadash) stays inactive.
+    /// and a curation list (leaderboard/502-gap/datadash/market participants)
+    /// stays inactive.
     ///
     /// Issue #385 defense-in-depth: a tombstoned wallet (`purged_wallets`) is
     /// never activated even if a stray row exists. The primary guard is the
@@ -4173,11 +4175,9 @@ impl WalletCache {
              AND wallet_hex NOT IN (SELECT wallet_hex FROM purged_wallets) AND (\
                 COALESCE(trade_count, 0) >= ?1 \
              OR COALESCE(dune_closed_markets, 0) >= ?1 \
-             OR (source_bits & 16) != 0 \
-             OR (source_bits & 64) != 0 \
-             OR (source_bits & 128) != 0\
+             OR (source_bits & ?2) != 0\
              )",
-            params![min_trades],
+            params![min_trades, crate::pile::PREFERRED_SOURCE_BITS],
         )?;
         Ok(affected)
     }
@@ -4264,18 +4264,21 @@ impl WalletCache {
                  ORDER BY CASE WHEN ( \
                               COALESCE(w.trade_count, 0) >= ?1 \
                            OR COALESCE(w.dune_closed_markets, 0) >= ?1 \
-                           OR (w.source_bits & 16) != 0 \
-                           OR (w.source_bits & 64) != 0 \
-                           OR (w.source_bits & 128) != 0 \
+                           OR (w.source_bits & ?3) != 0 \
                           ) THEN 0 ELSE 1 END, \
                           w.dune_win_rate_bps DESC NULLS LAST, \
                           w.dune_closed_markets DESC NULLS LAST, \
                           w.trade_count DESC, w.wallet_hex ASC \
                  LIMIT ?2",
             )?;
-            stmt.query_map(params![min_trades, requested_i64], |row| {
-                row.get::<_, String>(0)
-            })?
+            stmt.query_map(
+                params![
+                    min_trades,
+                    requested_i64,
+                    crate::pile::PREFERRED_SOURCE_BITS
+                ],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<Result<Vec<_>, _>>()?
         };
 
