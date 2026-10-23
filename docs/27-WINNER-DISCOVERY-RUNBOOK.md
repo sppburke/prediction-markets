@@ -1,7 +1,7 @@
 # 27 — Winner-Discovery Runbook
 
 Automates the ingest of new candidate wallets from the Polymarket leaderboard
-(plus the datadash.xyz cohorts). The
+(plus the datadash.xyz cohorts and recent 15-minute market takers). The
 `pe-bootstrap winner-discovery` subcommand upserts each discovered wallet into the
 local `wallet_cache.db`. A standalone invocation immediately applies the legacy
 activation rules; the full rank-and-push wrapper explicitly defers that behavior
@@ -28,6 +28,7 @@ defaults"):
 PE_BOOTSTRAP_LEADERBOARD_BASE_URL        # override leaderboard host (testing)
 PE_BOOTSTRAP_LEADERBOARD_TOP_N           # list depth; paged (canonical default in _GLOSSARY.md)
 PE_BOOTSTRAP_DATADASH_API_URL            # default https://api.datadash.xyz (on by default; "" disables)
+PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS    # recent market lookback; 0 disables with no HTTP
 PE_BOOTSTRAP_CACHE_PATH                  # default wallet_cache.db
 ```
 
@@ -63,7 +64,7 @@ records an activation batch of zero. Before the first ordinary cycle, the owner 
 ordinary batch size; a recorded cycle keeps that value through retries.
 
 There is no separate eval/export stage or candidates JSON: `winner-discovery` fetches
-the leaderboard + datadash slices and upserts new wallets (recording the
+the leaderboard, datadash and market participant slices and upserts new wallets (recording the
 source bit) straight into the cache. In standalone mode it activates eligible
 ones immediately. `rank_and_push.sh` instead admits only the controlled batch, then
 backfills their trade history and ranks them alongside the rest of the universe — the
@@ -94,7 +95,8 @@ snapshot changes nothing once its bit is present.
 
 The `SRC_LEADERBOARD` bit (16) bypasses the 100-trade activation gate in
 `pe_bootstrap::pile::apply_activation_rules`, matching the curation-list
-behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
+behaviour of the `SRC_GAP502` (64), `SRC_DATADASH` (128) and
+`SRC_MARKET_PARTICIPANT` (256) bits.
 
 > **Retired source — Radion.** A third source, the Radion `traders/analysis`
 > trader-ranking API (issue #373), was removed once Radion deprecated that
@@ -102,7 +104,47 @@ behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
 > route). Its `radion_*` config knobs, `PE_BOOTSTRAP_RADION_*` env keys, and the
 > `SRC_RADION` (bit 32) source bit were retired; bit 32 is now a reserved gap in
 > `source_bits` (not reused), and existing radion-tagged rows stay inert. Discovery
-> now runs the leaderboard + datadash sources only.
+> now runs leaderboard, datadash and market participant sources.
+
+## Recent market participants (#800)
+
+The third source sweeps the existing Gamma 15-minute series scope with a recent end-date
+floor, then reads public Data API `/trades` for those condition ids over one frozen lookback
+window. It uses the endpoint's default `takerOnly=true`, so only taker wallets are discovered.
+Future markets can be in the Gamma scope; an empty trades reply adds no wallet. The lookback
+default and request bounds are canonical in
+[`participant_lookback_secs`](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap).
+
+Lowercase, valid `proxyWallet` addresses are deduplicated and tagged with
+`SRC_MARKET_PARTICIPANT`. This bit gives the same preferred activation eligibility as datadash,
+including tagging already-known inactive wallets. It never lifts a tombstone or clears an
+infrastructure flag. Normal history acquisition, eligibility, ranking and sizing still apply.
+
+Each run logs one summary `record` under `winner_discovery: participants`: source id
+`polymarket-data-api-trades`, schema/parser versions, frozen window, wallet count, status, the
+Gamma scope's own source ID, version, schema/parser versions, digest, count and series, and page
+counts. Every page of a completed Gamma sweep and every `/trades` page fetched then gets its own
+`page` line under `winner_discovery: participant page` (URL, raw sha256, rows, and observed,
+received and source times). The Gamma sweep is all-or-nothing, like the `market-scope` command: if
+it fails, the run logs `failed:gamma` with the error, records no Gamma pages and writes no wallet.
+Each line stays under journald's 48 KB `LineMax`; a trades URL lists its condition ids and the
+scope digest covers the whole list. Statuses:
+
+- `ok`: collection completed; counts are included in both CLI discovery summaries.
+- `disabled`: lookback is zero; no Gamma or trades HTTP is made.
+- `failed:<reason>`: collection failed (for example `gamma`, `trades` or `trades-json`);
+  a warning is logged, counts are zero and no participant wallet is upserted.
+- `incomplete`: both allowed offsets were full even after splitting to a one-second
+  window; a warning is logged, counts are zero and no participant wallet is upserted.
+
+Cache upsert and activation errors remain fatal. Collection failures allow the cycle to continue.
+The existing fetchers retain their request retry policy. Once the wrapper records the cycle's
+activation batch, cycle retries skip discovery; a failed or incomplete participant source is
+attempted again in the next new cycle. Its status remains visible rather than implying success.
+
+Rollback: set `PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS=0` in the wrapper-loaded `.env`.
+Later discovery runs skip this source. Already activated wallets stay active and queued
+participant wallets keep their preferred eligibility.
 
 ## Operational notes
 
@@ -118,7 +160,8 @@ behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
   writes `data/eval-results/rank_and_push.cycle` before discovery or activation.
   If a transient pre-publication stage fails, the next zero-argument retry
   reuses that run directory, its deterministic activation batch ID, and the
-  already-committed cohort; it does not admit another batch. The batch size
+  already-committed cohort; it skips discovery once the activation batch is recorded
+  and does not admit another batch. The batch size
   (`PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS`; default
   `bootstrap_pipeline_activation_batch_wallets`; `0` admits none) must not
   change between the attempt and its retry: the committed batch reloads only
@@ -156,7 +199,7 @@ behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
 - `docs/26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md` — full data-refresh and
   re-optimisation pipeline (includes watchlist export and VPS deploy).
 - `docs/_GLOSSARY.md` — `bootstrap_leaderboard_*` and `bootstrap_datadash_*`
-  defaults, `SRC_LEADERBOARD` / `SRC_DATADASH` bit definitions.
+  defaults, `SRC_LEADERBOARD` / `SRC_DATADASH` / `SRC_MARKET_PARTICIPANT` bit definitions.
 - `docs/19-WINNER-FOLLOW-STRATEGY.md` — wallet selection, order eligibility, and
   risk rules. The owner's requested account mode is the only live on/off switch;
   discovery and promotion evidence do not change it.

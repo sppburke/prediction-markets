@@ -37,6 +37,8 @@ const DEFAULT_LEADERBOARD_TOP_N: u32 = 1_050;
 const DEFAULT_DATADASH_API_URL: &str = "https://api.datadash.xyz";
 const DEFAULT_DATADASH_REQUEST_INTERVAL_MS: u64 = 500;
 const DEFAULT_DATADASH_MAX_COHORT_WALLETS: u64 = 10_000;
+// Issue #800: recent 15-minute market participant discovery.
+const DEFAULT_PARTICIPANT_LOOKBACK_SECS: u64 = 86_400;
 // Issue #385: `pe-bootstrap purge` defaults.
 const DEFAULT_PURGE_INACTIVITY_SECS: i64 = 1_209_600; // 14 days
 const DEFAULT_PURGE_LOSER_TSTAT_MAX: f64 = -2.0;
@@ -399,6 +401,15 @@ pub struct BootstrapConfig {
     )]
     pub datadash_max_cohort_wallets: u64,
 
+    /// Recent 15-minute market participant lookback in seconds (#800). Zero disables
+    /// the source without HTTP. Canonical default in `docs/_GLOSSARY.md`.
+    /// `PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS` overrides.
+    #[serde(
+        default = "default_participant_lookback_secs",
+        alias = "bootstrap_participant_lookback_secs"
+    )]
+    pub participant_lookback_secs: u64,
+
     // ── pe-bootstrap purge (issue #385) ───────────────────────────────────────
     /// Arm the `pe-bootstrap purge` DELETE. Default `false` keeps the stage
     /// report-only (a dry-run that deletes nothing); the would-purge report still
@@ -606,6 +617,10 @@ fn default_leaderboard_categories() -> Vec<LeaderboardCategory> {
     LeaderboardCategory::ALL.to_vec()
 }
 
+const fn default_participant_lookback_secs() -> u64 {
+    DEFAULT_PARTICIPANT_LOOKBACK_SECS
+}
+
 fn default_datadash_api_url() -> Option<String> {
     Some(DEFAULT_DATADASH_API_URL.to_owned())
 }
@@ -686,6 +701,7 @@ impl Default for BootstrapConfig {
             leaderboard_request_interval_ms: default_leaderboard_request_interval_ms(),
             leaderboard_top_n: default_leaderboard_top_n(),
             leaderboard_categories: default_leaderboard_categories(),
+            participant_lookback_secs: default_participant_lookback_secs(),
             datadash_api_url: default_datadash_api_url(),
             datadash_request_interval_ms: default_datadash_request_interval_ms(),
             datadash_exclude_ids: default_datadash_exclude_ids(),
@@ -989,6 +1005,7 @@ mod tests {
             Some("https://api.datadash.xyz"),
             "datadash is on by default"
         );
+        assert_eq!(cfg.participant_lookback_secs, 86_400);
         assert_eq!(cfg.datadash_request_interval_ms, 500);
         assert_eq!(cfg.datadash_max_cohort_wallets, 10_000);
         assert_eq!(cfg.datadash_exclude_ids, vec!["07NQHFRAGB6HV".to_owned()]);
@@ -1026,6 +1043,42 @@ mod tests {
                 cfg.datadash_api_url.is_none(),
                 "PE_BOOTSTRAP_DATADASH_API_URL=\"\" must disable the source"
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn participant_lookback_env_zero_overrides_toml_and_disables_http() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                r#"
+                output_path = "/tmp/watchlist.json"
+                participant_lookback_secs = 3600
+                gamma_base_url = "invalid URL must never be fetched"
+                polymarket_base_url = "invalid URL must never be fetched"
+            "#,
+            )?;
+            let cfg = load(Some(std::path::Path::new("config.toml")))
+                .map_err(|e| figment::Error::from(e.to_string()))?;
+            assert_eq!(cfg.participant_lookback_secs, 3600);
+            jail.set_env("PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS", "0");
+            let cfg = load(Some(std::path::Path::new("config.toml")))
+                .map_err(|e| figment::Error::from(e.to_string()))?;
+            assert_eq!(cfg.participant_lookback_secs, 0);
+            let mut cache =
+                crate::cache::WalletCache::open(std::path::Path::new("cache.db")).unwrap();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let result = runtime
+                .block_on(crate::wallet_discovery::run_source_discovery(
+                    crate::wallet_discovery::WalletDiscoverySource::MarketParticipants,
+                    &cfg,
+                    &mut cache,
+                ))
+                .unwrap();
+            assert_eq!(result.status, "disabled");
+            assert_eq!((result.unique_wallets, result.activated), (0, 0));
+            assert_eq!(cache.wallet_pile_size().unwrap(), 0);
             Ok(())
         });
     }

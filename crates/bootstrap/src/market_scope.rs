@@ -39,20 +39,21 @@ const PAGE_MAX_RETRIES: u32 = 5;
 const PAGE_RETRY_BASE: Duration = Duration::from_secs(1);
 const SOURCE_ID: &str = "polymarket-gamma";
 
-/// One fetched Gamma page with its request and receipt times and the reply's `Date` (source) time.
-struct FetchedPage {
-    body: Vec<u8>,
-    observed_at_unix: i64,
-    received_at_unix: i64,
-    source_at_unix: Option<i64>,
+/// One fetched page with its request and receipt times and the reply's `Date` (source) time.
+pub(crate) struct FetchedPage {
+    pub(crate) body: Vec<u8>,
+    pub(crate) observed_at_unix: i64,
+    pub(crate) received_at_unix: i64,
+    pub(crate) source_at_unix: Option<i64>,
 }
 
 /// Page transport; production observes each attempt, tests supply pages directly.
-trait ScopeFetcher {
+pub(crate) trait ScopeFetcher {
     fn fetch(
         &self,
         url: &str,
         endpoint_kind: &'static str,
+        source_id: &'static str,
     ) -> impl std::future::Future<Output = Result<FetchedPage, SourceError>> + Send;
 }
 
@@ -61,13 +62,14 @@ impl ScopeFetcher for ReqwestFetcher {
         &self,
         url: &str,
         endpoint_kind: &'static str,
+        source_id: &'static str,
     ) -> Result<FetchedPage, SourceError> {
         let mut times = None;
         let body = self
             .fetch_page_observed(
                 url,
                 HttpRequestContext {
-                    source_id: SOURCE_ID,
+                    source_id,
                     endpoint_kind,
                 },
                 |attempt| {
@@ -141,20 +143,28 @@ pub async fn run_market_scope(
     out: &Path,
     end_date_min_unix: i64,
 ) -> Result<MarketScope, BootstrapError> {
+    let scope = recent_market_scope(config, end_date_min_unix).await?;
+    crate::cache_migration::atomic_write_json(out, &scope)?;
+    Ok(scope)
+}
+
+/// Sweep recent 15-minute markets with page provenance, without writing a file.
+pub(crate) async fn recent_market_scope(
+    config: &BootstrapConfig,
+    end_date_min_unix: i64,
+) -> Result<MarketScope, BootstrapError> {
     let client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(15))
         .build()
         .map_err(|_| BootstrapError::Internal)?;
     let fetcher = ReqwestFetcher::new(client).with_min_interval_ms(SCOPE_MIN_INTERVAL_MS);
-    let scope = sweep_market_scope(
+    sweep_market_scope(
         &fetcher,
         &config.gamma_base_url,
         end_date_min_unix,
         PAGE_RETRY_BASE,
     )
-    .await?;
-    crate::cache_migration::atomic_write_json(out, &scope)?;
-    Ok(scope)
+    .await
 }
 
 /// List the 15-minute series, then walk each one's events ending at or after the floor.
@@ -339,7 +349,7 @@ async fn fetch_with_retry<F: ScopeFetcher>(
 ) -> Result<FetchedPage, BootstrapError> {
     let mut retries = 0u32;
     loop {
-        match fetcher.fetch(url, endpoint_kind).await {
+        match fetcher.fetch(url, endpoint_kind, SOURCE_ID).await {
             Ok(page) => return Ok(page),
             Err(SourceError::Fatal { message }) => {
                 return Err(BootstrapError::Gamma {
@@ -477,7 +487,9 @@ mod tests {
             &self,
             url: &str,
             _endpoint_kind: &'static str,
+            source_id: &'static str,
         ) -> Result<FetchedPage, SourceError> {
+            assert_eq!(source_id, SOURCE_ID);
             let call = self.1.fetch_add(1, Ordering::SeqCst);
             Ok(FetchedPage {
                 body: (self.0)(url, call)?,

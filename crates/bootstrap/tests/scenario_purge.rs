@@ -15,7 +15,8 @@ use std::collections::HashSet;
 use pe_bootstrap::BootstrapConfig;
 use pe_bootstrap::cache::{PurgeReason, PurgeRow, WalletCache};
 use pe_bootstrap::pile::{
-    BACKFILL_STALENESS_SECS, PILE_ACTIVATION_MIN_TRADES, SRC_DATADASH, SRC_LEADERBOARD, SRC_TRADES,
+    BACKFILL_STALENESS_SECS, PILE_ACTIVATION_MIN_TRADES, SRC_DATADASH, SRC_LEADERBOARD,
+    SRC_MARKET_PARTICIPANT, SRC_TRADES,
 };
 use pe_bootstrap::purge::{recover_pending_reclamation, run_infra_purge, run_purge};
 use tempfile::TempDir;
@@ -156,6 +157,13 @@ fn datadash_rediscovery_does_not_lift() {
 }
 
 #[test]
+fn participant_rediscovery_does_not_lift_tombstone() {
+    let (still_purged, exists) = lift_outcome(SRC_MARKET_PARTICIPANT);
+    assert!(still_purged && !exists);
+    println!("PASS: participant rediscovery leaves the tombstone intact without re-insertion");
+}
+
+#[test]
 fn migrate_trades_rediscovery_does_not_lift() {
     // PASS: re-discovery via SRC_TRADES (the migrate path) does not lift.
     let (still_purged, exists) = lift_outcome(SRC_TRADES);
@@ -243,36 +251,47 @@ fn dry_run_estimates_and_writes_nothing() {
 #[test]
 fn activation_skips_tombstoned_wallet() {
     // PASS: apply_activation_rules never sets is_active=1 for a tombstoned wallet
-    // even if a stray row exists; a non-tombstoned leaderboard wallet activates.
-    let dir = TempDir::new().unwrap();
-    let mut cache = open_cache(&dir);
-    let w = wallet_hex(0x1);
-    let c = wallet_hex(0x2);
-    // Tombstone w (create + armed-purge).
-    upsert(&mut cache, &w, SRC_LEADERBOARD);
-    cache.conn_for_test_insert_trade(&w, "t", 1_000);
-    cache.purge_wallets(&[proven(&w)], 2_000, false).unwrap();
-    // Stray row for w via the single-wallet path (ungated) — the defense case.
-    cache
-        .upsert_wallet(&w, SRC_LEADERBOARD, false, None, None, None)
-        .unwrap();
-    // Control: a normal, non-tombstoned leaderboard wallet.
-    cache
-        .upsert_wallet(&c, SRC_LEADERBOARD, false, None, None, None)
-        .unwrap();
+    // even if a stray curated row exists; a non-tombstoned control activates.
+    for source in [SRC_LEADERBOARD, SRC_MARKET_PARTICIPANT] {
+        let dir = TempDir::new().unwrap();
+        let mut cache = open_cache(&dir);
+        let w = wallet_hex(0x1);
+        let c = wallet_hex(0x2);
+        // Tombstone w (create + armed-purge).
+        upsert(&mut cache, &w, SRC_LEADERBOARD);
+        cache.conn_for_test_insert_trade(&w, "t", 1_000);
+        cache.purge_wallets(&[proven(&w)], 2_000, false).unwrap();
+        // Stray row for w via the single-wallet path (ungated) — the defense case.
+        cache
+            .upsert_wallet(&w, source, false, None, None, None)
+            .unwrap();
+        // Control: a normal, non-tombstoned curated wallet.
+        cache
+            .upsert_wallet(&c, source, false, None, None, None)
+            .unwrap();
 
-    cache
-        .apply_activation_rules(PILE_ACTIVATION_MIN_TRADES)
-        .unwrap();
+        cache
+            .apply_activation_rules(PILE_ACTIVATION_MIN_TRADES)
+            .unwrap();
 
-    let active: HashSet<String> = cache
-        .active_tradeable_wallet_hexes()
-        .unwrap()
-        .into_iter()
-        .collect();
-    assert!(active.contains(&c), "control wallet should activate");
-    assert!(!active.contains(&w), "tombstoned wallet must NOT activate");
-    println!("PASS: activation guard blocks a tombstoned wallet; non-tombstoned control activates");
+        let active: HashSet<String> = cache
+            .active_tradeable_wallet_hexes()
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(active.contains(&c), "control wallet should activate");
+        assert!(!active.contains(&w), "tombstoned wallet must NOT activate");
+        let batch = cache
+            .activate_next_batch("tombstone", 1, PILE_ACTIVATION_MIN_TRADES, 2_001)
+            .unwrap();
+        assert!(
+            batch.wallet_hexes.is_empty(),
+            "controlled activation must also skip tombstones"
+        );
+        println!(
+            "PASS: activation guard blocks a tombstoned wallet; non-tombstoned control activates"
+        );
+    }
 }
 
 // ── Rule-B candidate selection: freshness gate + recency + NULL handling ──────
@@ -524,11 +543,18 @@ fn infra_purge_honors_shared_enable_flag_and_invalidates_wallet_derived_data() {
         .unwrap();
     assert_eq!(audit_rows, 1, "activation audit survives live-wallet purge");
 
-    upsert(&mut cache, &infra, SRC_LEADERBOARD);
-    assert!(
-        !cache.conn_for_test_wallet_exists(&infra),
-        "leaderboard cannot lift an infra exclusion"
-    );
+    for source in [
+        SRC_LEADERBOARD,
+        SRC_DATADASH,
+        SRC_MARKET_PARTICIPANT,
+        SRC_TRADES,
+    ] {
+        upsert(&mut cache, &infra, source);
+        assert!(
+            !cache.conn_for_test_wallet_exists(&infra),
+            "source {source} cannot lift an infra exclusion"
+        );
+    }
     assert!(cache.clear_infra_exclusion(&infra).unwrap());
     upsert(&mut cache, &infra, SRC_LEADERBOARD);
     assert!(cache.conn_for_test_wallet_exists(&infra));
