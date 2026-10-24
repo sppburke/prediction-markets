@@ -12,5 +12,12 @@
 # from webpki-roots 1, which Cargo.lock resolves to 1.0.10 (the root removed). tokio-tungstenite
 # 0.28 requires ^0.26 and no fixed 0.26 exists; deny.toml's [bans] keep every other affected
 # webpki-roots version out of Cargo.lock. Remove this ignore when it moves to webpki-roots 1.
+#
+# RUSTSEC-2026-0387 (crypto-bigint < 0.7.6 has timing-variable "constant-time" operations):
+# crypto-bigint 0.5.5 is required by elliptic-curve 0.13 (alloy-signer, k256, ecdsa), whose ^0.5
+# range no lockfile update can lift to the fixed 0.7.6. Its secret-key use is ECDSA signing by
+# the live venue client and the redemption signer, both run only with live credentials; paper
+# mode never signs. deny.toml's [bans] keep every other affected crypto-bigint version out of
+# Cargo.lock. Remove this ignore when alloy and k256 move to elliptic-curve 0.14 or later.
 [advisories]
-ignore = ["RUSTSEC-2026-0235", "RUSTSEC-2026-0381"]
+ignore = ["RUSTSEC-2026-0235", "RUSTSEC-2026-0381", "RUSTSEC-2026-0387"]
