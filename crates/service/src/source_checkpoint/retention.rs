@@ -28,7 +28,9 @@ use crate::paper_recovery::{
     FinancialPayload, PaperLog, PaperLogFrame, PaperLogRecord, generation_qualification_sealed,
     paper_era, paper_generation,
 };
-use crate::risk_inputs::{SourceFrameMetadata, SourceReceiptIndex};
+use crate::risk_inputs::{
+    BoundaryCandidate, ReceiptCommitment, RetentionAudit, SourceReceiptIndex,
+};
 use crate::source_log_boot::{FrozenCheckpoint, FrozenPrefix};
 use crate::trade_poller::PendingBoundary;
 
@@ -970,23 +972,32 @@ pub(crate) fn prepare(
         return Ok(PreparedRetention::Deferred("advance_not_due"));
     }
     let tail = index.current_tail_binding()?;
-    let count = super::tail_receipt_count(&tail)?;
-    let frames = index.checkpoint_suffix(0, count, &tail)?;
     let cutoff = now
         .checked_sub(SOURCE_RETENTION_BUFFER_SECS)
         .context("retention clock overflow")?;
     let cutoff_millis = cutoff
         .checked_mul(1000)
         .context("retention clock overflow")?;
-    let first = frames
-        .iter()
-        .find(|frame| frame.received_millis >= cutoff_millis)
-        .or_else(|| frames.last());
-    let Some(first) = first else {
-        return Ok(PreparedRetention::Nothing {
-            tail,
-            boundary_current: true,
-        });
+    let first = match index.retention_boundary_candidate(&tail, cutoff_millis)? {
+        BoundaryCandidate::Empty => {
+            return Ok(PreparedRetention::Nothing {
+                tail,
+                boundary_current: true,
+            });
+        }
+        BoundaryCandidate::Retired { base } => {
+            // The selected receipt is below the index's window base, which never passes the
+            // committed boundary loaded above, so the boundary cannot advance.
+            ensure!(
+                base <= old_boundary.sequence.0,
+                "retention index retired past the committed boundary"
+            );
+            return Ok(PreparedRetention::Nothing {
+                tail,
+                boundary_current: true,
+            });
+        }
+        BoundaryCandidate::Frame(first) => first,
     };
     let boundary = RetentionBoundary {
         sequence: first.receipt.sequence,
@@ -1139,7 +1150,11 @@ pub(crate) fn prepare(
         boundary,
     )?;
     // Receipts must be authentic and durable before an authority can make them retention metadata.
-    ensure_receipts(path, &frames, boundary)?;
+    ensure_receipts(
+        path,
+        &index.retention_audit(boundary.sequence, &tail)?,
+        boundary,
+    )?;
     if context.paper_state.sync_checkpoint_dispositions().is_err() {
         return Ok(PreparedRetention::Deferred("disposition_barrier"));
     }
@@ -1196,16 +1211,27 @@ fn add_payload_pins(
     Ok(())
 }
 
+/// Read every receipt below `boundary` from the sidecar and compare it with the verified index:
+/// retired receipts through their commitment, the rest one by one (#745).
 fn ensure_receipts(
     path: &Path,
-    frames: &[SourceFrameMetadata],
+    audit: &RetentionAudit,
     boundary: RetentionBoundary,
 ) -> anyhow::Result<()> {
-    let count = usize::try_from(boundary.sequence.0)?;
+    let count = boundary.sequence.0;
+    let base = audit.commitment.count();
     let file = File::open(super::receipts_path(path))?;
     let mut reader = std::io::BufReader::new(&file);
-    for (sequence, frame) in frames.iter().take(count).enumerate() {
-        let record = super::read_record(&mut reader, sequence)?;
+    let mut rebuilt = ReceiptCommitment::default();
+    for sequence in 0..base {
+        rebuilt.push(&super::read_record(&mut reader, usize::try_from(sequence)?)?)?;
+    }
+    ensure!(
+        rebuilt.matches(&audit.commitment),
+        "retention receipts differ from index"
+    );
+    for frame in &audit.window {
+        let record = super::read_record(&mut reader, usize::try_from(frame.receipt.sequence.0)?)?;
         ensure!(
             record.receipt == frame.receipt
                 && record.received_millis == frame.received_millis
@@ -1213,7 +1239,11 @@ fn ensure_receipts(
             "retention receipts differ from index"
         );
     }
-    ensure!(frames.len() >= count, "retention receipts incomplete");
+    ensure!(
+        base.checked_add(u64::try_from(audit.window.len())?)
+            .is_some_and(|audited| audited >= count),
+        "retention receipts incomplete"
+    );
     file.sync_all()?;
     Ok(())
 }
@@ -1275,9 +1305,12 @@ pub(crate) fn commit(
         request.authority.boundary,
     )?;
     request.authority.pins = pins.into_values().collect();
+    // The sidecar handle that serves retired receipts is opened under this lock, before the
+    // authority can become visible; the prefix it reads is never rewritten afterwards (#745).
+    let reader = request.receipts.retired_reader()?;
     let installer = request
         .receipts
-        .prepare_retention_install(request.authority.clone())?;
+        .prepare_retention_install(request.authority.clone(), Some(reader))?;
     let result = {
         #[cfg(feature = "scenario")]
         if let Some(write) = &request.context.hooks.authority_write {

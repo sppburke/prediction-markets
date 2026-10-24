@@ -918,15 +918,153 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
         .collect()
 }
 
+/// Constant-size commitment to the canonical receipt records of sequences `[0, count)` (#745).
+///
+/// The retention pre-commit audit rebuilds it from the receipt sidecar and compares, so damage to
+/// any retired record blocks the next commit even when the record's own checksum was recomputed.
+#[derive(Clone, Default)]
+pub(crate) struct ReceiptCommitment {
+    count: u64,
+    hasher: blake3::Hasher,
+}
+
+impl ReceiptCommitment {
+    /// Absorb the next record; its sequence must equal the current count.
+    pub(crate) fn push(&mut self, frame: &SourceFrameMetadata) -> Result<(), RiskInputsUnavailable> {
+        if frame.receipt.sequence.0 != self.count {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        let record = pe_event_log::ReceiptRecord {
+            receipt: frame.receipt,
+            received_millis: frame.received_millis,
+            byte_offset: frame.byte_offset,
+        };
+        self.hasher.update(&record.encode());
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or(RiskInputsUnavailable::Overflow)?;
+        Ok(())
+    }
+
+    pub(crate) fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// Whether both commitments cover the same number of records with identical bytes.
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        self.count == other.count && self.hasher.finalize() == other.hasher.finalize()
+    }
+}
+
+/// Receipts below the in-memory window: every sequence below the committed retention boundary
+/// (#745).
+///
+/// Memory keeps only this constant-size summary. The records stay in the dense receipt sidecar,
+/// which is never rewritten below the boundary once retention exists, and are read from it on
+/// demand through `reader`.
+#[derive(Clone, Default)]
+struct RetiredReceipts {
+    commitment: ReceiptCommitment,
+    /// Newest receive time among the retired receipts.
+    max_received: Option<i64>,
+    /// The two highest retired receipts, so tail and predecessor reads stay in memory.
+    last: Option<SourceFrameMetadata>,
+    before_last: Option<SourceFrameMetadata>,
+    reader: Option<Arc<std::fs::File>>,
+}
+
+impl RetiredReceipts {
+    fn count(&self) -> u64 {
+        self.commitment.count()
+    }
+
+    fn retire(&mut self, frame: SourceFrameMetadata) -> Result<(), RiskInputsUnavailable> {
+        self.commitment.push(&frame)?;
+        self.max_received = self.max_received.max(Some(frame.received_millis));
+        self.before_last = self.last.replace(frame);
+        Ok(())
+    }
+
+    fn cached(&self, sequence: u64) -> Option<&SourceFrameMetadata> {
+        [self.last.as_ref(), self.before_last.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|frame| frame.receipt.sequence.0 == sequence)
+    }
+}
+
+/// What a retention preparation's scan of every receipt selects as the next boundary (#745).
+pub(crate) enum BoundaryCandidate {
+    /// There are no receipts.
+    Empty,
+    /// The selected receipt is below `base`, among the retired receipts.
+    Retired { base: u64 },
+    Frame(SourceFrameMetadata),
+}
+
+/// Inputs for the retention pre-commit audit (#745).
+pub(crate) struct RetentionAudit {
+    /// Commitment to the retired receipts `[0, commitment.count())`.
+    pub(crate) commitment: ReceiptCommitment,
+    /// In-memory receipts from the window base up to the audited boundary.
+    pub(crate) window: Vec<SourceFrameMetadata>,
+}
+
+/// Where one receipt is: in memory, in the sidecar below the window, or not yet appended.
+enum ReceiptSlot {
+    Memory(SourceFrameMetadata),
+    Sidecar(Arc<std::fs::File>),
+    Absent,
+}
+
+impl ReceiptSlot {
+    /// Resolve outside the index lock. A sidecar read failure is a missing receipt (#745).
+    fn resolve(self, sequence: u64) -> Result<Option<SourceFrameMetadata>, RiskInputsUnavailable> {
+        match self {
+            Self::Memory(frame) => Ok(Some(frame)),
+            Self::Sidecar(file) => read_retired_receipt(&file, sequence).map(Some),
+            Self::Absent => Ok(None),
+        }
+    }
+}
+
+/// Positional, checksum-verified read of retired receipt `sequence` from the dense sidecar.
+fn read_retired_receipt(
+    file: &std::fs::File,
+    sequence: u64,
+) -> Result<SourceFrameMetadata, RiskInputsUnavailable> {
+    use std::os::unix::fs::FileExt as _;
+    let position = sequence
+        .checked_mul(pe_event_log::RECEIPT_RECORD_LEN)
+        .ok_or(RiskInputsUnavailable::Overflow)?;
+    let mut bytes = [0; 80];
+    file.read_exact_at(&mut bytes, position)
+        .map_err(|_| RiskInputsUnavailable::PriceMissing)?;
+    let record = pe_event_log::ReceiptRecord::read(&mut bytes.as_slice(), EventSeq(sequence))
+        .map_err(|_| RiskInputsUnavailable::PriceMissing)?;
+    Ok(SourceFrameMetadata {
+        receipt: record.receipt,
+        received_millis: record.received_millis,
+        byte_offset: record.byte_offset,
+    })
+}
+
 /// Process-wide verified source receipt projection.
 ///
 /// Boot replays the source log once to retain each receipt, receive millisecond, and frame byte
 /// offset. The sole synchronized source-log coordinator records each later append before
 /// acknowledging its receipt, so runtime paper risk and exact envelope retrieval
 /// never need to replay the growing source prefix.
+///
+/// Memory holds the receipts from the committed retention boundary to the tail, plus a
+/// constant-size summary of the retired ones below it. Retired receipts are read from the dense
+/// receipt sidecar on demand, never while the index lock is held (#745).
 #[derive(Default)]
 struct SourceReceiptIndexState {
+    /// Sequences from `retired.count()` to the tail: `frames[i]` is `retired.count() + i`.
     frames: Vec<SourceFrameMetadata>,
+    retired: RetiredReceipts,
     retention: Option<Arc<RetentionAuthority>>,
     next_byte_offset: Option<u64>,
     verified_feed_frontiers:
@@ -939,14 +1077,60 @@ struct SourceReceiptIndexState {
     binding_verification_categories: HashMap<(EventSeq, blake3::Hash), [usize; 3]>,
 }
 
+impl SourceReceiptIndexState {
+    /// Number of receipts from sequence zero to the tail.
+    fn len(&self) -> Result<u64, RiskInputsUnavailable> {
+        u64::try_from(self.frames.len())
+            .ok()
+            .and_then(|len| len.checked_add(self.retired.count()))
+            .ok_or(RiskInputsUnavailable::Overflow)
+    }
+
+    fn last(&self) -> Option<&SourceFrameMetadata> {
+        self.frames.last().or(self.retired.last.as_ref())
+    }
+
+    /// A receipt held in memory: in the window or among the two highest retired receipts.
+    fn memory(&self, sequence: u64) -> Option<&SourceFrameMetadata> {
+        match sequence.checked_sub(self.retired.count()) {
+            Some(index) => usize::try_from(index)
+                .ok()
+                .and_then(|index| self.frames.get(index)),
+            None => self.retired.cached(sequence),
+        }
+    }
+
+    /// Locate one receipt under the lock; resolve a sidecar slot after releasing it.
+    fn slot(&self, sequence: u64) -> Result<ReceiptSlot, RiskInputsUnavailable> {
+        if let Some(frame) = self.memory(sequence) {
+            return Ok(ReceiptSlot::Memory(frame.clone()));
+        }
+        if sequence >= self.retired.count() {
+            return Ok(ReceiptSlot::Absent);
+        }
+        self.retired
+            .reader
+            .clone()
+            .map(ReceiptSlot::Sidecar)
+            .ok_or(RiskInputsUnavailable::PriceMissing)
+    }
+}
+
 pub(crate) struct RetentionIndexInstall<'a> {
     state: std::sync::RwLockWriteGuard<'a, SourceReceiptIndexState>,
     authority: Arc<RetentionAuthority>,
+    /// The window from the new boundary and the extended retired summary, built while validating
+    /// so the switch itself cannot fail once the authority is visible.
+    window: Option<(Vec<SourceFrameMetadata>, RetiredReceipts)>,
 }
 
 impl RetentionIndexInstall<'_> {
     pub(crate) fn install_retention(mut self) {
         self.state.verified_feed_frontiers.clear();
+        if let Some((frames, retired)) = self.window.take() {
+            self.state.frames = frames;
+            self.state.retired = retired;
+        }
         self.state.retention = Some(self.authority);
     }
 }
@@ -970,23 +1154,111 @@ pub struct SourceReceiptIndex {
 /// observed frames to a scanner-verified physical log tail.
 pub(crate) struct SourceReceiptIndexStaging {
     canonical_source_log_path: PathBuf,
+    /// Sequences from the committed retention boundary (or zero) onward.
     frames: Vec<SourceFrameMetadata>,
+    /// Receipts below the boundary, folded into the constant-size summary as they stream in.
+    retired: RetiredReceipts,
+    /// Pins below the boundary and their neighbors, kept only to verify the pins at boot.
+    pinned: BTreeMap<u64, SourceFrameMetadata>,
+    /// Ascending sequences still to be kept in `pinned`.
+    pinned_wanted: std::collections::VecDeque<u64>,
     retention: Option<Arc<RetentionAuthority>>,
 }
 
 impl SourceReceiptIndexStaging {
+    fn new(canonical_source_log_path: PathBuf, retention: Option<Arc<RetentionAuthority>>) -> Self {
+        let mut wanted = std::collections::BTreeSet::new();
+        if let Some(authority) = &retention {
+            for pin in &authority.pins {
+                let sequence = pin.sequence.0;
+                wanted.extend(sequence.checked_sub(1));
+                wanted.insert(sequence);
+                wanted.extend(
+                    sequence
+                        .checked_add(1)
+                        .filter(|next| *next < authority.boundary.sequence.0),
+                );
+            }
+        }
+        Self {
+            canonical_source_log_path,
+            frames: Vec::new(),
+            retired: RetiredReceipts::default(),
+            pinned: BTreeMap::new(),
+            pinned_wanted: wanted.into_iter().collect(),
+            retention,
+        }
+    }
+
     pub(crate) fn retention(&self) -> Option<&RetentionAuthority> {
         self.retention.as_deref()
     }
 
-    pub(crate) fn frame_metadata(&self, sequence: EventSeq) -> Option<&SourceFrameMetadata> {
-        usize::try_from(sequence.0)
+    fn len(&self) -> Result<u64, RiskInputsUnavailable> {
+        u64::try_from(self.frames.len())
             .ok()
-            .and_then(|sequence| self.frames.get(sequence))
+            .and_then(|len| len.checked_add(self.retired.count()))
+            .ok_or(RiskInputsUnavailable::Overflow)
+    }
+
+    fn last(&self) -> Option<&SourceFrameMetadata> {
+        self.frames.last().or(self.retired.last.as_ref())
+    }
+
+    /// Append the next receipt, already checked to carry sequence `self.len()`.
+    fn push(&mut self, frame: SourceFrameMetadata) -> Result<(), RiskInputsUnavailable> {
+        let sequence = frame.receipt.sequence.0;
+        let boundary = self
+            .retention
+            .as_ref()
+            .map_or(0, |authority| authority.boundary.sequence.0);
+        if sequence >= boundary {
+            self.frames.push(frame);
+            return Ok(());
+        }
+        while self
+            .pinned_wanted
+            .front()
+            .is_some_and(|wanted| *wanted < sequence)
+        {
+            self.pinned_wanted.pop_front();
+        }
+        if self.pinned_wanted.front() == Some(&sequence) {
+            self.pinned_wanted.pop_front();
+            self.pinned.insert(sequence, frame.clone());
+        }
+        self.retired.retire(frame)
+    }
+
+    pub(crate) fn frame_metadata(&self, sequence: EventSeq) -> Option<&SourceFrameMetadata> {
+        match sequence.0.checked_sub(self.retired.count()) {
+            Some(index) => usize::try_from(index)
+                .ok()
+                .and_then(|index| self.frames.get(index)),
+            None => self
+                .retired
+                .cached(sequence.0)
+                .or_else(|| self.pinned.get(&sequence.0)),
+        }
+    }
+
+    /// Exact metadata for boot verification: absent past the tail, refused for a retired receipt
+    /// that boot did not keep.
+    fn known(&self, sequence: u64) -> Result<Option<SourceFrameMetadata>, RiskInputsUnavailable> {
+        if let Some(frame) = self.frame_metadata(EventSeq(sequence)) {
+            return Ok(Some(frame.clone()));
+        }
+        if sequence >= self.len()? {
+            return Ok(None);
+        }
+        Err(RiskInputsUnavailable::PriceConflict)
     }
 
     pub(crate) fn validate_retention(&self) -> Result<(), RiskInputsUnavailable> {
-        SourceReceiptIndex::validate_retention(&self.frames, self.retention.as_deref())
+        SourceReceiptIndex::validate_retention(
+            &|sequence| self.known(sequence),
+            self.retention.as_deref(),
+        )
     }
 
     pub(crate) fn restore_record(
@@ -994,13 +1266,12 @@ impl SourceReceiptIndexStaging {
         frame: SourceFrameMetadata,
         binding: &LogTailBinding,
     ) -> Result<(), RiskInputsUnavailable> {
-        let sequence =
-            u64::try_from(self.frames.len()).map_err(|_| RiskInputsUnavailable::Overflow)?;
+        let sequence = self.len()?;
         if frame.receipt.sequence.0 != sequence
             || frame.byte_offset.is_none_or(|offset| {
                 offset < pe_event_log::HEADER_LEN
                     || offset >= binding.physical_tail
-                    || self.frames.last().is_some_and(|previous| {
+                    || self.last().is_some_and(|previous| {
                         previous
                             .byte_offset
                             .is_none_or(|previous| offset <= previous)
@@ -1010,17 +1281,19 @@ impl SourceReceiptIndexStaging {
         {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
-        self.frames.push(frame);
-        Ok(())
+        self.push(frame)
     }
 
+    /// Bind restored receipts to `binding`. Every receipt arrived through
+    /// [`Self::restore_record`] against this same binding, which already checked its sequence and
+    /// offset, so only the tail binding remains.
     pub(crate) fn validate_checkpoint(
         &self,
         binding: &LogTailBinding,
     ) -> Result<(), RiskInputsUnavailable> {
-        SourceReceiptIndex::checkpoint_metadata_valid(
+        SourceReceiptIndex::checkpoint_tail_valid(
             &self.canonical_source_log_path,
-            &self.frames,
+            self.last(),
             binding,
         )?;
         Ok(())
@@ -1037,18 +1310,14 @@ impl SourceReceiptIndexStaging {
             this_hash: envelope.this_hash,
         };
         let received_millis = received_at_millis(&envelope.received_at)?;
-        let expected_sequence = u64::try_from(self.frames.len())
-            .map(EventSeq)
-            .map_err(|_| RiskInputsUnavailable::Overflow)?;
-        if envelope.seq != expected_sequence {
+        if envelope.seq != EventSeq(self.len()?) {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
-        self.frames.push(SourceFrameMetadata {
+        self.push(SourceFrameMetadata {
             receipt,
             received_millis,
             byte_offset: Some(byte_offset),
-        });
-        Ok(())
+        })
     }
 
     /// Complete an external projection only when its path and logical tail match exactly (#572).
@@ -1056,9 +1325,8 @@ impl SourceReceiptIndexStaging {
         self,
         binding: &LogTailBinding,
     ) -> Result<SourceReceiptIndex, RiskInputsUnavailable> {
-        let indexed_last_sequence = self.frames.last().map(|frame| frame.receipt.sequence);
+        let indexed_last_sequence = self.last().map(|frame| frame.receipt.sequence);
         let indexed_last_hash = self
-            .frames
             .last()
             .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
                 frame.receipt.this_hash
@@ -1069,14 +1337,24 @@ impl SourceReceiptIndexStaging {
         {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
-        SourceReceiptIndex::validate_retention(&self.frames, self.retention.as_deref())?;
+        self.validate_retention()?;
         Ok(self.complete_at(binding.physical_tail))
     }
 
     fn complete_at(self, physical_tail: u64) -> SourceReceiptIndex {
+        let mut retired = self.retired;
+        if retired.count() > 0 {
+            // Boot just read these records from the sidecar. Without it, retired reads fail closed.
+            retired.reader = std::fs::File::open(crate::source_checkpoint::receipts_path(
+                &self.canonical_source_log_path,
+            ))
+            .ok()
+            .map(Arc::new);
+        }
         SourceReceiptIndex {
             state: Arc::new(RwLock::new(SourceReceiptIndexState {
-                frames: self.frames,
+                frames: self.frames.into_boxed_slice().into_vec(),
+                retired,
                 retention: self.retention,
                 next_byte_offset: Some(physical_tail),
                 verified_feed_frontiers: HashMap::new(),
@@ -1241,23 +1519,56 @@ impl SourceReceiptIndex {
         self.source_log_path.as_deref().map(PathBuf::as_path)
     }
 
+    /// Receipts `[start, count)` after binding receipt `count - 1` to `binding`. Retired receipts
+    /// in the range are read from the sidecar after the lock is released.
     pub(crate) fn checkpoint_suffix(
         &self,
         start: usize,
         count: usize,
         binding: &LogTailBinding,
     ) -> Result<Vec<SourceFrameMetadata>, RiskInputsUnavailable> {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let frames = state
-            .frames
-            .get(..count)
-            .ok_or(RiskInputsUnavailable::PriceConflict)?;
-        if frames.last().map(|frame| frame.receipt.sequence) != binding.last_sequence
-            || frames
-                .last()
+        let start = u64::try_from(start).map_err(|_| RiskInputsUnavailable::Overflow)?;
+        let count = u64::try_from(count).map_err(|_| RiskInputsUnavailable::Overflow)?;
+        let (base, last, window, sidecar) = {
+            let state = self
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if count > state.len()? || start > count {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            let base = state.retired.count();
+            let last = count
+                .checked_sub(1)
+                .map(|last| state.slot(last))
+                .transpose()?;
+            let window_index = |sequence: u64| {
+                usize::try_from(sequence.max(base).saturating_sub(base))
+                    .map_err(|_| RiskInputsUnavailable::Overflow)
+            };
+            let window = state
+                .frames
+                .get(window_index(start)?..window_index(count)?)
+                .ok_or(RiskInputsUnavailable::PriceConflict)?
+                .to_vec();
+            let sidecar = (start < base.min(count))
+                .then(|| {
+                    state
+                        .retired
+                        .reader
+                        .clone()
+                        .ok_or(RiskInputsUnavailable::PriceMissing)
+                })
+                .transpose()?;
+            (base, last, window, sidecar)
+        };
+        let last = last
+            .map(|slot| slot.resolve(count.saturating_sub(1)))
+            .transpose()?
+            .flatten();
+        if last.as_ref().map(|frame| frame.receipt.sequence) != binding.last_sequence
+            || last
+                .as_ref()
                 .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
                     frame.receipt.this_hash
                 })
@@ -1265,10 +1576,14 @@ impl SourceReceiptIndex {
         {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
-        Ok(frames
-            .get(start..)
-            .ok_or(RiskInputsUnavailable::PriceConflict)?
-            .to_vec())
+        let mut frames = Vec::new();
+        if let Some(file) = sidecar {
+            for sequence in start..base.min(count) {
+                frames.push(read_retired_receipt(&file, sequence)?);
+            }
+        }
+        frames.extend(window);
+        Ok(frames)
     }
 
     pub(crate) fn checkpoint_metadata_valid(
@@ -1276,8 +1591,8 @@ impl SourceReceiptIndex {
         frames: &[SourceFrameMetadata],
         binding: &LogTailBinding,
     ) -> Result<PathBuf, RiskInputsUnavailable> {
-        let canonical_source_log_path =
-            std::fs::canonicalize(path).map_err(|_| RiskInputsUnavailable::PriceMissing)?;
+        // A missing path is reported before any receipt conflict, as it always has been.
+        std::fs::canonicalize(path).map_err(|_| RiskInputsUnavailable::PriceMissing)?;
         let mut previous_offset = None;
         for (index, frame) in frames.iter().enumerate() {
             if frame.receipt.sequence.0
@@ -1293,14 +1608,22 @@ impl SourceReceiptIndex {
             }
             previous_offset = frame.byte_offset;
         }
-        if (frames.is_empty() && binding.physical_tail != pe_event_log::HEADER_LEN)
-            || frames.last().map(|frame| frame.receipt.sequence) != binding.last_sequence
-            || frames
-                .last()
-                .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
-                    frame.receipt.this_hash
-                })
-                != binding.last_hash
+        Self::checkpoint_tail_valid(path, frames.last(), binding)
+    }
+
+    /// Bind the final restored receipt, or its absence, and the canonical path to `binding`.
+    fn checkpoint_tail_valid(
+        path: &Path,
+        last: Option<&SourceFrameMetadata>,
+        binding: &LogTailBinding,
+    ) -> Result<PathBuf, RiskInputsUnavailable> {
+        let canonical_source_log_path =
+            std::fs::canonicalize(path).map_err(|_| RiskInputsUnavailable::PriceMissing)?;
+        if (last.is_none() && binding.physical_tail != pe_event_log::HEADER_LEN)
+            || last.map(|frame| frame.receipt.sequence) != binding.last_sequence
+            || last.map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
+                frame.receipt.this_hash
+            }) != binding.last_hash
             || canonical_source_log_path != binding.path
         {
             return Err(RiskInputsUnavailable::PriceConflict);
@@ -1314,13 +1637,16 @@ impl SourceReceiptIndex {
         binding: &LogTailBinding,
     ) -> Result<SourceReceiptIndexStaging, RiskInputsUnavailable> {
         let canonical_source_log_path = Self::checkpoint_metadata_valid(path, &frames, binding)?;
-        Ok(SourceReceiptIndexStaging {
+        let mut staging = SourceReceiptIndexStaging::new(
             canonical_source_log_path,
-            frames,
-            retention: RetentionAuthority::load(path)
+            RetentionAuthority::load(path)
                 .map_err(|_| RiskInputsUnavailable::PriceConflict)?
                 .map(Arc::new),
-        })
+        );
+        for frame in frames {
+            staging.push(frame)?;
+        }
+        Ok(staging)
     }
 
     /// Start an externally driven source-receipt projection bound to the canonical log path (#572).
@@ -1329,13 +1655,12 @@ impl SourceReceiptIndex {
     ) -> Result<SourceReceiptIndexStaging, RiskInputsUnavailable> {
         let canonical_source_log_path = std::fs::canonicalize(source_log_path)
             .map_err(|_| RiskInputsUnavailable::PriceMissing)?;
-        Ok(SourceReceiptIndexStaging {
+        Ok(SourceReceiptIndexStaging::new(
             canonical_source_log_path,
-            frames: Vec::new(),
-            retention: RetentionAuthority::load(source_log_path)
+            RetentionAuthority::load(source_log_path)
                 .map_err(|_| RiskInputsUnavailable::PriceConflict)?
                 .map(Arc::new),
-        })
+        ))
     }
 
     /// Rebuild the complete verified source-log projection at boot.
@@ -1345,32 +1670,32 @@ impl SourceReceiptIndex {
             .map_err(|_| RiskInputsUnavailable::PriceConflict)
     }
 
+    /// Check the boundary chain head and every pin against `lookup`, which returns the exact
+    /// metadata of a receipt, `None` past the tail, or an error when it cannot be read.
     fn validate_retention(
-        frames: &[SourceFrameMetadata],
+        lookup: &dyn Fn(u64) -> Result<Option<SourceFrameMetadata>, RiskInputsUnavailable>,
         retention: Option<&RetentionAuthority>,
     ) -> Result<(), RiskInputsUnavailable> {
         let Some(authority) = retention else {
             return Ok(());
         };
-        let boundary = usize::try_from(authority.boundary.sequence.0)
-            .map_err(|_| RiskInputsUnavailable::Overflow)?;
-        if frames
-            .get(boundary.saturating_sub(1))
+        let boundary = authority.boundary.sequence.0;
+        if lookup(boundary.saturating_sub(1))?
             .is_none_or(|frame| frame.receipt.this_hash != authority.chain_head)
-            || frames
-                .get(boundary)
+            || lookup(boundary)?
                 .is_some_and(|frame| frame.byte_offset != Some(authority.boundary.offset))
         {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
         for pin in &authority.pins {
-            let sequence =
-                usize::try_from(pin.sequence.0).map_err(|_| RiskInputsUnavailable::Overflow)?;
-            if frames.get(sequence).is_none_or(|frame| {
+            let sequence = pin.sequence.0;
+            if lookup(sequence)?.is_none_or(|frame| {
                 frame.receipt.this_hash != pin.hash || frame.byte_offset != Some(pin.offset)
             }) || sequence
                 .checked_sub(1)
-                .and_then(|n| frames.get(n))
+                .map(lookup)
+                .transpose()?
+                .flatten()
                 .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
                     frame.receipt.this_hash
                 })
@@ -1382,32 +1707,218 @@ impl SourceReceiptIndex {
         Ok(())
     }
 
+    /// Receipt count bound by `tail`, whose final receipt must match it. The tail is a current
+    /// binding, so its final receipt is in memory.
+    fn bound_tail_count(
+        state: &SourceReceiptIndexState,
+        tail: &LogTailBinding,
+    ) -> Result<u64, RiskInputsUnavailable> {
+        let count = tail.last_sequence.map_or(Ok(0), |last| {
+            last.0.checked_add(1).ok_or(RiskInputsUnavailable::Overflow)
+        })?;
+        let last = count.checked_sub(1).map(|last| state.memory(last));
+        if count > state.len()?
+            || last.is_some_and(|frame| {
+                frame.is_none_or(|frame| frame.receipt.this_hash != tail.last_hash)
+            })
+            || (last.is_none() && tail.last_hash != blake3::Hash::from_bytes([0; 32]))
+        {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        Ok(count)
+    }
+
+    /// The receipt a retention preparation's scan of every receipt bound by `tail` selects: the
+    /// first received at or after `cutoff_millis`, else the last (#745). The retired prefix is
+    /// summarized by its newest receive time, so only the window is searched.
+    pub(crate) fn retention_boundary_candidate(
+        &self,
+        tail: &LogTailBinding,
+        cutoff_millis: i64,
+    ) -> Result<BoundaryCandidate, RiskInputsUnavailable> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = Self::bound_tail_count(&state, tail)?;
+        let base = state.retired.count();
+        if count == 0 {
+            return Ok(BoundaryCandidate::Empty);
+        }
+        if count <= base
+            || state
+                .retired
+                .max_received
+                .is_some_and(|newest| newest >= cutoff_millis)
+        {
+            return Ok(BoundaryCandidate::Retired { base });
+        }
+        let window = state
+            .frames
+            .get(
+                ..usize::try_from(count.saturating_sub(base))
+                    .map_err(|_| RiskInputsUnavailable::Overflow)?,
+            )
+            .ok_or(RiskInputsUnavailable::PriceConflict)?;
+        window
+            .iter()
+            .find(|frame| frame.received_millis >= cutoff_millis)
+            .or_else(|| window.last())
+            .cloned()
+            .map(BoundaryCandidate::Frame)
+            .ok_or(RiskInputsUnavailable::PriceConflict)
+    }
+
+    /// Inputs for the retention pre-commit audit of receipts `[0, boundary)` (#745): the retired
+    /// commitment and the in-memory receipts from the window base to `boundary`.
+    pub(crate) fn retention_audit(
+        &self,
+        boundary: EventSeq,
+        tail: &LogTailBinding,
+    ) -> Result<RetentionAudit, RiskInputsUnavailable> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = Self::bound_tail_count(&state, tail)?;
+        let base = state.retired.count();
+        if boundary.0 < base || boundary.0 > count {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        let window = state
+            .frames
+            .get(
+                ..usize::try_from(boundary.0.saturating_sub(base))
+                    .map_err(|_| RiskInputsUnavailable::Overflow)?,
+            )
+            .ok_or(RiskInputsUnavailable::PriceConflict)?
+            .to_vec();
+        Ok(RetentionAudit {
+            commitment: state.retired.commitment.clone(),
+            window,
+        })
+    }
+
+    /// Number of receipts below the in-memory window: the committed retention boundary, or zero.
+    pub(crate) fn retired_count(&self) -> u64 {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retired
+            .count()
+    }
+
+    /// The receipt sidecar handle that serves retired receipts: the current one, or a new one
+    /// opened for the first retention switch. A retention commit opens it under the checkpoint
+    /// lock before its authority can become visible (#745).
+    pub(crate) fn retired_reader(&self) -> Result<Arc<std::fs::File>, RiskInputsUnavailable> {
+        if let Some(reader) = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retired
+            .reader
+            .clone()
+        {
+            return Ok(reader);
+        }
+        let path = self
+            .source_log_path
+            .as_ref()
+            .ok_or(RiskInputsUnavailable::PriceMissing)?;
+        std::fs::File::open(crate::source_checkpoint::receipts_path(path))
+            .map(Arc::new)
+            .map_err(|_| RiskInputsUnavailable::PriceMissing)
+    }
+
     /// Validate while holding the index lock, before making the authority visible.
+    ///
+    /// Receipts below the current window that the authority depends on are read from the sidecar
+    /// before the write guard is taken; the guard then requires the window and epoch unchanged.
+    /// The new window and retired summary are built here, so the switch cannot fail later.
+    /// `reader` serves retired receipts after the first switch; without one they fail closed.
     pub(crate) fn prepare_retention_install(
         &self,
         authority: RetentionAuthority,
+        reader: Option<Arc<std::fs::File>>,
     ) -> Result<RetentionIndexInstall<'_>, RiskInputsUnavailable> {
         authority
             .validate()
             .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+        let (base, epoch, current_reader) = {
+            let state = self
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                state.retired.count(),
+                state
+                    .retention
+                    .as_ref()
+                    .map_or(0, |authority| authority.epoch),
+                state.retired.reader.clone(),
+            )
+        };
+        let reader = current_reader.or(reader);
+        // Below the retired cache (the two highest retired receipts) only the sidecar has them.
+        let uncached = base.saturating_sub(2);
+        let mut resolved = BTreeMap::new();
+        let boundary = authority.boundary.sequence.0;
+        let dependencies = authority
+            .pins
+            .iter()
+            .flat_map(|pin| [pin.sequence.0.checked_sub(1), Some(pin.sequence.0)])
+            .chain([boundary.checked_sub(1), Some(boundary)])
+            .flatten()
+            .filter(|sequence| *sequence < uncached);
+        for sequence in dependencies {
+            if let std::collections::btree_map::Entry::Vacant(entry) = resolved.entry(sequence) {
+                let file = reader.as_ref().ok_or(RiskInputsUnavailable::PriceMissing)?;
+                entry.insert(read_retired_receipt(file, sequence)?);
+            }
+        }
         let state = self
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.retired.count() != base
+            || state
+                .retention
+                .as_ref()
+                .map_or(0, |authority| authority.epoch)
+                != epoch
+        {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
         if state.retention.as_ref().is_some_and(|old| {
             old.epoch > authority.epoch || (old.epoch == authority.epoch && **old != authority)
         }) {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
-        Self::validate_retention(&state.frames, Some(&authority))?;
+        let len = state.len()?;
+        Self::validate_retention(
+            &|sequence| {
+                if let Some(frame) = state.memory(sequence) {
+                    return Ok(Some(frame.clone()));
+                }
+                if sequence >= len {
+                    return Ok(None);
+                }
+                resolved
+                    .get(&sequence)
+                    .cloned()
+                    .map(Some)
+                    .ok_or(RiskInputsUnavailable::PriceConflict)
+            },
+            Some(&authority),
+        )?;
         let captured = authority
             .retained_tail
             .last_sequence
-            .and_then(|seq| usize::try_from(seq.0).ok())
-            .ok_or(RiskInputsUnavailable::PriceConflict)?;
+            .ok_or(RiskInputsUnavailable::PriceConflict)?
+            .0;
         let captured_end = state
-            .frames
-            .get(
+            .memory(
                 captured
                     .checked_add(1)
                     .ok_or(RiskInputsUnavailable::Overflow)?,
@@ -1415,16 +1926,41 @@ impl SourceReceiptIndex {
             .and_then(|frame| frame.byte_offset)
             .or(state.next_byte_offset);
         if state
-            .frames
-            .get(captured)
+            .memory(captured)
             .is_none_or(|frame| frame.receipt.this_hash != authority.retained_tail.last_hash)
             || captured_end != Some(authority.retained_tail.physical_tail)
         {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
+        // Boundaries only advance; the retired prefix can never move back into memory.
+        if boundary < base {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        let window = if boundary > base {
+            let split = usize::try_from(boundary.saturating_sub(base))
+                .map_err(|_| RiskInputsUnavailable::Overflow)?;
+            let retiring = state
+                .frames
+                .get(..split)
+                .ok_or(RiskInputsUnavailable::PriceConflict)?;
+            let mut retired = state.retired.clone();
+            for frame in retiring {
+                retired.retire(frame.clone())?;
+            }
+            retired.reader = reader;
+            let frames = state
+                .frames
+                .get(split..)
+                .ok_or(RiskInputsUnavailable::PriceConflict)?
+                .to_vec();
+            Some((frames, retired))
+        } else {
+            None
+        };
         Ok(RetentionIndexInstall {
             state,
             authority: Arc::new(authority),
+            window,
         })
     }
 
@@ -1433,7 +1969,8 @@ impl SourceReceiptIndex {
         &self,
         authority: RetentionAuthority,
     ) -> Result<(), RiskInputsUnavailable> {
-        self.prepare_retention_install(authority)?
+        let reader = self.retired_reader().ok();
+        self.prepare_retention_install(authority, reader)?
             .install_retention();
         Ok(())
     }
@@ -1496,9 +2033,8 @@ impl SourceReceiptIndex {
             let physical_tail = state
                 .next_byte_offset
                 .ok_or(RiskInputsUnavailable::PriceMissing)?;
-            let last_sequence = state.frames.last().map(|frame| frame.receipt.sequence);
+            let last_sequence = state.last().map(|frame| frame.receipt.sequence);
             let last_hash = state
-                .frames
                 .last()
                 .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
                     frame.receipt.this_hash
@@ -1525,24 +2061,24 @@ impl SourceReceiptIndex {
             .source_log_path
             .as_ref()
             .ok_or(RiskInputsUnavailable::PriceMissing)?;
-        let last = state
-            .frames
-            .last()
-            .ok_or(RiskInputsUnavailable::PriceMissing)?;
+        let last = state.last().ok_or(RiskInputsUnavailable::PriceMissing)?;
         let byte_offset = last
             .byte_offset
             .ok_or(RiskInputsUnavailable::PriceMissing)?;
         let physical_tail = state
             .next_byte_offset
             .ok_or(RiskInputsUnavailable::PriceMissing)?;
-        let previous_hash = state
-            .frames
-            .iter()
-            .rev()
-            .nth(1)
-            .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
-                frame.receipt.this_hash
-            });
+        // The predecessor is in the window or the retired cache, never only in the sidecar.
+        let previous_hash = match last.receipt.sequence.0.checked_sub(1) {
+            Some(previous) => {
+                state
+                    .memory(previous)
+                    .ok_or(RiskInputsUnavailable::PriceMissing)?
+                    .receipt
+                    .this_hash
+            }
+            None => blake3::Hash::from_bytes([0; 32]),
+        };
         Ok((
             LogTailBinding {
                 path: path.as_ref().clone(),
@@ -1567,23 +2103,24 @@ impl SourceReceiptIndex {
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let sequence_index =
-            usize::try_from(receipt.sequence.0).map_err(|_| RiskInputsUnavailable::Overflow)?;
-        if let Some(known) = state.frames.get(sequence_index) {
+        let expected_sequence = EventSeq(state.len()?);
+        if receipt.sequence < expected_sequence {
+            let slot = state.slot(receipt.sequence.0)?;
+            // A retired duplicate is read after releasing the guard; retired receipts never change.
+            drop(state);
+            let known = slot
+                .resolve(receipt.sequence.0)?
+                .ok_or(RiskInputsUnavailable::PriceConflict)?;
             return if known.receipt == receipt && known.received_millis == received_millis {
                 Ok(())
             } else {
                 Err(RiskInputsUnavailable::PriceConflict)
             };
         }
-        let expected_sequence = u64::try_from(state.frames.len())
-            .map(EventSeq)
-            .map_err(|_| RiskInputsUnavailable::Overflow)?;
         if receipt.sequence != expected_sequence {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
         let prev_hash = state
-            .frames
             .last()
             .map_or(blake3::Hash::from_bytes([0; 32]), |known| {
                 known.receipt.this_hash
@@ -1652,6 +2189,7 @@ impl SourceReceiptIndex {
                 Ok(())
             };
         };
+        // Absolute counts survive a retention switch that moves the window during recovery.
         let (indexed_len, next_byte_offset, indexed_last_hash) = {
             let state = self
                 .state
@@ -1661,10 +2199,9 @@ impl SourceReceiptIndex {
                 return Err(RiskInputsUnavailable::PriceConflict);
             };
             (
-                state.frames.len(),
+                state.len()?,
                 next_byte_offset,
                 state
-                    .frames
                     .last()
                     .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
                         frame.receipt.this_hash
@@ -1685,9 +2222,9 @@ impl SourceReceiptIndex {
         let mut recovered = Vec::new();
         let mut byte_offset = next_byte_offset;
         while byte_offset < verified_tail {
-            let expected_sequence = indexed_len
-                .checked_add(recovered.len())
-                .and_then(|index| u64::try_from(index).ok())
+            let expected_sequence = u64::try_from(recovered.len())
+                .ok()
+                .and_then(|recovered| indexed_len.checked_add(recovered))
                 .map(EventSeq)
                 .ok_or(RiskInputsUnavailable::Overflow)?;
             let (envelope, frame_end) =
@@ -1729,10 +2266,9 @@ impl SourceReceiptIndex {
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.frames.len() != indexed_len
+        if state.len()? != indexed_len
             || state.next_byte_offset != Some(next_byte_offset)
             || state
-                .frames
                 .last()
                 .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
                     frame.receipt.this_hash
@@ -1747,18 +2283,19 @@ impl SourceReceiptIndex {
     }
 
     /// Return the receipt and receive millisecond stored for `sequence`, when present (#572).
+    ///
+    /// A retired receipt is read from the sidecar; a failed read is `PriceMissing` (#745).
     pub fn receipt_at(
         &self,
         sequence: EventSeq,
     ) -> Result<Option<(AppendReceipt, i64)>, RiskInputsUnavailable> {
-        let state = self
+        let slot = self
             .state
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let index = usize::try_from(sequence.0).map_err(|_| RiskInputsUnavailable::Overflow)?;
-        Ok(state
-            .frames
-            .get(index)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .slot(sequence.0)?;
+        Ok(slot
+            .resolve(sequence.0)?
             .map(|metadata| (metadata.receipt, metadata.received_millis)))
     }
 
@@ -1799,28 +2336,42 @@ impl SourceReceiptIndex {
         receipt: AppendReceipt,
         #[cfg(feature = "scenario")] pause: Option<&mut dyn FnMut()>,
     ) -> Result<EventEnvelope, RiskInputsUnavailable> {
-        let sequence_index =
-            usize::try_from(receipt.sequence.0).map_err(|_| RiskInputsUnavailable::Overflow)?;
-        let (metadata, previous_hash) = {
+        let sequence = receipt.sequence.0;
+        let (metadata, previous, successor) = {
             let state = self
                 .state
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             Self::require_retained(&state, receipt.sequence)?;
-            let metadata = state
-                .frames
-                .get(sequence_index)
-                .filter(|metadata| metadata.receipt == receipt)
-                .cloned()
-                .ok_or(RiskInputsUnavailable::PriceMissing)?;
-            let previous_hash = sequence_index
-                .checked_sub(1)
-                .and_then(|previous| state.frames.get(previous))
+            (
+                state.slot(sequence)?,
+                sequence
+                    .checked_sub(1)
+                    .map(|previous| state.slot(previous))
+                    .transpose()?,
+                sequence
+                    .checked_add(1)
+                    .map(|next| state.slot(next))
+                    .transpose()?,
+            )
+        };
+        // Retired receipts (a pin and its neighbors) are read only after the lock is released.
+        let metadata = metadata
+            .resolve(sequence)?
+            .filter(|metadata| metadata.receipt == receipt)
+            .ok_or(RiskInputsUnavailable::PriceMissing)?;
+        let previous_hash = match previous {
+            Some(slot) => slot
+                .resolve(sequence.saturating_sub(1))?
                 .map_or(blake3::Hash::from_bytes([0; 32]), |previous| {
                     previous.receipt.this_hash
-                });
-            (metadata, previous_hash)
+                }),
+            None => blake3::Hash::from_bytes([0; 32]),
         };
+        let successor = successor
+            .map(|slot| slot.resolve(sequence.saturating_add(1)))
+            .transpose()?
+            .flatten();
         let path = self
             .source_log_path
             .as_ref()
@@ -1846,11 +2397,22 @@ impl SourceReceiptIndex {
             .as_ref()
             .is_some_and(|authority| authority.pin(receipt.sequence).is_some())
         {
-            let expected_end = sequence_index
+            let next = sequence
                 .checked_add(1)
-                .and_then(|next| state.frames.get(next))
+                .map(|next| state.slot(next))
+                .transpose()?;
+            let next_byte_offset = state.next_byte_offset;
+            drop(state);
+            // A successor seen before the read never changes; one appended since may already
+            // be retired, so it is read after the guard is released.
+            let successor = match (successor, next) {
+                (Some(frame), _) => Some(frame),
+                (None, Some(slot)) => slot.resolve(sequence.saturating_add(1))?,
+                (None, None) => None,
+            };
+            let expected_end = successor
                 .and_then(|frame| frame.byte_offset)
-                .or(state.next_byte_offset);
+                .or(next_byte_offset);
             if expected_end != Some(end) {
                 return Err(RiskInputsUnavailable::PriceConflict);
             }
@@ -1875,22 +2437,52 @@ impl SourceReceiptIndex {
         Ok(())
     }
 
+    /// Every receipt from sequence zero, reading retired ones from the sidecar.
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> BTreeMap<EventSeq, (AppendReceipt, i64)> {
-        self.state
+        let len = self
+            .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .frames
-            .iter()
-            .map(|metadata| {
-                (
-                    metadata.receipt.sequence,
-                    (metadata.receipt, metadata.received_millis),
-                )
-            })
+            .len()
+            .unwrap_or(0);
+        (0..len)
+            .filter_map(|sequence| self.receipt_at(EventSeq(sequence)).ok().flatten())
+            .map(|(receipt, received_millis)| (receipt.sequence, (receipt, received_millis)))
             .collect()
     }
 
+    /// Write the dense receipt sidecar that production keeps beside a retained log, from an index
+    /// that still holds every receipt in memory (#745).
+    #[cfg(test)]
+    pub(crate) fn write_receipt_sidecar_for_test(&self) -> std::io::Result<()> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.retired.count() != 0 {
+            return Err(std::io::Error::other("receipts already retired"));
+        }
+        let path = self
+            .source_log_path
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("index has no source log"))?;
+        let bytes = state
+            .frames
+            .iter()
+            .flat_map(|frame| {
+                pe_event_log::ReceiptRecord {
+                    receipt: frame.receipt,
+                    received_millis: frame.received_millis,
+                    byte_offset: frame.byte_offset,
+                }
+                .encode()
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(crate::source_checkpoint::receipts_path(path), bytes)
+    }
+
+    /// Bytes reserved for in-memory receipt metadata: the window's capacity (#745).
     #[cfg(test)]
     pub(crate) fn retained_frame_metadata_bytes(&self) -> usize {
         let state = self
@@ -1898,6 +2490,20 @@ impl SourceReceiptIndex {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::size_of::<SourceFrameMetadata>().saturating_mul(state.frames.capacity())
+    }
+
+    /// Window base, window length and window capacity, for lifecycle scenarios (#745).
+    #[cfg(any(test, feature = "scenario"))]
+    pub fn receipt_window_for_scenario(&self) -> (u64, usize, usize) {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            state.retired.count(),
+            state.frames.len(),
+            state.frames.capacity(),
+        )
     }
 }
 
