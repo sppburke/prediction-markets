@@ -18,6 +18,13 @@ ignore = [
     # every other affected webpki-roots version out. Will resolve when tokio-tungstenite moves
     # to webpki-roots 1.
     "RUSTSEC-2026-0381",
+    # crypto-bigint 0.5.5 has timing-variable operations meant to be constant time; the fix is
+    # 0.7.6, but elliptic-curve 0.13 (alloy-signer, k256, ecdsa) requires ^0.5, so no lockfile
+    # update reaches it. Its secret-key use is ECDSA signing by the live venue client and the
+    # redemption signer, both run only with live credentials; paper mode never signs. The
+    # [bans] entries keep every other affected version out. Will resolve when alloy and k256
+    # move to elliptic-curve 0.14 or later.
+    "RUSTSEC-2026-0387",
 ]
 
 [licenses]
@@ -51,6 +58,10 @@ deny = [
     # other affected versions (everything below 1.0.10) out of Cargo.lock.
     { name = "webpki-roots", version = "<0.26.11" },
     { name = "webpki-roots", version = ">=1.0.0, <1.0.10" },
+    # RUSTSEC-2026-0387 is ignored above only for crypto-bigint 0.5.5, which elliptic-curve 0.13
+    # pins; these keep the advisory's other affected versions (everything below 0.7.6) out.
+    { name = "crypto-bigint", version = "<0.5.5" },
+    { name = "crypto-bigint", version = ">0.5.5, <0.7.6" },
 ]
 
 [sources]
