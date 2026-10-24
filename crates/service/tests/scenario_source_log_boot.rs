@@ -5765,13 +5765,7 @@ fn retention_rebuild_checkpoint_loss_stale_epoch_poison_preparation_and_migratio
             .unwrap();
         }
         let mut opened = SourceLogBoot::open(&paths, true).unwrap().unwrap();
-        let (_, booted_len, booted_capacity) =
-            opened.boot.receipt_index().receipt_window_for_scenario();
-        assert_eq!(
-            booted_capacity, booted_len,
-            "boot builds an exactly sized window"
-        );
-        assert_receipt_window(&opened.boot.receipt_index(), &paths.source_log);
+        assert_exact_receipt_window(&opened.boot.receipt_index(), &paths.source_log);
         opened.boot.extend(&mut opened.sink).unwrap();
         assert_receipt_window(&opened.boot.receipt_index(), &paths.source_log);
         let expected_with_boundary = &baseline.with_boundary;
@@ -5863,8 +5857,7 @@ fn retention_recovery_after_invalidation_rebuilds_the_window_from_the_trimmed_si
     );
     let mut opened = SourceLogBoot::open(&paths, true).unwrap().unwrap();
     assert!(!opened.boot.checkpoint_assisted_for_scenario());
-    let (_, len, capacity) = opened.boot.receipt_index().receipt_window_for_scenario();
-    assert_eq!(capacity, len);
+    assert_exact_receipt_window(&opened.boot.receipt_index(), &paths.source_log);
     opened.boot.extend(&mut opened.sink).unwrap();
     let index = opened.boot.receipt_index();
     assert_receipt_window(&index, &paths.source_log);
@@ -6622,6 +6615,13 @@ fn retention_boot_runtime_indexed(
     (owner, task, obligations, index)
 }
 
+/// #745: right after an advance or a boot the window is exactly sized.
+fn assert_exact_receipt_window(index: &SourceReceiptIndex, source_log: &Path) {
+    assert_receipt_window(index, source_log);
+    let (_, len, capacity) = index.receipt_window_for_scenario();
+    assert_eq!(capacity, len, "the window is exactly sized");
+}
+
 /// #745: memory holds exactly the receipts from the committed retention boundary to the tail,
 /// never the retired prefix, and the window capacity stays bounded by the window.
 fn assert_receipt_window(index: &SourceReceiptIndex, source_log: &Path) {
@@ -6829,7 +6829,7 @@ async fn retention_terminalized_during_boot_waits_through_two_advances_and_check
     for (epoch, at) in [(1, terminal_at), (2, terminal_at + 86_400)] {
         clock.store(u64::try_from(at).unwrap(), Ordering::Release);
         owner.retention_for_scenario().await.unwrap();
-        assert_receipt_window(&index, &paths.source_log);
+        assert_exact_receipt_window(&index, &paths.source_log);
         assert_eq!(
             pe_event_log::RetentionAuthority::load(&paths.source_log)
                 .unwrap()
@@ -6885,7 +6885,7 @@ async fn retention_terminalized_during_boot_waits_through_two_advances_and_check
         Ordering::Release,
     );
     owner.retention_for_scenario().await.unwrap();
-    assert_receipt_window(&index, &paths.source_log);
+    assert_exact_receipt_window(&index, &paths.source_log);
     assert_eq!(logs.last_run()["wallets_swapped_out"], 1);
     assert_eq!(logs.last_run()["wallets_waiting"], "[]");
     assert!(

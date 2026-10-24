@@ -1016,6 +1016,15 @@ pub(crate) struct RetentionAudit {
     pub(crate) window: Vec<SourceFrameMetadata>,
 }
 
+/// Retired receipts a retention authority depends on, read from the sidecar before the write
+/// guard, with the window base and epoch they were read against (#745).
+struct RetentionDependencies {
+    base: u64,
+    epoch: u64,
+    reader: Option<Arc<std::fs::File>>,
+    resolved: BTreeMap<u64, SourceFrameMetadata>,
+}
+
 /// Where one receipt is: in memory, in the sidecar below the window, or not yet appended.
 enum ReceiptSlot {
     Memory(SourceFrameMetadata),
@@ -1532,6 +1541,35 @@ impl SourceReceiptIndex {
         count: usize,
         binding: &LogTailBinding,
     ) -> Result<Vec<SourceFrameMetadata>, RiskInputsUnavailable> {
+        self.checkpoint_suffix_inner(
+            start,
+            count,
+            binding,
+            #[cfg(feature = "scenario")]
+            None,
+        )
+    }
+
+    /// Pause after the lock is released and before retired receipts are read, to exercise a
+    /// concurrent retention switch or sidecar rewrite (#745).
+    #[cfg(all(test, feature = "scenario"))]
+    pub(crate) fn checkpoint_suffix_with_pause(
+        &self,
+        start: usize,
+        count: usize,
+        binding: &LogTailBinding,
+        pause: &mut dyn FnMut(),
+    ) -> Result<Vec<SourceFrameMetadata>, RiskInputsUnavailable> {
+        self.checkpoint_suffix_inner(start, count, binding, Some(pause))
+    }
+
+    fn checkpoint_suffix_inner(
+        &self,
+        start: usize,
+        count: usize,
+        binding: &LogTailBinding,
+        #[cfg(feature = "scenario")] pause: Option<&mut dyn FnMut()>,
+    ) -> Result<Vec<SourceFrameMetadata>, RiskInputsUnavailable> {
         let start = u64::try_from(start).map_err(|_| RiskInputsUnavailable::Overflow)?;
         let count = u64::try_from(count).map_err(|_| RiskInputsUnavailable::Overflow)?;
         let (base, last, window, sidecar) = {
@@ -1567,6 +1605,10 @@ impl SourceReceiptIndex {
                 .transpose()?;
             (base, last, window, sidecar)
         };
+        #[cfg(feature = "scenario")]
+        if let Some(pause) = pause {
+            pause();
+        }
         let last = last
             .map(|slot| slot.resolve(count.saturating_sub(1)))
             .transpose()?
@@ -1850,6 +1892,17 @@ impl SourceReceiptIndex {
         authority
             .validate()
             .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+        let dependencies = self.retention_dependencies(&authority, reader)?;
+        self.prepare_resolved_retention_install(authority, dependencies)
+    }
+
+    /// Read, without the index lock, every retired receipt below the cache that `authority`'s
+    /// boundary and pins depend on, recording the window base and epoch they were read against.
+    fn retention_dependencies(
+        &self,
+        authority: &RetentionAuthority,
+        reader: Option<Arc<std::fs::File>>,
+    ) -> Result<RetentionDependencies, RiskInputsUnavailable> {
         let (base, epoch, current_reader) = {
             let state = self
                 .state
@@ -1882,6 +1935,28 @@ impl SourceReceiptIndex {
                 entry.insert(read_retired_receipt(file, sequence)?);
             }
         }
+        Ok(RetentionDependencies {
+            base,
+            epoch,
+            reader,
+            resolved,
+        })
+    }
+
+    /// Take the write guard and validate `authority` against `dependencies`, refusing when the
+    /// window base or epoch they were read against has moved since.
+    fn prepare_resolved_retention_install(
+        &self,
+        authority: RetentionAuthority,
+        dependencies: RetentionDependencies,
+    ) -> Result<RetentionIndexInstall<'_>, RiskInputsUnavailable> {
+        let RetentionDependencies {
+            base,
+            epoch,
+            reader,
+            resolved,
+        } = dependencies;
+        let boundary = authority.boundary.sequence.0;
         let state = self
             .state
             .write()
@@ -3488,9 +3563,6 @@ mod tests {
                 payload: br#"{"latency":true}"#.to_vec(),
             })
             .unwrap();
-        source_writer
-            .append_synced(source_input(10_000, b"retained"))
-            .unwrap();
         drop(source_writer);
 
         let prepared = frame(
@@ -3555,15 +3627,36 @@ mod tests {
         assert_eq!(maintained.latest.sample_count, 1);
         assert_eq!(maintained.latest.p95_ms, Some(2_000));
 
-        // #745: the same samples once the sample's source receipt is retired to the sidecar.
+        // #745: the same samples once the sample's source receipt is retired below the two cached
+        // receipts and read from the sidecar; damaging its record makes it a missing receipt.
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        for unix in 10_000..10_003 {
+            source_writer
+                .append_synced(source_input(unix, b"retained"))
+                .unwrap();
+        }
+        drop(source_writer);
         let windowed = SourceReceiptIndex::replay(&source_path).unwrap();
         windowed.write_receipt_sidecar_for_test().unwrap();
-        install_boundary(&windowed, 1);
-        assert_eq!(windowed.receipt_window_for_scenario(), (1, 1, 1));
+        install_boundary(&windowed, 3);
+        assert_eq!(windowed.receipt_window_for_scenario(), (3, 1, 1));
         assert_eq!(
             paper_latency_samples(&era, &windowed, 10_800).unwrap(),
             from_scratch
         );
+        damage_receipt_record(&source_path, source_receipt.sequence.0);
+        assert_eq!(
+            paper_latency_samples(&era, &windowed, 10_800).err(),
+            Some(RiskInputsUnavailable::PriceMissing)
+        );
+    }
+
+    /// Flip one byte of a receipt record's checksum in the sidecar beside `source_log`.
+    fn damage_receipt_record(source_log: &Path, sequence: u64) {
+        let sidecar = crate::source_checkpoint::receipts_path(source_log);
+        let mut bytes = std::fs::read(&sidecar).unwrap();
+        bytes[usize::try_from(sequence * pe_event_log::RECEIPT_RECORD_LEN + 50).unwrap()] ^= 1;
+        std::fs::write(&sidecar, bytes).unwrap();
     }
 
     /// Retire every receipt below `boundary` with an unpinned authority over the whole log.
@@ -3669,15 +3762,6 @@ mod tests {
             completed_prepared_before_boundary_indexed(&era, &index, 10_000, boundary).unwrap();
         assert_eq!(from_index, from_log);
         assert_eq!(from_index, HashSet::from([EventSeq(1)]));
-        // #745: unchanged with the receipts before the mark's boundary retired to the sidecar.
-        let windowed = SourceReceiptIndex::replay(&source_path).unwrap();
-        windowed.write_receipt_sidecar_for_test().unwrap();
-        install_boundary(&windowed, boundary.sequence.0);
-        assert_eq!(windowed.receipt_window_for_scenario(), (2, 2, 2));
-        assert_eq!(
-            completed_prepared_before_boundary_indexed(&era, &windowed, 10_000, boundary).unwrap(),
-            from_log
-        );
 
         let missing_index = SourceReceiptIndex::replay(&source_path).unwrap();
         missing_index
@@ -3709,6 +3793,27 @@ mod tests {
         assert_eq!(
             completed_prepared_before_boundary_indexed(&wrong_hash_era, &index, 10_000, boundary),
             Err(RiskInputsUnavailable::PriceConflict)
+        );
+
+        // #745: unchanged once the fills' source receipts are retired below the two cached
+        // receipts and read from the sidecar; damaging one makes it a missing receipt.
+        let mut writer = Writer::open(&source_path).unwrap();
+        for unix in [10_001, 10_002] {
+            writer.append_synced(source_input(unix, b"later")).unwrap();
+        }
+        drop(writer);
+        let windowed = SourceReceiptIndex::replay(&source_path).unwrap();
+        windowed.write_receipt_sidecar_for_test().unwrap();
+        install_boundary(&windowed, 4);
+        assert_eq!(windowed.receipt_window_for_scenario(), (4, 2, 2));
+        assert_eq!(
+            completed_prepared_before_boundary_indexed(&era, &windowed, 10_000, boundary).unwrap(),
+            from_log
+        );
+        damage_receipt_record(&source_path, before.sequence.0);
+        assert_eq!(
+            completed_prepared_before_boundary_indexed(&era, &windowed, 10_000, boundary),
+            Err(RiskInputsUnavailable::PriceMissing)
         );
     }
 
@@ -4550,6 +4655,7 @@ mod tests {
         use super::*;
 
         type Outcome<T> = Result<T, RiskInputsUnavailable>;
+        type Rows = Vec<(AppendReceipt, i64, Option<u64>)>;
 
         fn unix_at(sequence: u64) -> i64 {
             // Receive times wander backwards and forwards, as ingestion order allows.
@@ -4559,6 +4665,79 @@ mod tests {
 
         fn payload_at(sequence: u64) -> Vec<u8> {
             format!("{{\"frame\":{sequence}}}").into_bytes()
+        }
+
+        fn append_frames(path: &Path, sequences: std::ops::Range<u64>) -> Vec<AppendReceipt> {
+            let mut writer = Writer::open(path).unwrap();
+            sequences
+                .map(|sequence| {
+                    writer
+                        .append_synced(source_input(unix_at(sequence), &payload_at(sequence)))
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        fn tail_of(path: &Path, frames: &[SourceFrameMetadata]) -> LogTailBinding {
+            LogTailBinding {
+                path: std::fs::canonicalize(path).unwrap(),
+                physical_tail: std::fs::metadata(path).unwrap().len(),
+                last_sequence: frames.last().map(|frame| frame.receipt.sequence),
+                last_hash: frames
+                    .last()
+                    .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
+                        frame.receipt.this_hash
+                    }),
+            }
+        }
+
+        /// An authority retiring `[0, boundary)` with `pins`, over `frames` ending at `tail`.
+        fn authority_over(
+            frames: &[SourceFrameMetadata],
+            tail: &LogTailBinding,
+            boundary: u64,
+            pins: &[u64],
+            epoch: u64,
+        ) -> RetentionAuthority {
+            let at = |sequence: u64| &frames[usize::try_from(sequence).unwrap()];
+            RetentionAuthority {
+                format_version: 1,
+                epoch,
+                advanced_at: 1,
+                boundary: pe_event_log::RetentionBoundary {
+                    sequence: EventSeq(boundary),
+                    offset: at(boundary).byte_offset.unwrap(),
+                },
+                chain_head: at(boundary - 1).receipt.this_hash,
+                pins: pins
+                    .iter()
+                    .map(|&sequence| pe_event_log::RetentionPin {
+                        sequence: EventSeq(sequence),
+                        offset: at(sequence).byte_offset.unwrap(),
+                        hash: at(sequence).receipt.this_hash,
+                        predecessor_hash: sequence
+                            .checked_sub(1)
+                            .map_or(blake3::Hash::from_bytes([0; 32]), |previous| {
+                                at(previous).receipt.this_hash
+                            }),
+                        reducer: false,
+                        wallet: None,
+                    })
+                    .collect(),
+                retained_tail: pe_event_log::TailBinding::from(tail),
+                feed: Vec::new(),
+            }
+        }
+
+        /// Every receipt of the log at `path`, after writing its dense sidecar.
+        fn dense_frames_with_sidecar(path: &Path) -> Vec<SourceFrameMetadata> {
+            let dense = SourceReceiptIndex::replay(path).unwrap();
+            dense.write_receipt_sidecar_for_test().unwrap();
+            let tail = dense.current_tail_binding().unwrap();
+            let count = tail.last_sequence.map_or(0, |last| last.0 + 1);
+            dense
+                .checkpoint_suffix(0, usize::try_from(count).unwrap(), &tail)
+                .unwrap()
         }
 
         struct WindowFixture {
@@ -4571,19 +4750,8 @@ mod tests {
             fn new(count: u64) -> Self {
                 let dir = tempfile::tempdir().unwrap();
                 let path = dir.path().join("source.log");
-                let mut writer = Writer::open(&path).unwrap();
-                for sequence in 0..count {
-                    writer
-                        .append_synced(source_input(unix_at(sequence), &payload_at(sequence)))
-                        .unwrap();
-                }
-                drop(writer);
-                let dense = SourceReceiptIndex::replay(&path).unwrap();
-                dense.write_receipt_sidecar_for_test().unwrap();
-                let tail = dense.current_tail_binding().unwrap();
-                let frames = dense
-                    .checkpoint_suffix(0, usize::try_from(count).unwrap(), &tail)
-                    .unwrap();
+                append_frames(&path, 0..count);
+                let frames = dense_frames_with_sidecar(&path);
                 Self {
                     _dir: dir,
                     path,
@@ -4600,12 +4768,7 @@ mod tests {
             }
 
             fn tail(&self) -> LogTailBinding {
-                LogTailBinding {
-                    path: std::fs::canonicalize(&self.path).unwrap(),
-                    physical_tail: std::fs::metadata(&self.path).unwrap().len(),
-                    last_sequence: self.frames.last().map(|frame| frame.receipt.sequence),
-                    last_hash: self.frames.last().unwrap().receipt.this_hash,
-                }
+                tail_of(&self.path, &self.frames)
             }
 
             fn binding(&self, count: u64) -> LogTailBinding {
@@ -4621,33 +4784,7 @@ mod tests {
             }
 
             fn authority(&self, boundary: u64, pins: &[u64], epoch: u64) -> RetentionAuthority {
-                RetentionAuthority {
-                    format_version: 1,
-                    epoch,
-                    advanced_at: 1,
-                    boundary: pe_event_log::RetentionBoundary {
-                        sequence: EventSeq(boundary),
-                        offset: self.at(boundary).byte_offset.unwrap(),
-                    },
-                    chain_head: self.at(boundary - 1).receipt.this_hash,
-                    pins: pins
-                        .iter()
-                        .map(|&sequence| pe_event_log::RetentionPin {
-                            sequence: EventSeq(sequence),
-                            offset: self.at(sequence).byte_offset.unwrap(),
-                            hash: self.at(sequence).receipt.this_hash,
-                            predecessor_hash: sequence
-                                .checked_sub(1)
-                                .map_or(blake3::Hash::from_bytes([0; 32]), |previous| {
-                                    self.at(previous).receipt.this_hash
-                                }),
-                            reducer: false,
-                            wallet: None,
-                        })
-                        .collect(),
-                    retained_tail: pe_event_log::TailBinding::from(&self.tail()),
-                    feed: Vec::new(),
-                }
+                authority_over(&self.frames, &self.tail(), boundary, pins, epoch)
             }
 
             /// The pre-#745 layout: every receipt in memory, with the authority installed.
@@ -4697,15 +4834,12 @@ mod tests {
             }
         }
 
-        fn rows(
-            frames: Outcome<Vec<SourceFrameMetadata>>,
-        ) -> Outcome<Vec<(AppendReceipt, i64, Option<u64>)>> {
-            frames.map(|frames| {
-                frames
-                    .into_iter()
-                    .map(|frame| (frame.receipt, frame.received_millis, frame.byte_offset))
-                    .collect()
-            })
+        fn rows(frames: Outcome<Vec<SourceFrameMetadata>>) -> Outcome<Rows> {
+            frames.map(|frames| frames.iter().map(row).collect())
+        }
+
+        fn row(frame: &SourceFrameMetadata) -> (AppendReceipt, i64, Option<u64>) {
+            (frame.receipt, frame.received_millis, frame.byte_offset)
         }
 
         fn envelope(outcome: Outcome<EventEnvelope>) -> Outcome<(blake3::Hash, Vec<u8>)> {
@@ -4773,6 +4907,14 @@ mod tests {
                     rows(index.checkpoint_suffix(0, usize::try_from(count).unwrap(), &stale))
                 ));
             }
+            observed.push(format!(
+                "past the tail {:?}",
+                rows(index.checkpoint_suffix(
+                    0,
+                    usize::try_from(count + 1).unwrap(),
+                    &fixture.binding(count)
+                ))
+            ));
             observed.push(format!("tail {:?}", index.current_tail_binding()));
             observed.push(format!("tail frame {:?}", index.tail_with_last_frame()));
             observed.push(format!("pins {:?}", index.verify_retention_pins()));
@@ -4782,10 +4924,95 @@ mod tests {
             observed
         }
 
-        /// PASS: boot and live switching both yield a window equal to the dense projection on
-        /// every method, including pins just below the boundary, a pin at sequence zero, a
-        /// one-frame window and no pins. FAIL: any differing answer, or a window holding retired
-        /// receipts or spare capacity.
+        /// The same observation derived from the fixture's metadata alone, independent of any index.
+        fn expected(fixture: &WindowFixture, authority: &RetentionAuthority) -> Vec<String> {
+            let count = fixture.count();
+            let boundary = authority.boundary.sequence.0;
+            let mut expected = Vec::new();
+            for sequence in 0..count + 2 {
+                let stored: Outcome<Option<(AppendReceipt, i64)>> = Ok(fixture
+                    .frames
+                    .get(usize::try_from(sequence).unwrap())
+                    .map(|frame| (frame.receipt, frame.received_millis)));
+                expected.push(format!("receipt_at {sequence} {stored:?}"));
+            }
+            for frame in &fixture.frames {
+                let receipt = frame.receipt;
+                let sequence = receipt.sequence.0;
+                let millis: Outcome<i64> = Ok(frame.received_millis);
+                expected.push(format!("received {:?} {millis:?}", receipt.sequence));
+                let read: Outcome<(blake3::Hash, Vec<u8>)> =
+                    if sequence >= boundary || authority.pin(receipt.sequence).is_some() {
+                        Ok((receipt.this_hash, payload_at(sequence)))
+                    } else {
+                        Err(RiskInputsUnavailable::Erased)
+                    };
+                expected.push(format!("envelope {:?} {read:?}", receipt.sequence));
+                let missing: Outcome<i64> = Err(RiskInputsUnavailable::PriceMissing);
+                expected.push(format!("wrong {:?} {missing:?}", receipt.sequence));
+                let same: Outcome<()> = Ok(());
+                expected.push(format!("append {sequence} {same:?}"));
+                let conflict: Outcome<()> = Err(RiskInputsUnavailable::PriceConflict);
+                expected.push(format!("append moved {sequence} {conflict:?}"));
+            }
+            let refused: Outcome<Rows> = Err(RiskInputsUnavailable::PriceConflict);
+            for count in 0..=count {
+                for start in 0..=count + 1 {
+                    let suffix: Outcome<Rows> = if start <= count {
+                        Ok(fixture.frames
+                            [usize::try_from(start).unwrap()..usize::try_from(count).unwrap()]
+                            .iter()
+                            .map(row)
+                            .collect())
+                    } else {
+                        Err(RiskInputsUnavailable::PriceConflict)
+                    };
+                    expected.push(format!("suffix {start}..{count} {suffix:?}"));
+                }
+                expected.push(format!("stale suffix {count} {refused:?}"));
+            }
+            expected.push(format!("past the tail {refused:?}"));
+            let tail: Outcome<LogTailBinding> = Ok(fixture.tail());
+            expected.push(format!("tail {tail:?}"));
+            let last = fixture.frames.last().unwrap();
+            let previous = fixture.frames[fixture.frames.len() - 2].receipt.this_hash;
+            let tail_frame: Outcome<(LogTailBinding, u64, AppendReceipt, blake3::Hash)> = Ok((
+                fixture.tail(),
+                last.byte_offset.unwrap(),
+                last.receipt,
+                previous,
+            ));
+            expected.push(format!("tail frame {tail_frame:?}"));
+            let fine: Outcome<()> = Ok(());
+            expected.push(format!("pins {fine:?}"));
+            expected.push(format!("epoch {:?}", authority.epoch));
+            expected.push(format!("catch up {fine:?}"));
+            let snapshot = fixture
+                .frames
+                .iter()
+                .map(|frame| {
+                    (
+                        frame.receipt.sequence,
+                        (frame.receipt, frame.received_millis),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            expected.push(format!("snapshot {snapshot:?}"));
+            expected
+        }
+
+        fn assert_lines(expected: &[String], observed: &[String], context: &str) {
+            for (expected, observed) in expected.iter().zip(observed) {
+                assert_eq!(expected, observed, "{context}");
+            }
+            assert_eq!(expected.len(), observed.len(), "{context}");
+        }
+
+        /// PASS: boot and live switching both yield an exactly sized window whose every method
+        /// answers what the fixture's own metadata dictates (and what the dense layout answers),
+        /// including pins just below the boundary, a pin at sequence zero, a one-frame window and
+        /// no pins. FAIL: any differing answer, or a window holding retired receipts or spare
+        /// capacity.
         #[test]
         fn window_methods_match_the_dense_layout() {
             let fixture = WindowFixture::new(14);
@@ -4796,7 +5023,12 @@ mod tests {
                 (5, Vec::new()),
             ] {
                 let authority = fixture.authority(boundary, &pins, 1);
-                let expected = observe(&fixture.dense(&authority), &fixture);
+                let expected = expected(&fixture, &authority);
+                assert_lines(
+                    &expected,
+                    &observe(&fixture.dense(&authority), &fixture),
+                    "dense",
+                );
                 for (path, index) in [
                     ("switched", fixture.switched(&authority)),
                     ("booted", fixture.booted(&authority)),
@@ -4807,11 +5039,8 @@ mod tests {
                         (boundary, window, window),
                         "{path} {boundary}"
                     );
-                    let observed = observe(&index, &fixture);
-                    for (expected, observed) in expected.iter().zip(&observed) {
-                        assert_eq!(expected, observed, "{path} boundary {boundary}");
-                    }
-                    assert_eq!(expected.len(), observed.len());
+                    let context = format!("{path} boundary {boundary}");
+                    assert_lines(&expected, &observe(&index, &fixture), &context);
                     for audited in boundary..=fixture.count() {
                         let audit = index
                             .retention_audit(EventSeq(audited), &fixture.tail())
@@ -4823,10 +5052,11 @@ mod tests {
                         assert!(audit.commitment.matches(&commitment));
                         assert_eq!(
                             rows(Ok(audit.window)).unwrap(),
-                            rows(Ok(fixture.frames[usize::try_from(boundary).unwrap()
+                            fixture.frames[usize::try_from(boundary).unwrap()
                                 ..usize::try_from(audited).unwrap()]
-                                .to_vec()))
-                            .unwrap()
+                                .iter()
+                                .map(row)
+                                .collect::<Rows>()
                         );
                     }
                     assert!(
@@ -4835,6 +5065,45 @@ mod tests {
                             .is_err()
                     );
                 }
+            }
+        }
+
+        /// PASS: after retirement a newly synchronized append extends the window at the next
+        /// absolute sequence and reads back exactly; a gap is still refused.
+        /// FAIL: a refused append, a misnumbered receipt or an accepted gap.
+        #[test]
+        fn fresh_appends_extend_the_window_after_retirement() {
+            for path in ["switched", "booted"] {
+                let fixture = WindowFixture::new(10);
+                let authority = fixture.authority(7, &[3], 1);
+                let index = if path == "switched" {
+                    fixture.switched(&authority)
+                } else {
+                    fixture.booted(&authority)
+                };
+                let receipt = append_frames(&fixture.path, 10..11)[0];
+                let input = source_input(unix_at(10), &payload_at(10));
+                index.record_synced_append(receipt, &input).unwrap();
+                assert_eq!(receipt.sequence, EventSeq(10), "{path}");
+                let (base, len, _) = index.receipt_window_for_scenario();
+                assert_eq!((base, len), (7, 4), "{path}");
+                assert_eq!(index.receipt_at(EventSeq(10)).unwrap().unwrap().0, receipt);
+                assert_eq!(
+                    index.source_envelope(receipt).unwrap().payload,
+                    payload_at(10)
+                );
+                assert_eq!(
+                    index.current_tail_binding().unwrap().last_sequence,
+                    Some(EventSeq(10))
+                );
+                let gap = AppendReceipt {
+                    sequence: EventSeq(12),
+                    this_hash: receipt.this_hash,
+                };
+                assert_eq!(
+                    index.record_synced_append(gap, &input).unwrap_err(),
+                    RiskInputsUnavailable::PriceConflict
+                );
             }
         }
 
@@ -4935,181 +5204,216 @@ mod tests {
             ));
         }
 
-        /// PASS: once the sidecar is lost or damaged, each method needing a retired receipt
-        /// returns its missing-receipt error, while receipts in memory still answer.
-        /// FAIL: a silent answer, a different error, or a failure for an in-memory receipt.
+        /// PASS: after boot and after a live switch alike, once the sidecar is lost or damaged
+        /// each method needing a retired receipt returns its missing-receipt error, while
+        /// receipts in memory still answer. FAIL: a silent answer, a different error, or a
+        /// failure for an in-memory receipt.
         #[test]
         fn retired_read_failures_fail_closed() {
-            let fixture = WindowFixture::new(14);
-            let authority = fixture.authority(9, &[2, 4, 8], 1);
-            let index = fixture.switched(&authority);
-            let pin = |sequence: u64| fixture.at(sequence).receipt;
-            let sidecar = crate::source_checkpoint::receipts_path(&fixture.path);
-            let intact = std::fs::read(&sidecar).unwrap();
+            for path in ["switched", "booted"] {
+                let fixture = WindowFixture::new(14);
+                let authority = fixture.authority(9, &[2, 4, 8], 1);
+                let index = if path == "switched" {
+                    fixture.switched(&authority)
+                } else {
+                    fixture.booted(&authority)
+                };
+                let pin = |sequence: u64| fixture.at(sequence).receipt;
+                let sidecar = crate::source_checkpoint::receipts_path(&fixture.path);
+                let intact = std::fs::read(&sidecar).unwrap();
 
-            // A damaged predecessor or successor of a pin is a missing receipt for that pin.
-            for (damaged, pinned) in [(1, 2), (3, 2), (3, 4), (5, 4)] {
-                let mut bytes = intact.clone();
-                bytes[usize::try_from(damaged * pe_event_log::RECEIPT_RECORD_LEN + 50).unwrap()] ^=
-                    1;
-                std::fs::write(&sidecar, &bytes).unwrap();
-                assert_eq!(
-                    index.source_envelope(pin(pinned)).unwrap_err(),
-                    RiskInputsUnavailable::PriceMissing,
-                    "damaged {damaged}"
-                );
-            }
-            std::fs::write(&sidecar, &intact).unwrap();
-            assert!(index.verify_retention_pins().is_ok());
-
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&sidecar)
-                .unwrap()
-                .set_len(0)
-                .unwrap();
-            assert_eq!(
-                index.receipt_at(EventSeq(4)).unwrap_err(),
-                RiskInputsUnavailable::PriceMissing
-            );
-            assert_eq!(
-                index.received_millis(pin(4)).unwrap_err(),
-                RiskInputsUnavailable::PriceMissing
-            );
-            assert_eq!(
-                index.source_envelope(pin(2)).unwrap_err(),
-                RiskInputsUnavailable::PriceMissing
-            );
-            assert_eq!(
-                index.verify_retention_pins().unwrap_err(),
-                RiskInputsUnavailable::PriceMissing
-            );
-            assert_eq!(
-                index.checkpoint_suffix(0, 9, &fixture.binding(9)).err(),
-                Some(RiskInputsUnavailable::PriceMissing)
-            );
-            assert_eq!(
-                index.checkpoint_suffix(4, 5, &fixture.binding(5)).err(),
-                Some(RiskInputsUnavailable::PriceMissing)
-            );
-            let input = source_input(unix_at(4), &payload_at(4));
-            assert_eq!(
-                index.record_synced_append(pin(4), &input).unwrap_err(),
-                RiskInputsUnavailable::PriceMissing
-            );
-            // The two highest retired receipts and the window stay answerable from memory.
-            for sequence in [7, 8, 9, 13] {
-                assert_eq!(
-                    index.receipt_at(EventSeq(sequence)).unwrap(),
-                    Some((pin(sequence), fixture.at(sequence).received_millis))
-                );
-            }
-            assert_eq!(
-                envelope(index.source_envelope(pin(8))).unwrap().1,
-                payload_at(8)
-            );
-            assert_eq!(
-                index.source_envelope(pin(5)).unwrap_err(),
-                RiskInputsUnavailable::Erased
-            );
-            assert!(index.checkpoint_suffix(9, 14, &fixture.binding(14)).is_ok());
-            assert!(index.current_tail_binding().is_ok());
-            assert!(index.tail_with_last_frame().is_ok());
-        }
-
-        /// PASS: retired reads stay exact while the sidecar is trimmed to the boundary and its
-        /// suffix rewritten over and over, as invalidation and publication do. FAIL: any read
-        /// that errs or differs.
-        #[test]
-        fn retired_reads_survive_sidecar_trims_and_suffix_rewrites() {
-            let fixture = WindowFixture::new(14);
-            let index = fixture.switched(&fixture.authority(9, &[2, 6], 1));
-            let sidecar = crate::source_checkpoint::receipts_path(&fixture.path);
-            let suffix = std::fs::read(&sidecar).unwrap()
-                [usize::try_from(9 * pe_event_log::RECEIPT_RECORD_LEN).unwrap()..]
-                .to_vec();
-            let stop = std::sync::atomic::AtomicBool::new(false);
-            std::thread::scope(|scope| {
-                let reader = scope.spawn(|| {
-                    let mut reads = 0;
-                    while !stop.load(std::sync::atomic::Ordering::Acquire) || reads < 200 {
-                        for sequence in 0..9 {
-                            assert_eq!(
-                                index.receipt_at(EventSeq(sequence)).unwrap(),
-                                Some((
-                                    fixture.at(sequence).receipt,
-                                    fixture.at(sequence).received_millis
-                                ))
-                            );
-                        }
-                        assert_eq!(
-                            envelope(index.source_envelope(fixture.at(2).receipt))
-                                .unwrap()
-                                .1,
-                            payload_at(2)
-                        );
-                        reads += 1;
-                    }
-                });
-                for _ in 0..200 {
-                    let file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&sidecar)
-                        .unwrap();
-                    file.set_len(9 * pe_event_log::RECEIPT_RECORD_LEN).unwrap();
-                    use std::os::unix::fs::FileExt as _;
-                    file.write_all_at(&suffix, 9 * pe_event_log::RECEIPT_RECORD_LEN)
-                        .unwrap();
+                // A damaged predecessor or successor of a pin is a missing receipt for that pin.
+                for (damaged, pinned) in [(1, 2), (3, 2), (3, 4), (5, 4)] {
+                    let mut bytes = intact.clone();
+                    bytes[usize::try_from(damaged * pe_event_log::RECEIPT_RECORD_LEN + 50)
+                        .unwrap()] ^= 1;
+                    std::fs::write(&sidecar, &bytes).unwrap();
+                    assert_eq!(
+                        index.source_envelope(pin(pinned)).unwrap_err(),
+                        RiskInputsUnavailable::PriceMissing,
+                        "{path} damaged {damaged}"
+                    );
                 }
-                stop.store(true, std::sync::atomic::Ordering::Release);
-                reader.join().unwrap();
-            });
+                std::fs::write(&sidecar, &intact).unwrap();
+                assert!(index.verify_retention_pins().is_ok(), "{path}");
+
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&sidecar)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+                let missing = Some(RiskInputsUnavailable::PriceMissing);
+                assert_eq!(index.receipt_at(EventSeq(4)).err(), missing, "{path}");
+                assert_eq!(index.received_millis(pin(4)).err(), missing, "{path}");
+                assert_eq!(index.source_envelope(pin(2)).err(), missing, "{path}");
+                assert_eq!(index.verify_retention_pins().err(), missing, "{path}");
+                assert_eq!(
+                    index.checkpoint_suffix(0, 9, &fixture.binding(9)).err(),
+                    missing,
+                    "{path}"
+                );
+                assert_eq!(
+                    index.checkpoint_suffix(4, 5, &fixture.binding(5)).err(),
+                    missing,
+                    "{path}"
+                );
+                let input = source_input(unix_at(4), &payload_at(4));
+                assert_eq!(
+                    index.record_synced_append(pin(4), &input).err(),
+                    missing,
+                    "{path}"
+                );
+                // The two highest retired receipts and the window stay answerable from memory.
+                for sequence in [7, 8, 9, 13] {
+                    assert_eq!(
+                        index.receipt_at(EventSeq(sequence)).unwrap(),
+                        Some((pin(sequence), fixture.at(sequence).received_millis)),
+                        "{path}"
+                    );
+                }
+                assert_eq!(
+                    envelope(index.source_envelope(pin(8))).unwrap().1,
+                    payload_at(8)
+                );
+                assert_eq!(
+                    index.source_envelope(pin(5)).unwrap_err(),
+                    RiskInputsUnavailable::Erased
+                );
+                assert!(index.checkpoint_suffix(9, 14, &fixture.binding(14)).is_ok());
+                assert!(index.current_tail_binding().is_ok());
+                assert!(index.tail_with_last_frame().is_ok());
+            }
         }
 
-        /// PASS: reads racing two live retention switches return either the exact envelope or,
-        /// for a frame the later authority erases, `Erased`; pins kept by both always answer.
-        /// FAIL: any other error or differing envelope.
+        /// PASS: a second switch landing between an envelope read's lookup and its physical read
+        /// leaves a retired pin readable from the sidecar, erases a window frame the new authority
+        /// does not pin, and keeps a newly pinned frame readable with its successor's end checked.
+        /// FAIL: any other outcome.
+        #[cfg(feature = "scenario")]
         #[test]
-        fn reads_racing_retention_switches_stay_exact() {
+        fn envelope_reads_stay_exact_when_a_switch_lands_mid_read() {
+            for sequence in [2, 8, 9, 10, 12] {
+                let fixture = WindowFixture::new(14);
+                let index = fixture.switched(&fixture.authority(6, &[2, 4, 5], 1));
+                let second = fixture.authority(11, &[2, 4, 5, 9, 10], 2);
+                let read =
+                    index.source_envelope_with_pause(fixture.at(sequence).receipt, &mut || {
+                        index.install_retention(second.clone()).unwrap();
+                    });
+                let expected = if sequence == 8 {
+                    Err(RiskInputsUnavailable::Erased)
+                } else {
+                    Ok(payload_at(sequence))
+                };
+                assert_eq!(
+                    read.map(|envelope| envelope.payload),
+                    expected,
+                    "{sequence}"
+                );
+                assert_eq!(index.receipt_window_for_scenario(), (11, 3, 3));
+            }
+        }
+
+        /// PASS: when the read frame was the tail at lookup, and frames are appended and retired
+        /// past it before the physical read, the pin's end is checked against its successor read
+        /// from the sidecar. FAIL: a refused read or an unchecked end.
+        #[cfg(feature = "scenario")]
+        #[test]
+        fn a_successor_appended_and_retired_mid_read_is_read_from_the_sidecar() {
+            let fixture = WindowFixture::new(10);
+            let index = SourceReceiptIndex::replay(&fixture.path).unwrap();
+            let read = index.source_envelope_with_pause(fixture.at(9).receipt, &mut || {
+                append_frames(&fixture.path, 10..14);
+                index.catch_up_verified_tail().unwrap();
+                // Publication brings the sidecar to the new tail before retention retires it.
+                let grown = dense_frames_with_sidecar(&fixture.path);
+                let tail = tail_of(&fixture.path, &grown);
+                index
+                    .install_retention(authority_over(&grown, &tail, 13, &[9], 1))
+                    .unwrap();
+            });
+            assert_eq!(read.unwrap().payload, payload_at(9));
+            assert_eq!(index.receipt_window_for_scenario(), (13, 1, 1));
+        }
+
+        /// PASS: a range read stays exact when a retention switch, or an invalidation trim plus a
+        /// suffix rewrite of the sidecar, lands between its locked capture and its sidecar reads.
+        /// FAIL: any differing or refused range.
+        #[cfg(feature = "scenario")]
+        #[test]
+        fn range_reads_stay_exact_when_a_switch_or_sidecar_rewrite_lands_mid_read() {
+            use std::os::unix::fs::FileExt as _;
             let fixture = WindowFixture::new(14);
             let first = fixture.authority(6, &[2, 4, 5], 1);
             let second = fixture.authority(11, &[2, 4, 5, 9, 10], 2);
-            let index = SourceReceiptIndex::replay(&fixture.path).unwrap();
-            let stop = std::sync::atomic::AtomicBool::new(false);
-            std::thread::scope(|scope| {
-                let reader = scope.spawn(|| {
-                    let mut rounds = 0;
-                    while !stop.load(std::sync::atomic::Ordering::Acquire) || rounds < 50 {
-                        for frame in &fixture.frames {
-                            let sequence = frame.receipt.sequence.0;
-                            match index.source_envelope(frame.receipt) {
-                                Ok(read) => assert_eq!(read.payload, payload_at(sequence)),
-                                Err(error) => {
-                                    assert_eq!(error, RiskInputsUnavailable::Erased);
-                                    assert!(![2, 4, 5].contains(&sequence) && sequence < 11);
-                                }
-                            }
-                            assert_eq!(
-                                index.receipt_at(frame.receipt.sequence).unwrap(),
-                                Some((frame.receipt, frame.received_millis))
-                            );
-                        }
-                        rounds += 1;
-                    }
-                });
-                index.install_retention(first).unwrap();
-                index.install_retention(second).unwrap();
-                stop.store(true, std::sync::atomic::Ordering::Release);
-                reader.join().unwrap();
+            let all = Ok(fixture.frames.iter().map(row).collect::<Rows>());
+            let index = fixture.switched(&first);
+            let read = index.checkpoint_suffix_with_pause(0, 14, &fixture.binding(14), &mut || {
+                index.install_retention(second.clone()).unwrap();
             });
-            assert_eq!(index.receipt_window_for_scenario(), (11, 3, 3));
+            assert_eq!(rows(read), all);
+            let retired = fixture.frames[..6].iter().map(row).collect::<Rows>();
             assert_eq!(
-                observe(&index, &fixture),
-                observe(
-                    &fixture.dense(&fixture.authority(11, &[2, 4, 5, 9, 10], 2)),
-                    &fixture
-                )
+                rows(index.checkpoint_suffix(0, 6, &fixture.binding(6))),
+                Ok(retired)
             );
+
+            let index = fixture.switched(&first);
+            let sidecar = crate::source_checkpoint::receipts_path(&fixture.path);
+            let bytes = std::fs::read(&sidecar).unwrap();
+            let split = usize::try_from(6 * pe_event_log::RECEIPT_RECORD_LEN).unwrap();
+            let read = index.checkpoint_suffix_with_pause(0, 14, &fixture.binding(14), &mut || {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&sidecar)
+                    .unwrap();
+                file.set_len(6 * pe_event_log::RECEIPT_RECORD_LEN).unwrap();
+                file.write_all_at(&bytes[split..], 6 * pe_event_log::RECEIPT_RECORD_LEN)
+                    .unwrap();
+            });
+            assert_eq!(rows(read), all);
+        }
+
+        /// PASS: an installer whose dependencies were read against an older window base or epoch
+        /// is refused once it holds the guard, while a fresh read installs. FAIL: an install
+        /// validated against stale reads.
+        #[test]
+        fn a_stale_installer_is_refused() {
+            let fixture = WindowFixture::new(14);
+            let first = fixture.authority(6, &[2, 4, 5], 1);
+            let later = fixture.authority(11, &[2, 4, 5, 9, 10], 3);
+
+            // The window moves between the dependency reads and the guard.
+            let index = SourceReceiptIndex::replay(&fixture.path).unwrap();
+            let stale = index
+                .retention_dependencies(&later, index.retired_reader().ok())
+                .unwrap();
+            index.install_retention(first.clone()).unwrap();
+            assert_eq!(
+                index
+                    .prepare_resolved_retention_install(later.clone(), stale)
+                    .err(),
+                Some(RiskInputsUnavailable::PriceConflict)
+            );
+
+            // Only the epoch moves: the same boundary under a later epoch.
+            let stale = index
+                .retention_dependencies(&later, index.retired_reader().ok())
+                .unwrap();
+            let mut renewed = first.clone();
+            renewed.epoch = 2;
+            index.install_retention(renewed).unwrap();
+            assert_eq!(index.receipt_window_for_scenario().0, 6);
+            assert_eq!(
+                index
+                    .prepare_resolved_retention_install(later.clone(), stale)
+                    .err(),
+                Some(RiskInputsUnavailable::PriceConflict)
+            );
+
+            index.install_retention(later).unwrap();
+            assert_eq!(index.receipt_window_for_scenario(), (11, 3, 3));
         }
 
         /// PASS: a retention switch between catch-up's recovery and its extension moves the
@@ -5122,15 +5426,7 @@ mod tests {
             let index = SourceReceiptIndex::replay(&fixture.path).unwrap();
             // Captured before the appends, as a preparation captures its retained tail.
             let authority = fixture.authority(7, &[3], 1);
-            let mut writer = Writer::open(&fixture.path).unwrap();
-            let appended = (10..13)
-                .map(|sequence| {
-                    writer
-                        .append_synced(source_input(unix_at(sequence), &payload_at(sequence)))
-                        .unwrap()
-                })
-                .collect::<Vec<_>>();
-            drop(writer);
+            let appended = append_frames(&fixture.path, 10..13);
             index
                 .catch_up_verified_tail_with_pause(&mut || {
                     index.install_retention(authority.clone()).unwrap();
