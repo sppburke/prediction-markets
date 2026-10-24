@@ -1107,7 +1107,11 @@ fn candidate(
             usize::try_from(seq.0).ok().and_then(|n| n.checked_add(1))
         })
         .ok_or_else(|| anyhow::anyhow!("checkpoint receipt count overflow"))?;
-    let start = super::capture_start(&frozen.activation, frozen.financial_era, count);
+    // Publication never rewrites receipts below the retention boundary, so a capture starts there
+    // and never reads the retired prefix back from the sidecar (#745).
+    let start = super::capture_start(&frozen.activation, frozen.financial_era, count)
+        .max(usize::try_from(receipts.retired_count()).map_err(anyhow::Error::from)?)
+        .min(count);
     Ok(Some(super::serialize(
         CheckpointData {
             format_version: 2,

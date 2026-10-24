@@ -659,7 +659,10 @@ impl SourceLogBoot {
                         .and_then(|n| n.checked_add(1))
                         .context("checkpoint receipt count overflow")
                 })?;
-                let start = source_checkpoint::capture_start(&activation, financial_era, count);
+                // Publication never rewrites receipts below the retention boundary (#745).
+                let start = source_checkpoint::capture_start(&activation, financial_era, count)
+                    .max(usize::try_from(index.retired_count())?)
+                    .min(count);
                 let candidate = source_checkpoint::serialize(
                     CheckpointData {
                         format_version: 2,

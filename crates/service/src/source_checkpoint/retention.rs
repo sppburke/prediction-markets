@@ -28,7 +28,9 @@ use crate::paper_recovery::{
     FinancialPayload, PaperLog, PaperLogFrame, PaperLogRecord, generation_qualification_sealed,
     paper_era, paper_generation,
 };
-use crate::risk_inputs::{SourceFrameMetadata, SourceReceiptIndex};
+use crate::risk_inputs::{
+    BoundaryCandidate, ReceiptCommitment, RetentionAudit, SourceReceiptIndex,
+};
 use crate::source_log_boot::{FrozenCheckpoint, FrozenPrefix};
 use crate::trade_poller::PendingBoundary;
 
@@ -845,6 +847,95 @@ mod tests {
         );
         assert_eq!(pin(erased, None).unwrap(), expected(1));
     }
+
+    /// #745. PASS: on a second advance the audit reads every record below the new boundary from
+    /// the sidecar; a retired non-pin record with a broken checksum, the same record rewritten
+    /// with a recomputed checksum, a differing window record and a truncated sidecar each block
+    /// it, and the intact sidecar passes. FAIL: any damage accepted.
+    #[test]
+    fn retired_receipt_damage_blocks_the_next_advance_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let (receipts, index, offsets) = pin_fixture(
+            &path,
+            (0..8)
+                .map(|n| input("old", format!("{n}").into_bytes(), OLD + n, 1))
+                .collect(),
+        );
+        let tail = index.current_tail_binding().unwrap();
+        let frames = index.checkpoint_suffix(0, receipts.len(), &tail).unwrap();
+        let sidecar = crate::source_checkpoint::receipts_path(&path);
+        let intact = frames
+            .iter()
+            .flat_map(crate::source_checkpoint::encode_record)
+            .collect::<Vec<_>>();
+        std::fs::write(&sidecar, &intact).unwrap();
+        index
+            .install_retention(RetentionAuthority {
+                format_version: 1,
+                epoch: 1,
+                advanced_at: OLD,
+                boundary: boundary_at(&receipts, &offsets, 4),
+                chain_head: receipts[3].this_hash,
+                pins: vec![RetentionPin {
+                    sequence: receipts[1].sequence,
+                    offset: offsets[1],
+                    hash: receipts[1].this_hash,
+                    predecessor_hash: receipts[0].this_hash,
+                    reducer: false,
+                    wallet: None,
+                }],
+                retained_tail: TailBinding::from(&tail),
+                feed: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(index.retired_count(), 4);
+        let second = boundary_at(&receipts, &offsets, 7);
+        let audit = || index.retention_audit(second.sequence, &tail).unwrap();
+        ensure_receipts(&path, &audit(), second).unwrap();
+
+        let record = |position: usize| position * 80;
+        let rewritten = |position: usize, bytes: &mut [u8]| {
+            let mut frame = frames[position].clone();
+            frame.received_millis += 1;
+            bytes[record(position)..record(position + 1)]
+                .copy_from_slice(&crate::source_checkpoint::encode_record(&frame));
+        };
+        let mut broken = intact.clone();
+        broken[record(2) + 60] ^= 1;
+        let mut recomputed = intact.clone();
+        rewritten(2, &mut recomputed);
+        let mut window = intact.clone();
+        rewritten(5, &mut window);
+        for (case, bytes, message) in [
+            (
+                "broken checksum",
+                broken,
+                "checkpoint receipt checksum mismatch",
+            ),
+            (
+                "recomputed checksum",
+                recomputed,
+                "retention receipts differ from index",
+            ),
+            (
+                "window record",
+                window,
+                "retention receipts differ from index",
+            ),
+            (
+                "truncated",
+                intact[..record(6)].to_vec(),
+                "failed to fill whole buffer",
+            ),
+        ] {
+            std::fs::write(&sidecar, &bytes).unwrap();
+            let error = ensure_receipts(&path, &audit(), second).unwrap_err();
+            assert!(error.to_string().contains(message), "{case}: {error}");
+        }
+        std::fs::write(&sidecar, &intact).unwrap();
+        ensure_receipts(&path, &audit(), second).unwrap();
+    }
 }
 
 #[derive(Deserialize)]
@@ -970,23 +1061,32 @@ pub(crate) fn prepare(
         return Ok(PreparedRetention::Deferred("advance_not_due"));
     }
     let tail = index.current_tail_binding()?;
-    let count = super::tail_receipt_count(&tail)?;
-    let frames = index.checkpoint_suffix(0, count, &tail)?;
     let cutoff = now
         .checked_sub(SOURCE_RETENTION_BUFFER_SECS)
         .context("retention clock overflow")?;
     let cutoff_millis = cutoff
         .checked_mul(1000)
         .context("retention clock overflow")?;
-    let first = frames
-        .iter()
-        .find(|frame| frame.received_millis >= cutoff_millis)
-        .or_else(|| frames.last());
-    let Some(first) = first else {
-        return Ok(PreparedRetention::Nothing {
-            tail,
-            boundary_current: true,
-        });
+    let first = match index.retention_boundary_candidate(&tail, cutoff_millis)? {
+        BoundaryCandidate::Empty => {
+            return Ok(PreparedRetention::Nothing {
+                tail,
+                boundary_current: true,
+            });
+        }
+        BoundaryCandidate::Retired { base } => {
+            // The selected receipt is below the index's window base, which never passes the
+            // committed boundary loaded above, so the boundary cannot advance.
+            ensure!(
+                base <= old_boundary.sequence.0,
+                "retention index retired past the committed boundary"
+            );
+            return Ok(PreparedRetention::Nothing {
+                tail,
+                boundary_current: true,
+            });
+        }
+        BoundaryCandidate::Frame(first) => first,
     };
     let boundary = RetentionBoundary {
         sequence: first.receipt.sequence,
@@ -1139,7 +1239,11 @@ pub(crate) fn prepare(
         boundary,
     )?;
     // Receipts must be authentic and durable before an authority can make them retention metadata.
-    ensure_receipts(path, &frames, boundary)?;
+    ensure_receipts(
+        path,
+        &index.retention_audit(boundary.sequence, &tail)?,
+        boundary,
+    )?;
     if context.paper_state.sync_checkpoint_dispositions().is_err() {
         return Ok(PreparedRetention::Deferred("disposition_barrier"));
     }
@@ -1196,16 +1300,30 @@ fn add_payload_pins(
     Ok(())
 }
 
+/// Read every receipt below `boundary` from the sidecar and compare it with the verified index:
+/// retired receipts through their commitment, the rest one by one (#745).
 fn ensure_receipts(
     path: &Path,
-    frames: &[SourceFrameMetadata],
+    audit: &RetentionAudit,
     boundary: RetentionBoundary,
 ) -> anyhow::Result<()> {
-    let count = usize::try_from(boundary.sequence.0)?;
+    let count = boundary.sequence.0;
+    let base = audit.commitment.count();
     let file = File::open(super::receipts_path(path))?;
     let mut reader = std::io::BufReader::new(&file);
-    for (sequence, frame) in frames.iter().take(count).enumerate() {
-        let record = super::read_record(&mut reader, sequence)?;
+    let mut rebuilt = ReceiptCommitment::default();
+    for sequence in 0..base {
+        rebuilt.push(&super::read_record(
+            &mut reader,
+            usize::try_from(sequence)?,
+        )?)?;
+    }
+    ensure!(
+        rebuilt.matches(&audit.commitment),
+        "retention receipts differ from index"
+    );
+    for frame in &audit.window {
+        let record = super::read_record(&mut reader, usize::try_from(frame.receipt.sequence.0)?)?;
         ensure!(
             record.receipt == frame.receipt
                 && record.received_millis == frame.received_millis
@@ -1213,7 +1331,11 @@ fn ensure_receipts(
             "retention receipts differ from index"
         );
     }
-    ensure!(frames.len() >= count, "retention receipts incomplete");
+    ensure!(
+        base.checked_add(u64::try_from(audit.window.len())?)
+            .is_some_and(|audited| audited >= count),
+        "retention receipts incomplete"
+    );
     file.sync_all()?;
     Ok(())
 }
@@ -1275,9 +1397,12 @@ pub(crate) fn commit(
         request.authority.boundary,
     )?;
     request.authority.pins = pins.into_values().collect();
+    // The sidecar handle that serves retired receipts is opened under this lock, before the
+    // authority can become visible; the prefix it reads is never rewritten afterwards (#745).
+    let reader = request.receipts.retired_reader()?;
     let installer = request
         .receipts
-        .prepare_retention_install(request.authority.clone())?;
+        .prepare_retention_install(request.authority.clone(), Some(reader))?;
     let result = {
         #[cfg(feature = "scenario")]
         if let Some(write) = &request.context.hooks.authority_write {

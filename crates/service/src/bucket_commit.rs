@@ -7550,6 +7550,7 @@ pub(crate) mod continuation_v3_tests {
             feed: Vec::new(),
         };
         authority.write(&path).unwrap();
+        fixture.index.write_receipt_sidecar_for_test().unwrap();
         fixture.index.install_retention(authority).unwrap();
         assert!(
             fixture
@@ -7724,6 +7725,7 @@ pub(crate) mod continuation_v3_tests {
                 feed: Vec::new(),
             };
             authority.write(&path).unwrap();
+            fixture.index.write_receipt_sidecar_for_test().unwrap();
             fixture.index.install_retention(authority).unwrap();
             let result = engine.retire_observation(observed, &group, false, Some(&read));
             // Erased evidence is never acknowledged: the job keeps every frame the poller holds.
