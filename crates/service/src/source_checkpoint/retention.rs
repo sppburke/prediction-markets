@@ -847,6 +847,95 @@ mod tests {
         );
         assert_eq!(pin(erased, None).unwrap(), expected(1));
     }
+
+    /// #745. PASS: on a second advance the audit reads every record below the new boundary from
+    /// the sidecar; a retired non-pin record with a broken checksum, the same record rewritten
+    /// with a recomputed checksum, a differing window record and a truncated sidecar each block
+    /// it, and the intact sidecar passes. FAIL: any damage accepted.
+    #[test]
+    fn retired_receipt_damage_blocks_the_next_advance_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let (receipts, index, offsets) = pin_fixture(
+            &path,
+            (0..8)
+                .map(|n| input("old", format!("{n}").into_bytes(), OLD + n, 1))
+                .collect(),
+        );
+        let tail = index.current_tail_binding().unwrap();
+        let frames = index.checkpoint_suffix(0, receipts.len(), &tail).unwrap();
+        let sidecar = crate::source_checkpoint::receipts_path(&path);
+        let intact = frames
+            .iter()
+            .flat_map(crate::source_checkpoint::encode_record)
+            .collect::<Vec<_>>();
+        std::fs::write(&sidecar, &intact).unwrap();
+        index
+            .install_retention(RetentionAuthority {
+                format_version: 1,
+                epoch: 1,
+                advanced_at: OLD,
+                boundary: boundary_at(&receipts, &offsets, 4),
+                chain_head: receipts[3].this_hash,
+                pins: vec![RetentionPin {
+                    sequence: receipts[1].sequence,
+                    offset: offsets[1],
+                    hash: receipts[1].this_hash,
+                    predecessor_hash: receipts[0].this_hash,
+                    reducer: false,
+                    wallet: None,
+                }],
+                retained_tail: TailBinding::from(&tail),
+                feed: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(index.retired_count(), 4);
+        let second = boundary_at(&receipts, &offsets, 7);
+        let audit = || index.retention_audit(second.sequence, &tail).unwrap();
+        ensure_receipts(&path, &audit(), second).unwrap();
+
+        let record = |position: usize| position * 80;
+        let rewritten = |position: usize, bytes: &mut [u8]| {
+            let mut frame = frames[position].clone();
+            frame.received_millis += 1;
+            bytes[record(position)..record(position + 1)]
+                .copy_from_slice(&crate::source_checkpoint::encode_record(&frame));
+        };
+        let mut broken = intact.clone();
+        broken[record(2) + 60] ^= 1;
+        let mut recomputed = intact.clone();
+        rewritten(2, &mut recomputed);
+        let mut window = intact.clone();
+        rewritten(5, &mut window);
+        for (case, bytes, message) in [
+            (
+                "broken checksum",
+                broken,
+                "checkpoint receipt checksum mismatch",
+            ),
+            (
+                "recomputed checksum",
+                recomputed,
+                "retention receipts differ from index",
+            ),
+            (
+                "window record",
+                window,
+                "retention receipts differ from index",
+            ),
+            (
+                "truncated",
+                intact[..record(6)].to_vec(),
+                "failed to fill whole buffer",
+            ),
+        ] {
+            std::fs::write(&sidecar, &bytes).unwrap();
+            let error = ensure_receipts(&path, &audit(), second).unwrap_err();
+            assert!(error.to_string().contains(message), "{case}: {error}");
+        }
+        std::fs::write(&sidecar, &intact).unwrap();
+        ensure_receipts(&path, &audit(), second).unwrap();
+    }
 }
 
 #[derive(Deserialize)]
@@ -1224,7 +1313,10 @@ fn ensure_receipts(
     let mut reader = std::io::BufReader::new(&file);
     let mut rebuilt = ReceiptCommitment::default();
     for sequence in 0..base {
-        rebuilt.push(&super::read_record(&mut reader, usize::try_from(sequence)?)?)?;
+        rebuilt.push(&super::read_record(
+            &mut reader,
+            usize::try_from(sequence)?,
+        )?)?;
     }
     ensure!(
         rebuilt.matches(&audit.commitment),

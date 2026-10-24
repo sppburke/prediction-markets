@@ -5765,7 +5765,15 @@ fn retention_rebuild_checkpoint_loss_stale_epoch_poison_preparation_and_migratio
             .unwrap();
         }
         let mut opened = SourceLogBoot::open(&paths, true).unwrap().unwrap();
+        let (_, booted_len, booted_capacity) =
+            opened.boot.receipt_index().receipt_window_for_scenario();
+        assert_eq!(
+            booted_capacity, booted_len,
+            "boot builds an exactly sized window"
+        );
+        assert_receipt_window(&opened.boot.receipt_index(), &paths.source_log);
         opened.boot.extend(&mut opened.sink).unwrap();
+        assert_receipt_window(&opened.boot.receipt_index(), &paths.source_log);
         let expected_with_boundary = &baseline.with_boundary;
         assert_eq!(
             &opened.boot.obligations(&paper, &paths.paper_log).unwrap(),
@@ -5788,6 +5796,7 @@ fn retention_rebuild_checkpoint_loss_stale_epoch_poison_preparation_and_migratio
             .unwrap();
         opened.sink.poison_for_scenario();
         assert!(opened.sink.try_reopen());
+        assert_receipt_window(&opened.boot.receipt_index(), &paths.source_log);
         assert_eq!(
             rebuild_reconciliation_obligations(&paths.source_log, &paper).unwrap(),
             expected
@@ -5818,6 +5827,7 @@ fn retention_rebuild_checkpoint_loss_stale_epoch_poison_preparation_and_migratio
     let mut prepared_boot = SourceLogBoot::open(&paths, true).unwrap().unwrap();
     assert!(prepared_boot.boot.checkpoint_assisted_for_scenario());
     prepared_boot.boot.extend(&mut prepared_boot.sink).unwrap();
+    assert_receipt_window(&prepared_boot.boot.receipt_index(), &paths.source_log);
     assert_eq!(
         prepared_boot
             .boot
@@ -5837,6 +5847,36 @@ fn retention_rebuild_checkpoint_loss_stale_epoch_poison_preparation_and_migratio
     }
     drop(prepared_boot);
     PaperMigrationBoot::prepare(paths.clone(), NOW_UNIX + 21).unwrap();
+}
+
+/// #745. PASS: invalidation trims the receipt sidecar to the boundary, and recovery rebuilds an
+/// exactly sized window from it in which every receipt answers as before and every pin verifies.
+/// FAIL: a different window, a differing receipt or a failed pin.
+#[test]
+fn retention_recovery_after_invalidation_rebuilds_the_window_from_the_trimmed_sidecar() {
+    let (_dir, paths, authority, baseline) = retention_recovery_fixture();
+    erase_retention_frames(&paths.source_log, &authority);
+    pe_service::source_checkpoint::invalidate(&paths.source_log).unwrap();
+    assert_eq!(
+        file_len(&checkpoint_sidecar(&paths.source_log, ".receipts")),
+        authority.boundary.sequence.0 * pe_event_log::RECEIPT_RECORD_LEN
+    );
+    let mut opened = SourceLogBoot::open(&paths, true).unwrap().unwrap();
+    assert!(!opened.boot.checkpoint_assisted_for_scenario());
+    let (_, len, capacity) = opened.boot.receipt_index().receipt_window_for_scenario();
+    assert_eq!(capacity, len);
+    opened.boot.extend(&mut opened.sink).unwrap();
+    let index = opened.boot.receipt_index();
+    assert_receipt_window(&index, &paths.source_log);
+    for (sequence, metadata) in baseline.receipts.iter().enumerate() {
+        assert_eq!(
+            index
+                .receipt_at(EventSeq(u64::try_from(sequence).unwrap()))
+                .unwrap(),
+            Some(*metadata)
+        );
+    }
+    index.verify_retention_pins().unwrap();
 }
 
 #[tokio::test]
@@ -6561,8 +6601,54 @@ fn retention_boot_runtime(
     tokio::task::JoinHandle<()>,
     pe_service::trade_poller::ReconciliationObligations,
 ) {
-    let (owner, task, obligations, _, _) = retention_boot_runtime_with_control(paths, state, clock);
+    let (owner, task, obligations, _, _, _) =
+        retention_boot_runtime_with_control(paths, state, clock);
     (owner, task, obligations)
+}
+
+/// As [`retention_boot_runtime`], also returning the booted receipt index.
+fn retention_boot_runtime_indexed(
+    paths: &PaperMigrationPaths,
+    state: &Arc<PaperStateDb>,
+    clock: Arc<std::sync::atomic::AtomicU64>,
+) -> (
+    pe_service::source_checkpoint::SourceCheckpointOwner,
+    tokio::task::JoinHandle<()>,
+    pe_service::trade_poller::ReconciliationObligations,
+    SourceReceiptIndex,
+) {
+    let (owner, task, obligations, _, _, index) =
+        retention_boot_runtime_with_control(paths, state, clock);
+    (owner, task, obligations, index)
+}
+
+/// #745: memory holds exactly the receipts from the committed retention boundary to the tail,
+/// never the retired prefix, and the window capacity stays bounded by the window.
+fn assert_receipt_window(index: &SourceReceiptIndex, source_log: &Path) {
+    let boundary = pe_event_log::RetentionAuthority::load(source_log)
+        .unwrap()
+        .map_or(0, |authority| authority.boundary.sequence.0);
+    let count = pe_event_log::Reader::verified_tail(source_log)
+        .unwrap()
+        .last_sequence
+        .map_or(0, |last| last.0 + 1);
+    let (base, len, capacity) = index.receipt_window_for_scenario();
+    assert_eq!(base, boundary, "window base is the committed boundary");
+    assert_eq!(
+        u64::try_from(len).unwrap(),
+        count - boundary,
+        "window holds the boundary to the tail"
+    );
+    assert!(
+        capacity <= 2 * len.max(1),
+        "capacity {capacity} for a {len}-receipt window"
+    );
+    if boundary > 0 {
+        assert!(
+            u64::try_from(capacity).unwrap() < count,
+            "capacity {capacity} still covers the retired prefix of {boundary}"
+        );
+    }
 }
 
 fn retention_boot_runtime_with_control(
@@ -6575,6 +6661,7 @@ fn retention_boot_runtime_with_control(
     pe_service::trade_poller::ReconciliationObligations,
     tokio::sync::mpsc::Sender<pe_service::orchestrator_control::OrchestratorControl>,
     Arc<pe_service::orchestrator::ScenarioHooks>,
+    SourceReceiptIndex,
 ) {
     let mut opened = SourceLogBoot::open(paths, true).unwrap().unwrap();
     opened.boot.extend(&mut opened.sink).unwrap();
@@ -6593,7 +6680,7 @@ fn retention_boot_runtime_with_control(
     let (live, preparer, control, task) = support::retention_controls_at(
         paper.clone(),
         state.clone(),
-        index,
+        index.clone(),
         Some(terminal_at),
         Some(hooks.clone()),
     );
@@ -6633,7 +6720,7 @@ fn retention_boot_runtime_with_control(
         },
     ));
     drop(opened.sink);
-    (owner, task, obligations, control, hooks)
+    (owner, task, obligations, control, hooks, index)
 }
 
 fn record_failed_catch_up_group(
@@ -6714,7 +6801,8 @@ async fn retention_terminalized_during_boot_waits_through_two_advances_and_check
     let clock = Arc::new(AtomicU64::new(u64::try_from(terminal_at).unwrap()));
     let logs = support::RetentionLogs::default();
     let _subscriber = tracing::subscriber::set_default(logs.subscriber());
-    let (mut owner, control, obligations) = retention_boot_runtime(&paths, &state, clock.clone());
+    let (mut owner, control, obligations, index) =
+        retention_boot_runtime_indexed(&paths, &state, clock.clone());
     assert!(obligations.is_empty());
     owner.initialize_for_scenario().await.unwrap();
     let terminal = state
@@ -6741,6 +6829,7 @@ async fn retention_terminalized_during_boot_waits_through_two_advances_and_check
     for (epoch, at) in [(1, terminal_at), (2, terminal_at + 86_400)] {
         clock.store(u64::try_from(at).unwrap(), Ordering::Release);
         owner.retention_for_scenario().await.unwrap();
+        assert_receipt_window(&index, &paths.source_log);
         assert_eq!(
             pe_event_log::RetentionAuthority::load(&paths.source_log)
                 .unwrap()
@@ -6774,7 +6863,8 @@ async fn retention_terminalized_during_boot_waits_through_two_advances_and_check
         &paths.source_log,
     ))
     .unwrap();
-    let (mut owner, control, obligations) = retention_boot_runtime(&paths, &state, clock.clone());
+    let (mut owner, control, obligations, index) =
+        retention_boot_runtime_indexed(&paths, &state, clock.clone());
     assert!(obligations.is_empty());
     owner.initialize_for_scenario().await.unwrap();
     assert_eq!(
@@ -6795,6 +6885,7 @@ async fn retention_terminalized_during_boot_waits_through_two_advances_and_check
         Ordering::Release,
     );
     owner.retention_for_scenario().await.unwrap();
+    assert_receipt_window(&index, &paths.source_log);
     assert_eq!(logs.last_run()["wallets_swapped_out"], 1);
     assert_eq!(logs.last_run()["wallets_waiting"], "[]");
     assert!(
@@ -6981,7 +7072,7 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
                 .unwrap();
         }
         let clock = Arc::new(AtomicU64::new(u64::try_from(now).unwrap()));
-        let (mut owner, mut task, obligations, mut tx, mut hooks) =
+        let (mut owner, mut task, obligations, mut tx, mut hooks, _) =
             retention_boot_runtime_with_control(&paths, &state, clock.clone());
         assert!(obligations.is_empty());
         owner.initialize_for_scenario().await.unwrap();
@@ -7075,7 +7166,7 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
                 mode == "reboot"
             );
             drop(opened);
-            let (restarted, restarted_task, obligations, restarted_tx, restarted_hooks) =
+            let (restarted, restarted_task, obligations, restarted_tx, restarted_hooks, _) =
                 retention_boot_runtime_with_control(&paths, &state, clock.clone());
             assert!(obligations.is_empty());
             assert!(obligations.frame_recovery_receipts().0.is_empty());

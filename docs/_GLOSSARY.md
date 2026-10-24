@@ -954,9 +954,12 @@ reducer projections and `receipt_count`, without a receipt list; format 3 also b
 `<source-log>.boot-checkpoint.receipts` holds fixed 80-byte records:
 32-byte receipt hash, little-endian receive milliseconds (`i64`), little-endian byte offset
 (`u64`, absent encoded as `u64::MAX`), and BLAKE3 of the preceding 48 bytes. Record position i
-implies source sequence i, matching the dense in-memory receipt index. Boot reads the named
-records sequentially into that index, validating every checksum, offset bound/order and the
-manifest's last sequence/hash. Records below the retention boundary are durable metadata,
+implies source sequence i. Boot reads the named records sequentially, validating every checksum,
+offset bound/order and the manifest's last sequence/hash. The in-memory receipt index holds the
+records from the retention boundary to the tail plus a constant-size summary of the retired ones
+(a BLAKE3 commitment over their records, their newest receive time and the two highest records);
+it reads retired records from this file on demand and treats a failed read as a missing receipt
+(#745). Records below the retention boundary are durable metadata,
 including old fills' receipt times, and survive checkpoint loss, invalidation and recovery. Invalid
 records in that prefix beside a punched log require restoration of a coherent capture. Without
 retention, invalid records select a full verified walk and a fresh receipts file from record zero.
@@ -1040,7 +1043,7 @@ which detects external length drift but not equal-length rewrites of verified by
 | Pauses | The entire job, including finishing a committed epoch, pauses without a Start, until the generation's seal naming its first Start exists, or while a source-referencing live-journal record or any dispatch seed holds evidence. A successor Start does not pause retention. Live evidence is never erased. |
 | `<source-log>.retention` | Versioned checksummed authority, atomically installed and directory-synced: epoch, advance time, boundary, chain head, pins, pathless synced `retained_tail`, and committed feed entries (epoch, frame count, length, BLAKE3). A missing/invalid authority beside a punched log refuses boot. |
 | `<source-log>.feed/<epoch>.frames` | Compact verbatim feed frames in sequence order, kept long-term. Only committed epochs are read/captured; empty epochs have no file. Each file authenticates its count, length, hash and frames against dense receipt records. Feed files are audit evidence, not boot rebuild inputs. |
-| Receipts prefix | `<source-log>.boot-checkpoint.receipts` stays dense from sequence zero. Records below the boundary are durable retention metadata and survive every invalidation/recovery intermediate state; publication replaces only the suffix. Disk and in-memory metadata remain unbounded in this release. |
+| Receipts prefix | `<source-log>.boot-checkpoint.receipts` stays dense from sequence zero. Records below the boundary are durable retention metadata and survive every invalidation/recovery intermediate state; publication replaces only the suffix. Disk metadata remains unbounded; memory holds only the retained window and a constant-size commitment to the retired records, which every advance's audit rebuilds from this file (#745). |
 | Old-binary fence | The service installs a field in the existing invalidation record before listening and never removes it; staged preparation never writes it. An old executable refuses checkpoint use/publication after the fence. A checkpoint loaded earlier cannot be revoked, so deploy must clear the process census with the unit disabled and stopped before swapping the binary. Recovery is fix forward. |
 | `Erased` | Exact source read below the boundary without a pin fails closed, even if bytes survive in a shared block. Recheck the index after physical I/O, on success or failure, to cover a concurrent commit. Retained reads still verify normally. |
 | `Retired` | A full-prefix walk ending at/below the boundary, qualification re-verification or first-era complete-prefix tool refuses before selection once required history has retired. Successor preparation and Start use the retention-aware boot-equivalent source-index rebuild. Sealing stays at boundary zero. |

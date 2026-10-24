@@ -1829,6 +1829,13 @@ verifies pins and the retained suffix; missing/invalid prefix metadata beside a 
 a coherent capture restored. Only without retention may publication recreate receipts from zero.
 Deploy snapshot and archive inventories include `.retention` and nested `.feed/` files alongside
 the manifest, `.receipts` and `.invalidation` companions.
+Once retention exists, the running service holds in memory only the receipts from the boundary to
+the tail (about 64 bytes each) plus a constant-size commitment to the retired ones, and reads retired
+records from `.receipts` through a handle opened at boot or at the first advance (#745). Memory for
+receipt metadata therefore tracks the roughly 7-day window rather than the whole history; disk still
+grows by 80 bytes per frame. The sidecar is a live dependency: a lost or damaged record below the
+boundary makes reads that need it fail closed as a missing receipt and blocks the next advance's
+audit, so restore it only from a coherent capture.
 The exact format is canonical in
 [`_GLOSSARY.md`](_GLOSSARY.md#durable-log-migration-and-supervisor-boundaries-544).
 This release uses fix-forward recovery: `d998fbf` cannot read the format-2 checkpoint. I/O failures
