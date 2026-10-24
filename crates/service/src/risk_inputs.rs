@@ -5412,12 +5412,13 @@ mod tests {
         /// validated against stale reads.
         #[test]
         fn a_stale_installer_is_refused() {
-            let fixture = WindowFixture::new(14);
+            let fixture = WindowFixture::new(20);
             let first = fixture.authority(6, &[2, 4, 5], 1);
             let later = fixture.authority(11, &[2, 4, 5, 9, 10], 3);
 
             // The window moves between the dependency reads and the guard. This authority needs no
-            // receipt below the moved window's cache, so only the recheck can refuse it.
+            // receipt below the moved window's cache, and the moved window is longer than the split
+            // its stale base implies, so only the recheck can refuse it.
             let in_window = fixture.authority(11, &[9, 10], 3);
             let index = SourceReceiptIndex::replay(&fixture.path).unwrap();
             let stale = index
@@ -5447,7 +5448,7 @@ mod tests {
             );
 
             index.install_retention(later).unwrap();
-            assert_eq!(index.receipt_window_for_scenario(), (11, 3, 3));
+            assert_eq!(index.receipt_window_for_scenario(), (11, 9, 9));
         }
 
         /// PASS: a retention switch between catch-up's recovery and its extension moves the
