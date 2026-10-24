@@ -5317,24 +5317,42 @@ mod tests {
 
         /// PASS: when the read frame was the tail at lookup, and frames are appended and retired
         /// past it before the physical read, the pin's end is checked against its successor read
-        /// from the sidecar. FAIL: a refused read or an unchecked end.
+        /// from the sidecar only then: an intact successor reads, a successor whose recorded offset
+        /// differs is a conflict, and a damaged one is a missing receipt.
+        /// FAIL: any other outcome, which would mean the late successor was not read or not checked.
         #[cfg(feature = "scenario")]
         #[test]
         fn a_successor_appended_and_retired_mid_read_is_read_from_the_sidecar() {
-            let fixture = WindowFixture::new(10);
-            let index = SourceReceiptIndex::replay(&fixture.path).unwrap();
-            let read = index.source_envelope_with_pause(fixture.at(9).receipt, &mut || {
-                append_frames(&fixture.path, 10..14);
-                index.catch_up_verified_tail().unwrap();
-                // Publication brings the sidecar to the new tail before retention retires it.
-                let grown = dense_frames_with_sidecar(&fixture.path);
-                let tail = tail_of(&fixture.path, &grown);
-                index
-                    .install_retention(authority_over(&grown, &tail, 13, &[9], 1))
-                    .unwrap();
-            });
-            assert_eq!(read.unwrap().payload, payload_at(9));
-            assert_eq!(index.receipt_window_for_scenario(), (13, 1, 1));
+            for case in ["intact", "wrong end", "damaged"] {
+                let fixture = WindowFixture::new(10);
+                let index = SourceReceiptIndex::replay(&fixture.path).unwrap();
+                let read = index.source_envelope_with_pause(fixture.at(9).receipt, &mut || {
+                    append_frames(&fixture.path, 10..14);
+                    index.catch_up_verified_tail().unwrap();
+                    // Publication brings the sidecar to the new tail before retention retires it.
+                    let grown = dense_frames_with_sidecar(&fixture.path);
+                    let tail = tail_of(&fixture.path, &grown);
+                    index
+                        .install_retention(authority_over(&grown, &tail, 13, &[9], 1))
+                        .unwrap();
+                    match case {
+                        "wrong end" => {
+                            let mut moved = grown[10].clone();
+                            moved.byte_offset = moved.byte_offset.map(|offset| offset + 1);
+                            fixture.rewrite_record(10, &moved);
+                        }
+                        "damaged" => damage_receipt_record(&fixture.path, 10),
+                        _ => {}
+                    }
+                });
+                let expected = match case {
+                    "intact" => Ok(payload_at(9)),
+                    "wrong end" => Err(RiskInputsUnavailable::PriceConflict),
+                    _ => Err(RiskInputsUnavailable::PriceMissing),
+                };
+                assert_eq!(read.map(|envelope| envelope.payload), expected, "{case}");
+                assert_eq!(index.receipt_window_for_scenario(), (13, 1, 1), "{case}");
+            }
         }
 
         /// PASS: a range read stays exact when a retention switch, or an invalidation trim plus a
@@ -5373,6 +5391,20 @@ mod tests {
                     .unwrap();
             });
             assert_eq!(rows(read), all);
+
+            // The read resumes while the sidecar is still trimmed to the boundary, as between an
+            // invalidation and the next publication: only the retired prefix comes from the file.
+            let index = fixture.switched(&first);
+            let read = index.checkpoint_suffix_with_pause(0, 14, &fixture.binding(14), &mut || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&sidecar)
+                    .unwrap()
+                    .set_len(6 * pe_event_log::RECEIPT_RECORD_LEN)
+                    .unwrap();
+            });
+            assert_eq!(rows(read), all);
+            std::fs::write(&sidecar, &bytes).unwrap();
         }
 
         /// PASS: an installer whose dependencies were read against an older window base or epoch
@@ -5384,15 +5416,17 @@ mod tests {
             let first = fixture.authority(6, &[2, 4, 5], 1);
             let later = fixture.authority(11, &[2, 4, 5, 9, 10], 3);
 
-            // The window moves between the dependency reads and the guard.
+            // The window moves between the dependency reads and the guard. This authority needs no
+            // receipt below the moved window's cache, so only the recheck can refuse it.
+            let in_window = fixture.authority(11, &[9, 10], 3);
             let index = SourceReceiptIndex::replay(&fixture.path).unwrap();
             let stale = index
-                .retention_dependencies(&later, index.retired_reader().ok())
+                .retention_dependencies(&in_window, index.retired_reader().ok())
                 .unwrap();
             index.install_retention(first.clone()).unwrap();
             assert_eq!(
                 index
-                    .prepare_resolved_retention_install(later.clone(), stale)
+                    .prepare_resolved_retention_install(in_window.clone(), stale)
                     .err(),
                 Some(RiskInputsUnavailable::PriceConflict)
             );
