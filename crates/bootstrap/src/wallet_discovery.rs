@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
-use pe_source_polymarket_public::ReqwestFetcher;
+use pe_source_polymarket_public::{RECONCILIATION_RATE_LIMIT_RETRY_SECS, ReqwestFetcher};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -140,14 +140,7 @@ pub async fn run_source_discovery_with_policy(
                 cache,
                 activation_policy,
                 now,
-                || {
-                    let client = reqwest::Client::builder()
-                        .pool_idle_timeout(Duration::from_secs(15))
-                        .build()
-                        .map_err(|_| BootstrapError::Internal)?;
-                    Ok(ReqwestFetcher::new(client)
-                        .with_min_interval_ms(PARTICIPANT_MIN_INTERVAL_MS))
-                },
+                participant_fetcher,
                 |lo| recent_market_scope(config, lo),
             )
             .await
@@ -279,6 +272,18 @@ where
         activated,
         status: record.status,
     })
+}
+
+fn participant_fetcher() -> Result<ReqwestFetcher, BootstrapError> {
+    let client = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| BootstrapError::Internal)?;
+    // A venue `Retry-After: 1` answer to a `/trades` page is waited out in-line rather than
+    // ending the source for the whole cycle (#800).
+    Ok(ReqwestFetcher::new(client)
+        .with_min_interval_ms(PARTICIPANT_MIN_INTERVAL_MS)
+        .with_rate_limit_retry_max_secs(RECONCILIATION_RATE_LIMIT_RETRY_SECS))
 }
 
 fn participant_failure(reason: &'static str, error: &impl std::fmt::Display) -> &'static str {
@@ -722,6 +727,73 @@ mod tests {
             assert_eq!((r.unique_wallets, r.activated), (0, 0));
             assert_eq!(cache.wallet_pile_size().unwrap(), 0);
         }
+    }
+
+    /// The production fetcher waits out the venue's `Retry-After: 1` (#800); the page, its hash
+    /// and its times come from the successful reply only.
+    #[tokio::test]
+    async fn participants_wait_out_a_short_rate_limit_answer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let ok_body = serde_json::to_vec(&json!([{"proxyWallet": wallet(0xaa)}])).unwrap();
+        let replies = [
+            (
+                "429 Too Many Requests\r\nRetry-After: 1\r\nDate: Mon, 26 Oct 2026 00:00:00 GMT",
+                serde_json::to_vec(&json!([{"proxyWallet": wallet(0xcc)}])).unwrap(),
+            ),
+            (
+                "200 OK\r\nDate: Mon, 26 Oct 2026 00:00:05 GMT",
+                ok_body.clone(),
+            ),
+        ];
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        // On the test's runtime, so the stub ends with the test even after a single request.
+        tokio::spawn(async move {
+            for (head, body) in replies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let line = String::from_utf8(request).unwrap();
+                seen.lock()
+                    .unwrap()
+                    .push(line.lines().next().unwrap().to_owned());
+                let head = format!(
+                    "HTTP/1.1 {head}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        });
+        let mut pages = Vec::new();
+        let wallets = collect_participant_trades(
+            &participant_fetcher().unwrap(),
+            &base,
+            &scope(1),
+            100,
+            NOW,
+            &mut pages,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wallets, vec![wallet(0xaa)]);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].rows, 1);
+        assert_eq!(
+            pages[0].raw_sha256,
+            format!("{:x}", Sha256::digest(&ok_body))
+        );
+        assert_eq!(pages[0].source_at_unix, Some(1_792_972_805));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert!(requests[0].starts_with("GET /trades?market="));
     }
 
     #[tokio::test]

@@ -16,11 +16,12 @@ const REQUEST_TIMEOUT_SECS: u64 = 10;
 const MAX_RETRIES: u32 = 3;
 /// Enforces ≤ 20 req/s per the Polymarket Data API documented limit (200 req/10s on `/trades`).
 const MIN_INTERVAL_MS: u64 = 50;
-/// Longest HTTP 429 `Retry-After` a complete-activity reader waits out in-line
+/// Longest HTTP 429 `Retry-After` an opted-in reader waits out in-line
 /// (`reconciliation_rate_limit_retry_secs`, `docs/_GLOSSARY.md`): the venue answers
-/// an `/activity` page burst with `Retry-After: 1` (#555). Passed to
-/// [`ReqwestFetcher::with_rate_limit_retry_max_secs`] by the service's reconciliation
-/// fetcher and by `pe-bootstrap cache-populate-activity-v2` (#588).
+/// an `/activity` page burst with `Retry-After: 1` (#555), and `/trades` pages too (#800).
+/// Passed to [`ReqwestFetcher::with_rate_limit_retry_max_secs`] by the service's
+/// reconciliation fetcher, by `pe-bootstrap cache-populate-activity-v2` (#588) and by
+/// winner discovery's participant `/trades` reader (#800).
 pub const RECONCILIATION_RATE_LIMIT_RETRY_SECS: u32 = 1;
 /// Independent retry budget for opted-in short 429s. Ten one-second waits span
 /// a venue rate window and cost far less than restarting a collection (#588).
@@ -171,8 +172,8 @@ impl ReqwestFetcher {
 
     /// Opt in to waiting out a short HTTP 429 `Retry-After` (at most `max_secs`) inside the
     /// independent `RECONCILIATION_RATE_LIMIT_MAX_RETRIES` budget. The service's Data-API
-    /// reconciliation fetcher and bootstrap complete-activity collector opt in (#555, #588).
-    /// Hot-path and outer-budgeted clients keep the default.
+    /// reconciliation fetcher, bootstrap complete-activity collector and participant `/trades`
+    /// reader opt in (#555, #588, #800). Hot-path and outer-budgeted clients keep the default.
     pub fn with_rate_limit_retry_max_secs(mut self, max_secs: u32) -> Self {
         self.rate_limit_retry_max_secs = Some(max_secs);
         self
