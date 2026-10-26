@@ -7760,13 +7760,28 @@ async fn live_conversion_fence_recovers_through_reentry_with_buy_only_history() 
         .max_by_key(|anchor| anchor.anchor_seq)
         .unwrap();
     let proof: Value = serde_json::from_str(&anchor.proof_json).unwrap();
-    assert_eq!(proof["cleared_fence"]["cause"], "conversion_unknown_conditions");
+    assert_eq!(
+        proof["cleared_fence"]["cause"],
+        "conversion_unknown_conditions"
+    );
     assert!(anchor.balances_json.contains(&condition(1)));
     drop(preparer);
     actor.await.unwrap();
 
     let mut engine =
         BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
+    assert_eq!(
+        ledger_capture(
+            &replay_wallet_ledger(&paper, wallet).unwrap(),
+            &paper,
+            wallet
+        )
+        .unwrap()
+        .hash,
+        ledger_capture(engine.ledger(), &paper, wallet)
+            .unwrap()
+            .hash
+    );
     assert!(
         engine
             .commit(groups(), &context(4004), zero_basis())
