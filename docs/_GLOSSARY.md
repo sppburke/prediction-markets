@@ -492,15 +492,16 @@ During catch-up, verified prior purchases for unfenced wallets consume all missi
 through the existing bucket
 transaction and history projection, including while reanchoring is required and when a group was
 already stored without history. Fenced bracket reconciliation defers all covered-history repair to installation. Recovery permits
-only the existing order-dependent, underflow, overflow and late-group causes, or a revised aggregate
-with a unique durably dispositioned trigger matching original wallet/source epoch, canonical
+only the existing order-dependent, underflow, overflow, late-group and conversion causes, or a revised
+aggregate with a unique durably dispositioned trigger matching original wallet/source epoch, canonical
 transaction identity and fence recording time. The second activity read's fixed end must be strictly
 after the integer fence bucket epoch (the second tail for re-entry). Missing or ambiguous evidence
 refuses recovery.
 Fresh metadata-prepared and immutable recorded originals plus all attributable revisions must contain
-no effective conversion or unknown effect. At serialized installation their BUY evidence through
-the cutoff repairs each missing market using the earliest `(source_epoch, source_trade_id)`; SELL
-and raw-only effects consume no history. Clearance requires the accepted cutoff to be at or after the wallet's captured activity
+no effective unknown effect. At serialized installation their BUY evidence through
+the cutoff repairs each missing market using the earliest `(source_epoch, source_trade_id)`; SELL,
+conversion and raw-only effects consume no history, as in catch-up, and the anchor's authoritative
+balances stand. Clearance requires the accepted cutoff to be at or after the wallet's captured activity
 cursor; an earlier cutoff (for example after a clock rollback) refuses it and the wallet stays
 fenced. Exact fence comparison, history repair, authoritative
 balances, validation, coverage, history completion and fence deletion commit together. Version-one

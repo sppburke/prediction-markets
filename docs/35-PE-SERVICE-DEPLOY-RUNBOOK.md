@@ -2134,9 +2134,9 @@ deployment actions described above; this procedure makes no trading or policy ch
     before S for transitions, attempts, deferrals, exclusions and fairness; later lines establish
     coverage only. A survivor is live only if present in the closing copy's `live_wallets`.
     Structural membership and Supabase projection do not establish that. Policy exclusions require
-    evidence from the wallet's own inactivity history, knockout or capacity. Rank 25 and other
-    conversion-fenced survivors are reported as awaiting release 2; ranks 3 and 27 must be live or
-    excluded by an existing owner policy.
+    evidence from the wallet's own inactivity history, knockout or capacity. Survivors refused for
+    conversion-created holdings are reported with their `positions.missing_activity_mapping` evidence;
+    ranks 3 and 27 must be live or excluded by an existing owner policy.
 
     For each continuously eligible wallet, count ticks where its path ran first and started at least
     one bracket. N is the distinct eligible-wallet count across those path calls; k is their smallest
