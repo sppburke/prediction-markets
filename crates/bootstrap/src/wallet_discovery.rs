@@ -733,9 +733,9 @@ mod tests {
     /// and its times come from the successful reply only.
     #[tokio::test]
     async fn participants_wait_out_a_short_rate_limit_answer() {
-        use std::io::{Read, Write};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let ok_body = serde_json::to_vec(&json!([{"proxyWallet": wallet(0xaa)}])).unwrap();
         let replies = [
@@ -750,15 +750,13 @@ mod tests {
         ];
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
-        // Never joined: a fetcher that stops after one reply leaves it waiting harmlessly.
-        std::thread::spawn(move || {
-            for ((head, body), stream) in replies.into_iter().zip(listener.incoming()) {
-                let mut stream = stream.unwrap();
+        // On the test's runtime, so the stub ends with the test even after a single request.
+        tokio::spawn(async move {
+            for (head, body) in replies {
+                let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
-                let mut byte = [0u8; 1];
                 while !request.ends_with(b"\r\n\r\n") {
-                    stream.read_exact(&mut byte).unwrap();
-                    request.push(byte[0]);
+                    request.push(stream.read_u8().await.unwrap());
                 }
                 let line = String::from_utf8(request).unwrap();
                 seen.lock()
@@ -769,8 +767,8 @@ mod tests {
                      Content-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                stream.write_all(head.as_bytes()).unwrap();
-                stream.write_all(&body).unwrap();
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
             }
         });
         let mut pages = Vec::new();
