@@ -98,13 +98,15 @@
 > These pages and `probe15_prices_history.json` / `probe16_closure_fields.json` were read from
 > the supplied 2026-10-03 captures; no new live request was made for this implementation.
 
-> **Short-429 retry budget (#588), Last checked: 2026-10-03; re-verify by
-> 2026-12-02.** The [official rate-limit reference](https://docs.polymarket.com/api-reference/rate-limits)
-> still describes sliding windows and queued throttling. It lists legacy `/trades`
-> at 200 requests/10 seconds and v2 `/activity` at the same limit; it does not
-> separately list legacy `/activity` or promise a one-second `Retry-After`.
-> The short-429 policy remains grounded in the reported Forge responses, with
-> unchanged request pacing and a separate bounded retry budget (see `_GLOSSARY.md`).
+> **Short-429 retry budget (#588, #800), Last checked: 2026-10-26; re-verify by
+> 2026-12-25.** The [official rate-limit reference](https://docs.polymarket.com/api-reference/rate-limits)
+> still describes IP-based Cloudflare throttling on sliding windows, with requests queued
+> rather than rejected. It lists legacy `/trades` at 200 requests/10 seconds and v2
+> `/activity` at the same limit; it does not separately list legacy `/activity` or promise a
+> one-second `Retry-After`. The short-429 policy remains grounded in the reported Forge
+> responses (`/activity` pages, #588; participant `/trades` pages on 2026-10-24 and
+> 2026-10-25, #800), with unchanged request pacing and a separate bounded retry budget
+> (see `_GLOSSARY.md`).
 
 > **Reply completeness (#703), Last checked: 2026-10-13; re-verify by 2026-12-12.** The official
 > [activity](https://docs.polymarket.com/api-reference/core/get-user-activity),

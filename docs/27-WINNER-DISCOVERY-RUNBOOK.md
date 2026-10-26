@@ -138,9 +138,12 @@ scope digest covers the whole list. Statuses:
   window; a warning is logged, counts are zero and no participant wallet is upserted.
 
 Cache upsert and activation errors remain fatal. Collection failures allow the cycle to continue.
-The existing fetchers retain their request retry policy. Once the wrapper records the cycle's
-activation batch, cycle retries skip discovery; a failed or incomplete participant source is
-attempted again in the next new cycle. Its status remains visible rather than implying success.
+A `/trades` page answered HTTP 429 with `Retry-After: 1` is waited out in place within the
+short-429 budget (`reconciliation_rate_limit_max_retries` in the glossary, #800); a page that still
+fails ends the source with `failed:trades`. The Gamma sweep keeps its page retries. Once the
+wrapper records the cycle's activation batch, cycle retries skip discovery; a failed or incomplete
+participant source is attempted again in the next new cycle. Its status remains visible rather
+than implying success.
 
 Rollback: set `PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS=0` in the wrapper-loaded `.env`.
 Later discovery runs skip this source. Already activated wallets stay active and queued
