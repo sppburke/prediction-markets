@@ -2124,12 +2124,13 @@ if shard_owns 2; then
 census_dir="$TEST_TMP/census"
 mkdir -p "$census_dir/root/smoke-test"
 : > "$census_dir/root/smoke-test/service.toml"
-tail_bin=$(command -v tail)
-cp "$tail_bin" "$census_dir/pe-service.bak-census"
-cp "$tail_bin" "$census_dir/pe-service"
-cp "$tail_bin" "$census_dir/renamed"
-"$census_dir/pe-service.bak-census" -f /dev/null & known_pid=$!
-"$census_dir/renamed" -f /dev/null & renamed_pid=$!
+# The stand-in must keep running under any file name; Ubuntu 26.04's coreutils is one multi-call binary that exits.
+stand_in=$(command -v perl)
+cp "$stand_in" "$census_dir/pe-service.bak-census"
+cp "$stand_in" "$census_dir/pe-service"
+cp "$stand_in" "$census_dir/renamed"
+"$census_dir/pe-service.bak-census" -e 'sleep 600' & known_pid=$!
+"$census_dir/renamed" -e 'sleep 600' & renamed_pid=$!
 (cd "$census_dir/root" && exec python3 -c 'import time; time.sleep(600)' smoke-test/service.toml) & config_pid=$!
 bash -c 'exec -a pe-service-live-canary sleep 600' & canary_pid=$!
 sleep 0.5
