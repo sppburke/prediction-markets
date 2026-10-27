@@ -1776,7 +1776,8 @@ pub fn recoverable_fence(
         "order_dependent_equal_second"
         | "position_underflow"
         | "position_overflow"
-        | "late_group_after_bucket_commit" => true,
+        | "late_group_after_bucket_commit"
+        | "conversion_unknown_conditions" => true,
         "revised_applied_aggregate" => paper.revised_fence_trigger_disposed(fence, epoch)?,
         _ => false,
     })
@@ -1824,7 +1825,7 @@ fn recovery_fresh_history(
         for aggregate in bucket {
             let mutation = crate::bucket_commit::recordable_mutation(&aggregate, &context);
             match mutation.effect.effective() {
-                LedgerEffect::Conversion | LedgerEffect::UnknownEffect => {
+                LedgerEffect::UnknownEffect => {
                     return Err(CausalPositionError::UnsafeRecovery { wallet });
                 }
                 LedgerEffect::Trade {

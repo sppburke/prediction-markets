@@ -232,7 +232,7 @@ PY
     PGRST_SERVER_HOST=127.0.0.1 "PGRST_SERVER_PORT=$postgrest_port"
   docker run -d --name "$containers-rest-$branch" --network host \
     --env-file "$run_root/postgrest-$branch.env" postgrest/postgrest:v12.2.3 >/dev/null
-  printf 'events {}\nhttp { access_log off; server { listen 127.0.0.1:%s; location /rest/v1/ { proxy_pass http://127.0.0.1:%s/; } } }\n' \
+  printf 'events {}\nhttp { access_log off; proxy_buffer_size 64k; proxy_buffers 8 64k; proxy_busy_buffers_size 128k; server { listen 127.0.0.1:%s; location /rest/v1/ { proxy_pass http://127.0.0.1:%s/; } } }\n' \
     "$http_port" "$postgrest_port" > "$run_root/nginx-$branch.conf"
   docker run -d --name "$containers-gw-$branch" --network host \
     -v "$run_root/nginx-$branch.conf:/etc/nginx/nginx.conf:ro" nginx:alpine >/dev/null

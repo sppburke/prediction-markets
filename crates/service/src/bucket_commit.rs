@@ -4562,7 +4562,7 @@ impl BucketCommitEngine {
                     let applied = AppliedEffect::from_document(&row.proof_json)
                         .map_err(|error| AnchorInstallError::Durability(error.to_string()))?;
                     match applied.effect.effective() {
-                        LedgerEffect::Conversion | LedgerEffect::UnknownEffect => {
+                        LedgerEffect::UnknownEffect => {
                             return Err(AnchorInstallError::UnsafeRecovery {
                                 wallet: install.wallet,
                             });

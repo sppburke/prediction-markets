@@ -6505,8 +6505,9 @@ fn rollout_empty_reads(wallet: WalletAddress, attempts: usize) -> HashMap<String
 }
 
 /// PASS: every immutable effect participates in installation; a zero current revision cannot
-/// erase a prior BUY or hide a prior conversion/unknown effect. Exact secondary revisions remain
-/// idempotent after clearance, restart, and a full-history refresh.
+/// erase a prior BUY or hide a prior unknown effect, and a prior conversion recovers with no
+/// history. Exact secondary revisions remain idempotent after clearance, restart, and a
+/// full-history refresh.
 #[tokio::test]
 async fn paper_service_rollout_recorded_union_repairs_buys_and_refuses_unsafe_effects() {
     use pe_position_ledger::{LedgerEffect, LedgerMutation};
@@ -6547,7 +6548,9 @@ async fn paper_service_rollout_recorded_union_repairs_buys_and_refuses_unsafe_ef
         let preparer =
             AdmissionPreparer::with_validator(tx.clone(), paper.clone(), validator(reads));
         let result = preparer.prepare(&[wallet]).await.unwrap();
-        if unsafe_effect.is_some() {
+        let refused = unsafe_effect == Some(LedgerEffect::UnknownEffect);
+        let history_len = usize::from(unsafe_effect.is_none());
+        if refused {
             assert!(result.admitted.is_empty());
             assert_eq!(result.deferred[0].kind, "anchor.unsafe_recovery");
             assert!(paper.is_wallet_fenced(&wallet).unwrap());
@@ -6557,9 +6560,11 @@ async fn paper_service_rollout_recorded_union_repairs_buys_and_refuses_unsafe_ef
             assert_eq!(result.admitted, vec![wallet]);
             assert!(!paper.is_wallet_fenced(&wallet).unwrap());
             let history = rollout_history(&dir);
-            assert_eq!(history.len(), 1);
-            assert_eq!(history[0].first_epoch, 10);
-            assert_eq!(history[0].source_trade_id, *original.group_id.key());
+            assert_eq!(history.len(), history_len);
+            if let Some(history) = history.first() {
+                assert_eq!(history.first_epoch, 10);
+                assert_eq!(history.source_trade_id, *original.group_id.key());
+            }
             let proof: Value =
                 serde_json::from_str(&paper.position_anchors(&wallet).unwrap()[0].proof_json)
                     .unwrap();
@@ -6578,7 +6583,7 @@ async fn paper_service_rollout_recorded_union_repairs_buys_and_refuses_unsafe_ef
         drop(preparer);
         drop(tx);
         actor.await.unwrap();
-        if unsafe_effect.is_none() {
+        if !refused {
             let mut engine =
                 BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap())
                     .unwrap();
@@ -6600,7 +6605,7 @@ async fn paper_service_rollout_recorded_union_repairs_buys_and_refuses_unsafe_ef
                 paper.wallet_coverage(&wallet).unwrap().coverage_generation,
                 generation
             );
-            assert_eq!(rollout_history(&dir).len(), 1);
+            assert_eq!(rollout_history(&dir).len(), history_len);
         }
     }
 }
@@ -6608,7 +6613,7 @@ async fn paper_service_rollout_recorded_union_repairs_buys_and_refuses_unsafe_ef
 #[tokio::test]
 async fn paper_service_rollout_fresh_metadata_rejects_previously_raw_only_unsafe_effects() {
     use pe_position_ledger::LedgerEffect;
-    for activity_type in ["CONVERSION", "OTHER"] {
+    for (activity_type, refused) in [("CONVERSION", false), ("OTHER", true)] {
         let wallet = wallet(0xd2);
         let (dir, paper, _) = fresh(&[wallet]);
         let mut row = activity(wallet, 1, "1", "0xfresh-unsafe", 10);
@@ -6633,10 +6638,14 @@ async fn paper_service_rollout_fresh_metadata_rejects_previously_raw_only_unsafe
         let preparer =
             AdmissionPreparer::with_validator(tx.clone(), paper.clone(), validator(reads));
         let result = preparer.prepare(&[wallet]).await.unwrap();
-        assert!(result.admitted.is_empty());
-        assert_eq!(result.deferred[0].kind, "validation.unsafe_recovery");
-        assert!(paper.is_wallet_fenced(&wallet).unwrap());
-        assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+        if refused {
+            assert!(result.admitted.is_empty());
+            assert_eq!(result.deferred[0].kind, "validation.unsafe_recovery");
+            assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+        } else {
+            assert_eq!(result.admitted, vec![wallet]);
+        }
+        assert_eq!(paper.is_wallet_fenced(&wallet).unwrap(), refused);
         assert!(rollout_history(&dir).is_empty());
         drop(preparer);
         drop(tx);
@@ -6654,7 +6663,7 @@ async fn paper_service_rollout_fence_allowlist_cutoff_and_install_races_fail_clo
         ("late_group_after_bucket_commit", 10, true),
         ("position_underflow", END, false),
         ("invalid_mapping", 10, false),
-        ("conversion_unknown_conditions", 10, false),
+        ("conversion_unknown_conditions", 10, true),
         ("unknown_activity_effect", 10, false),
         ("revised_applied_aggregate", 10, false),
     ] {
@@ -7642,15 +7651,15 @@ async fn reentry_baseline_repairs_earliest_purchase_in_both_paths() {
     }
 }
 
-/// PASS: current baseline metadata makes a previously raw-only conversion attributable and
+/// PASS: current baseline metadata makes a previously raw-only unknown effect attributable and
 /// refuses fenced recovery before tails, retaining its original evidence and empty history.
-/// FAIL: a short tail hides the conversion or the baseline commits unsafe recovery early.
+/// FAIL: a short tail hides the unknown effect or the baseline commits unsafe recovery early.
 #[tokio::test]
-async fn reentry_baseline_refuses_previously_raw_only_conversion() {
+async fn reentry_baseline_refuses_previously_raw_only_unknown_effect() {
     let wallet = wallet(0xe5);
     let (dir, paper, _) = fresh(&[wallet]);
     let mut row = activity(wallet, 1, "1", "0xunsafe-baseline", 10);
-    row["type"] = json!("CONVERSION");
+    row["type"] = json!("OTHER");
     let group = aggregate(row.clone(), wallet);
     rollout_record_effect(
         &paper,
@@ -7695,6 +7704,91 @@ async fn reentry_baseline_refuses_previously_raw_only_conversion() {
     );
     drop(preparer);
     actor.await.unwrap();
+}
+
+/// PASS: a live conversion fences its wallet; the fenced re-entry clears that fence, installs the
+/// stable positions, repairs history from the BUY alone, and re-reading the stored conversion
+/// does not fence again. FAIL: the conversion blocks recovery, consumes history, or re-fences.
+#[tokio::test]
+async fn live_conversion_fence_recovers_through_reentry_with_buy_only_history() {
+    let wallet = wallet(0xe6);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 5);
+    let buy = activity(wallet, 1, "1", "0xbuy", 10);
+    let mut conversion = activity(wallet, 2, "1", "0xconversion", 10);
+    conversion["type"] = json!("CONVERSION");
+    let groups = || {
+        vec![
+            aggregate(buy.clone(), wallet),
+            aggregate(conversion.clone(), wallet),
+        ]
+    };
+    engine.commit(groups(), &context(10), zero_basis()).unwrap();
+    assert_eq!(
+        paper.wallet_fence(&wallet).unwrap().unwrap().cause,
+        "conversion_unknown_conditions"
+    );
+
+    let fetcher = Arc::new(QueueFetcher::new(reentry_reads(
+        wallet,
+        4000,
+        [4001, 4002, 4003],
+        &[conversion.clone(), buy.clone()],
+        [&[]; 3],
+        &[position(wallet, 1, "1")],
+    )));
+    let (tx, rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(rx, engine, paper.clone());
+    let preparer = AdmissionPreparer::with_validator(
+        tx,
+        paper.clone(),
+        clocked_validator(fetcher, vec![4000, 4001, 4002, 4003, 4003]),
+    );
+    let result = preparer
+        .scenario_prepare_reentry(&[wallet], &HashMap::from([(wallet, 10)]))
+        .await
+        .unwrap();
+    assert_eq!(result.admitted, vec![wallet]);
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+    let history = rollout_history(&dir);
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].market_id.0.0, condition(1));
+    let anchor = paper
+        .position_anchors(&wallet)
+        .unwrap()
+        .into_iter()
+        .max_by_key(|anchor| anchor.anchor_seq)
+        .unwrap();
+    let proof: Value = serde_json::from_str(&anchor.proof_json).unwrap();
+    assert_eq!(
+        proof["cleared_fence"]["cause"],
+        "conversion_unknown_conditions"
+    );
+    assert!(anchor.balances_json.contains(&condition(1)));
+    drop(preparer);
+    actor.await.unwrap();
+
+    let mut engine =
+        BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
+    assert_eq!(
+        ledger_capture(
+            &replay_wallet_ledger(&paper, wallet).unwrap(),
+            &paper,
+            wallet
+        )
+        .unwrap()
+        .hash,
+        ledger_capture(engine.ledger(), &paper, wallet)
+            .unwrap()
+            .hash
+    );
+    assert!(
+        engine
+            .commit(groups(), &context(4004), zero_basis())
+            .unwrap()
+            .already_committed
+    );
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
 }
 
 fn inactivity_config() -> pe_service::watchlist_maintenance::MaintenanceConfig {
