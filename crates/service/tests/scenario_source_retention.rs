@@ -907,7 +907,7 @@ async fn retention_source_referencing_live_record_pauses_advancing_and_finishing
         .append(
             pe_core_types::AccountId::new("retention-fixture").unwrap(),
             time::OffsetDateTime::from_unix_timestamp(NOW).unwrap(),
-            pe_execution_core::live_journal::LiveJournalPayload::ResolutionFinalized(Box::new(
+            pe_execution_core::live_journal::LiveJournalPayload::ResolutionFinalized(Arc::new(
                 pe_execution_core::live_journal::ResolutionFinalizedAudit {
                     condition_id: pe_core_types::PolymarketConditionId("condition".into()),
                     payout_by_outcome_index_json: "[1,0]".into(),

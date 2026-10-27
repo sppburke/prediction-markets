@@ -89,6 +89,7 @@ async fn scenario_ac9_fill_no_copy_and_no_fill_are_processed_before_the_tick() {
             supabase_anon_key: String::new(),
             supabase_secret_key: String::new(),
             gamma_base_url: String::new(),
+            relayer_base_url: String::new(),
             clob_base_url: String::new(),
             data_base_url: String::new(),
             projection_reconcile_interval_secs: 3600,

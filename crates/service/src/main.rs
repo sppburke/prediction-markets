@@ -1751,6 +1751,7 @@ async fn run() -> Result<()> {
             supabase_secret_key: cfg.supabase_secret_key.clone(),
             gamma_base_url: cfg.gamma_base_url.clone(),
             clob_base_url: cfg.polymarket_clob_base_url.clone(),
+            relayer_base_url: pe_venue_polymarket::RELAYER_BASE_URL.to_owned(),
             data_base_url: cfg.polymarket_base_url.clone(),
             projection_reconcile_interval_secs: cfg.supabase_sink_reconcile_interval_secs,
             shutdown: shutdown.clone(),

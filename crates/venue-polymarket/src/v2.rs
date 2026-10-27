@@ -155,7 +155,7 @@ pub struct CanaryV2Client {
 
 impl CanaryV2Client {
     pub async fn new(credentials: CanaryV2Credentials, host: &str) -> Result<Self, CanaryV2Error> {
-        if host != CLOB_V2_HOST && !cfg!(test) {
+        if host != CLOB_V2_HOST && !cfg!(any(test, feature = "scenario")) {
             return Err(CanaryV2Error::Client(
                 "canary requires the explicit production V2 host".to_owned(),
             ));
@@ -169,7 +169,7 @@ impl CanaryV2Client {
             .map_err(|e| CanaryV2Error::Client(e.to_string()))?;
         let observer = Arc::new(ObservationCollector::default());
         let observer_trait: Arc<dyn ResponseObserver> = observer.clone();
-        let config = if cfg!(test) {
+        let config = if cfg!(any(test, feature = "scenario")) {
             Config::builder()
                 .response_observer(observer_trait)
                 .geoblock_host(host)

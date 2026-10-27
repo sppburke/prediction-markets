@@ -1661,24 +1661,37 @@ deployment or order setup. The request is the sole account-mode command. Observe
 effective-mode transition after the updated service starts; request `off` to disarm. Observe
 `status.json` mode state, control availability and age, and credential-binding readiness.
 
-### D3 — set up orders
+### D3 — Ordinary live go-live
 
-These steps let orders succeed once the owner requests live mode; none is a prerequisite for the
-request or for the effective-mode transition.
-
-1. Rotate the account credentials through the panel; plaintext must never enter `.env`, Supabase,
-   logs, or shell history.
-2. Externally provision and verify pUSD allowance from the account wallet for both V2 exchange
-   spenders. `pe-service` verifies allowance but never mutates it.
-3. Record the custody wallet kind and address, then verify Conditional Tokens `isApprovedForAll`
-   for both V2 collateral adapters. Approval mutation remains an external operator action.
-4. For EOA custody, provision a small POL gas balance. EOA transport remains deferred pending the
-   wallet-kind inventory; ordinary-live v1 uses Relayer transport only.
+1. Deploy with the account's requested and effective modes `off`.
+2. Owner: use a polymarket.com account with a Deposit Wallet deployed on or after 2026-05-04,
+   with $1,000 pUSD deposited. From that deposit wallet, approve pUSD for both V2 exchanges
+   (`0xE111180000d2663C0091e4f400237545B87B996B` and
+   `0xe2222d279d744050d28e00520010520000310F59`) and Conditional Tokens `isApprovedForAll`
+   for both collateral adapters (`0xAdA100Db00Ca00073811820692005400218FcE1f` and
+   `0xadA2005600Dec949baf300f4C6120000bDB6eAab`). Seal one bundle in `/admin/accounts` with
+   `private_key`, `deposit_wallet`, `api_key`, `api_secret`, `api_passphrase`, and
+   `relayer_api_key`; create the Relayer key for the signer address of `private_key`.
+   Leave **Sizing mode** unset. Plaintext must never enter `.env`, Supabase, logs, or shell history.
+3. Operator pre-arm check (read-only): verify the service's loaded age identity matches the site's
+   `PE_AGE_RECIPIENT`, allowances and approvals are present on chain, and sealed bundle metadata
+   matches the account binding. Make one Relayer nonce read with the sealed key. Confirm account
+   sizing is unset, shared sizing is `cash_fraction`, and inspect the `status.json` live block.
+4. Owner: request `live_tiny`. Operator: confirm the audited effective-mode transition.
+5. After arming, never re-seal the bundle or change the service identity or site recipient, and
+   never trade, deposit or withdraw manually in that wallet. The live-Baseline preservation rule
+   in [Rollback](#rollback) also applies while mode is `off`.
 
 Credential, venue, financial, resolver, source, risk, and redemption checks apply per order and
 do not change the owner's requested mode.
 
 ## Rollback
+
+**#808 ordinary live:** rollback additionally requires a stopped-and-drained service, a verified
+header-only live journal, and every existing rollback prerequisite below. Older binaries cannot
+decode `CollateralCredited`; after any live append this rollout fixes forward. While any account
+has a live Baseline, never re-seal its bundle or change the loaded service identity or site
+recipient, including while mode is `off`.
 
 **#757 copy pipeline:** fix forward after the new binary's first recorded decision. Every new
 decision, including a Shadow decline, records `KillOnly` economics that a pre-#757 binary cannot

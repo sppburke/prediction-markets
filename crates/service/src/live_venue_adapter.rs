@@ -40,12 +40,11 @@ use pe_source_polymarket_public::{
     validate_live_market, validate_paper_market,
 };
 use pe_venue_polymarket::{
-    CLOB_V2_HOST, CanaryV2Client, CanaryV2Credentials, CustodyKind, PreparedSubmission,
+    CanaryV2Client, CanaryV2Credentials, CustodyKind, PreparedSubmission,
     REDEMPTION_ADAPTER_VERSION, REDEMPTION_PARSER_VERSION, REDEMPTION_SCHEMA_VERSION,
-    RELAYER_BASE_URL, RELAYER_DEPOSIT_WALLET_TRANSACTION_PATH_PREFIX,
-    RELAYER_LEGACY_TRANSACTION_PATH, RedemptionTransport, RedemptionTransportError,
-    RelayerCredentials, RelayerPollPolicy, RelayerTransportClient, SignedRedemptionRequest,
-    V2BuyRequest, parse_compact_market,
+    RELAYER_DEPOSIT_WALLET_TRANSACTION_PATH_PREFIX, RedemptionTransport, RedemptionTransportError,
+    RelayerApiKeyCredentials, RelayerCredentials, RelayerPollPolicy, RelayerTransportClient,
+    SignedRedemptionRequest, UnsupportedCustody, V2BuyRequest, parse_compact_market,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -58,6 +57,7 @@ use crate::live_credentials::LiveAccountCredentials;
 pub(crate) const LIVE_MARKET_FRESHNESS_SECS: u64 = 60;
 const MARKET_REQUEST_TIMEOUT_SECS: u64 = 10;
 const RECONCILIATION_TIMEOUT_SECS: u64 = 30;
+pub const LIVE_ORDER_REQUEST_TIMEOUT_SECS: u64 = 10;
 pub(crate) const CLOB_LONG_MARKET_SOURCE_ID: &str = "polymarket.clob.markets";
 pub(crate) const CLOB_COMPACT_MARKET_SOURCE_ID: &str = "polymarket.clob.compact-market";
 const POLYGON_RECEIPT_RPC_SCHEMA_VERSION: u16 = 1;
@@ -278,6 +278,7 @@ pub struct PolymarketLiveVenue {
 impl PolymarketLiveVenue {
     pub async fn from_credentials(
         credentials: &LiveAccountCredentials,
+        host: &str,
     ) -> Result<Self, LiveVenueAdapterError> {
         let client = CanaryV2Client::new(
             CanaryV2Credentials {
@@ -287,7 +288,7 @@ impl PolymarketLiveVenue {
                 api_passphrase: credentials.api_passphrase.clone(),
                 deposit_wallet: credentials.deposit_wallet.clone(),
             },
-            CLOB_V2_HOST,
+            host,
         )
         .await
         .map_err(|error| LiveVenueAdapterError::Client(error.to_string()))?;
@@ -395,9 +396,9 @@ impl LiveOrderVenue for PolymarketLiveVenue {
     ) -> LiveVenuePrepareFuture<'a, Self::Submission> {
         Box::pin(async move {
             let neg_risk = request.neg_risk;
-            let submission = self
-                .client
-                .prepare_buy_for_market(
+            let submission = tokio::time::timeout(
+                Duration::from_secs(LIVE_ORDER_REQUEST_TIMEOUT_SECS),
+                self.client.prepare_buy_for_market(
                     V2BuyRequest {
                         condition_id: request.condition_id,
                         outcome_id: request.outcome_id,
@@ -409,9 +410,11 @@ impl LiveOrderVenue for PolymarketLiveVenue {
                         metadata_hashes: request.metadata_hashes,
                     },
                     neg_risk,
-                )
-                .await
-                .map_err(|_| LiveVenuePreparationError::Venue)?;
+                ),
+            )
+            .await
+            .map_err(|_| LiveVenuePreparationError::Venue)?
+            .map_err(|_| LiveVenuePreparationError::Venue)?;
             Ok(LiveVenuePrepared::new(
                 submission.prepared().clone(),
                 submission,
@@ -425,9 +428,30 @@ impl LiveOrderVenue for PolymarketLiveVenue {
         wall_clock_deadline: Option<OffsetDateTime>,
     ) -> LivePostFuture<'a> {
         Box::pin(async move {
-            self.client
-                .post_order_once_with_deadline(submission, wall_clock_deadline)
-                .await
+            let observed_at = OffsetDateTime::now_utc();
+            match tokio::time::timeout(
+                Duration::from_secs(LIVE_ORDER_REQUEST_TIMEOUT_SECS),
+                self.client
+                    .post_order_once_with_deadline(submission, wall_clock_deadline),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(RawTransportFailure {
+                    source_id: "polymarket-clob-v2".to_owned(),
+                    endpoint_kind: "order-post".to_owned(),
+                    method: "POST".to_owned(),
+                    path: "/order".to_owned(),
+                    ordered_query: Vec::new(),
+                    attempt_ordinal: 1,
+                    observed_at,
+                    received_at: OffsetDateTime::now_utc(),
+                    error_class: TransportErrorClass::Timeout,
+                    schema_version: 1,
+                    parser_version: 1,
+                    adapter_version: pe_venue_polymarket::SDK_VERSION.to_owned(),
+                }),
+            }
         })
     }
 
@@ -469,8 +493,14 @@ impl LiveOrderVenue for PolymarketLiveVenue {
                 }
             })?;
             if let ReconciliationClassification::Cancel { order_id } = outcome {
-                match self.client.cancel_order_once(&order_id).await {
-                    Ok(response) if (200..300).contains(&response.status) => {
+                let observed_at = OffsetDateTime::now_utc();
+                match tokio::time::timeout(
+                    Duration::from_secs(LIVE_ORDER_REQUEST_TIMEOUT_SECS),
+                    self.client.cancel_order_once(&order_id),
+                )
+                .await
+                {
+                    Ok(Ok(response)) if (200..300).contains(&response.status) => {
                         evidence.push(RawHttpAttempt::Response(response));
                         return Ok(LiveVenueReconciliation {
                             outcome: LiveVenueReconciledOutcome::Killed {
@@ -479,8 +509,24 @@ impl LiveOrderVenue for PolymarketLiveVenue {
                             evidence,
                         });
                     }
-                    Ok(response) => evidence.push(RawHttpAttempt::Response(response)),
-                    Err(failure) => evidence.push(RawHttpAttempt::TransportFailure(failure)),
+                    Ok(Ok(response)) => evidence.push(RawHttpAttempt::Response(response)),
+                    Ok(Err(failure)) => evidence.push(RawHttpAttempt::TransportFailure(failure)),
+                    Err(_) => {
+                        evidence.push(RawHttpAttempt::TransportFailure(RawTransportFailure {
+                            source_id: "polymarket-clob-v2".to_owned(),
+                            endpoint_kind: "order-cancel".to_owned(),
+                            method: "DELETE".to_owned(),
+                            path: "/order".to_owned(),
+                            ordered_query: Vec::new(),
+                            attempt_ordinal: 1,
+                            observed_at,
+                            received_at: OffsetDateTime::now_utc(),
+                            error_class: TransportErrorClass::Timeout,
+                            schema_version: 1,
+                            parser_version: 1,
+                            adapter_version: pe_venue_polymarket::SDK_VERSION.to_owned(),
+                        }))
+                    }
                 }
                 return Ok(LiveVenueReconciliation {
                     outcome: LiveVenueReconciledOutcome::Ambiguous {
@@ -1002,42 +1048,27 @@ impl LiveAdmissionBuilder {
     }
 }
 
-#[derive(Clone)]
-enum StatusAuthentication {
-    RelayerApiKey {
-        api_key: String,
-        address: String,
-    },
-    /// Builder status signing is owned by the venue client, whose by-id request builder is not
-    /// exported. Preserve a typed fail-closed posture rather than reproducing crypto here.
-    BuilderUnavailable,
-}
-
 /// One per-account Relayer adapter. Submission delegates to the venue client; recovery polls the
 /// exported transaction path because `RelayerTransportClient` has no public by-id query.
 pub struct LiveRedemptionAdapter {
     transport: RelayerTransportClient,
     http: reqwest::Client,
     base_url: String,
-    custody: CustodyKind,
-    authentication: StatusAuthentication,
+    credentials: RelayerApiKeyCredentials,
 }
 
 impl LiveRedemptionAdapter {
     pub fn new(
-        credentials: RelayerCredentials,
-        custody: CustodyKind,
+        credentials: RelayerApiKeyCredentials,
+        base_url: &str,
         policy: RelayerPollPolicy,
     ) -> Result<Self, LiveVenueAdapterError> {
-        let authentication = match &credentials {
-            RelayerCredentials::RelayerApiKey(credentials) => StatusAuthentication::RelayerApiKey {
-                api_key: credentials.api_key.clone(),
-                address: credentials.address.clone(),
-            },
-            RelayerCredentials::BuilderApiKey(_) => StatusAuthentication::BuilderUnavailable,
-        };
-        let transport = RelayerTransportClient::new(RELAYER_BASE_URL, credentials, policy.clone())
-            .map_err(|error| LiveVenueAdapterError::Redemption(error.to_string()))?;
+        let transport = RelayerTransportClient::new(
+            base_url,
+            RelayerCredentials::RelayerApiKey(credentials.clone()),
+            policy.clone(),
+        )
+        .map_err(|error| LiveVenueAdapterError::Redemption(error.to_string()))?;
         let http = reqwest::Client::builder()
             .timeout(policy.request_timeout)
             .build()
@@ -1045,9 +1076,8 @@ impl LiveRedemptionAdapter {
         Ok(Self {
             transport,
             http,
-            base_url: RELAYER_BASE_URL.to_owned(),
-            custody,
-            authentication,
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            credentials,
         })
     }
 
@@ -1075,36 +1105,13 @@ impl LiveRedemptionAdapter {
                 evidence: Vec::new(),
             });
         }
-        let StatusAuthentication::RelayerApiKey { api_key, address } = &self.authentication else {
-            return Err(RedemptionStatusReadError {
-                evidence: Vec::new(),
-            });
-        };
-        let (path, query) = match self.custody {
-            CustodyKind::DepositWallet => (
-                format!("{RELAYER_DEPOSIT_WALLET_TRANSACTION_PATH_PREFIX}{transaction_id}"),
-                Vec::new(),
-            ),
-            CustodyKind::Proxy | CustodyKind::Safe => (
-                RELAYER_LEGACY_TRANSACTION_PATH.to_owned(),
-                vec![("id", transaction_id)],
-            ),
-            CustodyKind::Eoa => {
-                return Err(RedemptionStatusReadError {
-                    evidence: Vec::new(),
-                });
-            }
-        };
+        let path = format!("{RELAYER_DEPOSIT_WALLET_TRANSACTION_PATH_PREFIX}{transaction_id}");
         let observed_at = OffsetDateTime::now_utc();
-        let mut request = self
+        let response = self
             .http
             .get(format!("{}{}", self.base_url, path))
-            .header("RELAYER_API_KEY", api_key)
-            .header("RELAYER_API_KEY_ADDRESS", address);
-        if !query.is_empty() {
-            request = request.query(&query);
-        }
-        let response = request
+            .header("RELAYER_API_KEY", &self.credentials.api_key)
+            .header("RELAYER_API_KEY_ADDRESS", &self.credentials.address)
             .send()
             .await
             .map_err(|_| RedemptionStatusReadError {
@@ -1113,10 +1120,7 @@ impl LiveRedemptionAdapter {
                     endpoint_kind: "redemption-status".to_owned(),
                     method: "GET".to_owned(),
                     path: path.clone(),
-                    ordered_query: query
-                        .iter()
-                        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-                        .collect(),
+                    ordered_query: Vec::new(),
                     attempt_ordinal: 1,
                     observed_at,
                     received_at: OffsetDateTime::now_utc(),
@@ -1139,10 +1143,7 @@ impl LiveRedemptionAdapter {
             endpoint_kind: "redemption-status".to_owned(),
             method: "GET".to_owned(),
             path,
-            ordered_query: query
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-                .collect(),
+            ordered_query: Vec::new(),
             status,
             headers: Vec::new(),
             body: body.clone(),
@@ -1198,9 +1199,13 @@ impl LiveRedemptionAdapter {
 
 #[derive(Deserialize)]
 struct RelayerStatusBody {
-    #[serde(rename = "transactionID", alias = "transactionId")]
+    #[serde(
+        rename = "transactionID",
+        alias = "transactionId",
+        alias = "transaction_id"
+    )]
     transaction_id: String,
-    #[serde(default, rename = "transactionHash")]
+    #[serde(default, rename = "transactionHash", alias = "transaction_hash")]
     transaction_hash: Option<String>,
     state: String,
 }
@@ -1217,6 +1222,9 @@ impl RedemptionTransport for LiveRedemptionAdapter {
                 + 'a,
         >,
     > {
+        if custody != CustodyKind::DepositWallet {
+            return Box::pin(async move { Err(UnsupportedCustody { custody }.into()) });
+        }
         self.transport.fetch_nonce(signer_address, custody)
     }
 
@@ -1234,6 +1242,14 @@ impl RedemptionTransport for LiveRedemptionAdapter {
                 + 'a,
         >,
     > {
+        if request.custody != CustodyKind::DepositWallet {
+            return Box::pin(async move {
+                Err(UnsupportedCustody {
+                    custody: request.custody,
+                }
+                .into())
+            });
+        }
         self.transport.submit_and_confirm(request)
     }
 }
@@ -1271,6 +1287,368 @@ mod tests {
 
     const ADMISSION_CONDITION: &str =
         "0x4c27acaae6b9528e6121c226f0c7e253073c0ecdee87eed1bca5b2fe4028e6ee";
+
+    fn keep_paused_clock_busy() -> tokio::task::JoinHandle<()> {
+        // Keep loopback I/O from automatically advancing the paused clock to a request timeout.
+        tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+
+    fn relayer_credentials() -> RelayerApiKeyCredentials {
+        RelayerApiKeyCredentials {
+            api_key: "test-relayer-key".to_owned(),
+            address: "0x1111111111111111111111111111111111111111".to_owned(),
+        }
+    }
+
+    fn relayer_policy() -> RelayerPollPolicy {
+        RelayerPollPolicy {
+            request_timeout: Duration::from_secs(5),
+            poll_interval: Duration::ZERO,
+            maximum_polls: 1,
+        }
+    }
+
+    async fn relayer_status_fixture(
+        axum::extract::State((body, requests)): axum::extract::State<(
+            Value,
+            tokio::sync::mpsc::Sender<Uri>,
+        )>,
+        headers: axum::http::HeaderMap,
+        uri: Uri,
+    ) -> axum::Json<Value> {
+        assert_eq!(headers["RELAYER_API_KEY"], "test-relayer-key");
+        assert_eq!(
+            headers["RELAYER_API_KEY_ADDRESS"],
+            relayer_credentials().address
+        );
+        requests.send(uri).await.unwrap();
+        axum::Json(body)
+    }
+
+    async fn start_relayer_status(
+        body: Value,
+    ) -> (
+        String,
+        tokio::sync::mpsc::Receiver<Uri>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (requests, receiver) = tokio::sync::mpsc::channel(8);
+        let app = Router::new()
+            .fallback(relayer_status_fixture)
+            .with_state((body, requests));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, receiver, server)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relayer_status_body_accepts_camel_and_snake_case() {
+        for body in [
+            json!({"transactionID": "tx-1", "transactionHash": "0xhash", "state": "STATE_CONFIRMED"}),
+            json!({"transactionId": "tx-1", "transactionHash": "0xhash", "state": "STATE_CONFIRMED"}),
+            json!({"transaction_id": "tx-1", "transaction_hash": "0xhash", "state": "STATE_CONFIRMED"}),
+        ] {
+            let parsed: RelayerStatusBody = serde_json::from_value(body).unwrap();
+            assert_eq!(parsed.transaction_id, "tx-1");
+            assert_eq!(parsed.transaction_hash.as_deref(), Some("0xhash"));
+            assert_eq!(parsed.state, "STATE_CONFIRMED");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deposit_wallet_status_confirms_camel_and_snake_case() {
+        let clock_guard = keep_paused_clock_busy();
+        for body in [
+            json!({"transactionID": "tx-1", "transactionHash": "0xhash", "state": "STATE_CONFIRMED"}),
+            json!({"transaction_id": "tx-1", "transaction_hash": "0xhash", "state": "STATE_CONFIRMED"}),
+        ] {
+            let (base, mut requests, server) = start_relayer_status(body).await;
+            let adapter = LiveRedemptionAdapter::new(
+                relayer_credentials(),
+                &format!("{base}/"),
+                relayer_policy(),
+            )
+            .unwrap();
+            let observation = adapter.reconcile_transaction("tx-1").await.unwrap();
+            let RedemptionStatusObservation::Confirmed {
+                transaction_hash,
+                evidence,
+            } = observation
+            else {
+                unreachable!("confirmed status expected");
+            };
+            assert_eq!(transaction_hash, "0xhash");
+            let path = format!("{RELAYER_DEPOSIT_WALLET_TRANSACTION_PATH_PREFIX}tx-1");
+            let uri = requests.recv().await.unwrap();
+            assert_eq!(uri.path(), path);
+            assert_eq!(uri.query(), None);
+            assert!(matches!(
+                evidence.as_slice(),
+                [RawHttpAttempt::Response(response)]
+                    if response.path == path && response.ordered_query.is_empty()
+            ));
+            server.abort();
+        }
+        clock_guard.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn redemption_rejects_unsupported_custody_without_requests() {
+        let (base, mut requests, server) = start_relayer_status(json!({})).await;
+        let credentials = relayer_credentials();
+        let adapter =
+            LiveRedemptionAdapter::new(credentials.clone(), &base, relayer_policy()).unwrap();
+        for custody in [CustodyKind::Proxy, CustodyKind::Safe, CustodyKind::Eoa] {
+            assert!(matches!(
+                adapter.fetch_nonce(&credentials.address, custody).await,
+                Err(RedemptionTransportError::UnsupportedCustody(error)) if error.custody == custody
+            ));
+            let request = SignedRedemptionRequest {
+                call: pe_venue_polymarket::build_redemption_call(
+                    pe_core_types::PolymarketConditionId(ADMISSION_CONDITION.to_owned()),
+                    false,
+                )
+                .unwrap(),
+                custody,
+                signer_address: credentials.address.clone(),
+                custody_wallet: credentials.address.clone(),
+                nonce: "1".to_owned(),
+                signature: "0x01".to_owned(),
+                deadline_unix: Some(2_000_000_000),
+                signature_params: None,
+                metadata: String::new(),
+            };
+            assert!(matches!(
+                adapter.submit_and_confirm(&request).await,
+                Err(RedemptionTransportError::UnsupportedCustody(error)) if error.custody == custody
+            ));
+        }
+        assert!(matches!(
+            requests.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        server.abort();
+    }
+
+    #[cfg(feature = "scenario")]
+    mod order_timeouts {
+        use std::sync::{Arc, Mutex};
+
+        use axum::extract::State;
+        use axum::http::Method;
+        use pe_core_types::{OutcomeId, PolymarketConditionId, PolymarketTokenId, ShareAmount};
+
+        use super::*;
+
+        #[derive(Clone)]
+        struct OrderServer {
+            silent_method: Method,
+            silent_path: &'static str,
+            started: tokio::sync::mpsc::Sender<()>,
+            requests: Arc<Mutex<Vec<(Method, String)>>>,
+        }
+
+        async fn order_response(
+            State(state): State<OrderServer>,
+            method: Method,
+            uri: Uri,
+        ) -> Response {
+            state
+                .requests
+                .lock()
+                .unwrap()
+                .push((method.clone(), uri.path().to_owned()));
+            if method == state.silent_method && uri.path() == state.silent_path {
+                state.started.send(()).await.unwrap();
+                return std::future::pending().await;
+            }
+            let body = match uri.path() {
+                "/version" => json!({"version": 2}),
+                "/api/geoblock" => json!({"blocked": false, "country": "US"}),
+                "/auth/ban-status/closed-only" => json!({"closed_only": false}),
+                "/balance-allowance" => json!({"balance": "400000000", "allowances": {}}),
+                "/data/orders" | "/data/trades" => json!({"data": [], "next_cursor": "LTE="}),
+                path if path.starts_with("/data/order/") => {
+                    json!({"id": "venue-order", "status": "LIVE"})
+                }
+                _ => return StatusCode::NOT_FOUND.into_response(),
+            };
+            axum::Json(body).into_response()
+        }
+
+        async fn start_order_server(
+            silent_method: Method,
+            silent_path: &'static str,
+        ) -> (
+            PolymarketLiveVenue,
+            OrderServer,
+            tokio::sync::mpsc::Receiver<()>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let (started, receiver) = tokio::sync::mpsc::channel(1);
+            let state = OrderServer {
+                silent_method,
+                silent_path,
+                started,
+                requests: Arc::new(Mutex::new(Vec::new())),
+            };
+            let app = Router::new()
+                .fallback(order_response)
+                .with_state(state.clone());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            // Same synthetic credential values as the sealed fanout fixture.
+            let credentials = LiveAccountCredentials {
+                account_id: "acct".to_owned(),
+                bundle_version: 1,
+                key_id: "key".to_owned(),
+                private_key: format!("0x{}", "11".repeat(32)),
+                deposit_wallet: "0x1111111111111111111111111111111111111111".to_owned(),
+                api_key: "00000000-0000-0000-0000-000000000000".to_owned(),
+                api_secret: "c2VjcmV0".to_owned(),
+                api_passphrase: "passphrase".to_owned(),
+                relayer_api_key: None,
+                relayer_secret: None,
+                relayer_passphrase: None,
+            };
+            let venue = PolymarketLiveVenue::from_credentials(&credentials, &base)
+                .await
+                .unwrap();
+            (venue, state, receiver, server)
+        }
+
+        fn prepare_request() -> LiveVenuePrepareRequest {
+            LiveVenuePrepareRequest {
+                condition_id: PolymarketConditionId(ADMISSION_CONDITION.to_owned()),
+                outcome_id: OutcomeId(0),
+                token_id: PolymarketTokenId("11".to_owned()),
+                limit_price: Price::new(dec!(0.10)).unwrap(),
+                shares: ShareAmount::from_atomic(5_000_000),
+                maximum_collateral: CollateralAmount::from_atomic(500_000),
+                tick_size: Price::new(dec!(0.01)).unwrap(),
+                metadata_hashes: vec!["metadata-hash".to_owned()],
+                neg_risk: false,
+            }
+        }
+
+        fn assert_timeout(failure: &RawTransportFailure, endpoint: &str, method: &str) {
+            assert_eq!(failure.source_id, "polymarket-clob-v2");
+            assert_eq!(failure.endpoint_kind, endpoint);
+            assert_eq!(failure.method, method);
+            assert_eq!(failure.path, "/order");
+            assert!(failure.ordered_query.is_empty());
+            assert_eq!(failure.attempt_ordinal, 1);
+            assert_eq!(failure.error_class, TransportErrorClass::Timeout);
+            assert!(failure.received_at >= failure.observed_at);
+            assert_eq!(failure.schema_version, 1);
+            assert_eq!(failure.parser_version, 1);
+            assert_eq!(failure.adapter_version, pe_venue_polymarket::SDK_VERSION);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn prepare_timeout_fails_before_post() {
+            let clock_guard = keep_paused_clock_busy();
+            let (venue, state, mut started, server) =
+                start_order_server(Method::GET, "/version").await;
+            let operation = tokio::spawn(async move { venue.prepare(prepare_request()).await });
+            started.recv().await.unwrap();
+            assert!(!operation.is_finished());
+            tokio::time::advance(Duration::from_secs(LIVE_ORDER_REQUEST_TIMEOUT_SECS + 1)).await;
+            assert!(matches!(
+                operation.await.unwrap(),
+                Err(LiveVenuePreparationError::Venue)
+            ));
+            assert_eq!(
+                *state.requests.lock().unwrap(),
+                [(Method::GET, "/version".to_owned())]
+            );
+            server.abort();
+            clock_guard.abort();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn post_timeout_retains_single_attempt_transport_evidence() {
+            let clock_guard = keep_paused_clock_busy();
+            let (venue, state, mut started, server) =
+                start_order_server(Method::POST, "/order").await;
+            let request = prepare_request();
+            let submission = venue
+                .client
+                .prepare_buy(V2BuyRequest {
+                    condition_id: request.condition_id,
+                    outcome_id: request.outcome_id,
+                    token_id: request.token_id,
+                    limit_price: request.limit_price,
+                    shares: request.shares,
+                    maximum_collateral: request.maximum_collateral,
+                    tick_size: request.tick_size,
+                    metadata_hashes: request.metadata_hashes,
+                })
+                .await
+                .unwrap();
+            let operation = tokio::spawn(async move { venue.post_once(submission, None).await });
+            started.recv().await.unwrap();
+            assert!(!operation.is_finished());
+            tokio::time::advance(Duration::from_secs(LIVE_ORDER_REQUEST_TIMEOUT_SECS + 1)).await;
+            let failure = operation.await.unwrap().unwrap_err();
+            assert_timeout(&failure, "order-post", "POST");
+            assert_eq!(
+                state
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(method, _)| *method == Method::POST)
+                    .count(),
+                1
+            );
+            server.abort();
+            clock_guard.abort();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn cancel_timeout_retains_evidence_and_reconciliation_pending() {
+            let clock_guard = keep_paused_clock_busy();
+            let (venue, state, mut started, server) =
+                start_order_server(Method::DELETE, "/order").await;
+            let operation = tokio::spawn(async move {
+                venue.reconcile_and_cancel_by_order_hash("order-hash").await
+            });
+            started.recv().await.unwrap();
+            assert!(!operation.is_finished());
+            tokio::time::advance(Duration::from_secs(LIVE_ORDER_REQUEST_TIMEOUT_SECS + 1)).await;
+            let reconciliation = operation.await.unwrap().unwrap();
+            assert_eq!(
+                reconciliation.outcome,
+                LiveVenueReconciledOutcome::Ambiguous {
+                    kind: LiveOrderAmbiguityKind::ReconciliationPending
+                }
+            );
+            let Some(RawHttpAttempt::TransportFailure(failure)) = reconciliation.evidence.last()
+            else {
+                unreachable!("cancel timeout evidence expected");
+            };
+            assert_timeout(failure, "order-cancel", "DELETE");
+            assert_eq!(reconciliation.evidence.len(), 7);
+            let requests = state.requests.lock().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(method, _)| *method == Method::DELETE)
+                    .count(),
+                1
+            );
+            assert!(requests.contains(&(Method::GET, "/data/order/order-hash".to_owned())));
+            server.abort();
+            clock_guard.abort();
+        }
+    }
 
     /// Gamma, long CLOB, compact CLOB, and book bodies in the wire shape observed on 2026-09-15:
     /// Gamma omits `secondsDelay`; fee-bearing markets carry `mbf`/`tbf` = 1000 beside `fd`.

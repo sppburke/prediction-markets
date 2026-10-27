@@ -1103,6 +1103,15 @@ pub(crate) fn live_source_receipts(
                 );
                 receipts.extend(mark.prices.iter().map(|price| price.receipt));
             }
+            LiveJournalPayload::CollateralCredited(credit) => {
+                receipts.extend(
+                    credit
+                        .venue_position_evidence
+                        .pages
+                        .iter()
+                        .map(|page| page.receipt),
+                );
+            }
             _ => {}
         }
     }

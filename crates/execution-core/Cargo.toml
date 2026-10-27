@@ -9,10 +9,11 @@ publish.workspace = true
 workspace = true
 
 [features]
-scenario = []
+scenario = ["pe-event-log/scenario"]
 
 [dependencies]
 blake3.workspace = true
+imbl.workspace = true
 pe-core-types               = { path = "../core-types",               version = "0.1.0" }
 pe-event-log                = { path = "../event-log",                version = "0.1.0" }
 pe-venue-core               = { path = "../venue-core",               version = "0.1.0" }
@@ -30,6 +31,7 @@ time.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 rust_decimal.workspace = true
 rust_decimal_macros.workspace = true
 tempfile.workspace = true

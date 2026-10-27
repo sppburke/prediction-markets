@@ -585,17 +585,23 @@ account count, qualification, review, credentials, or venue probes. A fresh `req
 snapshot stops new staging and first POSTs for work not yet submitted. Credentials, source, resolver,
 venue, financial, risk, redemption, and idempotency checks remain separate order checks; a failed
 order check does not demote the requested mode. A pending, ambiguous, or failed redemption closes
-new-BUY admission for that account until confirmation.
+new-BUY admission for that account until custody reconciliation.
 
 Venue settlement is payoff authority (Decision 11). Ordinary live admission composes an automated
 `VenueSettlementRecord` from resolver evidence with fresh market evidence: condition, outcome, and
 token identity must agree. The compact CLOB response is the sole runtime fee authority; Gamma fee
 fields never enter economics. Missing, stale, ambiguous, or disagreeing evidence fails closed.
 
-Resolved positions redeem automatically (Decision 12). NegRisk evidence selects the V2 collateral
-adapter, and custody kind selects the supported Relayer transport. Recovery reconciles before any
-resubmission, applies no dust floor, and keeps new-BUY admission closed for that account after a
-pending, ambiguous, or failed attempt until redemption is confirmed.
+Resolved positions redeem automatically (Decision 12), including losing positions: zero-payout
+resolutions remain receivables until custody. NegRisk evidence selects the V2 collateral adapter.
+Only deposit-wallet custody submits through the Relayer; NULL `accounts.custody_wallet_kind`
+means deposit wallet, and any other kind closes redemption as unsupported. `drive_redemptions`
+finishes one unresolved family per account before starting another and applies no dust floor.
+A submission without a transaction id retries after its journaled request deadline; a
+relayer-reported failure retries at the next pass. A known transaction keeps reconciling until
+the relayer reports confirmed or failed. BUY admission reopens after custody reconciliation.
+Retry and reconciliation cadences are canonical in
+[`_GLOSSARY.md`](_GLOSSARY.md#ordinary-multi-account-live-execution-pe-service-issue-508).
 
 The dispatch aggregate is durably staged at shared signal admission, before the paper outcome can
 be durable, with frozen ordered account targets and credential bindings. The seed moves

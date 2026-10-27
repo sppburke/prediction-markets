@@ -1353,7 +1353,7 @@ fn rewrite_live_wrapper_preimage(
             } else {
                 "a"
             };
-            wrapper
+            std::sync::Arc::make_mut(wrapper)
                 .economic
                 .applied_configuration_hash
                 .replace_range(..1, replacement);

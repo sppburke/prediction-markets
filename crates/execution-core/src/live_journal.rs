@@ -3,19 +3,20 @@
 //! One service-owned instance serializes every account into one hash-chained stream. Per-account
 //! ledgers are projections of that stream, preserving the global sequence assigned at append time.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use pe_core_types::{
     AccountId, CollateralAmount, EventSeq, PolymarketConditionId, PolymarketTokenId, Price,
     RawHttpAttempt, ReceivedAt, ShareAmount, SourceId, SourceTimestamp, WalletAddress,
 };
 use pe_event_log::{
-    AppendReceipt, ContentType, EnvelopeIn, LogTailBinding, PoisonReason, Reader, Scanner, Writer,
+    AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, LogTailBinding, PoisonReason, Reader,
+    Scanner, Writer,
 };
 use pe_resolver_card::VenueSettlementRecord;
 use pe_source_polymarket_public::LiveMarketEvidence;
@@ -941,6 +942,19 @@ pub struct AccountPortfolioMarkedAudit {
     pub equity: CollateralAmount,
 }
 
+/// An external pUSD credit (taker rebate, bonus, or any third-party transfer): the venue collateral's
+/// surplus over journal cash while nothing is reserved or receivable, with the same account and
+/// inventory evidence a Daily mark carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollateralCreditedAudit {
+    pub account_binding: LiveAccountBindingAudit,
+    pub account_state: LiveAccountStateAudit,
+    pub venue_positions: Vec<CanonicalPositionAudit>,
+    pub venue_position_evidence: LivePositionEvidenceAudit,
+    pub credited: CollateralAmount,
+}
+
 /// Opaque schema-one payload retained when the superseding schema cannot represent it losslessly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -956,16 +970,22 @@ pub enum LiveJournalPayload {
     ApprovedRecoveryControlPause(Box<LiveTargetControlAudit>),
     AdmissionEvaluated(Box<LiveAdmissionEvaluationAudit>),
     OrderPreparationFailed(Box<LiveOrderPreparationFailedAudit>),
-    OrderPrepared(Box<LiveOrderPreparedAudit>),
+    /// Shared with the live folds that keep it, so a kept order is not copied.
+    OrderPrepared(Arc<LiveOrderPreparedAudit>),
     OrderPosted(Box<LiveOrderPostAudit>),
-    OrderReconciled(Box<LiveOrderReconciliationAudit>),
+    /// Shared with the live folds that keep it, so a kept reconciliation is not copied.
+    OrderReconciled(Arc<LiveOrderReconciliationAudit>),
     RedemptionRequested(Box<RedemptionRequestedAudit>),
     RedemptionTransactionIdentified(Box<RedemptionTransactionAudit>),
     RedemptionReceiptTransition(Box<RedemptionReceiptAudit>),
-    OrderFillFinalized(Box<OrderFillFinalizedAudit>),
-    ResolutionFinalized(Box<ResolutionFinalizedAudit>),
-    RedemptionCustodyReconciled(Box<RedemptionCustodyReconciledAudit>),
+    /// Shared with the live folds that keep it, so a kept fill is not copied.
+    OrderFillFinalized(Arc<OrderFillFinalizedAudit>),
+    /// Shared with the live folds that keep it, so a kept resolution is not copied.
+    ResolutionFinalized(Arc<ResolutionFinalizedAudit>),
+    /// Shared with the live folds that keep it, so a kept custody fact is not copied.
+    RedemptionCustodyReconciled(Arc<RedemptionCustodyReconciledAudit>),
     AccountPortfolioMarked(Box<AccountPortfolioMarkedAudit>),
+    CollateralCredited(Box<CollateralCreditedAudit>),
     CredentialBindingMismatch {
         frozen: CredentialBindingIdentity,
         current: CredentialBindingIdentity,
@@ -1005,7 +1025,7 @@ pub struct OpenOrderInventoryEntry {
 /// One nonterminal order plus the journal evidence required to recover it without a projection.
 pub struct OpenOrderRecoveryEntry {
     pub inventory: OpenOrderInventoryEntry,
-    pub prepared: Option<Box<LiveOrderPreparedAudit>>,
+    pub prepared: Option<Arc<LiveOrderPreparedAudit>>,
     pub transaction_hashes: Vec<String>,
     pub immutable_receipts: BTreeMap<String, MatchedReceipt>,
 }
@@ -1066,11 +1086,55 @@ pub enum LiveJournalError {
     InvalidFinalityEvidence,
     #[error("live journal mutex is poisoned")]
     Poisoned,
+    #[error("a durable live journal append was not published; a verified reopen is required")]
+    Unpublished,
 }
 
 struct LiveJournalInner {
     writer: Writer,
-    next_seq: u64,
+    last_hash: blake3::Hash,
+    /// Every decoded record in journal order; a record's sequence is its index.
+    records: Vec<Arc<LiveJournalEvent>>,
+    /// Sequences of pending-target control records by account and dispatch.
+    pending_controls: HashMap<(AccountId, String), Vec<usize>>,
+    /// Sequences of approved-recovery control pauses by account and dispatch.
+    approved_pauses: HashMap<(AccountId, String), Vec<usize>>,
+    /// Set from a durable append until its frame decodes and validates like a replayed one.
+    unpublished: bool,
+}
+
+impl LiveJournalInner {
+    fn publish(&mut self, record: Arc<LiveJournalEvent>) {
+        let index = self.records.len();
+        match &record.payload {
+            LiveJournalPayload::PendingTargetControl(audit) => self
+                .pending_controls
+                .entry((record.account_id.clone(), audit.dispatch_id.clone()))
+                .or_default()
+                .push(index),
+            LiveJournalPayload::ApprovedRecoveryControlPause(audit) => self
+                .approved_pauses
+                .entry((record.account_id.clone(), audit.dispatch_id.clone()))
+                .or_default()
+                .push(index),
+            _ => {}
+        }
+        self.records.push(record);
+    }
+
+    fn control_audits(
+        &self,
+        index: Option<&Vec<usize>>,
+    ) -> impl Iterator<Item = &LiveTargetControlAudit> {
+        index
+            .into_iter()
+            .flatten()
+            .filter_map(|index| match &self.records.get(*index)?.payload {
+                LiveJournalPayload::PendingTargetControl(audit)
+                | LiveJournalPayload::ApprovedRecoveryControlPause(audit) => Some(audit.as_ref()),
+                _ => None,
+            })
+    }
 }
 
 /// Synchronized owner of the single ordinary-live journal stream.
@@ -1100,14 +1164,110 @@ impl LiveJournal {
             Err(error) => return Err(error.into()),
         }
 
-        let writer = Writer::open(path)?;
-        let events = replay_all(path)?;
-        let next_seq =
-            u64::try_from(events.len()).map_err(|_| LiveJournalError::SequenceMismatch)?;
+        // One verified read decodes every record with the replay decoder.
+        let mut records = Vec::new();
+        let mut decode_error = None;
+        let mut observer = |_: u64, envelope: &EventEnvelope| {
+            if decode_error.is_none() {
+                match decode_record(envelope, records.len()) {
+                    Ok(event) => records.push(Arc::new(event)),
+                    Err(error) => decode_error = Some(error),
+                }
+            }
+        };
+        let (writer, binding) = Writer::open_verified(path, None, &mut observer)?;
+        if let Some(error) = decode_error {
+            return Err(error);
+        }
+        let mut inner = LiveJournalInner {
+            writer,
+            last_hash: binding.last_hash,
+            records: Vec::with_capacity(records.len()),
+            pending_controls: HashMap::new(),
+            approved_pauses: HashMap::new(),
+            unpublished: false,
+        };
+        for record in records {
+            inner.publish(record);
+        }
         Ok(Self {
             path: path.to_path_buf(),
-            inner: Mutex::new(LiveJournalInner { writer, next_seq }),
+            inner: Mutex::new(inner),
         })
+    }
+
+    fn published(&self) -> Result<std::sync::MutexGuard<'_, LiveJournalInner>, LiveJournalError> {
+        let inner = self.inner.lock().map_err(|_| LiveJournalError::Poisoned)?;
+        if let Some(reason) = inner.writer.poisoned() {
+            return Err(pe_event_log::LogError::Poisoned { reason: *reason }.into());
+        }
+        if inner.unpublished {
+            return Err(LiveJournalError::Unpublished);
+        }
+        Ok(inner)
+    }
+
+    /// The published records from sequence `next` on, in journal order.
+    pub fn records_from(&self, next: u64) -> Result<Vec<Arc<LiveJournalEvent>>, LiveJournalError> {
+        let inner = self.published()?;
+        let start = usize::try_from(next)
+            .map_err(|_| LiveJournalError::SequenceMismatch)?
+            .min(inner.records.len());
+        Ok(inner.records[start..].to_vec())
+    }
+
+    /// The staged dispatch control at `seq` when it names `dispatch_id`. An append followed by a
+    /// failed SQLite staging transaction remains an unreferenced attempt and is deliberately not
+    /// returned for a different dispatch.
+    pub fn staged_dispatch_control(
+        &self,
+        seq: u64,
+        dispatch_id: &str,
+    ) -> Result<Option<LiveStagedDispatchControlAudit>, LiveJournalError> {
+        let inner = self.published()?;
+        let record = usize::try_from(seq)
+            .ok()
+            .and_then(|index| inner.records.get(index));
+        Ok(record.and_then(|record| match &record.payload {
+            LiveJournalPayload::StagedDispatchControl(audit)
+                if audit.dispatch_id == dispatch_id =>
+            {
+                Some(audit.as_ref().clone())
+            }
+            _ => None,
+        }))
+    }
+
+    /// The account's pending-target control records for one dispatch, in journal order.
+    pub fn pending_target_controls(
+        &self,
+        account_id: &AccountId,
+        dispatch_id: &str,
+    ) -> Result<Vec<LiveTargetControlAudit>, LiveJournalError> {
+        let inner = self.published()?;
+        let index = inner
+            .pending_controls
+            .get(&(account_id.clone(), dispatch_id.to_owned()));
+        Ok(inner.control_audits(index).cloned().collect())
+    }
+
+    /// The account's latest approved-recovery control pause for one dispatch.
+    pub fn last_approved_recovery_pause(
+        &self,
+        account_id: &AccountId,
+        dispatch_id: &str,
+    ) -> Result<Option<LiveTargetControlAudit>, LiveJournalError> {
+        let inner = self.published()?;
+        let index = inner
+            .approved_pauses
+            .get(&(account_id.clone(), dispatch_id.to_owned()));
+        Ok(inner.control_audits(index).last().cloned())
+    }
+
+    #[cfg(feature = "scenario")]
+    pub fn scenario_fail_next_sync(&self) -> Result<(), LiveJournalError> {
+        self.published()?.writer.scenario_fail_next_sync();
+        Ok(())
     }
 
     #[must_use]
@@ -1147,45 +1307,67 @@ impl LiveJournal {
             .map(|events| events.into_iter().map(|(event, _receipt)| event).collect())
     }
 
-    /// Typed writer poison state for service readiness and producer shutdown.
+    /// Typed writer poison state for service readiness and producer shutdown. A durable append
+    /// that was not published is an error: nothing may proceed past it without a verified reopen.
     pub fn poisoned(&self) -> Result<Option<PoisonReason>, LiveJournalError> {
         let inner = self.inner.lock().map_err(|_| LiveJournalError::Poisoned)?;
-        Ok(inner.writer.poisoned().copied())
+        if let Some(reason) = inner.writer.poisoned() {
+            return Ok(Some(*reason));
+        }
+        if inner.unpublished {
+            return Err(LiveJournalError::Unpublished);
+        }
+        Ok(None)
     }
 
-    /// Append and fsync one event. The supplied timestamp is used for both payload and envelope.
+    /// Append and fsync one event, then publish it only after its written frame decodes and
+    /// validates like a replayed one. The supplied timestamp is used for payload and envelope.
     pub fn append(
         &self,
         account_id: AccountId,
         timestamp: OffsetDateTime,
         payload: LiveJournalPayload,
     ) -> Result<LiveJournalEvent, LiveJournalError> {
-        let mut inner = self.inner.lock().map_err(|_| LiveJournalError::Poisoned)?;
+        let mut inner = self.published()?;
         let event = LiveJournalEvent {
             account_id,
-            seq: inner.next_seq,
+            seq: u64::try_from(inner.records.len())
+                .map_err(|_| LiveJournalError::SequenceMismatch)?,
             timestamp,
             payload,
         };
         let payload = serde_json::to_vec(&event)?;
-        let assigned = inner.writer.append(EnvelopeIn {
-            source_id: SourceId(LIVE_JOURNAL_SOURCE.to_owned()),
+        let source_id = SourceId(LIVE_JOURNAL_SOURCE.to_owned());
+        // Any writer failure or a frame that fails replay decoding leaves this set: every read
+        // then fails until a verified reopen, so no decision passes the unpublished record.
+        inner.unpublished = true;
+        let receipt = inner.writer.append_synced(EnvelopeIn {
+            source_id: source_id.clone(),
             schema_version: LIVE_JOURNAL_SCHEMA_VERSION,
             parser_version: LIVE_JOURNAL_PARSER_VERSION,
             observed_at: SourceTimestamp(timestamp),
             received_at: ReceivedAt(timestamp),
             content_type: ContentType::Json,
-            payload,
+            payload: payload.clone(),
         })?;
-        if assigned.0 != event.seq {
-            return Err(LiveJournalError::SequenceMismatch);
-        }
-        inner.writer.sync()?;
-        inner.next_seq = inner
-            .next_seq
-            .checked_add(1)
-            .ok_or(LiveJournalError::SequenceMismatch)?;
-        Ok(event)
+        let written = EventEnvelope {
+            seq: receipt.sequence,
+            source_id,
+            schema_version: LIVE_JOURNAL_SCHEMA_VERSION,
+            parser_version: LIVE_JOURNAL_PARSER_VERSION,
+            observed_at: SourceTimestamp(timestamp),
+            received_at: ReceivedAt(timestamp),
+            content_type: ContentType::Json,
+            raw_payload_hash: blake3::hash(&payload),
+            prev_hash: inner.last_hash,
+            this_hash: receipt.this_hash,
+            payload,
+        };
+        let decoded = decode_record(&written, inner.records.len())?;
+        inner.last_hash = receipt.this_hash;
+        inner.publish(Arc::new(decoded.clone()));
+        inner.unpublished = false;
+        Ok(decoded)
     }
 }
 
@@ -1936,12 +2118,12 @@ pub fn verify_polygon_finalized(
 struct OpenOrderState {
     entry: OpenOrderInventoryEntry,
     order_hash: String,
-    prepared: Option<Box<LiveOrderPreparedAudit>>,
+    prepared: Option<Arc<LiveOrderPreparedAudit>>,
     transaction_hashes: BTreeSet<String>,
     immutable_receipts: BTreeMap<String, MatchedReceipt>,
     terminal: bool,
     finality_conflict: bool,
-    terminal_reconciliation: Option<Box<LiveOrderReconciliationAudit>>,
+    terminal_reconciliation: Option<Arc<LiveOrderReconciliationAudit>>,
 }
 
 fn insert_open_order(
@@ -1950,7 +2132,7 @@ fn insert_open_order(
     prepared_journal_seq: u64,
     identity: LiveOrderIdentity,
     order_hash: String,
-    prepared: Option<Box<LiveOrderPreparedAudit>>,
+    prepared: Option<Arc<LiveOrderPreparedAudit>>,
 ) -> Result<(), LiveJournalError> {
     let key = (account_id.clone(), identity.dispatch_id.clone());
     if orders.contains_key(&key) {
@@ -2089,16 +2271,65 @@ where
             }
         }
     }
-    let mut orders = BTreeMap::<(AccountId, String), OpenOrderState>::new();
-    let mut account_ids = BTreeSet::new();
-    let mut account_bindings = BTreeMap::<AccountId, LiveAccountBindingAudit>::new();
-    let mut evaluated_admissions = BTreeSet::<(AccountId, String)>::new();
-    let mut approved_admissions =
-        BTreeMap::<(AccountId, String), (u64, Box<LiveAdmissionEvaluationAudit>)>::new();
-    let mut terminal_admissions = Vec::new();
-    for event in events {
+    let mut fold = LiveRecoveryFold::default();
+    for event in &events {
+        fold.apply(event, verify_admissions)?;
+    }
+    Ok(fold.inventory())
+}
+
+/// The recovery builder's rules advanced one journal record at a time. Callers feed each
+/// account's records from its first Baseline on, in journal order; a record that fails leaves the
+/// fold unusable.
+#[derive(Default)]
+pub struct LiveRecoveryFold {
+    orders: BTreeMap<(AccountId, String), OpenOrderState>,
+    account_ids: BTreeSet<AccountId>,
+    account_bindings: BTreeMap<AccountId, LiveAccountBindingAudit>,
+    evaluated_admissions: BTreeSet<(AccountId, String)>,
+    approved_admissions: BTreeMap<(AccountId, String), (u64, Box<LiveAdmissionEvaluationAudit>)>,
+    terminal_admissions: Vec<TerminalAdmissionRecoveryEntry>,
+    terminal_keys: BTreeSet<(AccountId, String)>,
+}
+
+impl LiveRecoveryFold {
+    /// Whether an Approved admission or a nonterminal order awaits recovery.
+    #[must_use]
+    pub fn has_pending_work(&self) -> bool {
+        !self.approved_admissions.is_empty() || self.orders.values().any(|order| !order.terminal)
+    }
+
+    /// Whether any admission ended without an order or with a failed preparation.
+    #[must_use]
+    pub fn has_terminal_admissions(&self) -> bool {
+        !self.terminal_admissions.is_empty()
+    }
+
+    /// Whether `dispatch_id` ended for `account_id` without an order or with a failed preparation.
+    #[must_use]
+    pub fn is_terminal_admission(&self, account_id: &AccountId, dispatch_id: &str) -> bool {
+        self.terminal_keys
+            .contains(&(account_id.clone(), dispatch_id.to_owned()))
+    }
+
+    /// Apply the next record. With `verify_admissions`, an admission's own risk decision and
+    /// account evidence are re-evaluated; its financial reconstruction belongs to the caller.
+    pub fn apply(
+        &mut self,
+        event: &LiveJournalEvent,
+        verify_admissions: bool,
+    ) -> Result<(), LiveJournalError> {
+        let Self {
+            orders,
+            account_ids,
+            account_bindings,
+            evaluated_admissions,
+            approved_admissions,
+            terminal_admissions,
+            terminal_keys,
+        } = self;
         account_ids.insert(event.account_id.clone());
-        match event.payload {
+        match &event.payload {
             LiveJournalPayload::OrderPrepared(prepared) => {
                 let admission_key = (
                     event.account_id.clone(),
@@ -2114,21 +2345,19 @@ where
                 {
                     return Err(LiveJournalError::OrderFactConflict);
                 }
-                let identity = prepared.identity.clone();
-                let order_hash = prepared.prepared.order_hash.clone();
                 insert_open_order(
-                    &mut orders,
-                    event.account_id,
+                    orders,
+                    event.account_id.clone(),
                     event.seq,
-                    identity,
-                    order_hash,
-                    Some(prepared),
+                    prepared.identity.clone(),
+                    prepared.prepared.order_hash.clone(),
+                    Some(Arc::clone(prepared)),
                 )?;
             }
             LiveJournalPayload::AdmissionEvaluated(admission) => {
                 if verify_admissions {
                     verify_live_admission_evaluation(
-                        &admission,
+                        admission,
                         event.timestamp,
                         account_bindings.get(&event.account_id),
                     )
@@ -2148,10 +2377,11 @@ where
                     return Err(LiveJournalError::OrderFactConflict);
                 }
                 if admission.verdict == LiveAdmissionVerdict::Approved {
-                    approved_admissions.insert(key, (event.seq, admission));
+                    approved_admissions.insert(key, (event.seq, admission.clone()));
                 } else if let LiveAdmissionVerdict::Refused(reason) = &admission.verdict {
+                    terminal_keys.insert(key);
                     terminal_admissions.push(TerminalAdmissionRecoveryEntry {
-                        account_id: event.account_id,
+                        account_id: event.account_id.clone(),
                         journal_seq: event.seq,
                         identity: admission.identity.clone(),
                         outcome: TerminalAdmissionRecoveryOutcome::Refused(reason.clone()),
@@ -2176,11 +2406,12 @@ where
                     }
                     order.terminal = true;
                 }
+                terminal_keys.insert(key);
                 terminal_admissions.push(TerminalAdmissionRecoveryEntry {
-                    account_id: event.account_id,
+                    account_id: event.account_id.clone(),
                     journal_seq: event.seq,
                     identity: failed.identity.clone(),
-                    outcome: TerminalAdmissionRecoveryOutcome::PreparationFailed(failed),
+                    outcome: TerminalAdmissionRecoveryOutcome::PreparationFailed(failed.clone()),
                 });
             }
             LiveJournalPayload::AccountPortfolioMarked(mark) => {
@@ -2190,14 +2421,14 @@ where
                     {
                         return Err(LiveJournalError::RequestBinding);
                     }
-                    account_bindings.insert(event.account_id, mark.account_binding.clone());
+                    account_bindings.insert(event.account_id.clone(), mark.account_binding.clone());
                 }
             }
             LiveJournalPayload::LegacyV1(raw) => {
                 if let Some((identity, order_hash)) = legacy_v1::prepared_order(&raw.0)? {
                     insert_open_order(
-                        &mut orders,
-                        event.account_id,
+                        orders,
+                        event.account_id.clone(),
                         event.seq,
                         identity,
                         order_hash,
@@ -2206,7 +2437,10 @@ where
                 }
             }
             LiveJournalPayload::OrderPosted(posted) => {
-                let key = (event.account_id, posted.identity.dispatch_id.clone());
+                let key = (
+                    event.account_id.clone(),
+                    posted.identity.dispatch_id.clone(),
+                );
                 let order = orders
                     .get(&key)
                     .ok_or(LiveJournalError::OrderFactConflict)?;
@@ -2215,20 +2449,23 @@ where
                         order.entry.prepared_journal_seq,
                         &order.entry.identity,
                         &order.order_hash,
-                        PreparedOrderFact::Posted(&posted),
+                        PreparedOrderFact::Posted(posted),
                     )
                 {
                     return Err(LiveJournalError::OrderFactConflict);
                 }
             }
             LiveJournalPayload::OrderReconciled(reconciled) => {
-                let key = (event.account_id, reconciled.identity.dispatch_id.clone());
+                let key = (
+                    event.account_id.clone(),
+                    reconciled.identity.dispatch_id.clone(),
+                );
                 let order = orders
                     .get_mut(&key)
                     .ok_or(LiveJournalError::OrderFactConflict)?;
                 if order.terminal {
                     if order.terminal_reconciliation.as_deref() == Some(reconciled.as_ref()) {
-                        continue;
+                        return Ok(());
                     }
                     return Err(LiveJournalError::OrderFactConflict);
                 }
@@ -2236,7 +2473,7 @@ where
                     order.entry.prepared_journal_seq,
                     &order.entry.identity,
                     &order.order_hash,
-                    PreparedOrderFact::Reconciled(&reconciled),
+                    PreparedOrderFact::Reconciled(reconciled),
                 ) {
                     return Err(LiveJournalError::OrderFactConflict);
                 }
@@ -2250,7 +2487,7 @@ where
                     let immutable = verify_polygon_reconciliation(
                         prepared,
                         &transaction_hashes,
-                        &reconciled,
+                        reconciled,
                         &order.immutable_receipts,
                     )?;
                     if matches!(
@@ -2282,11 +2519,14 @@ where
                 ) {
                     order.terminal = true;
                     order.finality_conflict = true;
-                    order.terminal_reconciliation = Some(reconciled);
+                    order.terminal_reconciliation = Some(reconciled.clone());
                 }
             }
             LiveJournalPayload::OrderFillFinalized(finalized) => {
-                let key = (event.account_id, finalized.identity.dispatch_id.clone());
+                let key = (
+                    event.account_id.clone(),
+                    finalized.identity.dispatch_id.clone(),
+                );
                 let order = orders
                     .get_mut(&key)
                     .ok_or(LiveJournalError::OrderFactConflict)?;
@@ -2294,7 +2534,7 @@ where
                     order.entry.prepared_journal_seq,
                     &order.entry.identity,
                     &order.order_hash,
-                    PreparedOrderFact::Finalized(&finalized),
+                    PreparedOrderFact::Finalized(finalized),
                 ) {
                     return Err(LiveJournalError::OrderFactConflict);
                 }
@@ -2308,7 +2548,7 @@ where
                 verify_polygon_finalized(
                     prepared,
                     &order.transaction_hashes,
-                    &finalized,
+                    finalized,
                     &order.immutable_receipts,
                 )?;
                 order.terminal = true;
@@ -2321,39 +2561,49 @@ where
             | LiveJournalPayload::RedemptionReceiptTransition(_)
             | LiveJournalPayload::ResolutionFinalized(_)
             | LiveJournalPayload::RedemptionCustodyReconciled(_)
+            | LiveJournalPayload::CollateralCredited(_)
             | LiveJournalPayload::CredentialBindingMismatch { .. }
             | LiveJournalPayload::ModeTransitionApplied(_) => {}
         }
+        Ok(())
     }
-    let mut open_orders = orders
-        .into_values()
-        .filter(|order| !order.terminal)
-        .map(|order| OpenOrderRecoveryEntry {
-            inventory: order.entry,
-            prepared: order.prepared,
-            transaction_hashes: order.transaction_hashes.into_iter().collect(),
-            immutable_receipts: order.immutable_receipts,
-        })
-        .collect::<Vec<_>>();
-    open_orders.sort_by_key(|order| order.inventory.prepared_journal_seq);
-    let mut approved_admissions = approved_admissions
-        .into_iter()
-        .map(|((account_id, _), (admission_journal_seq, admission))| {
-            ApprovedAdmissionRecoveryEntry {
-                account_id,
-                admission_journal_seq,
-                admission,
-            }
-        })
-        .collect::<Vec<_>>();
-    approved_admissions.sort_by_key(|admission| admission.admission_journal_seq);
-    terminal_admissions.sort_by_key(|admission| admission.journal_seq);
-    Ok(LiveRecoveryInventory {
-        account_ids: account_ids.into_iter().collect(),
-        approved_admissions,
-        terminal_admissions,
-        open_orders,
-    })
+
+    /// The recovery work implied by the records applied so far.
+    #[must_use]
+    pub fn inventory(&self) -> LiveRecoveryInventory {
+        let mut open_orders = self
+            .orders
+            .values()
+            .filter(|order| !order.terminal)
+            .map(|order| OpenOrderRecoveryEntry {
+                inventory: order.entry.clone(),
+                prepared: order.prepared.clone(),
+                transaction_hashes: order.transaction_hashes.iter().cloned().collect(),
+                immutable_receipts: order.immutable_receipts.clone(),
+            })
+            .collect::<Vec<_>>();
+        open_orders.sort_by_key(|order| order.inventory.prepared_journal_seq);
+        let mut approved_admissions = self
+            .approved_admissions
+            .iter()
+            .map(|((account_id, _), (admission_journal_seq, admission))| {
+                ApprovedAdmissionRecoveryEntry {
+                    account_id: account_id.clone(),
+                    admission_journal_seq: *admission_journal_seq,
+                    admission: admission.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        approved_admissions.sort_by_key(|admission| admission.admission_journal_seq);
+        let mut terminal_admissions = self.terminal_admissions.clone();
+        terminal_admissions.sort_by_key(|admission| admission.journal_seq);
+        LiveRecoveryInventory {
+            account_ids: self.account_ids.iter().cloned().collect(),
+            approved_admissions,
+            terminal_admissions,
+            open_orders,
+        }
+    }
 }
 
 mod legacy_v1 {
@@ -2503,7 +2753,7 @@ mod legacy_v1 {
             }
             LiveJournalPayload::OrderPosted(value) => super::LiveJournalPayload::OrderPosted(value),
             LiveJournalPayload::OrderReconciled(value) => {
-                super::LiveJournalPayload::OrderReconciled(value)
+                super::LiveJournalPayload::OrderReconciled(value.into())
             }
             LiveJournalPayload::RedemptionRequested(value) => {
                 super::LiveJournalPayload::RedemptionRequested(value)
@@ -2552,26 +2802,10 @@ fn replay_with_receipts(
         if last_sequence.is_some_and(|last_sequence| seq > last_sequence) {
             break;
         }
-        if envelope.source_id != SourceId(LIVE_JOURNAL_SOURCE.to_owned())
-            || !matches!(envelope.schema_version, 1 | LIVE_JOURNAL_SCHEMA_VERSION)
-            || envelope.parser_version != LIVE_JOURNAL_PARSER_VERSION
-            || envelope.content_type != ContentType::Json
-        {
-            return Err(LiveJournalError::UnexpectedEnvelope);
-        }
-        let event = if envelope.schema_version == 1 {
-            let raw_event = serde_json::from_slice(&envelope.payload)?;
-            let legacy = serde_json::from_slice(&envelope.payload)?;
-            legacy_v1::convert(legacy, raw_event)
-        } else {
-            serde_json::from_slice(&envelope.payload)?
-        };
-        let expected =
-            u64::try_from(events.len()).map_err(|_| LiveJournalError::SequenceMismatch)?;
-        if seq.0 != expected || event.seq != expected || event.timestamp != envelope.observed_at.0 {
+        if seq != envelope.seq {
             return Err(LiveJournalError::SequenceMismatch);
         }
-        validate_control_event(&event)?;
+        let event = decode_record(&envelope, events.len())?;
         events.push((
             event,
             AppendReceipt {
@@ -2586,6 +2820,37 @@ fn replay_with_receipts(
         return Err(LiveJournalError::SequenceMismatch);
     }
     Ok(events)
+}
+
+/// Decode one verified frame as the `expected`-th journal record: envelope identity, schema
+/// dispatch, sequence and timestamp binding, and control-record validity.
+fn decode_record(
+    envelope: &EventEnvelope,
+    expected: usize,
+) -> Result<LiveJournalEvent, LiveJournalError> {
+    if envelope.source_id != SourceId(LIVE_JOURNAL_SOURCE.to_owned())
+        || !matches!(envelope.schema_version, 1 | LIVE_JOURNAL_SCHEMA_VERSION)
+        || envelope.parser_version != LIVE_JOURNAL_PARSER_VERSION
+        || envelope.content_type != ContentType::Json
+    {
+        return Err(LiveJournalError::UnexpectedEnvelope);
+    }
+    let event: LiveJournalEvent = if envelope.schema_version == 1 {
+        let raw_event = serde_json::from_slice(&envelope.payload)?;
+        let legacy = serde_json::from_slice(&envelope.payload)?;
+        legacy_v1::convert(legacy, raw_event)
+    } else {
+        serde_json::from_slice(&envelope.payload)?
+    };
+    let expected = u64::try_from(expected).map_err(|_| LiveJournalError::SequenceMismatch)?;
+    if envelope.seq.0 != expected
+        || event.seq != expected
+        || event.timestamp != envelope.observed_at.0
+    {
+        return Err(LiveJournalError::SequenceMismatch);
+    }
+    validate_control_event(&event)?;
+    Ok(event)
 }
 
 fn validate_control_event(event: &LiveJournalEvent) -> Result<(), LiveJournalError> {
@@ -3137,7 +3402,7 @@ mod tests {
             .append(
                 account_id.clone(),
                 at,
-                LiveJournalPayload::OrderPrepared(Box::new(prepared.clone())),
+                LiveJournalPayload::OrderPrepared(Arc::new(prepared.clone())),
             )
             .unwrap()
             .seq
@@ -3160,7 +3425,7 @@ mod tests {
             .append(
                 killed_account,
                 at,
-                LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+                LiveJournalPayload::OrderReconciled(Arc::new(LiveOrderReconciliationAudit {
                     identity: killed.identity.clone(),
                     order_hash: killed.prepared.order_hash.clone(),
                     source: LiveReconciliationSource::OrderHashLookupAndCancel,
@@ -3176,7 +3441,7 @@ mod tests {
             .append(
                 open_account.clone(),
                 at,
-                LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+                LiveJournalPayload::OrderReconciled(Arc::new(LiveOrderReconciliationAudit {
                     identity: open.identity.clone(),
                     order_hash: open.prepared.order_hash.clone(),
                     source: LiveReconciliationSource::PostResponse,
@@ -3300,7 +3565,7 @@ mod tests {
                 .append(
                     account_id.clone(),
                     at,
-                    LiveJournalPayload::OrderReconciled(Box::new(audit)),
+                    LiveJournalPayload::OrderReconciled(Arc::new(audit)),
                 )
                 .unwrap();
         }
@@ -3322,7 +3587,7 @@ mod tests {
             .append(
                 account_id,
                 at,
-                LiveJournalPayload::OrderReconciled(Box::new(changed)),
+                LiveJournalPayload::OrderReconciled(Arc::new(changed)),
             )
             .unwrap();
         drop(journal);
@@ -3350,7 +3615,7 @@ mod tests {
             .append(
                 account_id.clone(),
                 at,
-                LiveJournalPayload::OrderPrepared(prepared.clone()),
+                LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             )
             .unwrap();
         drop(missing);
@@ -3380,7 +3645,7 @@ mod tests {
             .append(
                 account_id,
                 at,
-                LiveJournalPayload::OrderPrepared(underfunded),
+                LiveJournalPayload::OrderPrepared(underfunded.into()),
             )
             .unwrap();
         drop(underfunded_journal);
@@ -3602,7 +3867,7 @@ mod tests {
             .append(
                 account_id.clone(),
                 at,
-                LiveJournalPayload::OrderPrepared(prepared.clone()),
+                LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             )
             .unwrap();
         journal
@@ -3636,7 +3901,7 @@ mod tests {
             .append(
                 account_id.clone(),
                 at,
-                LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+                LiveJournalPayload::OrderReconciled(Arc::new(LiveOrderReconciliationAudit {
                     identity: prepared.identity.clone(),
                     order_hash: prepared.prepared.order_hash.clone(),
                     source: LiveReconciliationSource::PostResponse,
@@ -3718,7 +3983,7 @@ mod tests {
             .append(
                 account_id.clone(),
                 at,
-                LiveJournalPayload::OrderPrepared(prepared),
+                LiveJournalPayload::OrderPrepared(prepared.into()),
             )
             .unwrap();
         journal
@@ -4260,5 +4525,362 @@ mod tests {
                 assert_eq!(fs::read(&path).unwrap(), b"EDGE\x01");
             }
         }
+    }
+
+    fn cached_control(at: OffsetDateTime) -> LiveControlObservation {
+        LiveControlObservation {
+            decided_at_unix: at.unix_timestamp(),
+            last_successful_read_unix: Some(at.unix_timestamp()),
+            stale_after_secs: 120,
+            availability: LiveControlAvailability::Fresh,
+            account_present: true,
+            requested_mode: Some(LiveControlMode::LiveTiny),
+            effective_mode: Some(LiveControlMode::LiveTiny),
+            credential_version_available: true,
+            bundle_version: Some(1),
+        }
+    }
+
+    fn cached_pause(
+        account_id: &AccountId,
+        dispatch: &str,
+        at: OffsetDateTime,
+    ) -> LiveTargetControlAudit {
+        let mut control = cached_control(at);
+        control.availability = LiveControlAvailability::FailedRead;
+        LiveTargetControlAudit {
+            dispatch_id: dispatch.to_owned(),
+            account_id: account_id.clone(),
+            exec_rank: 0,
+            control,
+            outcome: LiveTargetControlOutcome::Pause,
+        }
+    }
+
+    /// PASS: cached records and suffixes equal file replay, share allocations on repeated
+    /// reads, and survive a verified reopen with identical ordering and values.
+    /// FAIL: a read loses, reorders, changes or re-decodes a published record.
+    #[test]
+    fn live_journal_cached_records_match_file_replay_and_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account = AccountId::new("account").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let mut expected = Vec::new();
+        for dispatch in ["first", "second", "third"] {
+            expected.push(
+                journal
+                    .append(
+                        account.clone(),
+                        at,
+                        LiveJournalPayload::PendingTargetControl(Box::new(cached_pause(
+                            &account, dispatch, at,
+                        ))),
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(replay_all(&path).unwrap(), expected);
+        let records = journal.records_from(0).unwrap();
+        assert_eq!(
+            records.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
+            expected.iter().collect::<Vec<_>>()
+        );
+        for next in 0..=4 {
+            let suffix = journal.records_from(next).unwrap();
+            let start = usize::try_from(next).unwrap().min(records.len());
+            assert_eq!(suffix, records[start..]);
+            for (cached, original) in suffix.iter().zip(&records[start..]) {
+                assert!(Arc::ptr_eq(cached, original));
+            }
+        }
+        assert!(journal.records_from(u64::MAX).unwrap().is_empty());
+        drop(journal);
+        let reopened = LiveJournal::open(&path).unwrap();
+        assert_eq!(reopened.records_from(0).unwrap(), records);
+        for (first, again) in reopened
+            .records_from(0)
+            .unwrap()
+            .iter()
+            .zip(reopened.records_from(0).unwrap())
+        {
+            assert!(Arc::ptr_eq(first, &again));
+        }
+    }
+
+    /// PASS: control indexes equal scoped file scans before and after reopen, preserving
+    /// pending-control order and the latest approved pause.
+    /// FAIL: a lookup crosses account/dispatch boundaries or accepts an incorrect sequence.
+    #[test]
+    fn live_journal_control_indexes_match_file_scans() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account = AccountId::new("account").unwrap();
+        let other = AccountId::new("other").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let staged = journal
+            .append(
+                account.clone(),
+                at,
+                LiveJournalPayload::StagedDispatchControl(Box::new(
+                    LiveStagedDispatchControlAudit {
+                        dispatch_id: "dispatch".to_owned(),
+                        targets: vec![LiveStagedTargetControlAudit {
+                            account_id: account.clone(),
+                            exec_rank: 0,
+                            is_primary: true,
+                            execution_order: 0,
+                            control: cached_control(at),
+                            observed_credential_key_id: "key".to_owned(),
+                            frozen_binding: CredentialBindingIdentity {
+                                version: 1,
+                                key_id: "key".to_owned(),
+                            },
+                        }],
+                    },
+                )),
+            )
+            .unwrap();
+        for (index, (owner, dispatch)) in [
+            (&account, "dispatch"),
+            (&other, "dispatch"),
+            (&account, "other"),
+            (&account, "dispatch"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let stamp = at + time::Duration::seconds(i64::try_from(index).unwrap());
+            let audit = cached_pause(owner, dispatch, stamp);
+            journal
+                .append(
+                    owner.clone(),
+                    stamp,
+                    LiveJournalPayload::PendingTargetControl(Box::new(audit.clone())),
+                )
+                .unwrap();
+            journal
+                .append(
+                    owner.clone(),
+                    stamp,
+                    LiveJournalPayload::ApprovedRecoveryControlPause(Box::new(audit)),
+                )
+                .unwrap();
+        }
+        let events = replay_all(&path).unwrap();
+        let check = |journal: &LiveJournal| {
+            assert_eq!(
+                journal
+                    .staged_dispatch_control(staged.seq, "dispatch")
+                    .unwrap(),
+                staged_dispatch_control_at(&path, staged.seq, "dispatch").unwrap()
+            );
+            assert_eq!(
+                journal
+                    .staged_dispatch_control(staged.seq, "wrong")
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                journal
+                    .staged_dispatch_control(staged.seq + 1, "dispatch")
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                journal.staged_dispatch_control(999, "dispatch").unwrap(),
+                None
+            );
+            for owner in [&account, &other] {
+                for dispatch in ["dispatch", "other", "missing"] {
+                    let pending = events
+                        .iter()
+                        .filter_map(|event| match &event.payload {
+                            LiveJournalPayload::PendingTargetControl(audit)
+                                if &event.account_id == owner && audit.dispatch_id == dispatch =>
+                            {
+                                Some(audit.as_ref().clone())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let pause = events.iter().rev().find_map(|event| match &event.payload {
+                        LiveJournalPayload::ApprovedRecoveryControlPause(audit)
+                            if &event.account_id == owner && audit.dispatch_id == dispatch =>
+                        {
+                            Some(audit.as_ref().clone())
+                        }
+                        _ => None,
+                    });
+                    assert_eq!(
+                        journal.pending_target_controls(owner, dispatch).unwrap(),
+                        pending
+                    );
+                    assert_eq!(
+                        journal
+                            .last_approved_recovery_pause(owner, dispatch)
+                            .unwrap(),
+                        pause
+                    );
+                }
+            }
+        };
+        check(&journal);
+        drop(journal);
+        check(&LiveJournal::open(&path).unwrap());
+    }
+
+    /// PASS: a durable invalid control leaves every cached read and append unpublished;
+    /// reopening rejects the very same durable invalid frame.
+    /// FAIL: a stale prefix is served, a later append succeeds, or reopen accepts the frame.
+    #[test]
+    fn live_journal_invalid_durable_append_closes_all_cached_reads() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account = AccountId::new("account").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let payload = LiveJournalPayload::PendingTargetControl(Box::new(cached_pause(
+            &account, "dispatch", at,
+        )));
+        journal
+            .append(account.clone(), at, payload.clone())
+            .unwrap();
+        assert!(matches!(
+            journal.append(
+                account.clone(),
+                at + time::Duration::seconds(1),
+                payload.clone()
+            ),
+            Err(LiveJournalError::InvalidControlEvidence)
+        ));
+        assert!(matches!(
+            journal.append(account.clone(), at, payload),
+            Err(LiveJournalError::Unpublished)
+        ));
+        assert!(matches!(
+            journal.records_from(0),
+            Err(LiveJournalError::Unpublished)
+        ));
+        assert!(matches!(
+            journal.records_from(2),
+            Err(LiveJournalError::Unpublished)
+        ));
+        assert!(matches!(
+            journal.staged_dispatch_control(0, "dispatch"),
+            Err(LiveJournalError::Unpublished)
+        ));
+        assert!(matches!(
+            journal.pending_target_controls(&account, "dispatch"),
+            Err(LiveJournalError::Unpublished)
+        ));
+        assert!(matches!(
+            journal.last_approved_recovery_pause(&account, "dispatch"),
+            Err(LiveJournalError::Unpublished)
+        ));
+        assert!(matches!(
+            journal.poisoned(),
+            Err(LiveJournalError::Unpublished)
+        ));
+        let frames = Reader::replay(&path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(matches!(
+            decode_record(&frames[1].1, 1),
+            Err(LiveJournalError::InvalidControlEvidence)
+        ));
+        drop(journal);
+        assert!(matches!(
+            LiveJournal::open(&path),
+            Err(LiveJournalError::InvalidControlEvidence)
+        ));
+    }
+
+    /// PASS: sync uncertainty blocks publication and later appends; reopening recovers
+    /// the fully written frame and the preceding durable prefix.
+    /// FAIL: cached state leaks through the failed sync or reopen loses the written frame.
+    #[cfg(feature = "scenario")]
+    #[test]
+    fn live_journal_sync_failure_blocks_publication_until_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account = AccountId::new("account").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let payload = LiveJournalPayload::PendingTargetControl(Box::new(cached_pause(
+            &account, "dispatch", at,
+        )));
+        let prefix = journal
+            .append(account.clone(), at, payload.clone())
+            .unwrap();
+        journal.scenario_fail_next_sync().unwrap();
+        assert!(
+            journal
+                .append(account.clone(), at, payload.clone())
+                .is_err()
+        );
+        let is_sync_poison = |result: Result<(), LiveJournalError>| {
+            assert!(matches!(
+                result,
+                Err(LiveJournalError::EventLog(
+                    pe_event_log::LogError::Poisoned {
+                        reason: PoisonReason::Synchronize
+                    }
+                ))
+            ))
+        };
+        is_sync_poison(journal.append(account.clone(), at, payload).map(|_| ()));
+        is_sync_poison(journal.records_from(0).map(|_| ()));
+        is_sync_poison(journal.staged_dispatch_control(0, "dispatch").map(|_| ()));
+        is_sync_poison(
+            journal
+                .pending_target_controls(&account, "dispatch")
+                .map(|_| ()),
+        );
+        is_sync_poison(
+            journal
+                .last_approved_recovery_pause(&account, "dispatch")
+                .map(|_| ()),
+        );
+        drop(journal);
+        let reopened = LiveJournal::open(&path).unwrap();
+        let recovered = reopened.records_from(0).unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].as_ref(), &prefix);
+        assert_eq!(recovered[1].seq, 1);
+        assert_eq!(recovered[1].payload, prefix.payload);
+        assert_eq!(reopened.poisoned().unwrap(), None);
+    }
+
+    /// PASS: the readiness poison query exposes the writer's synchronization poison reason.
+    /// FAIL: the generic unpublished flag hides the typed writer poison reason.
+    #[cfg(feature = "scenario")]
+    #[test]
+    fn live_journal_sync_failure_reports_writer_poison_reason() {
+        let dir = tempdir().unwrap();
+        let journal = LiveJournal::open(dir.path().join("live.log")).unwrap();
+        let account = AccountId::new("account").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        journal.scenario_fail_next_sync().unwrap();
+        assert!(
+            journal
+                .append(
+                    account.clone(),
+                    at,
+                    LiveJournalPayload::PendingTargetControl(Box::new(cached_pause(
+                        &account, "dispatch", at
+                    )))
+                )
+                .is_err()
+        );
+        let poison = journal.poisoned();
+        assert!(
+            matches!(poison, Ok(Some(PoisonReason::Synchronize))),
+            "writer poison reason: {poison:?}"
+        );
     }
 }

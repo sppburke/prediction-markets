@@ -38,9 +38,10 @@ use pe_execution_core::{
     MarkKind, ObservationEvidence, OrderFillFinalizedAudit, PreparedLiveOrder, PreparedOrderFact,
     RedemptionAttempt, RedemptionAttemptIdentity, RedemptionAttemptState, RedemptionPassInput,
     RiskAudit, RiskDecisionAudit, SizingModeAudit, TerminalAdmissionRecoveryOutcome,
-    http_attempt_hashes, prepared_order_fact_matches, reconstruct_redemption_attempts,
-    recovery_inventory, redemption_posture, replay_account, run_redemption_pass,
+    http_attempt_hashes, prepared_order_fact_matches, redemption_posture, run_redemption_pass,
 };
+#[cfg(test)]
+use pe_execution_core::{recovery_inventory, replay_account};
 use pe_kelly_sizer::{KellyInput, size_contracts};
 use pe_paper_state::{DispatchSeedRow, DispatchTargetRow, PaperStateDb};
 use pe_risk_engine::snapshot::{RiskSnapshot, TradingMode};
@@ -58,10 +59,9 @@ use pe_strategy_winner_follow::{
 };
 use pe_venue_polymarket::{
     BuySizing, CustodyKind, LadderError, MatchedReceipt, ReceiptError, RedemptionTransport,
-    RelayerApiKeyCredentials, RelayerCredentials, RelayerPollPolicy, build_redemption_call,
-    canonical_block_matches, parse_chain_id_response, parse_compact_market,
-    parse_finalized_block_response, parse_receipt_response, plan_sized_buy,
-    sign_deposit_wallet_redemption,
+    RelayerApiKeyCredentials, RelayerPollPolicy, build_redemption_call, canonical_block_matches,
+    parse_chain_id_response, parse_compact_market, parse_finalized_block_response,
+    parse_receipt_response, plan_sized_buy, sign_deposit_wallet_redemption,
 };
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
@@ -157,6 +157,8 @@ pub struct LiveFanoutConfig {
     pub supabase_secret_key: String,
     pub gamma_base_url: String,
     pub clob_base_url: String,
+    /// Relayer origin; production passes `RELAYER_BASE_URL`.
+    pub relayer_base_url: String,
     pub data_base_url: String,
     pub projection_reconcile_interval_secs: u64,
     /// Cheap ordered-shutdown probe used to revoke Approved resumption at StopProducers.
@@ -183,8 +185,346 @@ struct FanoutState {
     last_redemption_unix: Option<i64>,
     last_projection_unix: Option<i64>,
     last_prune_unix: Option<i64>,
+    live: std::sync::Mutex<LiveState>,
+    /// Receipt and stamp clock for resolution reads, position reads and Daily marks; the wall
+    /// clock outside scenarios.
+    clock: FanoutClock,
 }
 
+type FanoutClock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
+
+/// Per-account live state advanced from the journal's published records, each applied once
+/// (#808). Records inside the era's paper prefix or before an account's first Baseline are not
+/// applied, as in the journal views this replaces.
+#[derive(Default)]
+struct LiveState {
+    /// Next journal sequence to read.
+    next_seq: u64,
+    accounts: BTreeMap<AccountId, LiveAccountView>,
+}
+
+/// One account's records from its first Baseline on and the two folds over them. A record that
+/// either fold rejects closes the account at that record.
+struct LiveAccountView {
+    records: Vec<Arc<LiveJournalEvent>>,
+    financial: ProjectionFold,
+    timeline: CopyTimeline,
+    recovery: pe_execution_core::live_journal::LiveRecoveryFold,
+    rejected: Option<String>,
+    /// How many times each record was applied to this view.
+    #[cfg(test)]
+    applied: BTreeMap<u64, usize>,
+}
+
+/// Why an account's live state cannot be read.
+#[derive(Debug, thiserror::Error)]
+enum LiveStateError {
+    #[error("live journal or record evidence unavailable: {0}")]
+    Unavailable(String),
+    #[error("live journal record rejected: {0}")]
+    Rejected(String),
+}
+
+/// The evidence one record's checks read. Gathering it changes no state, so a failure leaves the
+/// record to be applied by a later read.
+struct RecordEvidence {
+    sources: Vec<EventEnvelope>,
+    observation_pages: LiveObservationPageIndex,
+}
+
+impl LiveAccountView {
+    fn new(account_id: AccountId) -> Self {
+        Self {
+            records: Vec::new(),
+            financial: ProjectionFold::new(account_id),
+            timeline: CopyTimeline::default(),
+            recovery: pe_execution_core::live_journal::LiveRecoveryFold::default(),
+            rejected: None,
+            #[cfg(test)]
+            applied: BTreeMap::new(),
+        }
+    }
+
+    /// Apply one record to both folds: the financial fold first checks an admission against the
+    /// state just before it, which also answers the recovery fold's admission verification.
+    fn apply(
+        &mut self,
+        record: &Arc<LiveJournalEvent>,
+        evidence: &RecordEvidence,
+        source_receipts: &SourceReceiptIndex,
+        paper_frames: &[Arc<ScannedPaperFrame>],
+    ) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            *self.applied.entry(record.seq).or_default() += 1;
+        }
+        let replay = LiveReplayEvidence {
+            source_envelopes: &evidence.sources,
+            source_receipts: Some(source_receipts),
+            paper_frames,
+            observation_pages: &evidence.observation_pages,
+        };
+        if let LiveJournalPayload::AdmissionEvaluated(admission) = &record.payload {
+            let derived = self
+                .financial
+                .summary()
+                .map_err(|error| error.to_string())?;
+            verify_live_risk_against(&record.account_id, &derived, admission, replay)
+                .map_err(|error| error.to_string())?;
+            self.timeline
+                .admit(&record.account_id, admission, replay)
+                .map_err(|error| error.to_string())?;
+        }
+        self.timeline
+            .check(record)
+            .map_err(|error| error.to_string())?;
+        self.financial
+            .apply(record, &evidence.sources)
+            .map_err(|error| error.to_string())?;
+        self.recovery
+            .apply(record, true)
+            .map_err(|error| error.to_string())?;
+        self.records.push(Arc::clone(record));
+        Ok(())
+    }
+}
+
+impl LiveState {
+    fn view(&self, account_id: &AccountId) -> Result<Option<&LiveAccountView>, LiveStateError> {
+        match self.accounts.get(account_id) {
+            Some(LiveAccountView {
+                rejected: Some(reason),
+                ..
+            }) => Err(LiveStateError::Rejected(reason.clone())),
+            view => Ok(view),
+        }
+    }
+
+    /// The account's gate summary; an account without a Baseline has the empty one.
+    fn summary(&self, account_id: &AccountId) -> Result<ProjectionDerivation, LiveStateError> {
+        match self.view(account_id)? {
+            Some(view) => view
+                .financial
+                .summary()
+                .map_err(|error| LiveStateError::Rejected(error.to_string())),
+            None => Ok(ProjectionDerivation::default()),
+        }
+    }
+
+    /// The account's view as of one UTC-midnight cutoff, for building that Daily mark.
+    fn cutoff_summary(
+        &self,
+        account_id: &AccountId,
+        cutoff_unix: i64,
+    ) -> Result<ProjectionDerivation, LiveStateError> {
+        match self.view(account_id)? {
+            Some(view) => view
+                .financial
+                .cutoff_summary(cutoff_unix)
+                .map_err(|error| LiveStateError::Rejected(error.to_string())),
+            None => Ok(ProjectionDerivation::default()),
+        }
+    }
+
+    /// Token identities of the account's accepted orders; `None` when two of them conflict.
+    fn prepared_tokens(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<Option<Arc<ActivityAssetMapping>>, LiveStateError> {
+        Ok(match self.view(account_id)? {
+            Some(view) => view.financial.main.prepared_tokens.clone(),
+            None => Some(Arc::new(ActivityAssetMapping::from_rows(&[]))),
+        })
+    }
+
+    /// The account's full derivation, historical fill rows included, for projection writes.
+    fn derivation(&self, account_id: &AccountId) -> Result<ProjectionDerivation, LiveStateError> {
+        match self.view(account_id)? {
+            Some(view) => view
+                .financial
+                .derivation()
+                .map_err(|error| LiveStateError::Rejected(error.to_string())),
+            None => Ok(ProjectionDerivation::default()),
+        }
+    }
+
+    /// Every account's recovery work. As with an unreadable journal, any closed account makes the
+    /// whole inventory unreadable.
+    fn recovery_inventory(&self) -> Result<LiveRecoveryInventory, LiveStateError> {
+        let mut inventory = LiveRecoveryInventory {
+            account_ids: Vec::new(),
+            approved_admissions: Vec::new(),
+            terminal_admissions: Vec::new(),
+            open_orders: Vec::new(),
+        };
+        for account_id in self.accounts.keys() {
+            let Some(view) = self.view(account_id)? else {
+                continue;
+            };
+            let account = view.recovery.inventory();
+            inventory.account_ids.extend(account.account_ids);
+            inventory
+                .approved_admissions
+                .extend(account.approved_admissions);
+            inventory
+                .terminal_admissions
+                .extend(account.terminal_admissions);
+            inventory.open_orders.extend(account.open_orders);
+        }
+        inventory
+            .approved_admissions
+            .sort_by_key(|admission| admission.admission_journal_seq);
+        inventory
+            .terminal_admissions
+            .sort_by_key(|admission| admission.journal_seq);
+        inventory
+            .open_orders
+            .sort_by_key(|order| order.inventory.prepared_journal_seq);
+        Ok(inventory)
+    }
+}
+
+fn record_evidence(
+    config: &LiveFanoutConfig,
+    record: &LiveJournalEvent,
+) -> Result<RecordEvidence, String> {
+    let record = std::slice::from_ref(record);
+    let sources = source_envelopes_for_live_events(&config.source_receipts, record)
+        .map_err(|error| error.to_string())?;
+    let source_trade_ids = referenced_source_trade_ids(record);
+    let observation_pages = if source_trade_ids.is_empty() {
+        HashMap::new()
+    } else {
+        live_observation_page_index(&config.paper_state, &source_trade_ids)
+            .map_err(|error| error.to_string())?
+    };
+    Ok(RecordEvidence {
+        sources,
+        observation_pages,
+    })
+}
+
+/// Apply every record published since the last read, then hold the state for this read.
+fn sync_live(state: &FanoutState) -> Result<std::sync::MutexGuard<'_, LiveState>, LiveStateError> {
+    let mut live = state
+        .live
+        .lock()
+        .map_err(|_| LiveStateError::Unavailable("live state lock poisoned".to_owned()))?;
+    let records = state
+        .config
+        .journal
+        .records_from(live.next_seq)
+        .map_err(|error| LiveStateError::Unavailable(error.to_string()))?;
+    let era_last = state
+        .config
+        .era_live_prefix
+        .as_ref()
+        .and_then(|prefix| prefix.last_sequence);
+    let mut paper_frames = None;
+    for record in records {
+        let next_seq = record
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| LiveStateError::Unavailable("journal sequence overflow".to_owned()))?;
+        if era_last.is_none_or(|last| record.seq > last.0) {
+            let baseline = matches!(
+                &record.payload,
+                LiveJournalPayload::AccountPortfolioMarked(mark) if mark.kind == MarkKind::Baseline
+            );
+            if baseline && !live.accounts.contains_key(&record.account_id) {
+                live.accounts.insert(
+                    record.account_id.clone(),
+                    LiveAccountView::new(record.account_id.clone()),
+                );
+            }
+            if let Some(view) = live
+                .accounts
+                .get_mut(&record.account_id)
+                .filter(|view| view.rejected.is_none())
+            {
+                let evidence =
+                    record_evidence(&state.config, &record).map_err(LiveStateError::Unavailable)?;
+                if paper_frames.is_none()
+                    && matches!(record.payload, LiveJournalPayload::AdmissionEvaluated(_))
+                {
+                    paper_frames = Some(
+                        state
+                            .config
+                            .paper_log
+                            .snapshot()
+                            .map_err(|error| LiveStateError::Unavailable(error.to_string()))?,
+                    );
+                }
+                if let Err(reason) = view.apply(
+                    &record,
+                    &evidence,
+                    &state.config.source_receipts,
+                    paper_frames.as_deref().unwrap_or_default(),
+                ) {
+                    error!(account_id = %record.account_id, seq = record.seq, reason = %reason, "live journal record rejected; account closed");
+                    view.rejected = Some(format!("record {}: {reason}", record.seq));
+                }
+            }
+        }
+        live.next_seq = next_seq;
+    }
+    Ok(live)
+}
+
+/// The account's gate summary from the live state.
+fn live_summary(
+    state: &FanoutState,
+    account_id: &AccountId,
+) -> Result<ProjectionDerivation, LiveStateError> {
+    sync_live(state)?.summary(account_id)
+}
+
+/// Custody work polls every [`REDEMPTION_RETRY_SECS`] until done, then every
+/// [`REDEMPTION_RECONCILE_CADENCE_SECS`].
+fn redemption_cadence_secs(state: &FanoutState) -> i64 {
+    let custody_work = sync_live(state).is_ok_and(|live| {
+        live.accounts.values().any(|view| {
+            view.rejected.is_none() && !view.financial.main.receivable_by_condition.is_empty()
+        })
+    });
+    if custody_work {
+        REDEMPTION_RETRY_SECS
+    } else {
+        REDEMPTION_RECONCILE_CADENCE_SECS
+    }
+}
+
+/// The account's applied records from its first Baseline on.
+#[cfg(test)]
+fn live_records(
+    state: &FanoutState,
+    account_id: &AccountId,
+) -> Result<Vec<Arc<LiveJournalEvent>>, LiveStateError> {
+    Ok(sync_live(state)?
+        .view(account_id)?
+        .map(|view| view.records.clone())
+        .unwrap_or_default())
+}
+
+/// The later of `now` and the newest receipt of the evidence a record cites, so the record is
+/// never stamped before that evidence arrived.
+fn stamp_after_evidence<'a>(
+    state: &FanoutState,
+    now: OffsetDateTime,
+    receipts: impl IntoIterator<Item = &'a AppendReceipt>,
+) -> Result<OffsetDateTime, String> {
+    receipts.into_iter().try_fold(now, |stamp, receipt| {
+        let envelope = state
+            .config
+            .source_receipts
+            .source_envelope(*receipt)
+            .map_err(|error| error.to_string())?;
+        Ok(stamp.max(envelope.received_at.0))
+    })
+}
+
+/// Test oracle: the account's view read back from the journal file.
+#[cfg(test)]
 fn replay_live_account(
     state: &FanoutState,
     account_id: &AccountId,
@@ -199,6 +539,8 @@ fn replay_live_account(
     Ok(events.split_off(baseline_index))
 }
 
+/// Test oracle: today's batch strict derivation of `events`.
+#[cfg(test)]
 fn derive_projection_rows_for_state(
     state: &FanoutState,
     account_id: &AccountId,
@@ -286,6 +628,15 @@ pub(crate) fn projection_source_receipts(
                         .map(|receipt| (receipt.sequence, receipt.this_hash)),
                 );
             }
+            LiveJournalPayload::CollateralCredited(credit) => {
+                receipts.extend(
+                    credit
+                        .venue_position_evidence
+                        .pages
+                        .iter()
+                        .map(|page| (page.receipt.sequence, page.receipt.this_hash)),
+                );
+            }
             _ => {}
         }
     }
@@ -340,6 +691,8 @@ pub async fn run_live_fanout_until(
         last_redemption_unix: None,
         last_projection_unix: None,
         last_prune_unix: None,
+        live: std::sync::Mutex::new(LiveState::default()),
+        clock: Arc::new(OffsetDateTime::now_utc),
     };
     reconcile_projections(&mut state, OffsetDateTime::now_utc()).await;
     state.last_projection_unix = Some(OffsetDateTime::now_utc().unix_timestamp());
@@ -394,7 +747,7 @@ pub async fn run_live_fanout_until(
         if due(
             state.last_redemption_unix,
             now.unix_timestamp(),
-            REDEMPTION_RECONCILE_CADENCE_SECS,
+            redemption_cadence_secs(&state),
         ) {
             drive_redemptions(&mut state, now).await;
             state.last_redemption_unix = Some(now.unix_timestamp());
@@ -442,109 +795,7 @@ pub async fn run_live_fanout_until(
 }
 
 fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInventory, FanoutError> {
-    let paper_frames = state
-        .config
-        .paper_log
-        .snapshot()
-        .map_err(|error| FanoutError::Signal(format!("paper risk prefix: {error}")))?;
-    let inventory = pe_execution_core::live_journal::recovery_inventory_with_admission_verifier(
-        &state.config.journal_path,
-        state.config.era_live_prefix.as_ref(),
-        |event, preceding_events| {
-            let LiveJournalPayload::AdmissionEvaluated(admission) = &event.payload else {
-                return Ok(());
-            };
-            let account_prefix = preceding_events
-                .iter()
-                .filter(|prior| prior.account_id == event.account_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut scoped_events = account_prefix.clone();
-            scoped_events.push(event.clone());
-            let source_envelopes =
-                source_envelopes_for_live_events(&state.config.source_receipts, &scoped_events)
-                    .map_err(|_| pe_execution_core::LiveJournalError::OrderFactConflict)?;
-            let observation_pages = live_observation_page_index(
-                &state.config.paper_state,
-                &referenced_source_trade_ids(std::slice::from_ref(event)),
-            )
-            .map_err(|_| pe_execution_core::LiveJournalError::OrderFactConflict)?;
-            verify_replayed_live_risk_with_index(
-                &event.account_id,
-                &account_prefix,
-                admission.as_ref(),
-                LiveReplayEvidence {
-                    source_envelopes: &source_envelopes,
-                    source_receipts: Some(&state.config.source_receipts),
-                    paper_frames: &paper_frames,
-                    observation_pages: &observation_pages,
-                },
-            )
-            .map_err(|_| pe_execution_core::LiveJournalError::OrderFactConflict)
-        },
-    )?;
-    let mut recoverable_accounts = inventory
-        .approved_admissions
-        .iter()
-        .map(|entry| entry.account_id.clone())
-        .chain(
-            inventory
-                .open_orders
-                .iter()
-                .map(|entry| entry.inventory.account_id.clone()),
-        )
-        .chain(
-            inventory
-                .terminal_admissions
-                .iter()
-                .map(|entry| entry.account_id.clone()),
-        )
-        .collect::<BTreeSet<_>>();
-    for account_id in std::mem::take(&mut recoverable_accounts) {
-        let events = replay_live_account(state, &account_id)?;
-        let source_envelopes =
-            source_envelopes_for_live_events(&state.config.source_receipts, &events).map_err(
-                |error| {
-                    FanoutError::Signal(format!(
-                        "live recovery source evidence for {account_id}: {error}"
-                    ))
-                },
-            )?;
-        let observation_pages = live_observation_page_index(
-            &state.config.paper_state,
-            &referenced_source_trade_ids(&events),
-        )
-        .map_err(|error| {
-            FanoutError::Signal(format!(
-                "live recovery continuation evidence for {account_id}: {error}"
-            ))
-        })?;
-        verify_replayed_live_risks(
-            &account_id,
-            &events,
-            &source_envelopes,
-            Some(&state.config.source_receipts),
-            &paper_frames,
-            &observation_pages,
-        )
-        .map_err(|error| {
-            FanoutError::Signal(format!(
-                "live recovery event replay for {account_id}: {error}"
-            ))
-        })?;
-        let derived = derive_projection_rows_with_sources(&account_id, &events, &source_envelopes)
-            .map_err(|error| {
-                FanoutError::Signal(format!(
-                    "live recovery strict reduction failed for {account_id}: {error}"
-                ))
-            })?;
-        if derived.baseline_sequence.is_none() {
-            return Err(FanoutError::Signal(format!(
-                "live recovery account {account_id} has no verified financial-era Baseline"
-            )));
-        }
-    }
-    Ok(inventory)
+    Ok(sync_live(state)?.recovery_inventory()?)
 }
 
 fn terminal_recovery_reason(outcome: &TerminalAdmissionRecoveryOutcome) -> &'static str {
@@ -561,19 +812,13 @@ fn terminal_recovery_reason(outcome: &TerminalAdmissionRecoveryOutcome) -> &'sta
 
 fn terminal_projection_is_pending(
     state: &FanoutState,
-    inventory: &LiveRecoveryInventory,
+    live: &LiveState,
 ) -> Result<bool, FanoutError> {
-    let terminal_targets = inventory
-        .terminal_admissions
-        .iter()
-        .map(|terminal| {
-            (
-                terminal.identity.dispatch_id.as_str(),
-                terminal.account_id.as_str(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    if terminal_targets.is_empty() {
+    if !live
+        .accounts
+        .values()
+        .any(|view| view.recovery.has_terminal_admissions())
+    {
         return Ok(false);
     }
     let seeds = state
@@ -583,7 +828,12 @@ fn terminal_projection_is_pending(
     Ok(nonterminal_dispatch_targets_for_seeds(state, &seeds)?
         .iter()
         .any(|target| {
-            terminal_targets.contains(&(target.dispatch_id.as_str(), target.account_id.as_str()))
+            AccountId::new(&target.account_id).is_ok_and(|account_id| {
+                live.accounts.get(&account_id).is_some_and(|view| {
+                    view.recovery
+                        .is_terminal_admission(&account_id, &target.dispatch_id)
+                })
+            })
         }))
 }
 
@@ -606,15 +856,17 @@ fn nonterminal_dispatch_targets_for_seeds(
 }
 
 fn recovery_is_pending(state: &FanoutState) -> Result<bool, FanoutError> {
-    // This is only an idle-work hint. The consuming pass verifies the journal and every admission
-    // before using them, while even an unverifiable nonterminal admission must keep recovery pending.
-    let inventory = pe_execution_core::live_journal::structural_recovery_inventory(
-        &state.config.journal_path,
-        state.config.era_live_prefix.as_ref(),
-    )?;
-    Ok(!inventory.approved_admissions.is_empty()
-        || !inventory.open_orders.is_empty()
-        || terminal_projection_is_pending(state, &inventory)?)
+    // An idle-work hint read from the live state; a closed account keeps recovery unreadable.
+    let live = sync_live(state)?;
+    for account_id in live.accounts.keys() {
+        if live
+            .view(account_id)?
+            .is_some_and(|view| view.recovery.has_pending_work())
+        {
+            return Ok(true);
+        }
+    }
+    terminal_projection_is_pending(state, &live)
 }
 
 fn reconcile_terminal_recovery_work(
@@ -689,13 +941,15 @@ enum FanoutError {
     Journal(#[from] pe_execution_core::LiveJournalError),
     #[error("live executor: {0}")]
     Executor(#[from] pe_execution_core::LiveExecutorError),
+    #[error("live state: {0}")]
+    LiveState(#[from] LiveStateError),
 }
 
 /// One authenticated matched order awaiting Polygon finality.
 #[derive(Debug, Clone)]
 pub struct PendingOrderFinality {
     pub prepared_journal_seq: u64,
-    pub prepared: Box<pe_execution_core::LiveOrderPreparedAudit>,
+    pub prepared: Arc<pe_execution_core::LiveOrderPreparedAudit>,
     pub transaction_hashes: Vec<String>,
     pub immutable_receipts: BTreeMap<String, MatchedReceipt>,
 }
@@ -924,13 +1178,13 @@ pub fn append_order_finality_result(
 ) -> Result<FinalityJournalEffect, pe_execution_core::LiveJournalError> {
     let (payload, effect) = match result.disposition {
         OrderFinalityDisposition::Finalized(finalized) => (
-            LiveJournalPayload::OrderFillFinalized(finalized),
+            LiveJournalPayload::OrderFillFinalized(finalized.into()),
             FinalityJournalEffect::Finalized,
         ),
         OrderFinalityDisposition::Pending { reason, evidence } => {
             let evidence_hashes = http_attempt_hashes(&evidence)?;
             (
-                LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+                LiveJournalPayload::OrderReconciled(Arc::new(LiveOrderReconciliationAudit {
                     identity: result.identity,
                     order_hash: result.order_hash,
                     source: LiveReconciliationSource::PolygonFinality,
@@ -944,7 +1198,7 @@ pub fn append_order_finality_result(
         OrderFinalityDisposition::Conflict { reason, evidence } => {
             let evidence_hashes = http_attempt_hashes(&evidence)?;
             (
-                LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+                LiveJournalPayload::OrderReconciled(Arc::new(LiveOrderReconciliationAudit {
                     identity: result.identity,
                     order_hash: result.order_hash,
                     source: LiveReconciliationSource::PolygonFinality,
@@ -1014,18 +1268,13 @@ fn pending_control_history(
 ) -> Result<Vec<pe_execution_core::live_journal::LiveTargetControlAudit>, FanoutError> {
     let account_id = AccountId::new(&target.account_id)
         .map_err(|error| FanoutError::Signal(error.to_string()))?;
-    Ok(replay_account(&state.config.journal_path, &account_id)?
+    let exec_rank = u64::try_from(target.exec_rank).ok();
+    Ok(state
+        .config
+        .journal
+        .pending_target_controls(&account_id, &target.dispatch_id)?
         .into_iter()
-        .filter_map(|event| match event.payload {
-            LiveJournalPayload::PendingTargetControl(audit)
-                if audit.dispatch_id == target.dispatch_id
-                    && audit.account_id == account_id
-                    && audit.exec_rank == u64::try_from(target.exec_rank).ok()? =>
-            {
-                Some(*audit)
-            }
-            _ => None,
-        })
+        .filter(|audit| audit.account_id == account_id && Some(audit.exec_rank) == exec_rank)
         .collect())
 }
 
@@ -1243,10 +1492,14 @@ fn recovery_authorization(
     if !snapshot.credential_metadata_available {
         account.credential_binding = Some((frozen_binding.version, frozen_binding.key_id.clone()));
     }
-    let redemption_closed =
-        reconstruct_redemption_attempts(&replay_live_account(state, account_id)?)
+    let redemption_closed = sync_live(state)?.view(account_id)?.is_some_and(|view| {
+        view.financial
+            .main
+            .redemption_attempts
+            .as_map()
             .values()
-            .any(|attempt| redemption_posture(&attempt.state).closes_new_buy_admission);
+            .any(|attempt| redemption_posture(&attempt.state).closes_new_buy_admission)
+    });
     if state.closures.reason(account_id.as_str()).is_some()
         || redemption_closed
         || global_risk_halt_active(state, pe_risk_engine::DrawdownPolicy::KillOnly)?
@@ -1268,34 +1521,18 @@ fn record_approved_recovery_pause(
     target: &DispatchTargetRow,
     control: pe_execution_core::live_journal::LiveControlObservation,
 ) -> Result<(), FanoutError> {
-    record_approved_recovery_pause_in_journal(
-        &state.config.journal,
-        &state.config.journal_path,
-        target,
-        control,
-    )
+    record_approved_recovery_pause_in_journal(&state.config.journal, target, control)
 }
 
 fn record_approved_recovery_pause_in_journal(
     journal: &LiveJournal,
-    journal_path: &std::path::Path,
     target: &DispatchTargetRow,
     control: pe_execution_core::live_journal::LiveControlObservation,
 ) -> Result<(), FanoutError> {
     use pe_execution_core::live_journal::{LiveTargetControlAudit, LiveTargetControlOutcome};
     let account_id = AccountId::new(&target.account_id)
         .map_err(|error| FanoutError::Signal(error.to_string()))?;
-    let prior = replay_account(journal_path, &account_id)?
-        .into_iter()
-        .filter_map(|event| match event.payload {
-            LiveJournalPayload::ApprovedRecoveryControlPause(audit)
-                if audit.dispatch_id == target.dispatch_id =>
-            {
-                Some(*audit)
-            }
-            _ => None,
-        })
-        .next_back();
+    let prior = journal.last_approved_recovery_pause(&account_id, &target.dispatch_id)?;
     if prior
         .as_ref()
         .is_some_and(|previous| same_control_state(&previous.control, &control))
@@ -1576,13 +1813,16 @@ where
                 continue;
             }
         }
-        let venue = match PolymarketLiveVenue::from_credentials(&credentials).await {
-            Ok(venue) => venue,
-            Err(_) => {
-                freeze = true;
-                continue;
-            }
-        };
+        let venue =
+            match PolymarketLiveVenue::from_credentials(&credentials, &state.config.clob_base_url)
+                .await
+            {
+                Ok(venue) => venue,
+                Err(_) => {
+                    freeze = true;
+                    continue;
+                }
+            };
         match recovery_authorization(
             state,
             &pending.account_id,
@@ -2060,14 +2300,13 @@ fn verify_seed_control_reference(
     let Some(journal_seq) = journal_seq else {
         return Ok(()); // Historical seed predating control records.
     };
-    let recorded = pe_execution_core::live_journal::staged_dispatch_control_at(
-        &state.config.journal_path,
-        journal_seq,
-        &seed.dispatch_id,
-    )?
-    .ok_or_else(|| {
-        FanoutError::Signal("dispatch control journal reference is missing".to_owned())
-    })?;
+    let recorded = state
+        .config
+        .journal
+        .staged_dispatch_control(journal_seq, &seed.dispatch_id)?
+        .ok_or_else(|| {
+            FanoutError::Signal("dispatch control journal reference is missing".to_owned())
+        })?;
     if recorded.targets.len() != targets.len()
         || recorded.targets.iter().zip(targets).any(|(audit, target)| {
             audit.account_id.as_str() != target.account_id
@@ -2167,7 +2406,12 @@ async fn process_target(
             return Ok(PassControl::StopSeed);
         }
     };
-    let venue = match PolymarketLiveVenue::from_credentials(&credentials).await {
+    let venue = match PolymarketLiveVenue::from_credentials(
+        &credentials,
+        &state.config.clob_base_url,
+    )
+    .await
+    {
         Ok(venue) => venue,
         Err(error) => {
             warn!(account_id = %target.account_id, error = %error, "live V2 client construction failed; seed paused");
@@ -2355,9 +2599,7 @@ async fn process_target(
     );
     let requested_sizing = match strategy_config.sizing_mode {
         SizingMode::CashFraction { fraction } => {
-            let events = replay_live_account(state, &account.account_id)?;
-            let derived = derive_projection_rows_for_state(state, &account.account_id, &events)
-                .map_err(|error| FanoutError::Signal(error.to_string()))?;
+            let derived = live_summary(state, &account.account_id)?;
             let baseline = derived.baseline_equity.ok_or_else(|| {
                 FanoutError::Signal("live cash-fraction baseline missing".to_owned())
             })?;
@@ -3018,9 +3260,7 @@ async fn live_risk_audit(
     proposed_debit: CollateralAmount,
     per_trade_cap_bps: i32,
 ) -> Result<RiskAudit, RiskInputsUnavailable> {
-    let events = replay_live_account(state, &account.account_id)
-        .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
-    let derived = derive_projection_rows_for_state(state, &account.account_id, &events)
+    let derived = live_summary(state, &account.account_id)
         .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
     let ids = derived
         .positions
@@ -4331,6 +4571,7 @@ struct LiveReplayEvidence<'a> {
     observation_pages: &'a LiveObservationPageIndex,
 }
 
+#[cfg(test)]
 fn verify_replayed_live_risk_with_index(
     account_id: &AccountId,
     preceding_events: &[LiveJournalEvent],
@@ -4342,6 +4583,16 @@ fn verify_replayed_live_risk_with_index(
         preceding_events,
         evidence.source_envelopes,
     )?;
+    verify_live_risk_against(account_id, &derived, admission, evidence)
+}
+
+/// Recompose one admission's risk decision and economics from the financial state just before it.
+fn verify_live_risk_against(
+    account_id: &AccountId,
+    derived: &ProjectionDerivation,
+    admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
+    evidence: LiveReplayEvidence<'_>,
+) -> Result<(), ProjectionReducerError> {
     // Pre-Baseline history remains audit-only and owns no financial state.
     if derived.baseline_sequence.is_none() {
         return Ok(());
@@ -4373,10 +4624,14 @@ fn verify_replayed_live_risk_with_index(
         return Err(ProjectionReducerError::InvalidRiskEvidence);
     }
     let evaluated_at_unix_ms = admission.economic.risk.evaluated_at_unix_ms;
+    // Runtime sizes from authenticated free collateral, which the exact cash check equates with
+    // journal cash less outstanding receivables.
     let cash_before = CollateralAmount::from_decimal_exact(
         derived
             .economic_cash
-            .ok_or(ProjectionReducerError::InvalidRiskEvidence)?,
+            .ok_or(ProjectionReducerError::InvalidRiskEvidence)?
+            .checked_sub(derived.receivable)
+            .ok_or(ProjectionReducerError::Arithmetic)?,
     )
     .map_err(|_| ProjectionReducerError::Arithmetic)?;
     let source_backed_economic = replay_source_backed_economic_with_live_binding(
@@ -4449,7 +4704,7 @@ fn verify_replayed_live_risk_with_index(
         return Err(ProjectionReducerError::InvalidRiskEvidence);
     }
     let reconstructed = compose_live_risk_audit(
-        &derived,
+        derived,
         &paper_era,
         &mids,
         &admission.economic.risk.price_receipts,
@@ -4779,6 +5034,7 @@ fn verify_replayed_live_risk(
     )
 }
 
+#[cfg(test)]
 fn verify_replayed_live_risks(
     account_id: &AccountId,
     events: &[LiveJournalEvent],
@@ -4787,69 +5043,100 @@ fn verify_replayed_live_risks(
     paper_frames: &[Arc<ScannedPaperFrame>],
     observation_pages: &LiveObservationPageIndex,
 ) -> Result<(), ProjectionReducerError> {
-    let mut wire_two_admissions = HashMap::new();
-    let mut expired_dispatches = HashSet::new();
+    let mut timeline = CopyTimeline::default();
     for (event_index, event) in events.iter().enumerate() {
         if let LiveJournalPayload::AdmissionEvaluated(admission) = &event.payload {
+            let evidence = LiveReplayEvidence {
+                source_envelopes,
+                source_receipts,
+                paper_frames,
+                observation_pages,
+            };
             verify_replayed_live_risk_with_index(
                 account_id,
                 &events[..event_index],
                 admission,
-                LiveReplayEvidence {
-                    source_envelopes,
-                    source_receipts,
-                    paper_frames,
-                    observation_pages,
-                },
+                evidence,
             )?;
-            if admission.economic.version
-                == pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
-            {
-                let projection = admission
-                    .identity
-                    .fill_projection
-                    .as_deref()
-                    .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
-                let source_trade_id = SourceTradeId(
-                    projection
-                        .source_trade_id
-                        .clone()
-                        .ok_or(ProjectionReducerError::InvalidRiskEvidence)?,
-                );
-                let (continuation, _) = observation_pages
-                    .get(&source_trade_id)
-                    .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
-                let deadline = verified_copy_deadline_for_continuation(
-                    continuation,
-                    account_id.as_str(),
-                    &admission.identity,
-                    &mut |receipt| {
-                        let envelope = match source_receipts {
-                            Some(index) => index
-                                .source_envelope(receipt)
-                                .map_err(|error| error.to_string())?,
-                            None => source_envelopes
-                                .iter()
-                                .find(|envelope| {
-                                    envelope.seq == receipt.sequence
-                                        && envelope.this_hash == receipt.this_hash
-                                })
-                                .cloned()
-                                .ok_or_else(|| "source receipt is absent".to_owned())?,
-                        };
-                        Ok::<_, String>(CompleteActivityPage::from(envelope))
-                    },
-                )
-                .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
-                wire_two_admissions.insert(
-                    admission.identity.dispatch_id.clone(),
-                    (admission.identity.clone(), deadline),
-                );
-            }
+            timeline.admit(account_id, admission, evidence)?;
         }
-        verify_copy_timeline_event(event, &wire_two_admissions, &mut expired_dispatches)?;
+        timeline.check(event)?;
     }
     Ok(())
+}
+
+/// Wire-two admissions' copy deadlines and the dispatches that expired against them.
+#[derive(Default)]
+struct CopyTimeline {
+    wire_two_admissions: HashMap<String, (LiveOrderIdentity, Option<OffsetDateTime>)>,
+    expired_dispatches: HashSet<String>,
+}
+
+impl CopyTimeline {
+    /// Record a wire-two admission's verified copy deadline; other versions carry none.
+    fn admit(
+        &mut self,
+        account_id: &AccountId,
+        admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
+        evidence: LiveReplayEvidence<'_>,
+    ) -> Result<(), ProjectionReducerError> {
+        if admission.economic.version
+            != pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
+        {
+            return Ok(());
+        }
+        let projection = admission
+            .identity
+            .fill_projection
+            .as_deref()
+            .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+        let source_trade_id = SourceTradeId(
+            projection
+                .source_trade_id
+                .clone()
+                .ok_or(ProjectionReducerError::InvalidRiskEvidence)?,
+        );
+        let (continuation, _) = evidence
+            .observation_pages
+            .get(&source_trade_id)
+            .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+        let deadline = verified_copy_deadline_for_continuation(
+            continuation,
+            account_id.as_str(),
+            &admission.identity,
+            &mut |receipt| {
+                let envelope = match evidence.source_receipts {
+                    Some(index) => index
+                        .source_envelope(receipt)
+                        .map_err(|error| error.to_string())?,
+                    None => evidence
+                        .source_envelopes
+                        .iter()
+                        .find(|envelope| {
+                            envelope.seq == receipt.sequence
+                                && envelope.this_hash == receipt.this_hash
+                        })
+                        .cloned()
+                        .ok_or_else(|| "source receipt is absent".to_owned())?,
+                };
+                Ok::<_, String>(CompleteActivityPage::from(envelope))
+            },
+        )
+        .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+        self.wire_two_admissions.insert(
+            admission.identity.dispatch_id.clone(),
+            (admission.identity.clone(), deadline),
+        );
+        Ok(())
+    }
+
+    fn check(&mut self, event: &LiveJournalEvent) -> Result<(), ProjectionReducerError> {
+        verify_copy_timeline_event(
+            event,
+            &self.wire_two_admissions,
+            &mut self.expired_dispatches,
+        )
+    }
 }
 
 fn verify_copy_timeline_event(
@@ -5133,7 +5420,7 @@ struct LiveOpenExposure {
     debit: CollateralAmount,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub(crate) enum ProjectionReducerError {
     #[error("a second Baseline mark exists in the same account era")]
     DuplicateBaseline,
@@ -5197,6 +5484,12 @@ pub(crate) enum ProjectionReducerError {
     DuplicateDailyMark,
     #[error("a Daily portfolio mark is not a causal UTC-midnight observation")]
     InvalidDailyMark,
+    #[error("a source-citing record is stamped before its evidence was received")]
+    EvidenceAfterStamp,
+    #[error(
+        "a collateral credit is not the surplus over journal cash with nothing reserved or receivable"
+    )]
+    InvalidCollateralCredit,
 }
 
 #[cfg(test)]
@@ -5207,49 +5500,150 @@ pub(crate) fn derive_projection_rows(
     derive_projection_rows_with_sources(account_id, events, &[])
 }
 
-pub(crate) fn derive_projection_rows_with_sources(
-    account_id: &AccountId,
-    events: &[LiveJournalEvent],
-    source_envelopes: &[EventEnvelope],
-) -> Result<ProjectionDerivation, ProjectionReducerError> {
-    if events.iter().any(|event| event.account_id != *account_id) {
-        return Err(ProjectionReducerError::IdentityConflict);
-    }
-    let first_baseline_index =
-        pe_execution_core::live_journal::first_account_baseline_index(events, account_id)
-            .unwrap_or(events.len());
-    let mut baseline_seen = false;
-    let mut economic_cash = None;
-    let mut fills = BTreeMap::<String, (OrderFillFinalizedAudit, LiveFillRow)>::new();
-    let mut prepared_orders =
-        BTreeMap::<String, (u64, Box<pe_execution_core::LiveOrderPreparedAudit>, bool)>::new();
-    let mut evaluated_admissions = BTreeSet::<String>::new();
-    let mut approved_admissions =
-        BTreeMap::<String, Box<pe_execution_core::LiveAdmissionEvaluationAudit>>::new();
-    let mut reservations = BTreeMap::<String, Decimal>::new();
-    let mut resolutions = BTreeMap::<String, pe_execution_core::ResolutionFinalizedAudit>::new();
-    let mut receivable_by_condition = BTreeMap::<String, CollateralAmount>::new();
-    let mut latest_free_collateral = None;
-    let mut latest_reconciled_at = None;
-    let mut daily_marks = BTreeMap::new();
-    let mut baseline_equity = None;
-    let mut baseline_cutoff_unix = None;
-    let mut baseline_sequence = None;
-    let mut realized_closes = Vec::new();
-    let mut custody_facts = HashMap::<
+/// The financial projection reducer, advanced one journal record at a time. A record that fails
+/// leaves the reducer unusable; callers discard it.
+/// History-sized maps share structure: the copy made once per crossed midnight shares them, and
+/// the next write copies only the nodes it touches. The copy still duplicates `realized_closes`
+/// (one entry per resolved condition) and the small per-order state.
+#[derive(Clone)]
+struct ProjectionReducer {
+    account_id: AccountId,
+    baseline_seen: bool,
+    economic_cash: Option<Decimal>,
+    fills: FinalizedFills,
+    prepared_orders: PreparedOrders,
+    evaluated_admissions: imbl::OrdSet<String>,
+    approved_admissions: BTreeMap<String, Box<pe_execution_core::LiveAdmissionEvaluationAudit>>,
+    reservations: BTreeMap<String, Decimal>,
+    resolutions: imbl::OrdMap<String, Arc<pe_execution_core::ResolutionFinalizedAudit>>,
+    receivable_by_condition: BTreeMap<String, CollateralAmount>,
+    latest_free_collateral: Option<Decimal>,
+    latest_reconciled_at: Option<String>,
+    daily_marks: BTreeMap<i64, CollateralAmount>,
+    baseline_equity: Option<CollateralAmount>,
+    baseline_cutoff_unix: Option<i64>,
+    baseline_sequence: Option<u64>,
+    realized_closes: Vec<(i64, Decimal)>,
+    custody_facts: imbl::HashMap<
         RedemptionAttemptIdentity,
-        pe_execution_core::RedemptionCustodyReconciledAudit,
-    >::new();
-    let mut polygon_finality = BTreeMap::<String, PolygonFinalityAuditState>::new();
-    let mut terminal_reconciliations = BTreeMap::<String, Box<LiveOrderReconciliationAudit>>::new();
-    let mut matched_transaction_hashes = BTreeMap::<String, BTreeSet<String>>::new();
-    let mut current_account_binding = None::<LiveAccountBindingAudit>;
+        Arc<pe_execution_core::RedemptionCustodyReconciledAudit>,
+    >,
+    polygon_finality: imbl::OrdMap<String, PolygonFinalityAuditState>,
+    terminal_reconciliations: imbl::OrdMap<String, Arc<LiveOrderReconciliationAudit>>,
+    matched_transaction_hashes: imbl::OrdMap<String, BTreeSet<String>>,
+    current_account_binding: Option<LiveAccountBindingAudit>,
+    /// Token identities of every `OrderPrepared` applied so far, Baseline or not; `None` once two
+    /// of them conflict.
+    prior_prepared_tokens: Option<Arc<ActivityAssetMapping>>,
+    /// Token identities of the accepted post-Baseline `OrderPrepared` records; `None` once two of
+    /// them conflict.
+    prepared_tokens: Option<Arc<ActivityAssetMapping>>,
+    redemption_attempts: pe_execution_core::RedemptionAttempts,
+    /// Finalized fill keys by their prepared order's condition.
+    fills_by_condition: imbl::OrdMap<String, BTreeSet<String>>,
+    /// Conditions holding a finalized fill and no resolution yet.
+    unresolved_fill_conditions: BTreeSet<String>,
+}
 
-    for (event_index, event) in events.iter().enumerate().skip(first_baseline_index) {
+impl ProjectionReducer {
+    fn new(account_id: AccountId) -> Self {
+        Self {
+            account_id,
+            baseline_seen: false,
+            economic_cash: None,
+            fills: imbl::OrdMap::new(),
+            prepared_orders: imbl::OrdMap::new(),
+            evaluated_admissions: imbl::OrdSet::new(),
+            approved_admissions: BTreeMap::new(),
+            reservations: BTreeMap::new(),
+            resolutions: imbl::OrdMap::new(),
+            receivable_by_condition: BTreeMap::new(),
+            latest_free_collateral: None,
+            latest_reconciled_at: None,
+            daily_marks: BTreeMap::new(),
+            baseline_equity: None,
+            baseline_cutoff_unix: None,
+            baseline_sequence: None,
+            realized_closes: Vec::new(),
+            custody_facts: imbl::HashMap::new(),
+            polygon_finality: imbl::OrdMap::new(),
+            terminal_reconciliations: imbl::OrdMap::new(),
+            matched_transaction_hashes: imbl::OrdMap::new(),
+            current_account_binding: None,
+            prior_prepared_tokens: Some(Arc::new(ActivityAssetMapping::from_rows(&[]))),
+            prepared_tokens: Some(Arc::new(ActivityAssetMapping::from_rows(&[]))),
+            redemption_attempts: pe_execution_core::RedemptionAttempts::default(),
+            fills_by_condition: imbl::OrdMap::new(),
+            unresolved_fill_conditions: BTreeSet::new(),
+        }
+    }
+
+    /// Apply the next record of this account's journal. A Daily mark is checked against
+    /// `cutoff`, the financial view of its cutoff supplied by [`ProjectionFold`].
+    fn apply(
+        &mut self,
+        event: &LiveJournalEvent,
+        source_envelopes: &[EventEnvelope],
+        cutoff: Option<&Result<ProjectionDerivation, ProjectionReducerError>>,
+    ) -> Result<(), ProjectionReducerError> {
+        self.apply_record(event, source_envelopes, cutoff)?;
+        if let LiveJournalPayload::OrderPrepared(prepared) = &event.payload {
+            insert_prepared_tokens(&mut self.prior_prepared_tokens, prepared);
+        }
+        self.redemption_attempts.apply(event);
+        Ok(())
+    }
+
+    fn apply_record(
+        &mut self,
+        event: &LiveJournalEvent,
+        source_envelopes: &[EventEnvelope],
+        cutoff: Option<&Result<ProjectionDerivation, ProjectionReducerError>>,
+    ) -> Result<(), ProjectionReducerError> {
+        if event.account_id != self.account_id {
+            return Err(ProjectionReducerError::IdentityConflict);
+        }
+        let baseline_mark = matches!(
+            &event.payload,
+            LiveJournalPayload::AccountPortfolioMarked(mark) if mark.kind == MarkKind::Baseline
+        );
+        if baseline_mark || self.baseline_seen {
+            require_evidence_before_stamp(event, source_envelopes)?;
+        }
+        let Self {
+            account_id,
+            baseline_seen,
+            economic_cash,
+            fills,
+            prepared_orders,
+            evaluated_admissions,
+            approved_admissions,
+            reservations,
+            resolutions,
+            receivable_by_condition,
+            latest_free_collateral,
+            latest_reconciled_at,
+            daily_marks,
+            baseline_equity,
+            baseline_cutoff_unix,
+            baseline_sequence,
+            realized_closes,
+            custody_facts,
+            polygon_finality,
+            terminal_reconciliations,
+            matched_transaction_hashes,
+            current_account_binding,
+            prior_prepared_tokens,
+            prepared_tokens,
+            redemption_attempts,
+            fills_by_condition,
+            unresolved_fill_conditions,
+        } = self;
+        let account_id = &*account_id;
         if let LiveJournalPayload::AccountPortfolioMarked(mark) = &event.payload
             && mark.kind == MarkKind::Baseline
         {
-            if baseline_seen {
+            if *baseline_seen {
                 return Err(ProjectionReducerError::DuplicateBaseline);
             }
             verify_account_binding(&mark.account_binding, account_id)?;
@@ -5258,12 +5652,7 @@ pub(crate) fn derive_projection_rows_with_sources(
                 &mark.venue_position_evidence,
                 source_envelopes,
                 &mark.account_binding,
-                events[..event_index]
-                    .iter()
-                    .filter_map(|prior| match &prior.payload {
-                        LiveJournalPayload::OrderPrepared(prepared) => Some(prepared.as_ref()),
-                        _ => None,
-                    }),
+                prior_prepared_tokens.as_deref(),
             )?;
             if mark.venue_position_evidence.requested_wallet != mark.account_binding.custody_wallet
             {
@@ -5279,19 +5668,19 @@ pub(crate) fn derive_projection_rows_with_sources(
             {
                 return Err(ProjectionReducerError::InvalidBaseline);
             }
-            baseline_seen = true;
-            baseline_equity = Some(mark.equity);
-            baseline_cutoff_unix = Some(mark.cutoff_unix);
-            baseline_sequence = Some(event.seq);
-            economic_cash = Some(mark.equity.to_decimal());
-            current_account_binding = Some(mark.account_binding.clone());
-            latest_free_collateral = Some(mark.account_state.collateral_balance.to_decimal());
-            latest_reconciled_at = format_observed_at(mark.account_state.observed_at);
-            continue;
+            *baseline_seen = true;
+            *baseline_equity = Some(mark.equity);
+            *baseline_cutoff_unix = Some(mark.cutoff_unix);
+            *baseline_sequence = Some(event.seq);
+            *economic_cash = Some(mark.equity.to_decimal());
+            *current_account_binding = Some(mark.account_binding.clone());
+            *latest_free_collateral = Some(mark.account_state.collateral_balance.to_decimal());
+            *latest_reconciled_at = format_observed_at(mark.account_state.observed_at);
+            return Ok(());
         }
-        if !baseline_seen {
+        if !*baseline_seen {
             // Everything before the first synchronized Baseline is retained audit only.
-            continue;
+            return Ok(());
         }
         match &event.payload {
             LiveJournalPayload::OrderPrepared(order) => {
@@ -5315,12 +5704,13 @@ pub(crate) fn derive_projection_rows_with_sources(
                         key.clone(),
                         order.economic.balance.worst_case_debit.to_decimal(),
                     );
+                    insert_prepared_tokens(prepared_tokens, order);
                     prepared_orders.insert(key, (event.seq, order.clone(), false));
                 }
             }
             LiveJournalPayload::AdmissionEvaluated(admission) => {
                 let key = admission.identity.dispatch_id.clone();
-                if !evaluated_admissions.insert(key.clone()) {
+                if evaluated_admissions.insert(key.clone()).is_some() {
                     return Err(ProjectionReducerError::IdentityConflict);
                 }
                 let binding = current_account_binding
@@ -5384,7 +5774,7 @@ pub(crate) fn derive_projection_rows_with_sources(
                         .get(&key)
                         .is_some_and(|prior| prior.as_ref() == reconciled.as_ref())
                     {
-                        continue;
+                        return Ok(());
                     }
                     return Err(ProjectionReducerError::IdentityConflict);
                 }
@@ -5525,14 +5915,14 @@ pub(crate) fn derive_projection_rows_with_sources(
                     {
                         return Err(ProjectionReducerError::IdentityConflict);
                     }
-                    continue;
+                    return Ok(());
                 }
                 let debit = finalized
                     .principal
                     .to_decimal()
                     .checked_add(finalized.fee.to_decimal())
                     .ok_or(ProjectionReducerError::Arithmetic)?;
-                economic_cash = Some(
+                *economic_cash = Some(
                     economic_cash
                         .ok_or(ProjectionReducerError::InvalidBaseline)?
                         .checked_sub(debit)
@@ -5540,7 +5930,13 @@ pub(crate) fn derive_projection_rows_with_sources(
                 );
                 reservations.remove(&key);
                 *terminal = true;
-                fills.insert(key, (finalized.as_ref().clone(), row));
+                let condition = prepared_audit.prepared.condition_id.0.clone();
+                fills_by_condition
+                    .entry(condition.clone())
+                    .or_default()
+                    .insert(key.clone());
+                unresolved_fill_conditions.insert(condition);
+                fills.insert(key, (Arc::clone(finalized), row));
             }
             LiveJournalPayload::ResolutionFinalized(resolution) => {
                 let payout = BinaryPayoutVector::from_canonical_json(
@@ -5554,59 +5950,68 @@ pub(crate) fn derive_projection_rows_with_sources(
                     prepared_orders.values().map(|(_, order, _)| order.as_ref()),
                 )?;
                 if let Some(existing) = resolutions.get(&condition) {
-                    if existing != resolution.as_ref() {
+                    if existing.as_ref() != resolution.as_ref() {
                         return Err(ProjectionReducerError::IdentityConflict);
                     }
-                    continue;
+                    return Ok(());
                 }
                 if prepared_orders.values().any(|(_, order, terminal)| {
                     order.prepared.condition_id.0 == condition && !*terminal
                 }) {
                     return Err(ProjectionReducerError::ResolutionWithPendingOrder);
                 }
-                let credit = resolution_credit(&condition, &payout, &prepared_orders, &fills)?;
-                let closed_cost =
-                    fills
-                        .iter()
-                        .try_fold(CollateralAmount::ZERO, |total, (key, (fill, _))| {
-                            let Some((_, order, _)) = prepared_orders.get(key) else {
-                                return Err(ProjectionReducerError::MissingPrepared);
-                            };
-                            if order.prepared.condition_id.0 != condition {
-                                return Ok(total);
-                            }
-                            let debit = fill
-                                .principal
-                                .checked_add(fill.fee)
-                                .map_err(|_| ProjectionReducerError::Arithmetic)?;
-                            total
-                                .checked_add(debit)
-                                .map_err(|_| ProjectionReducerError::Arithmetic)
-                        })?;
+                let condition_fills = fills_by_condition.get(&condition);
+                let credit = resolution_credit(
+                    &condition,
+                    &payout,
+                    prepared_orders,
+                    fills,
+                    condition_fills,
+                )?;
+                let closed_cost = condition_fills.into_iter().flatten().try_fold(
+                    CollateralAmount::ZERO,
+                    |total, key| {
+                        let (Some((fill, _)), Some((_, order, _))) =
+                            (fills.get(key), prepared_orders.get(key))
+                        else {
+                            return Err(ProjectionReducerError::MissingPrepared);
+                        };
+                        if order.prepared.condition_id.0 != condition {
+                            return Ok(total);
+                        }
+                        let debit = fill
+                            .principal
+                            .checked_add(fill.fee)
+                            .map_err(|_| ProjectionReducerError::Arithmetic)?;
+                        total
+                            .checked_add(debit)
+                            .map_err(|_| ProjectionReducerError::Arithmetic)
+                    },
+                )?;
                 let realized = credit
                     .to_decimal()
                     .checked_sub(closed_cost.to_decimal())
                     .ok_or(ProjectionReducerError::Arithmetic)?;
                 realized_closes.push((event.timestamp.unix_timestamp(), realized));
-                economic_cash = Some(
+                *economic_cash = Some(
                     economic_cash
                         .ok_or(ProjectionReducerError::InvalidBaseline)?
                         .checked_add(credit.to_decimal())
                         .ok_or(ProjectionReducerError::Arithmetic)?,
                 );
-                if credit != CollateralAmount::ZERO {
-                    receivable_by_condition.insert(condition.clone(), credit);
-                }
-                resolutions.insert(condition, resolution.as_ref().clone());
+                // Every resolved holding, a zero payout included, awaits custody of its tokens.
+                receivable_by_condition.insert(condition.clone(), credit);
+                unresolved_fill_conditions.remove(&condition);
+                resolutions.insert(condition, Arc::clone(resolution));
             }
             LiveJournalPayload::RedemptionCustodyReconciled(custody) => {
                 if let Some(existing) = custody_facts.get(&custody.identity) {
-                    if existing != custody.as_ref() {
+                    if existing.as_ref() != custody.as_ref() {
                         return Err(ProjectionReducerError::IdentityConflict);
                     }
-                    continue;
+                    return Ok(());
                 }
-                let attempts = reconstruct_redemption_attempts(&events[..event_index]);
+                let attempts = &*redemption_attempts;
                 if !matches!(
                     attempts
                         .get(&custody.identity)
@@ -5615,8 +6020,9 @@ pub(crate) fn derive_projection_rows_with_sources(
                 ) {
                     return Err(ProjectionReducerError::CustodyWithoutConfirmedRedemption);
                 }
+                // Custody consumes the condition's outstanding receivable, a zero payout included.
                 let condition = custody.identity.condition_id.0.clone();
-                if !resolutions.contains_key(&condition) {
+                if !receivable_by_condition.contains_key(&condition) {
                     return Err(ProjectionReducerError::IdentityConflict);
                 }
                 let binding = current_account_binding
@@ -5628,9 +6034,7 @@ pub(crate) fn derive_projection_rows_with_sources(
                     source_envelopes,
                     &custody.identity.custody_wallet,
                     binding,
-                    prepared_orders
-                        .values()
-                        .map(|(_, prepared, _)| prepared.as_ref()),
+                    prepared_tokens.as_deref(),
                 )?;
                 if canonical_positions(&custody.venue_positions)?
                     != canonical_positions(&raw_positions)?
@@ -5639,24 +6043,37 @@ pub(crate) fn derive_projection_rows_with_sources(
                 }
                 receivable_by_condition.remove(&condition);
                 let expected = derive_custody_positions(
-                    &prepared_orders,
-                    &fills,
-                    &resolutions,
-                    &receivable_by_condition,
+                    prepared_orders,
+                    fills,
+                    resolutions,
+                    receivable_by_condition,
+                    &custody_fill_keys(
+                        fills_by_condition,
+                        unresolved_fill_conditions,
+                        receivable_by_condition,
+                    ),
                 )?;
-                if canonical_positions(&custody.venue_positions)? != expected {
+                if without_redeemable(canonical_positions(&custody.venue_positions)?)
+                    != without_redeemable(expected)
+                {
                     return Err(ProjectionReducerError::CustodyInventoryMismatch);
                 }
-                let receivable = sum_receivable(&receivable_by_condition)?;
-                require_cash_reconciliation(
-                    custody.account_state.collateral_balance,
-                    economic_cash.ok_or(ProjectionReducerError::InvalidBaseline)?,
-                    receivable,
-                )?;
-                latest_free_collateral =
+                // The payout moves from receivable to collateral; any credit that landed while it
+                // was outstanding is the surplus and is recognized here.
+                let accounted = custody
+                    .account_state
+                    .collateral_balance
+                    .to_decimal()
+                    .checked_add(sum_receivable(receivable_by_condition)?.to_decimal())
+                    .ok_or(ProjectionReducerError::Arithmetic)?;
+                if accounted < economic_cash.ok_or(ProjectionReducerError::InvalidBaseline)? {
+                    return Err(ProjectionReducerError::CashMismatch);
+                }
+                *economic_cash = Some(accounted);
+                *latest_free_collateral =
                     Some(custody.account_state.collateral_balance.to_decimal());
-                latest_reconciled_at = format_observed_at(custody.account_state.observed_at);
-                custody_facts.insert(custody.identity.clone(), custody.as_ref().clone());
+                *latest_reconciled_at = format_observed_at(custody.account_state.observed_at);
+                custody_facts.insert(custody.identity.clone(), Arc::clone(custody));
             }
             LiveJournalPayload::AccountPortfolioMarked(mark) if mark.kind == MarkKind::Daily => {
                 if daily_marks.contains_key(&mark.cutoff_unix) {
@@ -5683,12 +6100,7 @@ pub(crate) fn derive_projection_rows_with_sources(
                     &mark.venue_position_evidence,
                     source_envelopes,
                     &mark.account_binding,
-                    events[..event_index]
-                        .iter()
-                        .filter_map(|prior| match &prior.payload {
-                            LiveJournalPayload::OrderPrepared(prepared) => Some(prepared.as_ref()),
-                            _ => None,
-                        }),
+                    prior_prepared_tokens.as_deref(),
                 )?;
                 if canonical_positions(&mark.venue_positions)?
                     != canonical_positions(&raw_positions)?
@@ -5696,34 +6108,31 @@ pub(crate) fn derive_projection_rows_with_sources(
                     return Err(ProjectionReducerError::CustodyInventoryMismatch);
                 }
                 let current_expected = derive_custody_positions(
-                    &prepared_orders,
-                    &fills,
-                    &resolutions,
-                    &receivable_by_condition,
+                    prepared_orders,
+                    fills,
+                    resolutions,
+                    receivable_by_condition,
+                    &custody_fill_keys(
+                        fills_by_condition,
+                        unresolved_fill_conditions,
+                        receivable_by_condition,
+                    ),
                 )?;
-                if canonical_positions(&mark.venue_positions)? != current_expected {
+                if without_redeemable(canonical_positions(&mark.venue_positions)?)
+                    != without_redeemable(current_expected)
+                {
                     return Err(ProjectionReducerError::CustodyInventoryMismatch);
                 }
                 require_cash_reconciliation(
                     mark.account_state.collateral_balance,
                     economic_cash.ok_or(ProjectionReducerError::InvalidBaseline)?,
-                    sum_receivable(&receivable_by_condition)?,
+                    sum_receivable(receivable_by_condition)?,
                 )?;
-                let bounded_events = events[..event_index]
-                    .iter()
-                    .filter(|prior| prior.timestamp.unix_timestamp() < mark.cutoff_unix)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let bounded_sources = source_envelopes
-                    .iter()
-                    .filter(|source| source.received_at.0.unix_timestamp() < mark.cutoff_unix)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let bounded = derive_projection_rows_with_sources(
-                    account_id,
-                    &bounded_events,
-                    &bounded_sources,
-                )?;
+                let bounded = match cutoff {
+                    Some(Ok(bounded)) => bounded,
+                    Some(Err(error)) => return Err(error.clone()),
+                    None => return Err(ProjectionReducerError::InvalidDailyMark),
+                };
                 let mut price_receipts = BTreeSet::new();
                 for price in &mark.prices {
                     if !price_receipts.insert((
@@ -5763,6 +6172,62 @@ pub(crate) fn derive_projection_rows_with_sources(
                     &bounded.custody_positions,
                 )?;
             }
+            LiveJournalPayload::CollateralCredited(credit) => {
+                verify_account_binding(&credit.account_binding, account_id)?;
+                if current_account_binding.as_ref() != Some(&credit.account_binding) {
+                    return Err(ProjectionReducerError::InvalidAccountEvidence);
+                }
+                verify_account_state(&credit.account_state, &credit.account_binding)?;
+                if credit.venue_position_evidence.requested_wallet
+                    != credit.account_binding.custody_wallet
+                {
+                    return Err(ProjectionReducerError::InvalidPositionEvidence);
+                }
+                let raw_positions = replay_position_evidence(
+                    &credit.venue_position_evidence,
+                    source_envelopes,
+                    &credit.account_binding,
+                    prior_prepared_tokens.as_deref(),
+                )?;
+                if canonical_positions(&credit.venue_positions)?
+                    != canonical_positions(&raw_positions)?
+                {
+                    return Err(ProjectionReducerError::CustodyInventoryMismatch);
+                }
+                let expected = derive_custody_positions(
+                    prepared_orders,
+                    fills,
+                    resolutions,
+                    receivable_by_condition,
+                    &custody_fill_keys(
+                        fills_by_condition,
+                        unresolved_fill_conditions,
+                        receivable_by_condition,
+                    ),
+                )?;
+                if without_redeemable(canonical_positions(&credit.venue_positions)?)
+                    != without_redeemable(expected)
+                {
+                    return Err(ProjectionReducerError::CustodyInventoryMismatch);
+                }
+                let reserved = reservations
+                    .values()
+                    .try_fold(Decimal::ZERO, |total, value| total.checked_add(*value))
+                    .ok_or(ProjectionReducerError::Arithmetic)?;
+                let collateral = credit.account_state.collateral_balance;
+                if collateral_credit(
+                    reserved,
+                    sum_receivable(receivable_by_condition)?.to_decimal(),
+                    economic_cash.ok_or(ProjectionReducerError::InvalidBaseline)?,
+                    collateral,
+                ) != Some(credit.credited)
+                {
+                    return Err(ProjectionReducerError::InvalidCollateralCredit);
+                }
+                *economic_cash = Some(collateral.to_decimal());
+                *latest_free_collateral = Some(collateral.to_decimal());
+                *latest_reconciled_at = format_observed_at(credit.account_state.observed_at);
+            }
             LiveJournalPayload::AccountPortfolioMarked(_)
             | LiveJournalPayload::StagedDispatchControl(_)
             | LiveJournalPayload::PendingTargetControl(_)
@@ -5774,115 +6239,456 @@ pub(crate) fn derive_projection_rows_with_sources(
             | LiveJournalPayload::ModeTransitionApplied(_)
             | LiveJournalPayload::LegacyV1(_) => {}
         }
+        Ok(())
     }
 
-    let mut position_totals = BTreeMap::<(String, i64), (Decimal, Decimal)>::new();
-    for (key, (finalized, row)) in &fills {
-        let Some((_, order, _)) = prepared_orders.get(key) else {
-            return Err(ProjectionReducerError::MissingPrepared);
-        };
-        if resolutions.contains_key(&order.prepared.condition_id.0) {
-            continue;
-        }
-        let total = position_totals
-            .entry((row.market_id.clone(), row.outcome_id))
-            .or_insert((Decimal::ZERO, Decimal::ZERO));
-        total.0 = total
-            .0
-            .checked_add(row.contracts)
-            .ok_or(ProjectionReducerError::Arithmetic)?;
-        total.1 = total
-            .1
-            .checked_add(finalized.principal.to_decimal())
-            .and_then(|value| value.checked_add(finalized.fee.to_decimal()))
-            .ok_or(ProjectionReducerError::Arithmetic)?;
+    /// The full derivation, including every historical fill row.
+    fn derivation(&self) -> Result<ProjectionDerivation, ProjectionReducerError> {
+        self.derive(true)
     }
 
-    let mut fill_rows = fills
-        .values()
-        .map(|(_, row)| row.clone())
-        .collect::<Vec<_>>();
-    fill_rows.sort_by(|left, right| left.idempotency_key.cmp(&right.idempotency_key));
-    let mut positions = position_totals
-        .into_iter()
-        .map(
-            |((market_id, outcome_id), (long_contracts, cost_basis))| LivePositionRow {
-                account_id: account_id.as_str().to_owned(),
-                market_id,
-                outcome_id,
-                long_contracts,
-                short_contracts: Decimal::ZERO,
-                cost_basis,
-            },
-        )
-        .collect::<Vec<_>>();
-    positions.sort_by(|left, right| {
-        (&left.market_id, left.outcome_id).cmp(&(&right.market_id, right.outcome_id))
-    });
-    let mut open_exposures = Vec::new();
-    for (key, (finalized, _)) in &fills {
-        let Some((_, order, _)) = prepared_orders.get(key) else {
-            return Err(ProjectionReducerError::MissingPrepared);
-        };
-        if resolutions.contains_key(&order.prepared.condition_id.0) {
-            continue;
+    /// Conditions ready for resolution discovery: each holds a finalized fill and no resolution,
+    /// and every order prepared for it is terminal. Each maps to the outcome tokens its orders
+    /// were admitted for.
+    fn resolvable_conditions(
+        &self,
+    ) -> Result<BTreeMap<String, [pe_core_types::PolymarketTokenId; 2]>, &'static str> {
+        let mut pending = BTreeSet::new();
+        let mut conditions = BTreeMap::new();
+        for (_, order, terminal) in self.prepared_orders.values() {
+            let condition = &order.prepared.condition_id.0;
+            if !self.unresolved_fill_conditions.contains(condition) {
+                continue;
+            }
+            if !terminal {
+                pending.insert(condition);
+            }
+            let tokens = &order.economic.admission.market.ordered_outcome_token_ids;
+            if conditions
+                .entry(condition.clone())
+                .or_insert_with(|| tokens.clone())
+                != tokens
+            {
+                return Err("condition admission mapping conflicts");
+            }
         }
-        let projection = order
-            .identity
-            .fill_projection
-            .as_deref()
-            .ok_or(ProjectionReducerError::MissingProjectionIdentity)?;
-        open_exposures.push(LiveOpenExposure {
-            leader_wallet: projection.leader_wallet.clone(),
-            market_id: projection.market_id.clone(),
-            debit: finalized
-                .principal
-                .checked_add(finalized.fee)
-                .map_err(|_| ProjectionReducerError::Arithmetic)?,
+        conditions.retain(|condition, _| !pending.contains(condition));
+        Ok(conditions)
+    }
+
+    /// The derivation for gates and checks: open and custody-pending state only, without the
+    /// historical fill rows or the prepared-sequence set.
+    fn summary(&self) -> Result<ProjectionDerivation, ProjectionReducerError> {
+        self.derive(false)
+    }
+
+    fn derive(&self, history: bool) -> Result<ProjectionDerivation, ProjectionReducerError> {
+        let Self {
+            account_id,
+            baseline_seen,
+            economic_cash,
+            fills,
+            prepared_orders,
+            evaluated_admissions,
+            approved_admissions,
+            reservations,
+            resolutions,
+            receivable_by_condition,
+            latest_free_collateral,
+            latest_reconciled_at,
+            daily_marks,
+            baseline_equity,
+            baseline_cutoff_unix,
+            baseline_sequence,
+            realized_closes,
+            custody_facts,
+            polygon_finality,
+            terminal_reconciliations,
+            matched_transaction_hashes,
+            current_account_binding,
+            prior_prepared_tokens,
+            prepared_tokens,
+            redemption_attempts,
+            fills_by_condition,
+            unresolved_fill_conditions,
+        } = self;
+        let _ = (
+            baseline_seen,
+            evaluated_admissions,
+            custody_facts,
+            polygon_finality,
+        );
+        let _ = (terminal_reconciliations, matched_transaction_hashes);
+        let _ = (prior_prepared_tokens, prepared_tokens, redemption_attempts);
+        let open_fill_keys = unresolved_fill_conditions
+            .iter()
+            .filter_map(|condition| fills_by_condition.get(condition))
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        let mut position_totals = BTreeMap::<(String, i64), (Decimal, Decimal)>::new();
+        for key in &open_fill_keys {
+            let (Some((finalized, row)), Some((_, order, _))) =
+                (fills.get(*key), prepared_orders.get(*key))
+            else {
+                return Err(ProjectionReducerError::MissingPrepared);
+            };
+            if resolutions.contains_key(&order.prepared.condition_id.0) {
+                continue;
+            }
+            let total = position_totals
+                .entry((row.market_id.clone(), row.outcome_id))
+                .or_insert((Decimal::ZERO, Decimal::ZERO));
+            total.0 = total
+                .0
+                .checked_add(row.contracts)
+                .ok_or(ProjectionReducerError::Arithmetic)?;
+            total.1 = total
+                .1
+                .checked_add(finalized.principal.to_decimal())
+                .and_then(|value| value.checked_add(finalized.fee.to_decimal()))
+                .ok_or(ProjectionReducerError::Arithmetic)?;
+        }
+
+        let mut fill_rows = if history {
+            fills
+                .values()
+                .map(|(_, row)| row.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        fill_rows.sort_by(|left, right| left.idempotency_key.cmp(&right.idempotency_key));
+        let mut positions = position_totals
+            .into_iter()
+            .map(
+                |((market_id, outcome_id), (long_contracts, cost_basis))| LivePositionRow {
+                    account_id: account_id.as_str().to_owned(),
+                    market_id,
+                    outcome_id,
+                    long_contracts,
+                    short_contracts: Decimal::ZERO,
+                    cost_basis,
+                },
+            )
+            .collect::<Vec<_>>();
+        positions.sort_by(|left, right| {
+            (&left.market_id, left.outcome_id).cmp(&(&right.market_id, right.outcome_id))
         });
-    }
+        let mut open_exposures = Vec::new();
+        for key in &open_fill_keys {
+            let (Some((finalized, _)), Some((_, order, _))) =
+                (fills.get(*key), prepared_orders.get(*key))
+            else {
+                return Err(ProjectionReducerError::MissingPrepared);
+            };
+            if resolutions.contains_key(&order.prepared.condition_id.0) {
+                continue;
+            }
+            let projection = order
+                .identity
+                .fill_projection
+                .as_deref()
+                .ok_or(ProjectionReducerError::MissingProjectionIdentity)?;
+            open_exposures.push(LiveOpenExposure {
+                leader_wallet: projection.leader_wallet.clone(),
+                market_id: projection.market_id.clone(),
+                debit: finalized
+                    .principal
+                    .checked_add(finalized.fee)
+                    .map_err(|_| ProjectionReducerError::Arithmetic)?,
+            });
+        }
 
-    let custody_positions = derive_custody_positions(
-        &prepared_orders,
-        &fills,
-        &resolutions,
-        &receivable_by_condition,
-    )?;
-    let receivable = sum_receivable(&receivable_by_condition)?.to_decimal();
-    let reserved = reservations
-        .values()
-        .try_fold(Decimal::ZERO, |total, value| {
-            total
-                .checked_add(*value)
-                .ok_or(ProjectionReducerError::Arithmetic)
-        })?;
-    Ok(ProjectionDerivation {
-        fills: fill_rows,
-        positions,
-        custody_positions,
-        reserved,
-        economic_cash,
-        receivable,
-        latest_free_collateral,
-        latest_reconciled_at,
-        baseline_equity,
-        baseline_cutoff_unix,
-        baseline_sequence,
-        account_binding: current_account_binding,
-        daily_marks,
-        realized_closes,
-        validated_prepared_sequences: prepared_orders
+        let custody_positions = derive_custody_positions(
+            prepared_orders,
+            fills,
+            resolutions,
+            receivable_by_condition,
+            &custody_fill_keys(
+                fills_by_condition,
+                unresolved_fill_conditions,
+                receivable_by_condition,
+            ),
+        )?;
+        let receivable = sum_receivable(receivable_by_condition)?.to_decimal();
+        let reserved = reservations
             .values()
-            .map(|(sequence, _, _)| *sequence)
-            .collect(),
-        pending_approved_admission_keys: approved_admissions.keys().cloned().collect(),
-        open_exposures,
-        receivable_by_condition,
-    })
+            .try_fold(Decimal::ZERO, |total, value| {
+                total
+                    .checked_add(*value)
+                    .ok_or(ProjectionReducerError::Arithmetic)
+            })?;
+        Ok(ProjectionDerivation {
+            fills: fill_rows,
+            positions,
+            custody_positions,
+            reserved,
+            economic_cash: *economic_cash,
+            receivable,
+            latest_free_collateral: *latest_free_collateral,
+            latest_reconciled_at: latest_reconciled_at.clone(),
+            baseline_equity: *baseline_equity,
+            baseline_cutoff_unix: *baseline_cutoff_unix,
+            baseline_sequence: *baseline_sequence,
+            account_binding: current_account_binding.clone(),
+            daily_marks: daily_marks.clone(),
+            realized_closes: realized_closes.clone(),
+            validated_prepared_sequences: if history {
+                prepared_orders
+                    .values()
+                    .map(|(sequence, _, _)| *sequence)
+                    .collect()
+            } else {
+                BTreeSet::new()
+            },
+            pending_approved_admission_keys: approved_admissions.keys().cloned().collect(),
+            open_exposures,
+            receivable_by_condition: receivable_by_condition.clone(),
+        })
+    }
 }
 
-type PreparedOrders = BTreeMap<String, (u64, Box<pe_execution_core::LiveOrderPreparedAudit>, bool)>;
-type FinalizedFills = BTreeMap<String, (OrderFillFinalizedAudit, LiveFillRow)>;
+/// The financial reducer plus, for each UTC midnight after the Baseline that a record has
+/// crossed and no Daily mark has consumed yet, a copy holding only the records stamped before it.
+/// A Daily mark's cutoff view is that copy, or the reducer itself while nothing at or after the
+/// cutoff has been applied; with every source-citing record stamped after its evidence, either
+/// equals the records stamped before the cutoff with sources received before it.
+struct ProjectionFold {
+    main: ProjectionReducer,
+    /// The Baseline's stamp, in unix seconds.
+    baseline_stamp: Option<i64>,
+    /// The latest stamp applied since the Baseline, in unix seconds, or stamped on a record
+    /// before it.
+    latest_stamp: Option<i64>,
+    /// A failed copy keeps its error until that cutoff's mark is built or applied.
+    cutoffs: BTreeMap<i64, Result<Arc<ProjectionReducer>, ProjectionReducerError>>,
+    /// Records before the Baseline, kept until it arrives: a cutoff after the Baseline that some
+    /// of them are stamped at or after gets a copy holding only the earlier ones.
+    pre_baseline: Vec<LiveJournalEvent>,
+    /// How many times each (cutoff, record) pair was applied to a copy.
+    #[cfg(test)]
+    late_applied: BTreeMap<(i64, u64), usize>,
+}
+
+impl ProjectionFold {
+    fn new(account_id: AccountId) -> Self {
+        Self {
+            main: ProjectionReducer::new(account_id),
+            baseline_stamp: None,
+            latest_stamp: None,
+            cutoffs: BTreeMap::new(),
+            pre_baseline: Vec::new(),
+            #[cfg(test)]
+            late_applied: BTreeMap::new(),
+        }
+    }
+
+    /// Apply the next record of this account's journal; a failure leaves the fold unusable.
+    fn apply(
+        &mut self,
+        event: &LiveJournalEvent,
+        source_envelopes: &[EventEnvelope],
+    ) -> Result<(), ProjectionReducerError> {
+        let stamp = event.timestamp.unix_timestamp();
+        let daily_cutoff = match &event.payload {
+            LiveJournalPayload::AccountPortfolioMarked(mark) if mark.kind == MarkKind::Daily => {
+                Some(mark.cutoff_unix)
+            }
+            _ => None,
+        };
+        let cutoff = daily_cutoff
+            .filter(|_| self.main.baseline_seen)
+            .map(|cutoff_unix| self.cutoff_summary(cutoff_unix));
+        let first_crossed = self.latest_stamp.map(|latest| {
+            latest
+                .div_euclid(86_400)
+                .saturating_add(1)
+                .saturating_mul(86_400)
+        });
+        if let Some(mut midnight) = first_crossed.filter(|midnight| *midnight <= stamp) {
+            // Copied only when a midnight is crossed: once per day, not per record.
+            let last_mark = self
+                .main
+                .daily_marks
+                .last_key_value()
+                .map(|(cutoff, _)| *cutoff);
+            let copy = Arc::new(self.main.clone());
+            while midnight <= stamp {
+                if last_mark.is_none_or(|last| midnight > last) {
+                    self.cutoffs
+                        .entry(midnight)
+                        .or_insert_with(|| Ok(Arc::clone(&copy)));
+                }
+                midnight = midnight.saturating_add(86_400);
+            }
+        }
+        self.main.apply(event, source_envelopes, cutoff.as_ref())?;
+        for (cutoff_unix, copy) in self.cutoffs.range_mut(stamp.saturating_add(1)..) {
+            let Ok(reducer) = copy else {
+                continue;
+            };
+            #[cfg(test)]
+            {
+                *self
+                    .late_applied
+                    .entry((*cutoff_unix, event.seq))
+                    .or_default() += 1;
+            }
+            let bounded_sources = source_envelopes
+                .iter()
+                .filter(|source| source.received_at.0.unix_timestamp() < *cutoff_unix)
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Err(error) =
+                Arc::make_mut(reducer).apply(event, &bounded_sources, cutoff.as_ref())
+            {
+                *copy = Err(error);
+            }
+        }
+        if !self.main.baseline_seen {
+            self.pre_baseline.push(event.clone());
+            return Ok(());
+        }
+        if self.baseline_stamp.is_none() {
+            self.baseline_stamp = Some(stamp);
+            self.copy_pre_baseline_cutoffs(event, source_envelopes, stamp);
+        }
+        self.latest_stamp = Some(self.latest_stamp.map_or(stamp, |latest| latest.max(stamp)));
+        if let Some(marked) = daily_cutoff.filter(|_| cutoff.is_some()) {
+            self.cutoffs.retain(|cutoff_unix, _| *cutoff_unix > marked);
+        }
+        Ok(())
+    }
+
+    /// At the Baseline, give each midnight after it that a record before it is stamped at or after
+    /// a copy of the records stamped before that midnight, so the cutoff view excludes the later
+    /// ones as for any other record.
+    fn copy_pre_baseline_cutoffs(
+        &mut self,
+        baseline: &LiveJournalEvent,
+        source_envelopes: &[EventEnvelope],
+        baseline_stamp: i64,
+    ) {
+        let pre_baseline = std::mem::take(&mut self.pre_baseline);
+        let Some(latest) = pre_baseline
+            .iter()
+            .map(|event| event.timestamp.unix_timestamp())
+            .max()
+        else {
+            return;
+        };
+        let mut midnight = baseline_stamp
+            .div_euclid(86_400)
+            .saturating_add(1)
+            .saturating_mul(86_400);
+        while midnight <= latest {
+            let bounded_sources = source_envelopes
+                .iter()
+                .filter(|source| source.received_at.0.unix_timestamp() < midnight)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut copy = ProjectionReducer::new(self.main.account_id.clone());
+            let built = pre_baseline
+                .iter()
+                .filter(|event| event.timestamp.unix_timestamp() < midnight)
+                .chain(std::iter::once(baseline))
+                .try_for_each(|event| copy.apply(event, &bounded_sources, None));
+            self.cutoffs
+                .insert(midnight, built.map(|()| Arc::new(copy)));
+            midnight = midnight.saturating_add(86_400);
+        }
+        self.latest_stamp = Some(latest.max(baseline_stamp));
+    }
+
+    /// The financial view as of one UTC-midnight cutoff: the records stamped before it.
+    fn cutoff_summary(
+        &self,
+        cutoff_unix: i64,
+    ) -> Result<ProjectionDerivation, ProjectionReducerError> {
+        if self
+            .baseline_stamp
+            .is_none_or(|baseline| cutoff_unix <= baseline)
+        {
+            return Ok(ProjectionDerivation::default());
+        }
+        match self.cutoffs.get(&cutoff_unix) {
+            Some(Ok(copy)) => copy.summary(),
+            Some(Err(error)) => Err(error.clone()),
+            None if self.latest_stamp.is_some_and(|latest| latest < cutoff_unix) => {
+                self.main.summary()
+            }
+            None => Err(ProjectionReducerError::InvalidDailyMark),
+        }
+    }
+
+    fn derivation(&self) -> Result<ProjectionDerivation, ProjectionReducerError> {
+        self.main.derivation()
+    }
+
+    fn summary(&self) -> Result<ProjectionDerivation, ProjectionReducerError> {
+        self.main.summary()
+    }
+}
+
+/// A source-citing record must be stamped no earlier than the receipt of the evidence it cites;
+/// evidence absent from `source_envelopes` is left to the record's own checks.
+fn require_evidence_before_stamp(
+    event: &LiveJournalEvent,
+    source_envelopes: &[EventEnvelope],
+) -> Result<(), ProjectionReducerError> {
+    let cited: Vec<&AppendReceipt> = match &event.payload {
+        LiveJournalPayload::AccountPortfolioMarked(mark) => mark
+            .venue_position_evidence
+            .pages
+            .iter()
+            .map(|page| &page.receipt)
+            .chain(mark.prices.iter().map(|price| &price.receipt))
+            .collect(),
+        LiveJournalPayload::ResolutionFinalized(resolution) => {
+            vec![&resolution.source_append_receipt]
+        }
+        LiveJournalPayload::RedemptionCustodyReconciled(custody) => {
+            custody.venue_position_receipts.iter().collect()
+        }
+        LiveJournalPayload::CollateralCredited(credit) => credit
+            .venue_position_evidence
+            .pages
+            .iter()
+            .map(|page| &page.receipt)
+            .collect(),
+        _ => return Ok(()),
+    };
+    let late = cited.into_iter().any(|receipt| {
+        source_envelopes.iter().any(|envelope| {
+            envelope.seq == receipt.sequence
+                && envelope.this_hash == receipt.this_hash
+                && envelope.received_at.0 > event.timestamp
+        })
+    });
+    if late {
+        return Err(ProjectionReducerError::EvidenceAfterStamp);
+    }
+    Ok(())
+}
+
+pub(crate) fn derive_projection_rows_with_sources(
+    account_id: &AccountId,
+    events: &[LiveJournalEvent],
+    source_envelopes: &[EventEnvelope],
+) -> Result<ProjectionDerivation, ProjectionReducerError> {
+    if events.iter().any(|event| event.account_id != *account_id) {
+        return Err(ProjectionReducerError::IdentityConflict);
+    }
+    let mut fold = ProjectionFold::new(account_id.clone());
+    for event in events {
+        fold.apply(event, source_envelopes)?;
+    }
+    fold.derivation()
+}
+
+type PreparedOrders =
+    imbl::OrdMap<String, (u64, Arc<pe_execution_core::LiveOrderPreparedAudit>, bool)>;
+type FinalizedFills = imbl::OrdMap<String, (Arc<OrderFillFinalizedAudit>, LiveFillRow)>;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum PolygonFinalityPhase {
@@ -5893,7 +6699,7 @@ enum PolygonFinalityPhase {
     Finalized,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct PolygonFinalityAuditState {
     phase: PolygonFinalityPhase,
     immutable_receipts: BTreeMap<String, MatchedReceipt>,
@@ -6056,11 +6862,11 @@ fn retained_position_response(
     serde_json::from_slice(payload).map_err(|_| ProjectionReducerError::InvalidPositionEvidence)
 }
 
-fn replay_position_evidence<'a>(
+fn replay_position_evidence(
     evidence: &LivePositionEvidenceAudit,
     source_envelopes: &[EventEnvelope],
     binding: &LiveAccountBindingAudit,
-    prepared_orders: impl Iterator<Item = &'a pe_execution_core::LiveOrderPreparedAudit>,
+    prepared_tokens: Option<&ActivityAssetMapping>,
 ) -> Result<Vec<CanonicalPositionAudit>, ProjectionReducerError> {
     if evidence.pages.is_empty()
         || evidence
@@ -6093,28 +6899,7 @@ fn replay_position_evidence<'a>(
     if requested_wallet.to_string() != evidence.requested_wallet {
         return Err(ProjectionReducerError::InvalidPositionEvidence);
     }
-    let mut mapping = ActivityAssetMapping::from_rows(&[]);
-    for prepared in prepared_orders {
-        for (outcome_index, token_id) in prepared
-            .economic
-            .admission
-            .market
-            .ordered_outcome_token_ids
-            .iter()
-            .enumerate()
-        {
-            mapping
-                .insert_verified_ordinary(
-                    token_id.clone(),
-                    prepared.economic.market.condition_id.clone(),
-                    OutcomeId(
-                        u16::try_from(outcome_index)
-                            .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?,
-                    ),
-                )
-                .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?;
-        }
-    }
+    let mapping = prepared_tokens.ok_or(ProjectionReducerError::InvalidPositionEvidence)?;
     let fetcher = RetainedPositionFetcher {
         pages: Mutex::new(pages),
     };
@@ -6122,7 +6907,7 @@ fn replay_position_evidence<'a>(
         &fetcher,
         "https://offline.invalid",
         requested_wallet,
-        &mapping,
+        mapping,
     ))
     .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?;
     if complete.pages.len() != evidence.pages.len()
@@ -6153,12 +6938,12 @@ fn replay_position_evidence<'a>(
         .collect()
 }
 
-fn replay_position_receipts_legacy<'a>(
+fn replay_position_receipts_legacy(
     receipts: &[AppendReceipt],
     source_envelopes: &[EventEnvelope],
     requested_wallet: &str,
     binding: &LiveAccountBindingAudit,
-    prepared_orders: impl Iterator<Item = &'a pe_execution_core::LiveOrderPreparedAudit>,
+    prepared_tokens: Option<&ActivityAssetMapping>,
 ) -> Result<Vec<CanonicalPositionAudit>, ProjectionReducerError> {
     if receipts.is_empty()
         || receipts
@@ -6186,28 +6971,7 @@ fn replay_position_receipts_legacy<'a>(
         .collect::<Result<VecDeque<_>, _>>()?;
     let requested_wallet = WalletAddress::from_hex(requested_wallet)
         .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?;
-    let mut mapping = ActivityAssetMapping::from_rows(&[]);
-    for prepared in prepared_orders {
-        for (outcome_index, token_id) in prepared
-            .economic
-            .admission
-            .market
-            .ordered_outcome_token_ids
-            .iter()
-            .enumerate()
-        {
-            mapping
-                .insert_verified_ordinary(
-                    token_id.clone(),
-                    prepared.economic.market.condition_id.clone(),
-                    OutcomeId(
-                        u16::try_from(outcome_index)
-                            .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?,
-                    ),
-                )
-                .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?;
-        }
-    }
+    let mapping = prepared_tokens.ok_or(ProjectionReducerError::InvalidPositionEvidence)?;
     let fetcher = RetainedPositionFetcher {
         pages: Mutex::new(pages),
     };
@@ -6215,7 +6979,7 @@ fn replay_position_receipts_legacy<'a>(
         &fetcher,
         "https://offline.invalid",
         requested_wallet,
-        &mapping,
+        mapping,
     ))
     .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?;
     if complete.pages.len() != receipts.len()
@@ -6392,10 +7156,11 @@ fn resolution_credit(
     payout: &BinaryPayoutVector,
     prepared: &PreparedOrders,
     fills: &FinalizedFills,
+    condition_fills: Option<&BTreeSet<String>>,
 ) -> Result<CollateralAmount, ProjectionReducerError> {
     let mut positions = Vec::new();
-    for (key, (fill, _)) in fills {
-        let Some((_, order, _)) = prepared.get(key) else {
+    for key in condition_fills.into_iter().flatten() {
+        let (Some((fill, _)), Some((_, order, _))) = (fills.get(key), prepared.get(key)) else {
             return Err(ProjectionReducerError::MissingPrepared);
         };
         if order.prepared.condition_id.0 != condition {
@@ -6410,15 +7175,89 @@ fn resolution_credit(
         .map_err(|_| ProjectionReducerError::Arithmetic)
 }
 
+/// The external credit an account journals: the venue collateral's surplus over journal cash while
+/// nothing is reserved or receivable. One rule for the runtime gate and the reducer.
+fn collateral_credit(
+    reserved: Decimal,
+    receivable: Decimal,
+    economic_cash: Decimal,
+    collateral: CollateralAmount,
+) -> Option<CollateralAmount> {
+    if reserved != Decimal::ZERO || receivable != Decimal::ZERO {
+        return None;
+    }
+    let surplus = collateral.to_decimal().checked_sub(economic_cash)?;
+    if surplus <= Decimal::ZERO {
+        return None;
+    }
+    CollateralAmount::from_decimal_exact(surplus).ok()
+}
+
+/// Journal-versus-venue inventory equality ignores the venue's redeemable flag, which the Data API
+/// sets at on-chain resolution before the journal records it; the journal's own flag still values
+/// positions and raw-page-versus-record checks stay exact.
+fn without_redeemable(mut positions: Vec<CanonicalPositionAudit>) -> Vec<CanonicalPositionAudit> {
+    for position in &mut positions {
+        position.redeemable = false;
+    }
+    positions
+}
+
+/// Insert one prepared order's outcome tokens; a conflict leaves no mapping.
+fn insert_prepared_tokens(
+    tokens: &mut Option<Arc<ActivityAssetMapping>>,
+    prepared: &pe_execution_core::LiveOrderPreparedAudit,
+) {
+    let Some(mapping) = tokens else {
+        return;
+    };
+    let mapping = Arc::make_mut(mapping);
+    let inserted = prepared
+        .economic
+        .admission
+        .market
+        .ordered_outcome_token_ids
+        .iter()
+        .enumerate()
+        .try_for_each(|(outcome_index, token_id)| {
+            let outcome = u16::try_from(outcome_index).map_err(|_| ())?;
+            mapping
+                .insert_verified_ordinary(
+                    token_id.clone(),
+                    prepared.economic.market.condition_id.clone(),
+                    OutcomeId(outcome),
+                )
+                .map_err(|_| ())
+        });
+    if inserted.is_err() {
+        *tokens = None;
+    }
+}
+
+/// Finalized fills still held in custody: unresolved, or resolved with a receivable.
+fn custody_fill_keys<'a>(
+    fills_by_condition: &'a imbl::OrdMap<String, BTreeSet<String>>,
+    unresolved_fill_conditions: &'a BTreeSet<String>,
+    receivable: &'a BTreeMap<String, CollateralAmount>,
+) -> BTreeSet<&'a String> {
+    unresolved_fill_conditions
+        .iter()
+        .chain(receivable.keys())
+        .filter_map(|condition| fills_by_condition.get(condition))
+        .flatten()
+        .collect()
+}
+
 fn derive_custody_positions(
     prepared: &PreparedOrders,
     fills: &FinalizedFills,
-    resolutions: &BTreeMap<String, pe_execution_core::ResolutionFinalizedAudit>,
+    resolutions: &imbl::OrdMap<String, Arc<pe_execution_core::ResolutionFinalizedAudit>>,
     receivable: &BTreeMap<String, CollateralAmount>,
+    custody_fills: &BTreeSet<&String>,
 ) -> Result<Vec<CanonicalPositionAudit>, ProjectionReducerError> {
     let mut positions = BTreeMap::<String, CanonicalPositionAudit>::new();
-    for (key, (fill, _)) in fills {
-        let Some((_, order, _)) = prepared.get(key) else {
+    for key in custody_fills {
+        let (Some((fill, _)), Some((_, order, _))) = (fills.get(*key), prepared.get(*key)) else {
             return Err(ProjectionReducerError::MissingPrepared);
         };
         let condition = &order.prepared.condition_id.0;
@@ -6560,14 +7399,7 @@ async fn reconcile_account_projection(
     account_id: &AccountId,
     _now: OffsetDateTime,
 ) {
-    let events = match replay_live_account(state, account_id) {
-        Ok(events) => events,
-        Err(error) => {
-            error!(account_id = %account_id, error = %error, "live projection journal replay failed");
-            return;
-        }
-    };
-    let derived = match derive_projection_rows_for_state(state, account_id, &events) {
+    let derived = match sync_live(state).and_then(|live| live.derivation(account_id)) {
         Ok(derived) => derived,
         Err(error) => {
             error!(account_id = %account_id, error = %error, "live projection derivation failed");
@@ -6625,12 +7457,9 @@ fn compose_account_state_row(
 
 async fn reconcile_projections(state: &mut FanoutState, now: OffsetDateTime) {
     let snapshot = state.config.live_accounts.snapshot();
-    let mut accounts = recovery_inventory(
-        &state.config.journal_path,
-        state.config.era_live_prefix.as_ref(),
-    )
-    .map(|inventory| inventory.account_ids.into_iter().collect::<BTreeSet<_>>())
-    .unwrap_or_default();
+    let mut accounts = sync_live(state)
+        .map(|live| live.accounts.keys().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
     accounts.extend(
         snapshot
             .accounts
@@ -6643,8 +7472,7 @@ async fn reconcile_projections(state: &mut FanoutState, now: OffsetDateTime) {
 }
 
 struct RecoveredPrepared {
-    journal_seq: u64,
-    audit: Box<pe_execution_core::LiveOrderPreparedAudit>,
+    audit: Arc<pe_execution_core::LiveOrderPreparedAudit>,
     transaction_hashes: BTreeSet<String>,
     finalized: bool,
 }
@@ -6655,107 +7483,32 @@ fn recovered_prepared(
 ) -> Result<Option<RecoveredPrepared>, FanoutError> {
     let account_id = AccountId::new(&target.account_id)
         .map_err(|error| FanoutError::Signal(error.to_string()))?;
-    let events = replay_live_account(state, &account_id)?;
-    let mut recovered = None;
-    for event in events {
-        if event.account_id != account_id {
-            return Err(FanoutError::Signal(
-                "live order fact belongs to the wrong account envelope".to_owned(),
-            ));
-        }
-        match event.payload {
-            LiveJournalPayload::OrderPrepared(prepared)
-                if prepared.identity.dispatch_id == target.dispatch_id && recovered.is_some() =>
-            {
-                return Err(FanoutError::Signal(
-                    "duplicate prepared record for one dispatch target".to_owned(),
-                ));
-            }
-            LiveJournalPayload::OrderPrepared(prepared)
-                if prepared.identity.dispatch_id == target.dispatch_id =>
-            {
-                if prepared.frozen_binding.version != target.credential_bundle_version
-                    || prepared.frozen_binding.key_id != target.credential_key_id
-                {
-                    return Err(FanoutError::Signal(
-                        "prepared order does not match the target account binding".to_owned(),
-                    ));
-                }
-                recovered = Some(RecoveredPrepared {
-                    journal_seq: event.seq,
-                    audit: prepared,
-                    transaction_hashes: BTreeSet::new(),
-                    finalized: false,
-                });
-            }
-            LiveJournalPayload::OrderPosted(posted)
-                if posted.identity.dispatch_id == target.dispatch_id =>
-            {
-                let Some(prepared) = recovered.as_ref() else {
-                    return Err(FanoutError::Signal(
-                        "posted order precedes its prepared record".to_owned(),
-                    ));
-                };
-                if !prepared_order_fact_matches(
-                    prepared.journal_seq,
-                    &prepared.audit.identity,
-                    &prepared.audit.prepared.order_hash,
-                    PreparedOrderFact::Posted(&posted),
-                ) {
-                    return Err(FanoutError::Signal(
-                        "posted order does not match its prepared record".to_owned(),
-                    ));
-                }
-            }
-            LiveJournalPayload::OrderReconciled(reconciled)
-                if reconciled.identity.dispatch_id == target.dispatch_id =>
-            {
-                let Some(prepared) = recovered.as_mut() else {
-                    return Err(FanoutError::Signal(
-                        "reconciled order precedes its prepared record".to_owned(),
-                    ));
-                };
-                if !prepared_order_fact_matches(
-                    prepared.journal_seq,
-                    &prepared.audit.identity,
-                    &prepared.audit.prepared.order_hash,
-                    PreparedOrderFact::Reconciled(&reconciled),
-                ) {
-                    return Err(FanoutError::Signal(
-                        "reconciled order does not match its prepared record".to_owned(),
-                    ));
-                }
-                if let LiveJournalOrderOutcome::Matched {
-                    transaction_hashes, ..
-                } = reconciled.outcome
-                {
-                    prepared.transaction_hashes.extend(transaction_hashes);
-                }
-            }
-            LiveJournalPayload::OrderFillFinalized(finalized)
-                if finalized.identity.dispatch_id == target.dispatch_id =>
-            {
-                let Some(prepared) = recovered.as_mut() else {
-                    return Err(FanoutError::Signal(
-                        "finalized fill precedes its prepared record".to_owned(),
-                    ));
-                };
-                if !prepared_order_fact_matches(
-                    prepared.journal_seq,
-                    &prepared.audit.identity,
-                    &prepared.audit.prepared.order_hash,
-                    PreparedOrderFact::Finalized(&finalized),
-                ) {
-                    return Err(FanoutError::Signal(
-                        "finalized fill does not match its prepared record".to_owned(),
-                    ));
-                }
-                prepared.finalized = true;
-            }
-            _ => {}
-        }
+    let live = sync_live(state)?;
+    let Some(view) = live.view(&account_id)? else {
+        return Ok(None);
+    };
+    // The folds already rejected any fact that precedes, duplicates, or contradicts its prepared
+    // record; what remains is this target's frozen binding.
+    let reducer = &view.financial.main;
+    let Some((_, audit, _)) = reducer.prepared_orders.get(&target.dispatch_id) else {
+        return Ok(None);
+    };
+    if audit.frozen_binding.version != target.credential_bundle_version
+        || audit.frozen_binding.key_id != target.credential_key_id
+    {
+        return Err(FanoutError::Signal(
+            "prepared order does not match the target account binding".to_owned(),
+        ));
     }
-    Ok(recovered)
+    Ok(Some(RecoveredPrepared {
+        audit: Arc::clone(audit),
+        transaction_hashes: reducer
+            .matched_transaction_hashes
+            .get(&target.dispatch_id)
+            .cloned()
+            .unwrap_or_default(),
+        finalized: reducer.fills.contains_key(&target.dispatch_id),
+    }))
 }
 
 /// Reconcile one `submitted`/`ambiguous` target (#514 classify-first). Runs before — and
@@ -6795,7 +7548,12 @@ async fn recover_in_flight_target(
             return Ok(PassControl::StopSeed);
         }
     };
-    let venue = match PolymarketLiveVenue::from_credentials(&credentials).await {
+    let venue = match PolymarketLiveVenue::from_credentials(
+        &credentials,
+        &state.config.clob_base_url,
+    )
+    .await
+    {
         Ok(venue) => venue,
         Err(error) => {
             warn!(account_id = %target.account_id, error = %error, "live V2 client construction failed; recovery retries");
@@ -6913,7 +7671,7 @@ async fn recover_target(
     state.config.journal.append(
         account_id,
         reconciled_at,
-        LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+        LiveJournalPayload::OrderReconciled(Arc::new(LiveOrderReconciliationAudit {
             identity,
             order_hash,
             source: LiveReconciliationSource::OrderHashLookupAndCancel,
@@ -7104,7 +7862,7 @@ async fn ensure_live_portfolio_marks(
         account_state,
         account_binding,
         custody_wallet,
-        OffsetDateTime::now_utc(),
+        (state.clock)(),
     )
     .await
 }
@@ -7117,9 +7875,14 @@ async fn ensure_live_portfolio_marks_at(
     custody_wallet: &str,
     now: OffsetDateTime,
 ) -> CheckOutcome {
-    let mut events = match replay_live_account(state, &account.account_id) {
-        Ok(events) => events,
-        Err(_) => return CheckOutcome::Transient("live journal unavailable"),
+    let read = sync_live(state).map(|live| {
+        (
+            live.summary(&account.account_id),
+            live.prepared_tokens(&account.account_id),
+        )
+    });
+    let Ok((summary, prepared_tokens)) = read else {
+        return CheckOutcome::Transient("live journal unavailable");
     };
     let expected_credential = account
         .credential_binding
@@ -7135,22 +7898,26 @@ async fn ensure_live_portfolio_marks_at(
     {
         return CheckOutcome::PersistentFail("live account binding invalid");
     }
-    let mut derived = match derive_projection_rows_for_state(state, &account.account_id, &events) {
-        Ok(derived) => derived,
-        Err(_) => return CheckOutcome::PersistentFail("live financial journal conflicts"),
+    let (mut derived, prepared_tokens) = match (summary, prepared_tokens) {
+        (Ok(derived), Ok(prepared_tokens)) => (derived, prepared_tokens),
+        _ => return CheckOutcome::PersistentFail("live financial journal conflicts"),
     };
     if !baseline_owns_current_binding(&derived, account_binding) {
         return CheckOutcome::PersistentFail(
             "current live account binding differs from the financial-era Baseline",
         );
     }
-    let inventory =
-        match fetch_complete_venue_inventory(state, custody_wallet, account_binding, &events).await
-        {
-            Ok(inventory) => inventory,
-            Err(_) => return CheckOutcome::Transient("complete venue inventory unavailable"),
-        };
-    let inventory_observed_at = now;
+    let inventory = match fetch_complete_venue_inventory(
+        state,
+        custody_wallet,
+        account_binding,
+        prepared_tokens.as_deref(),
+    )
+    .await
+    {
+        Ok(inventory) => inventory,
+        Err(_) => return CheckOutcome::Transient("complete venue inventory unavailable"),
+    };
     if derived.baseline_equity.is_none() {
         // The first Baseline is the account's era boundary. Older records remain readable audit
         // history and deliberately create no managed state; only current complete venue inventory
@@ -7164,6 +7931,13 @@ async fn ensure_live_portfolio_marks_at(
         let audit = match account_state.audit() {
             Ok(audit) => audit,
             Err(_) => return CheckOutcome::PersistentFail("account audit invalid"),
+        };
+        let Ok(inventory_observed_at) = stamp_after_evidence(
+            state,
+            now,
+            inventory.evidence.pages.iter().map(|page| &page.receipt),
+        ) else {
+            return CheckOutcome::Transient("venue inventory evidence unavailable");
         };
         if state
             .config
@@ -7189,13 +7963,14 @@ async fn ensure_live_portfolio_marks_at(
         {
             return CheckOutcome::Transient("live Baseline journal append failed");
         }
-        events = match replay_live_account(state, &account.account_id) {
-            Ok(events) => events,
-            Err(_) => return CheckOutcome::Transient("live Baseline replay failed"),
-        };
-        derived = match derive_projection_rows_for_state(state, &account.account_id, &events) {
+        derived = match live_summary(state, &account.account_id) {
             Ok(derived) => derived,
-            Err(_) => return CheckOutcome::PersistentFail("live Baseline conflicts"),
+            Err(LiveStateError::Unavailable(_)) => {
+                return CheckOutcome::Transient("live Baseline replay failed");
+            }
+            Err(LiveStateError::Rejected(_)) => {
+                return CheckOutcome::PersistentFail("live Baseline conflicts");
+            }
         };
     }
 
@@ -7207,8 +7982,58 @@ async fn ensure_live_portfolio_marks_at(
         Ok(observed) => observed,
         Err(_) => return CheckOutcome::PersistentFail("venue inventory conflicts"),
     };
-    if expected != observed {
+    if without_redeemable(expected) != without_redeemable(observed) {
         return CheckOutcome::PersistentFail("venue inventory drift");
+    }
+    let Some(economic_cash) = derived.economic_cash else {
+        return CheckOutcome::Transient("live Baseline unavailable");
+    };
+    if let Some(credited) = collateral_credit(
+        derived.reserved,
+        derived.receivable,
+        economic_cash,
+        account_state.collateral_balance,
+    ) {
+        let audit = match account_state.audit() {
+            Ok(audit) => audit,
+            Err(_) => return CheckOutcome::PersistentFail("account audit invalid"),
+        };
+        let Ok(credited_at) = stamp_after_evidence(
+            state,
+            now,
+            inventory.evidence.pages.iter().map(|page| &page.receipt),
+        ) else {
+            return CheckOutcome::Transient("venue inventory evidence unavailable");
+        };
+        if state
+            .config
+            .journal
+            .append(
+                account.account_id.clone(),
+                credited_at,
+                LiveJournalPayload::CollateralCredited(Box::new(
+                    pe_execution_core::CollateralCreditedAudit {
+                        account_binding: account_binding.clone(),
+                        account_state: audit,
+                        venue_positions: inventory.positions.clone(),
+                        venue_position_evidence: inventory.evidence.clone(),
+                        credited,
+                    },
+                )),
+            )
+            .is_err()
+        {
+            return CheckOutcome::Transient("collateral credit journal append failed");
+        }
+        derived = match live_summary(state, &account.account_id) {
+            Ok(derived) => derived,
+            Err(LiveStateError::Unavailable(_)) => {
+                return CheckOutcome::Transient("live journal unavailable");
+            }
+            Err(LiveStateError::Rejected(_)) => {
+                return CheckOutcome::PersistentFail("collateral credit conflicts");
+            }
+        };
     }
     let Some(economic_cash) = derived.economic_cash else {
         return CheckOutcome::Transient("live Baseline unavailable");
@@ -7233,23 +8058,14 @@ async fn ensure_live_portfolio_marks_at(
     while cutoff <= completed_cutoff {
         let cutoff_is_missing = !derived.daily_marks.contains_key(&cutoff);
         if cutoff_is_missing {
-            let cutoff_events = events
-                .iter()
-                .filter(|event| event.timestamp.unix_timestamp() < cutoff)
-                .cloned()
-                .collect::<Vec<_>>();
-            let Ok(cutoff_sources) =
-                source_envelopes_for_live_events(&state.config.source_receipts, &cutoff_events)
-            else {
-                return CheckOutcome::PersistentFail("daily mark source evidence");
-            };
-            let cutoff_derived = match derive_projection_rows_with_sources(
-                &account.account_id,
-                &cutoff_events,
-                &cutoff_sources,
-            ) {
+            let cutoff_derived = match sync_live(state)
+                .and_then(|live| live.cutoff_summary(&account.account_id, cutoff))
+            {
                 Ok(derived) => derived,
-                Err(_) => {
+                Err(LiveStateError::Unavailable(_)) => {
+                    return CheckOutcome::Transient("live journal unavailable");
+                }
+                Err(LiveStateError::Rejected(_)) => {
                     return CheckOutcome::PersistentFail("cutoff live journal conflicts");
                 }
             };
@@ -7300,12 +8116,24 @@ async fn ensure_live_portfolio_marks_at(
                 Ok(audit) => audit,
                 Err(_) => return CheckOutcome::PersistentFail("account audit invalid"),
             };
+            let Ok(marked_at) = stamp_after_evidence(
+                state,
+                now,
+                inventory
+                    .evidence
+                    .pages
+                    .iter()
+                    .map(|page| &page.receipt)
+                    .chain(prices.iter().map(|price| &price.receipt)),
+            ) else {
+                return CheckOutcome::Transient("daily mark evidence unavailable");
+            };
             if state
                 .config
                 .journal
                 .append(
                     account.account_id.clone(),
-                    now,
+                    marked_at,
                     LiveJournalPayload::AccountPortfolioMarked(Box::new(
                         pe_execution_core::AccountPortfolioMarkedAudit {
                             kind: MarkKind::Daily,
@@ -7368,13 +8196,14 @@ fn live_financial_posture(
     authenticated_cash: CollateralAmount,
     require_empty_inventory: bool,
 ) -> CheckOutcome {
-    let events = match replay_live_account(state, &account.account_id) {
-        Ok(events) => events,
-        Err(_) => return CheckOutcome::Transient("live journal unavailable"),
-    };
-    let derived = match derive_projection_rows_for_state(state, &account.account_id, &events) {
+    let derived = match live_summary(state, &account.account_id) {
         Ok(derived) => derived,
-        Err(_) => return CheckOutcome::PersistentFail("live financial journal conflicts"),
+        Err(LiveStateError::Unavailable(_)) => {
+            return CheckOutcome::Transient("live journal unavailable");
+        }
+        Err(LiveStateError::Rejected(_)) => {
+            return CheckOutcome::PersistentFail("live financial journal conflicts");
+        }
     };
     let Some(economic_cash) = derived.economic_cash else {
         return CheckOutcome::Transient("portfolio Baseline unavailable");
@@ -7415,165 +8244,138 @@ struct ResolutionDiscovery {
     receipt: AppendReceipt,
 }
 
+/// Journal a resolution for each condition the financial fold reports resolvable once CLOB
+/// reports its payout. A condition whose lookup fails is retried next pass and holds back nothing
+/// else: no other condition, no redemption work, and no admission.
 async fn discover_live_resolutions(
     state: &FanoutState,
     account_id: &AccountId,
-    events: &[LiveJournalEvent],
+    conditions: BTreeMap<String, [pe_core_types::PolymarketTokenId; 2]>,
+    discoveries: &mut BTreeMap<String, Result<ResolutionDiscovery, &'static str>>,
+    now: OffsetDateTime,
+) {
+    for (condition, expected_tokens) in conditions {
+        if let Err(reason) = discover_live_resolution(
+            state,
+            account_id,
+            &condition,
+            &expected_tokens,
+            discoveries,
+            now,
+        )
+        .await
+        {
+            warn!(account_id = %account_id, condition = %condition, reason, "resolution discovery failed; retried next pass");
+        }
+    }
+}
+
+async fn discover_live_resolution(
+    state: &FanoutState,
+    account_id: &AccountId,
+    condition: &str,
+    expected_tokens: &[pe_core_types::PolymarketTokenId; 2],
     discoveries: &mut BTreeMap<String, Result<ResolutionDiscovery, &'static str>>,
     now: OffsetDateTime,
 ) -> Result<(), &'static str> {
-    let mut prepared = BTreeMap::<String, Box<pe_execution_core::LiveOrderPreparedAudit>>::new();
-    let mut terminal = BTreeSet::new();
-    let mut filled_conditions = BTreeSet::new();
-    let mut resolved_conditions = BTreeSet::new();
-    for event in events {
-        match &event.payload {
-            LiveJournalPayload::OrderPrepared(order) => {
-                prepared.insert(order.identity.idempotency_key.clone(), order.clone());
-            }
-            LiveJournalPayload::OrderReconciled(reconciled)
-                if matches!(
-                    reconciled.outcome,
-                    LiveJournalOrderOutcome::Killed { .. }
-                        | LiveJournalOrderOutcome::Rejected { .. }
-                ) =>
-            {
-                terminal.insert(reconciled.identity.idempotency_key.clone());
-            }
-            LiveJournalPayload::OrderFillFinalized(fill) => {
-                terminal.insert(fill.identity.idempotency_key.clone());
-                let order = prepared
-                    .get(&fill.identity.idempotency_key)
-                    .ok_or("finalized fill has no prepared admission")?;
-                filled_conditions.insert(order.economic.market.condition_id.0.clone());
-            }
-            LiveJournalPayload::ResolutionFinalized(resolution) => {
-                resolved_conditions.insert(resolution.condition_id.0.clone());
-            }
-            _ => {}
-        }
-    }
-    for condition in filled_conditions {
-        if resolved_conditions.contains(&condition)
-            || prepared.values().any(|order| {
-                order.economic.market.condition_id.0 == condition
-                    && !terminal.contains(&order.identity.idempotency_key)
-            })
-        {
-            continue;
-        }
-        let admissions = prepared
-            .values()
-            .filter(|order| order.economic.market.condition_id.0 == condition)
-            .collect::<Vec<_>>();
-        let first = admissions
-            .first()
-            .copied()
-            .ok_or("condition admission missing")?;
-        if admissions.iter().any(|order| {
-            order.economic.admission.market.ordered_outcome_token_ids
-                != first.economic.admission.market.ordered_outcome_token_ids
-        }) {
-            return Err("condition admission mapping conflicts");
-        }
-        let expected_tokens = &first.economic.admission.market.ordered_outcome_token_ids;
-        let discovery = if let Some(discovery) = discoveries.get(&condition) {
-            discovery.clone()?
-        } else {
-            let fetched = async {
-                let url = format!(
-                    "{}/markets/{condition}",
-                    state.config.clob_base_url.trim_end_matches('/')
-                );
-                let observed_at = OffsetDateTime::now_utc();
-                let response = state
-                    .config
-                    .http
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|_| "CLOB resolution transport")?;
-                let status = response.status();
-                let body = response
-                    .bytes()
-                    .await
-                    .map_err(|_| "CLOB resolution body")?
-                    .to_vec();
-                let received_at = OffsetDateTime::now_utc();
-                let receipt = state
-                    .config
-                    .source_log
-                    .append(EnvelopeIn {
-                        source_id: SourceId("polymarket.clob.resolution".to_owned()),
-                        schema_version: pe_source_polymarket_public::CLOB_RESOLUTION_SCHEMA_VERSION,
-                        parser_version: pe_source_polymarket_public::CLOB_RESOLUTION_PARSER_VERSION,
-                        observed_at: SourceTimestamp(observed_at),
-                        received_at: ReceivedAt(received_at),
-                        content_type: ContentType::Json,
-                        payload: body.clone(),
-                    })
-                    .await
-                    .map_err(|_| "resolution source append")?;
-                if !status.is_success() {
-                    return Err("CLOB resolution status");
-                }
-                let market = parse_clob_market(&body).map_err(|_| "CLOB resolution parse")?;
-                if market
-                    .condition_id
-                    .as_deref()
-                    .is_none_or(|value| !value.eq_ignore_ascii_case(&condition))
-                {
-                    return Err("CLOB resolution condition mismatch");
-                }
-                let token_ids: [pe_core_types::PolymarketTokenId; 2] = market
-                    .tokens
-                    .iter()
-                    .map(|token| {
-                        token
-                            .token_id
-                            .as_ref()
-                            .map(|token| pe_core_types::PolymarketTokenId(token.clone()))
-                            .ok_or("CLOB resolution token mapping missing")
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-                    .try_into()
-                    .map_err(|_| "CLOB resolution token mapping cardinality")?;
-                let payout = match market.resolution_evidence().payout {
-                    ClobPayoutResolution::Resolved(payout) => Some(payout),
-                    ClobPayoutResolution::Unresolved(_) => None,
-                };
-                Ok(ResolutionDiscovery {
-                    token_ids,
-                    payout,
-                    receipt,
+    let discovery = if let Some(discovery) = discoveries.get(condition) {
+        discovery.clone()?
+    } else {
+        let fetched = async {
+            let url = format!(
+                "{}/markets/{condition}",
+                state.config.clob_base_url.trim_end_matches('/')
+            );
+            let observed_at = (state.clock)();
+            let response = state
+                .config
+                .http
+                .get(&url)
+                .send()
+                .await
+                .map_err(|_| "CLOB resolution transport")?;
+            let status = response.status();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|_| "CLOB resolution body")?
+                .to_vec();
+            let received_at = (state.clock)();
+            let receipt = state
+                .config
+                .source_log
+                .append(EnvelopeIn {
+                    source_id: SourceId("polymarket.clob.resolution".to_owned()),
+                    schema_version: pe_source_polymarket_public::CLOB_RESOLUTION_SCHEMA_VERSION,
+                    parser_version: pe_source_polymarket_public::CLOB_RESOLUTION_PARSER_VERSION,
+                    observed_at: SourceTimestamp(observed_at),
+                    received_at: ReceivedAt(received_at),
+                    content_type: ContentType::Json,
+                    payload: body.clone(),
                 })
+                .await
+                .map_err(|_| "resolution source append")?;
+            if !status.is_success() {
+                return Err("CLOB resolution status");
             }
-            .await;
-            discoveries.insert(condition.clone(), fetched.clone());
-            fetched?
-        };
-        if &discovery.token_ids != expected_tokens {
-            return Err("CLOB resolution token mapping mismatch");
+            let market = parse_clob_market(&body).map_err(|_| "CLOB resolution parse")?;
+            if market
+                .condition_id
+                .as_deref()
+                .is_none_or(|value| !value.eq_ignore_ascii_case(condition))
+            {
+                return Err("CLOB resolution condition mismatch");
+            }
+            let token_ids: [pe_core_types::PolymarketTokenId; 2] = market
+                .tokens
+                .iter()
+                .map(|token| {
+                    token
+                        .token_id
+                        .as_ref()
+                        .map(|token| pe_core_types::PolymarketTokenId(token.clone()))
+                        .ok_or("CLOB resolution token mapping missing")
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .try_into()
+                .map_err(|_| "CLOB resolution token mapping cardinality")?;
+            let payout = match market.resolution_evidence().payout {
+                ClobPayoutResolution::Resolved(payout) => Some(payout),
+                ClobPayoutResolution::Unresolved(_) => None,
+            };
+            Ok(ResolutionDiscovery {
+                token_ids,
+                payout,
+                receipt,
+            })
         }
-        let Some(payout) = discovery.payout else {
-            continue;
-        };
-        state
-            .config
-            .journal
-            .append(
-                account_id.clone(),
-                now,
-                LiveJournalPayload::ResolutionFinalized(Box::new(
-                    pe_execution_core::ResolutionFinalizedAudit {
-                        condition_id: PolymarketConditionId(condition),
-                        payout_by_outcome_index_json: payout.canonical_json(),
-                        source_append_receipt: discovery.receipt,
-                    },
-                )),
-            )
-            .map_err(|_| "resolution journal append")?;
+        .await;
+        discoveries.insert(condition.to_owned(), fetched.clone());
+        fetched?
+    };
+    if &discovery.token_ids != expected_tokens {
+        return Err("CLOB resolution token mapping mismatch");
     }
+    let Some(payout) = discovery.payout else {
+        return Ok(());
+    };
+    let resolved_at = stamp_after_evidence(state, now, [&discovery.receipt])
+        .map_err(|_| "resolution evidence unavailable")?;
+    state
+        .config
+        .journal
+        .append(
+            account_id.clone(),
+            resolved_at,
+            LiveJournalPayload::ResolutionFinalized(Arc::new(
+                pe_execution_core::ResolutionFinalizedAudit {
+                    condition_id: PolymarketConditionId(condition.to_owned()),
+                    payout_by_outcome_index_json: payout.canonical_json(),
+                    source_append_receipt: discovery.receipt,
+                },
+            )),
+        )
+        .map_err(|_| "resolution journal append")?;
     Ok(())
 }
 
@@ -7586,11 +8388,8 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
         .iter()
         .map(|account| account.account_id.clone())
         .collect::<BTreeSet<_>>();
-    if let Ok(inventory) = recovery_inventory(
-        &state.config.journal_path,
-        state.config.era_live_prefix.as_ref(),
-    ) {
-        account_ids.extend(inventory.account_ids);
+    if let Ok(live) = sync_live(state) {
+        account_ids.extend(live.accounts.keys().cloned());
     }
     state
         .closures
@@ -7598,8 +8397,17 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
         .retain(|account, _| account_ids.iter().any(|id| id.as_str() == account));
     let mut resolution_discoveries = BTreeMap::new();
     for account_id in account_ids {
-        let events = match replay_live_account(state, &account_id) {
-            Ok(events) => events,
+        let read = sync_live(state).and_then(|live| {
+            Ok(match live.view(&account_id)? {
+                Some(view) => (
+                    view.records.clone(),
+                    view.financial.main.resolvable_conditions(),
+                ),
+                None => (Vec::new(), Ok(BTreeMap::new())),
+            })
+        });
+        let (events, conditions) = match read {
+            Ok(read) => read,
             Err(error) => {
                 error!(account_id = %account_id, error = %error, "redemption journal replay failed; attempt frozen");
                 state.closures.redemption.insert(
@@ -7609,21 +8417,24 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
                 continue;
             }
         };
-        if let Err(reason) = discover_live_resolutions(
+        let conditions = match conditions {
+            Ok(conditions) => conditions,
+            Err(reason) => {
+                state.closures.redemption.insert(
+                    account_id.as_str().to_owned(),
+                    format!("resolution discovery unavailable: {reason}"),
+                );
+                continue;
+            }
+        };
+        discover_live_resolutions(
             state,
             &account_id,
-            &events,
+            conditions,
             &mut resolution_discoveries,
             now,
         )
-        .await
-        {
-            state.closures.redemption.insert(
-                account_id.as_str().to_owned(),
-                format!("resolution discovery unavailable: {reason}"),
-            );
-            continue;
-        }
+        .await;
         let Some(account) = snapshot
             .accounts
             .iter()
@@ -7637,23 +8448,30 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
             );
             continue;
         };
-        let events = match replay_live_account(state, &account.account_id) {
-            Ok(events) => events,
-            Err(_) => {
-                state.closures.redemption.insert(
-                    account.account_id.as_str().to_owned(),
-                    "resolution replay unavailable".to_owned(),
-                );
-                continue;
-            }
+        let read = sync_live(state).and_then(|live| {
+            let attempts = live
+                .view(&account.account_id)?
+                .map(|view| view.financial.main.redemption_attempts.as_map().clone())
+                .unwrap_or_default();
+            Ok((
+                attempts,
+                live.summary(&account.account_id)?,
+                live.prepared_tokens(&account.account_id)?,
+            ))
+        });
+        let Ok((attempts, derived, prepared_tokens)) = read else {
+            state.closures.redemption.insert(
+                account.account_id.as_str().to_owned(),
+                "resolution replay unavailable".to_owned(),
+            );
+            continue;
         };
-        let mut attempts = reconstruct_redemption_attempts(&events);
         let incomplete_attempt = attempts
             .values()
             .any(|attempt| !matches!(attempt.state, RedemptionAttemptState::Complete { .. }));
-        let has_receivable = derive_projection_rows_for_state(state, &account.account_id, &events)
-            .is_ok_and(|derived| derived.receivable != Decimal::ZERO);
-        if !account.is_armed() && !incomplete_attempt && !has_receivable {
+        // Outstanding custody work is receivable-map membership: a zero payout counts too.
+        let custody_work = derived.receivable_by_condition;
+        if !account.is_armed() && !incomplete_attempt && custody_work.is_empty() {
             state
                 .closures
                 .redemption
@@ -7686,21 +8504,24 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
             );
             continue;
         };
-        let venue = match PolymarketLiveVenue::from_credentials(&credentials).await {
-            Ok(venue) => venue,
-            Err(error) => {
-                state.closures.redemption.insert(
-                    account.account_id.as_str().to_owned(),
-                    format!("redemption venue unavailable: {error}"),
-                );
-                continue;
-            }
-        };
+        let venue =
+            match PolymarketLiveVenue::from_credentials(&credentials, &state.config.clob_base_url)
+                .await
+            {
+                Ok(venue) => venue,
+                Err(error) => {
+                    state.closures.redemption.insert(
+                        account.account_id.as_str().to_owned(),
+                        format!("redemption venue unavailable: {error}"),
+                    );
+                    continue;
+                }
+            };
         let inventory = match fetch_complete_venue_inventory(
             state,
             &venue.deposit_wallet(),
             venue.account_binding(),
-            &events,
+            prepared_tokens.as_deref(),
         )
         .await
         {
@@ -7740,7 +8561,26 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
                 continue;
             }
         }
-        if positions.is_empty() && attempts.is_empty() {
+        // At most one family is unresolved: it is finished before any other starts, and a new
+        // family starts only for a condition the journal resolved and the wallet still lists.
+        let unresolved = attempts
+            .values()
+            .filter(|attempt| !matches!(attempt.state, RedemptionAttemptState::Complete { .. }))
+            .min_by(|left, right| {
+                left.identity
+                    .condition_id
+                    .0
+                    .cmp(&right.identity.condition_id.0)
+            })
+            .cloned();
+        let next_position = positions
+            .iter()
+            .filter(|position| {
+                custody_work.contains_key(&position.condition_id) && position.size > Decimal::ZERO
+            })
+            .min_by(|left, right| left.condition_id.cmp(&right.condition_id))
+            .cloned();
+        if unresolved.is_none() && next_position.is_none() {
             state
                 .closures
                 .redemption
@@ -7748,20 +8588,17 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
             continue;
         }
 
-        let Some(custody) = custody_kind(account.custody_wallet_kind.as_deref()) else {
-            state.closures.redemption.insert(
-                account.account_id.as_str().to_owned(),
-                "redemption custody kind is missing or unknown".to_owned(),
-            );
-            continue;
+        // Orders always sign as a deposit wallet, so an unset custody kind is one.
+        let custody = match account.custody_wallet_kind.as_deref() {
+            None | Some("deposit_wallet") => CustodyKind::DepositWallet,
+            Some(kind) => {
+                state.closures.redemption.insert(
+                    account.account_id.as_str().to_owned(),
+                    format!("redemption submission unsupported for {kind} custody"),
+                );
+                continue;
+            }
         };
-        if custody != CustodyKind::DepositWallet {
-            state.closures.redemption.insert(
-                account.account_id.as_str().to_owned(),
-                format!("redemption submission unsupported for {custody:?} custody"),
-            );
-            continue;
-        }
         let Some(api_key) = credentials.relayer_api_key.as_ref() else {
             state.closures.redemption.insert(
                 account.account_id.as_str().to_owned(),
@@ -7770,16 +8607,20 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
             continue;
         };
         let owner_signer = venue.owner_signer();
-        let relayer_credentials = RelayerCredentials::RelayerApiKey(RelayerApiKeyCredentials {
+        let relayer_credentials = RelayerApiKeyCredentials {
             api_key: api_key.clone(),
             address: owner_signer.clone(),
-        });
+        };
         let policy = RelayerPollPolicy {
             request_timeout: Duration::from_secs(10),
             poll_interval: Duration::from_secs(2),
             maximum_polls: 5,
         };
-        let adapter = match LiveRedemptionAdapter::new(relayer_credentials, custody, policy) {
+        let adapter = match LiveRedemptionAdapter::new(
+            relayer_credentials,
+            &state.config.relayer_base_url,
+            policy,
+        ) {
             Ok(adapter) => adapter,
             Err(error) => {
                 state.closures.redemption.insert(
@@ -7801,15 +8642,9 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
             continue;
         }
 
-        let reconcile_first = attempts
-            .values()
+        let reconcile_first = unresolved
+            .as_ref()
             .filter(|attempt| !redemption_needs_fresh_submission(&attempt.state, now))
-            .min_by(|left, right| {
-                left.identity
-                    .condition_id
-                    .0
-                    .cmp(&right.identity.condition_id.0)
-            })
             .cloned();
         if let Some(attempt) = reconcile_first {
             let redeemable = redeemable_for_attempt(&positions, &attempt.identity);
@@ -7836,18 +8671,39 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
             continue;
         }
 
-        let Some(position) = positions.first() else {
-            state
-                .closures
-                .redemption
-                .remove(account.account_id.as_str());
-            continue;
+        // An unresolved family is resubmitted from its own identity, at zero balance if the
+        // wallet no longer lists it; otherwise the next listed condition starts a fresh family.
+        let built = match &unresolved {
+            Some(attempt) => redemption_call_for(&attempt.identity).map(|call| {
+                (
+                    call,
+                    attempt.clone(),
+                    redeemable_for_attempt(&positions, &attempt.identity),
+                )
+            }),
+            None => next_position
+                .as_ref()
+                .ok_or_else(|| "redemption position missing".to_owned())
+                .and_then(|position| {
+                    let call = build_redemption_call(
+                        PolymarketConditionId(position.condition_id.clone()),
+                        position.neg_risk,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let attempt = RedemptionAttempt {
+                        identity: RedemptionAttemptIdentity {
+                            account_id: account.account_id.clone(),
+                            condition_id: call.condition_id.clone(),
+                            adapter: call.to.clone(),
+                            custody_wallet: custody_wallet.clone(),
+                        },
+                        state: RedemptionAttemptState::default(),
+                    };
+                    Ok((call, attempt, redeemable_amount(position.size)))
+                }),
         };
-        let call = match build_redemption_call(
-            PolymarketConditionId(position.condition_id.clone()),
-            position.neg_risk,
-        ) {
-            Ok(call) => call,
+        let (call, attempt, redeemable) = match built {
+            Ok(built) => built,
             Err(error) => {
                 state.closures.redemption.insert(
                     account.account_id.as_str().to_owned(),
@@ -7856,16 +8712,6 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
                 continue;
             }
         };
-        let identity = RedemptionAttemptIdentity {
-            account_id: account.account_id.clone(),
-            condition_id: call.condition_id.clone(),
-            adapter: call.to.clone(),
-            custody_wallet: custody_wallet.clone(),
-        };
-        let attempt = attempts.remove(&identity).unwrap_or(RedemptionAttempt {
-            identity,
-            state: RedemptionAttemptState::default(),
-        });
         let nonce = match adapter.fetch_nonce(&owner_signer, custody).await {
             Ok(nonce) => nonce,
             Err(error) => {
@@ -7916,7 +8762,6 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
                 continue;
             }
         };
-        let redeemable = redeemable_amount(position.size);
         let closure_reason = match run_redemption_pass(
             &adapter,
             &adapter,
@@ -7941,7 +8786,7 @@ async fn drive_redemptions(state: &mut FanoutState, now: OffsetDateTime) {
 
 fn journal_recovery_account(
     account_id: &AccountId,
-    events: &[LiveJournalEvent],
+    events: &[Arc<LiveJournalEvent>],
 ) -> Option<AccountContext> {
     let prepared = events.iter().rev().find_map(|event| match &event.payload {
         LiveJournalPayload::OrderPrepared(prepared) => Some(prepared.as_ref()),
@@ -7969,11 +8814,26 @@ fn redemption_needs_fresh_submission(state: &RedemptionAttemptState, now: Offset
         RedemptionAttemptState::Failed {
             retry_not_before, ..
         } => now >= *retry_not_before,
-        RedemptionAttemptState::SubmissionReserved { .. }
-        | RedemptionAttemptState::InFlight { .. }
+        RedemptionAttemptState::SubmissionReserved { .. } => state.submission_deadline_passed(now),
+        RedemptionAttemptState::InFlight { .. }
         | RedemptionAttemptState::Ambiguous { .. }
         | RedemptionAttemptState::ConfirmedAwaitingBalance { .. } => false,
     }
+}
+
+/// Rebuild an attempt's call from its identity: the condition and the collateral adapter, which
+/// fixes the market's negative-risk flag.
+fn redemption_call_for(
+    identity: &RedemptionAttemptIdentity,
+) -> Result<pe_venue_polymarket::RedemptionCall, String> {
+    for neg_risk in [false, true] {
+        let call = build_redemption_call(identity.condition_id.clone(), neg_risk)
+            .map_err(|error| error.to_string())?;
+        if call.to.eq_ignore_ascii_case(&identity.adapter) {
+            return Ok(call);
+        }
+    }
+    Err("redemption adapter is not a collateral adapter".to_owned())
 }
 
 async fn append_ready_redemption_custody<'a>(
@@ -8000,9 +8860,11 @@ async fn append_ready_redemption_custody<'a>(
     else {
         return Ok(false);
     };
-    let events = replay_live_account(state, &account.account_id).map_err(|_| "journal replay")?;
-    let derived = derive_projection_rows_for_state(state, &account.account_id, &events)
-        .map_err(|_| "journal reducer")?;
+    let derived = match live_summary(state, &account.account_id) {
+        Ok(derived) => derived,
+        Err(LiveStateError::Unavailable(_)) => return Err("journal replay"),
+        Err(LiveStateError::Rejected(_)) => return Err("journal reducer"),
+    };
     let credit = derived
         .receivable_by_condition
         .get(&attempt.identity.condition_id.0)
@@ -8014,8 +8876,10 @@ async fn append_ready_redemption_custody<'a>(
         .filter(|position| position.condition_id != attempt.identity.condition_id)
         .cloned()
         .collect::<Vec<_>>();
-    if canonical_positions(&expected).map_err(|_| "expected inventory")?
-        != canonical_positions(&inventory.positions).map_err(|_| "venue inventory")?
+    if without_redeemable(canonical_positions(&expected).map_err(|_| "expected inventory")?)
+        != without_redeemable(
+            canonical_positions(&inventory.positions).map_err(|_| "venue inventory")?,
+        )
     {
         return Err("remaining inventory mismatch");
     }
@@ -8027,21 +8891,31 @@ async fn append_ready_redemption_custody<'a>(
         .receivable
         .checked_sub(credit.to_decimal())
         .ok_or("receivable arithmetic")?;
-    if account_state
+    // A credit that landed while the payout was outstanding stays as surplus; a deficit fails.
+    let accounted = account_state
         .collateral_balance
         .to_decimal()
         .checked_add(remaining_receivable)
-        != derived.economic_cash
+        .ok_or("cash arithmetic")?;
+    if derived
+        .economic_cash
+        .is_none_or(|economic_cash| accounted < economic_cash)
     {
         return Err("cash reconciliation mismatch");
     }
+    let reconciled_at = stamp_after_evidence(
+        state,
+        now,
+        inventory.evidence.pages.iter().map(|page| &page.receipt),
+    )
+    .map_err(|_| "custody evidence unavailable")?;
     state
         .config
         .journal
         .append(
             account.account_id.clone(),
-            now,
-            LiveJournalPayload::RedemptionCustodyReconciled(Box::new(
+            reconciled_at,
+            LiveJournalPayload::RedemptionCustodyReconciled(Arc::new(
                 pe_execution_core::RedemptionCustodyReconciledAudit {
                     identity: attempt.identity.clone(),
                     account_state: account_state.audit().map_err(|_| "account audit")?,
@@ -8080,21 +8954,6 @@ fn redeemable_for_attempt(
 }
 
 fn redemption_closure_reason(attempt: RedemptionAttempt) -> Option<String> {
-    if matches!(
-        attempt.state,
-        RedemptionAttemptState::SubmissionReserved { .. }
-            | RedemptionAttemptState::Ambiguous {
-                transaction_id: None,
-                ..
-            }
-    ) {
-        error!(
-            account_id = %attempt.identity.account_id,
-            condition_id = %attempt.identity.condition_id.0,
-            "redemption submission identity cannot be reconstructed; attempt remains frozen"
-        );
-        return Some("redemption submission identity unavailable; attempt frozen".to_owned());
-    }
     let posture = redemption_posture(&attempt.state);
     if posture.surface_prominently {
         Some("redemption unresolved after repeated attempts".to_owned())
@@ -8123,16 +8982,6 @@ fn set_redemption_closure(
     }
 }
 
-fn custody_kind(value: Option<&str>) -> Option<CustodyKind> {
-    match value {
-        Some("deposit_wallet") => Some(CustodyKind::DepositWallet),
-        Some("proxy") => Some(CustodyKind::Proxy),
-        Some("safe") => Some(CustodyKind::Safe),
-        Some("eoa") => Some(CustodyKind::Eoa),
-        _ => None,
-    }
-}
-
 #[derive(Debug, Clone)]
 struct RecordedPositionPage {
     request_url: String,
@@ -8141,6 +8990,7 @@ struct RecordedPositionPage {
 }
 
 struct LivePositionFetcher {
+    clock: FanoutClock,
     http: reqwest::Client,
     source_log: SourceLogHandle,
     account_binding: LiveAccountBindingAudit,
@@ -8159,7 +9009,7 @@ impl ReconciliationFetcher for LivePositionFetcher {
                         message: "complete-position request descriptor is invalid".to_owned(),
                     }
                 })?;
-            let observed_at = OffsetDateTime::now_utc();
+            let observed_at = (self.clock)();
             let response =
                 self.http
                     .get(url)
@@ -8176,7 +9026,7 @@ impl ReconciliationFetcher for LivePositionFetcher {
                     message: error.to_string(),
                 })?
                 .to_vec();
-            let received_at = OffsetDateTime::now_utc();
+            let received_at = (self.clock)();
             let payload = serde_json::to_vec(&RetainedPositionResponse {
                 request,
                 body: body.clone(),
@@ -8233,44 +9083,24 @@ async fn fetch_complete_venue_inventory(
     state: &FanoutState,
     wallet: &str,
     account_binding: &LiveAccountBindingAudit,
-    events: &[LiveJournalEvent],
+    prepared_tokens: Option<&ActivityAssetMapping>,
 ) -> Result<CompleteVenueInventory, &'static str> {
     let wallet = WalletAddress::from_hex(wallet).map_err(|_| "invalid custody wallet")?;
     let requested_wallet = wallet.to_string();
     if requested_wallet != account_binding.custody_wallet {
         return Err("custody wallet does not match account request binding");
     }
-    let mut mapping = ActivityAssetMapping::from_rows(&[]);
-    for event in events {
-        if let LiveJournalPayload::OrderPrepared(prepared) = &event.payload {
-            for (outcome, token) in prepared
-                .economic
-                .admission
-                .market
-                .ordered_outcome_token_ids
-                .iter()
-                .enumerate()
-            {
-                mapping
-                    .insert_verified_ordinary(
-                        token.clone(),
-                        prepared.economic.market.condition_id.clone(),
-                        OutcomeId(u16::try_from(outcome).map_err(|_| "outcome overflow")?),
-                    )
-                    .map_err(|_| "journal admission mapping conflict")?;
-            }
-        }
-    }
+    let mapping = prepared_tokens.ok_or("journal admission mapping conflict")?;
     let fetcher = LivePositionFetcher {
+        clock: Arc::clone(&state.clock),
         http: state.config.http.clone(),
         source_log: state.config.source_log.clone(),
         account_binding: account_binding.clone(),
         pages: Mutex::new(Vec::new()),
     };
-    let complete =
-        fetch_complete_positions(&fetcher, &state.config.data_base_url, wallet, &mapping)
-            .await
-            .map_err(|_| "complete position read failed")?;
+    let complete = fetch_complete_positions(&fetcher, &state.config.data_base_url, wallet, mapping)
+        .await
+        .map_err(|_| "complete position read failed")?;
     let mut recorded = fetcher
         .pages
         .into_inner()
@@ -8616,7 +9446,7 @@ mod tests {
             account_id: account_id.clone(),
             seq: 4,
             timestamp: now,
-            payload: LiveJournalPayload::RedemptionCustodyReconciled(Box::new(
+            payload: LiveJournalPayload::RedemptionCustodyReconciled(Arc::new(
                 pe_execution_core::RedemptionCustodyReconciledAudit {
                     identity: RedemptionAttemptIdentity {
                         account_id: account_id.clone(),
@@ -8652,6 +9482,7 @@ mod tests {
         else {
             unreachable!();
         };
+        let resolution_audit = Arc::make_mut(resolution_audit);
         resolution_audit.source_append_receipt = fixture_receipt(202);
         let mut audit_custody = custody.clone();
         let LiveJournalPayload::RedemptionCustodyReconciled(custody_audit) =
@@ -8659,6 +9490,7 @@ mod tests {
         else {
             unreachable!();
         };
+        let custody_audit = Arc::make_mut(custody_audit);
         custody_audit.venue_position_receipts = vec![fixture_receipt(203)];
         let mut events = vec![audit_mark, audit_resolution, audit_custody];
         assert!(projection_source_receipts(&account_id, &events).is_empty());
@@ -8854,7 +9686,7 @@ mod tests {
                 account_id: account_id.clone(),
                 seq: 2,
                 timestamp: OffsetDateTime::UNIX_EPOCH,
-                payload: LiveJournalPayload::OrderPrepared(prior.clone()),
+                payload: LiveJournalPayload::OrderPrepared(prior.clone().into()),
             },
             finality_matched_event(&account_id, &prior, 3, OffsetDateTime::UNIX_EPOCH),
             finalized_fill_event(&account_id, &prior, 4, 2),
@@ -11181,7 +12013,7 @@ mod tests {
             .append(
                 account_id.clone(),
                 journal_at,
-                LiveJournalPayload::OrderPrepared(prepared),
+                LiveJournalPayload::OrderPrepared(prepared.into()),
             )
             .unwrap();
         let events = replay_account(&journal_path, &account_id).unwrap();
@@ -13723,7 +14555,7 @@ mod tests {
             account_id: account_id.clone(),
             seq,
             timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
-            payload: LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+            payload: LiveJournalPayload::OrderReconciled(Arc::new(LiveOrderReconciliationAudit {
                 identity: projection_identity(dispatch_id),
                 order_hash: "order-hash".to_owned(),
                 source: LiveReconciliationSource::PostResponse,
@@ -13795,7 +14627,7 @@ mod tests {
                 account_id: account_id.clone(),
                 seq: 2,
                 timestamp: at,
-                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             },
             LiveJournalEvent {
                 account_id: account_id.clone(),
@@ -14979,7 +15811,7 @@ mod tests {
             .append(
                 account_id.clone(),
                 now,
-                LiveJournalPayload::OrderPrepared(prior.clone()),
+                LiveJournalPayload::OrderPrepared(prior.clone().into()),
             )
             .unwrap();
         let matched = finality_matched_event(account_id, &prior, 0, now);
@@ -15368,9 +16200,7 @@ mod tests {
 
         assert!(matches!(
             verified_recovery_inventory(&state),
-            Err(FanoutError::Journal(
-                pe_execution_core::LiveJournalError::OrderFactConflict
-            ))
+            Err(FanoutError::LiveState(LiveStateError::Rejected(_)))
         ));
         assert!(
             replay_live_account(&state, &pending.account_id)
@@ -15408,7 +16238,7 @@ mod tests {
             account_id: account_id.clone(),
             seq,
             timestamp,
-            payload: LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+            payload: LiveJournalPayload::OrderReconciled(Arc::new(finality_matched(
                 prepared,
                 format!("0x{}", "11".repeat(32)),
             ))),
@@ -15430,13 +16260,13 @@ mod tests {
                 account_id: account_id.clone(),
                 seq: 3,
                 timestamp: OffsetDateTime::UNIX_EPOCH,
-                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             },
             LiveJournalEvent {
                 account_id: account_id.clone(),
                 seq: 4,
                 timestamp: OffsetDateTime::UNIX_EPOCH,
-                payload: LiveJournalPayload::OrderReconciled(Box::new(
+                payload: LiveJournalPayload::OrderReconciled(Arc::new(
                     LiveOrderReconciliationAudit {
                         identity: wrong_identity,
                         order_hash: prepared.prepared.order_hash.clone(),
@@ -15457,6 +16287,7 @@ mod tests {
 
         let mut wrong_pair = events;
         if let LiveJournalPayload::OrderReconciled(reconciled) = &mut wrong_pair[3].payload {
+            let reconciled = Arc::make_mut(reconciled);
             reconciled.identity = prepared.identity.clone();
             reconciled.source = LiveReconciliationSource::PolygonFinality;
         }
@@ -15486,7 +16317,7 @@ mod tests {
             account_id: account_id.clone(),
             seq,
             timestamp: OffsetDateTime::from_unix_timestamp(i64::try_from(seq).unwrap()).unwrap(),
-            payload: LiveJournalPayload::OrderReconciled(Box::new(audit)),
+            payload: LiveJournalPayload::OrderReconciled(Arc::new(audit)),
         };
         let prefix = vec![
             baseline_event(&account_id, 1),
@@ -15500,7 +16331,7 @@ mod tests {
                 account_id: account_id.clone(),
                 seq: 3,
                 timestamp: OffsetDateTime::from_unix_timestamp(3).unwrap(),
-                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             },
             event(4, terminal.clone()),
         ];
@@ -15726,7 +16557,7 @@ mod tests {
         let reserve = finality_prepared().economic.fee.reserve;
         let order = PendingOrderFinality {
             prepared_journal_seq: 9,
-            prepared: finality_prepared(),
+            prepared: finality_prepared().into(),
             transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
             immutable_receipts: BTreeMap::new(),
         };
@@ -15808,7 +16639,7 @@ mod tests {
                 .append(
                     account_id.clone(),
                     OffsetDateTime::UNIX_EPOCH,
-                    LiveJournalPayload::OrderPrepared(prepared.clone()),
+                    LiveJournalPayload::OrderPrepared(prepared.clone().into()),
                 )
                 .unwrap();
             let transaction_hash = format!("0x{}", "11".repeat(32));
@@ -15816,7 +16647,7 @@ mod tests {
                 .append(
                     account_id.clone(),
                     OffsetDateTime::UNIX_EPOCH,
-                    LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+                    LiveJournalPayload::OrderReconciled(Arc::new(finality_matched(
                         &prepared,
                         transaction_hash.clone(),
                     ))),
@@ -15827,7 +16658,7 @@ mod tests {
                 &rpc,
                 vec![PendingOrderFinality {
                     prepared_journal_seq: prepared_event.seq,
-                    prepared: prepared.clone(),
+                    prepared: prepared.clone().into(),
                     transaction_hashes: vec![transaction_hash.clone()],
                     immutable_receipts: BTreeMap::new(),
                 }],
@@ -15943,7 +16774,7 @@ mod tests {
             &rpc,
             vec![PendingOrderFinality {
                 prepared_journal_seq: 9,
-                prepared: finality_prepared(),
+                prepared: finality_prepared().into(),
                 transaction_hashes: vec![second.clone(), first, second],
                 immutable_receipts: BTreeMap::new(),
             }],
@@ -16018,7 +16849,7 @@ mod tests {
             &FakePolygonRpc::new(101).with_receipt(receipt_with_word(3, 3_250_000)),
             vec![PendingOrderFinality {
                 prepared_journal_seq: 9,
-                prepared,
+                prepared: prepared.into(),
                 transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
                 immutable_receipts: BTreeMap::new(),
             }],
@@ -16041,7 +16872,7 @@ mod tests {
     async fn finality_equal_and_above_head_issue_no_canonical_block_read() {
         let order = PendingOrderFinality {
             prepared_journal_seq: 9,
-            prepared: finality_prepared(),
+            prepared: finality_prepared().into(),
             transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
             immutable_receipts: BTreeMap::new(),
         };
@@ -16094,7 +16925,7 @@ mod tests {
                 .append(
                     account_id.clone(),
                     OffsetDateTime::UNIX_EPOCH,
-                    LiveJournalPayload::OrderPrepared(prepared.clone()),
+                    LiveJournalPayload::OrderPrepared(prepared.clone().into()),
                 )
                 .unwrap();
             let first_hash = format!("0x{}", "11".repeat(32));
@@ -16102,7 +16933,7 @@ mod tests {
                 .append(
                     account_id.clone(),
                     OffsetDateTime::UNIX_EPOCH,
-                    LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+                    LiveJournalPayload::OrderReconciled(Arc::new(finality_matched(
                         &prepared,
                         first_hash.clone(),
                     ))),
@@ -16112,7 +16943,7 @@ mod tests {
                 &FakePolygonRpc::new(101).with_receipt(receipt_with_word(2, 2_500_001)),
                 vec![PendingOrderFinality {
                     prepared_journal_seq: prepared_event.seq,
-                    prepared: prepared.clone(),
+                    prepared: prepared.clone().into(),
                     transaction_hashes: vec![first_hash],
                     immutable_receipts: BTreeMap::new(),
                 }],
@@ -16156,7 +16987,7 @@ mod tests {
                         .append(
                             account_id.clone(),
                             OffsetDateTime::UNIX_EPOCH,
-                            LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+                            LiveJournalPayload::OrderReconciled(Arc::new(finality_matched(
                                 &prepared,
                                 format!("0x{}", "22".repeat(32)),
                             ))),
@@ -16188,7 +17019,7 @@ mod tests {
         let account_id = AccountId::new("account").unwrap();
         let order = PendingOrderFinality {
             prepared_journal_seq: 2,
-            prepared: finality_prepared(),
+            prepared: finality_prepared().into(),
             transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
             immutable_receipts: BTreeMap::new(),
         };
@@ -16213,7 +17044,7 @@ mod tests {
             .append(
                 account_id.clone(),
                 OffsetDateTime::UNIX_EPOCH,
-                LiveJournalPayload::OrderPrepared(prepared.clone()),
+                LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             )
             .unwrap();
         let matched_prepared = prepared.clone();
@@ -16233,7 +17064,7 @@ mod tests {
             .append(
                 account_id.clone(),
                 OffsetDateTime::UNIX_EPOCH,
-                LiveJournalPayload::OrderReconciled(Box::new(matched.clone())),
+                LiveJournalPayload::OrderReconciled(Arc::new(matched.clone())),
             )
             .unwrap();
         assert_eq!(
@@ -16288,13 +17119,13 @@ mod tests {
                 account_id: account_id.clone(),
                 seq: 3,
                 timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
-                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             },
             LiveJournalEvent {
                 account_id: account_id.clone(),
                 seq: 4,
                 timestamp: OffsetDateTime::from_unix_timestamp(6).unwrap(),
-                payload: LiveJournalPayload::OrderReconciled(Box::new(matched)),
+                payload: LiveJournalPayload::OrderReconciled(Arc::new(matched)),
             },
             LiveJournalEvent {
                 account_id: account_id.clone(),
@@ -16319,7 +17150,7 @@ mod tests {
             account_id: account_id.clone(),
             seq: 4,
             timestamp: OffsetDateTime::from_unix_timestamp(9).unwrap(),
-            payload: LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+            payload: LiveJournalPayload::OrderReconciled(Arc::new(LiveOrderReconciliationAudit {
                 identity: prepared.identity.clone(),
                 order_hash: prepared.prepared.order_hash.clone(),
                 source: LiveReconciliationSource::PolygonFinality,
@@ -16338,6 +17169,7 @@ mod tests {
         for endpoint_kind in ["polygon-transaction-receipt", "polygon-finalized-block"] {
             let mut malformed = reducer_events[..5].to_vec();
             if let LiveJournalPayload::OrderReconciled(conflict) = &mut malformed[4].payload {
+                let conflict = Arc::make_mut(conflict);
                 let response = conflict
                     .evidence
                     .iter_mut()
@@ -16383,14 +17215,14 @@ mod tests {
             .append(
                 account_id.clone(),
                 OffsetDateTime::UNIX_EPOCH,
-                LiveJournalPayload::OrderPrepared(prepared.clone()),
+                LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             )
             .unwrap();
         journal
             .append(
                 account_id.clone(),
                 OffsetDateTime::UNIX_EPOCH,
-                LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+                LiveJournalPayload::OrderReconciled(Arc::new(finality_matched(
                     &prepared,
                     transaction_hash.clone(),
                 ))),
@@ -16401,7 +17233,7 @@ mod tests {
             &FakePolygonRpc::new(101).with_receipt(receipt_with_word(2, 2_499_999)),
             vec![PendingOrderFinality {
                 prepared_journal_seq: prepared_event.seq,
-                prepared: prepared.clone(),
+                prepared: prepared.clone().into(),
                 transaction_hashes: vec![transaction_hash.clone()],
                 immutable_receipts: BTreeMap::new(),
             }],
@@ -16505,13 +17337,13 @@ mod tests {
                     account_id: account_id.clone(),
                     seq: 2,
                     timestamp: OffsetDateTime::UNIX_EPOCH,
-                    payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                    payload: LiveJournalPayload::OrderPrepared(prepared.clone().into()),
                 },
                 LiveJournalEvent {
                     account_id: account_id.clone(),
                     seq: 3,
                     timestamp: OffsetDateTime::UNIX_EPOCH,
-                    payload: LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+                    payload: LiveJournalPayload::OrderReconciled(Arc::new(finality_matched(
                         &prepared,
                         transaction_hash.clone(),
                     ))),
@@ -16522,6 +17354,7 @@ mod tests {
         let mut malformed = prefix();
         let mut malformed_final = finalized_fill_event(&account_id, &prepared, 4, 2);
         if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut malformed_final.payload {
+            let finalized = Arc::make_mut(finalized);
             finalized.receipts.clear();
             finalized.blocks.clear();
         }
@@ -16530,6 +17363,7 @@ mod tests {
         let mut economic = prefix();
         let mut economic_final = finalized_fill_event(&account_id, &prepared, 4, 2);
         if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut economic_final.payload {
+            let finalized = Arc::make_mut(finalized);
             finalized.principal = CollateralAmount::from_atomic(2_500_001);
             let RawHttpAttempt::Response(response) = finalized.receipts.get_mut(1).unwrap() else {
                 unreachable!();
@@ -16544,7 +17378,7 @@ mod tests {
             &mut missing_authenticated_hash[3].payload
             && let LiveJournalOrderOutcome::Matched {
                 transaction_hashes, ..
-            } = &mut reconciled.outcome
+            } = &mut Arc::make_mut(reconciled).outcome
         {
             transaction_hashes.push(second_transaction_hash.clone());
         }
@@ -16555,7 +17389,7 @@ mod tests {
             &mut substituted_authenticated_hash[3].payload
             && let LiveJournalOrderOutcome::Matched {
                 transaction_hashes, ..
-            } = &mut reconciled.outcome
+            } = &mut Arc::make_mut(reconciled).outcome
         {
             *transaction_hashes = vec![second_transaction_hash.clone()];
         }
@@ -16568,7 +17402,7 @@ mod tests {
                 account_id: account_id.clone(),
                 seq: 2,
                 timestamp: OffsetDateTime::UNIX_EPOCH,
-                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             },
         ];
         zero_authenticated_hashes.push(finalized_fill_event(&account_id, &prepared, 3, 2));
@@ -16577,6 +17411,7 @@ mod tests {
         let mut extra_receipt_final = finalized_fill_event(&account_id, &prepared, 4, 2);
         if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut extra_receipt_final.payload
         {
+            let finalized = Arc::make_mut(finalized);
             let mut receipt_body: serde_json::Value = serde_json::from_slice(
                 &receipt_for_transaction(&second_transaction_hash, 8, 0, 0, 0),
             )
@@ -16596,6 +17431,7 @@ mod tests {
         if let LiveJournalPayload::OrderFillFinalized(finalized) =
             &mut canonical_key_mismatch_final.payload
         {
+            let finalized = Arc::make_mut(finalized);
             let RawHttpAttempt::Response(mut response) = finalized.blocks[0].clone() else {
                 unreachable!();
             };
@@ -16609,7 +17445,7 @@ mod tests {
             &FakePolygonRpc::new(101).with_receipt(receipt_with_word(2, 2_499_999)),
             vec![PendingOrderFinality {
                 prepared_journal_seq: 2,
-                prepared: prepared.clone(),
+                prepared: prepared.clone().into(),
                 transaction_hashes: vec![transaction_hash.clone()],
                 immutable_receipts: BTreeMap::new(),
             }],
@@ -16626,7 +17462,7 @@ mod tests {
             account_id: account_id.clone(),
             seq: 4,
             timestamp: OffsetDateTime::UNIX_EPOCH,
-            payload: LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+            payload: LiveJournalPayload::OrderReconciled(Arc::new(LiveOrderReconciliationAudit {
                 identity: prepared.identity.clone(),
                 order_hash: prepared.prepared.order_hash.clone(),
                 source: LiveReconciliationSource::PolygonFinality,
@@ -16688,7 +17524,7 @@ mod tests {
             rpc,
             vec![PendingOrderFinality {
                 prepared_journal_seq: 9,
-                prepared: finality_prepared(),
+                prepared: finality_prepared().into(),
                 transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
                 immutable_receipts: BTreeMap::new(),
             }],
@@ -16739,7 +17575,7 @@ mod tests {
             &overflow,
             vec![PendingOrderFinality {
                 prepared_journal_seq: 9,
-                prepared: finality_prepared(),
+                prepared: finality_prepared().into(),
                 transaction_hashes: vec![first, second],
                 immutable_receipts: BTreeMap::new(),
             }],
@@ -16914,7 +17750,10 @@ mod tests {
         let valid = vec![
             baseline_event(&account_a, 1),
             event(2, LiveJournalPayload::AdmissionEvaluated(valid_admission)),
-            event(3, LiveJournalPayload::OrderPrepared(prepared.clone())),
+            event(
+                3,
+                LiveJournalPayload::OrderPrepared(prepared.clone().into()),
+            ),
         ];
         assert!(derive_with_baseline_evidence(&account_a, &valid, &[]).is_ok());
 
@@ -16934,7 +17773,7 @@ mod tests {
             ),
             event(
                 3,
-                LiveJournalPayload::OrderPrepared(substituted_prepared.clone()),
+                LiveJournalPayload::OrderPrepared(substituted_prepared.clone().into()),
             ),
         ];
         assert!(matches!(
@@ -16945,6 +17784,7 @@ mod tests {
         let mut prepared_only_substitution = valid.clone();
         if let LiveJournalPayload::OrderPrepared(order) = &mut prepared_only_substitution[2].payload
         {
+            let order = Arc::make_mut(order);
             order.account_state = account_b_state.clone();
         }
         assert!(matches!(
@@ -17086,7 +17926,7 @@ mod tests {
             let mut resumed = prefix.clone();
             resumed.push(event(
                 3,
-                LiveJournalPayload::OrderPrepared(prepared.clone()),
+                LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             ));
             let resumed = derive_with_baseline_evidence(&account_id, &resumed, &[]).unwrap();
             assert!(resumed.pending_approved_admission_keys.is_empty());
@@ -17133,7 +17973,24 @@ mod tests {
             CollateralAmount::from_atomic(10_000_000),
         )
         .await;
+        let _ = bind_activity_observation(
+            &mut prepared,
+            &account_id,
+            fixture_receipt(5),
+            fixture_receipt(6),
+            OffsetDateTime::UNIX_EPOCH,
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        prepared.economic.risk.price_receipts.clear();
         bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, OffsetDateTime::UNIX_EPOCH);
+        append_economic_sources(
+            &state,
+            &mut prepared,
+            &account_id,
+            OffsetDateTime::UNIX_EPOCH,
+            None,
+        )
+        .await;
         append_approved_admission(
             state.config.journal.as_ref(),
             &account_id,
@@ -17143,15 +18000,17 @@ mod tests {
         assert!(recovery_is_pending(&state).unwrap());
 
         let prefix = LiveJournal::verified_tail(&state.config.journal_path).unwrap();
+        // The era prefix is fixed at boot, so the restarted live state starts after it.
         state.config.era_live_prefix = Some(prefix);
+        state.live = std::sync::Mutex::new(LiveState::default());
         assert!(!recovery_is_pending(&state).unwrap());
     }
 
-    /// PASS: the structural idle hint reports a tampered Approved admission as pending without
-    /// evaluating its evidence, while consuming recovery rejects the invalid risk decision.
-    /// FAIL: the hint errors on the tamper, misses the pending admission, or consumption accepts it.
+    /// PASS: a tampered Approved admission is rejected once, when the live state applies it, and
+    /// both the idle hint and consuming recovery then read the account as closed.
+    /// FAIL: either read reports no pending work or exposes the admission for recovery.
     #[tokio::test]
-    async fn idle_recovery_hint_does_not_verify_admission_evidence() {
+    async fn tampered_admission_closes_the_account_for_both_recovery_reads() {
         let dir = tempdir().unwrap();
         let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         let state = fanout_state(
@@ -17175,8 +18034,18 @@ mod tests {
         prepared.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
         prepared.economic.admission.settlement.source_timestamp_unix = Some(now.unix_timestamp());
         prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
+        prepared.economic.risk.evaluated_at_unix_ms = unix_millis_i64(now);
         prepared.economic.risk.price_receipts.clear();
+        let _ = bind_activity_observation(
+            &mut prepared,
+            &account_id,
+            fixture_receipt(5),
+            fixture_receipt(6),
+            now,
+            now,
+        );
         bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
+        append_economic_sources(&state, &mut prepared, &account_id, now, None).await;
         let mut admission = approved_admission(&prepared);
         admission.economic.risk.snapshot.absolute_pnl_bps = BasisPoints(-1_000);
         admission.economic.risk.decision = RiskDecisionAudit::Approved;
@@ -17190,12 +18059,13 @@ mod tests {
             )
             .unwrap();
 
-        assert!(recovery_is_pending(&state).unwrap());
+        assert!(matches!(
+            recovery_is_pending(&state),
+            Err(FanoutError::LiveState(LiveStateError::Rejected(_)))
+        ));
         assert!(matches!(
             verified_recovery_inventory(&state),
-            Err(FanoutError::Journal(
-                pe_execution_core::LiveJournalError::OrderFactConflict
-            ))
+            Err(FanoutError::LiveState(LiveStateError::Rejected(_)))
         ));
     }
 
@@ -17260,10 +18130,7 @@ mod tests {
             }
             assert!(matches!(
                 verified_recovery_inventory(&state),
-                Err(FanoutError::Journal(
-                    pe_execution_core::LiveJournalError::OrderFactConflict
-                        | pe_execution_core::LiveJournalError::RequestBinding
-                ))
+                Err(FanoutError::LiveState(LiveStateError::Rejected(_)))
             ));
         }
     }
@@ -17484,11 +18351,11 @@ mod tests {
             timestamp: OffsetDateTime::from_unix_timestamp(i64::try_from(seq).unwrap()).unwrap(),
             payload,
         };
-        let stream = |admission, prepared| {
+        let stream = |admission, prepared: Box<pe_execution_core::LiveOrderPreparedAudit>| {
             vec![
                 baseline_event(&account_id, 1),
                 event(2, LiveJournalPayload::AdmissionEvaluated(admission)),
-                event(3, LiveJournalPayload::OrderPrepared(prepared)),
+                event(3, LiveJournalPayload::OrderPrepared(prepared.into())),
             ]
         };
         assert!(
@@ -17620,7 +18487,7 @@ mod tests {
                 &account_id,
                 &[
                     baseline_event(&account_id, 1),
-                    event(2, LiveJournalPayload::OrderPrepared(prepared)),
+                    event(2, LiveJournalPayload::OrderPrepared(prepared.into())),
                 ],
                 &[],
             ),
@@ -17827,7 +18694,7 @@ mod tests {
             account_id: account_id.clone(),
             seq,
             timestamp: OffsetDateTime::from_unix_timestamp(10).unwrap(),
-            payload: LiveJournalPayload::OrderFillFinalized(Box::new(OrderFillFinalizedAudit {
+            payload: LiveJournalPayload::OrderFillFinalized(Arc::new(OrderFillFinalizedAudit {
                 identity: prepared.identity.clone(),
                 prepared_journal_seq: prepared_seq,
                 principal: CollateralAmount::from_atomic(2_500_000),
@@ -17879,7 +18746,7 @@ mod tests {
             account_id: account_id.clone(),
             seq,
             timestamp: OffsetDateTime::from_unix_timestamp(20).unwrap(),
-            payload: LiveJournalPayload::ResolutionFinalized(Box::new(
+            payload: LiveJournalPayload::ResolutionFinalized(Arc::new(
                 pe_execution_core::ResolutionFinalizedAudit {
                     condition_id: PolymarketConditionId(format!("0x{}", "77".repeat(32))),
                     payout_by_outcome_index_json: BinaryPayoutVector::winner(0)
@@ -17971,7 +18838,7 @@ mod tests {
             .append(
                 account_id.clone(),
                 OffsetDateTime::from_unix_timestamp(1).unwrap(),
-                LiveJournalPayload::OrderPrepared(prepared.clone()),
+                LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             )
             .unwrap();
         let finalized = finalized_fill_event(
@@ -18006,15 +18873,24 @@ mod tests {
             LiveJournalPayload::AccountPortfolioMarked(_)
         ));
 
+        let conditions = sync_live(&state)
+            .unwrap()
+            .view(&account_id)
+            .unwrap()
+            .unwrap()
+            .financial
+            .main
+            .resolvable_conditions()
+            .unwrap();
+        assert!(conditions.is_empty());
         discover_live_resolutions(
             &state,
             &account_id,
-            &events,
+            conditions,
             &mut BTreeMap::new(),
             OffsetDateTime::from_unix_timestamp(4).unwrap(),
         )
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(hits.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -18033,6 +18909,7 @@ mod tests {
         let prepared = finality_prepared();
         let mut half_fill = finalized_fill_event(&account_id, &prepared, 5, 3);
         if let LiveJournalPayload::OrderFillFinalized(fill) = &mut half_fill.payload {
+            let fill = Arc::make_mut(fill);
             fill.quantity = ShareAmount::from_atomic(3_125_001);
             if let Some(RawHttpAttempt::Response(response)) = fill.receipts.get_mut(1) {
                 response.body = receipt_with_word(3, 3_125_001);
@@ -18040,6 +18917,7 @@ mod tests {
         }
         let mut half_resolution = resolution_event(&account_id, 5);
         if let LiveJournalPayload::ResolutionFinalized(resolution) = &mut half_resolution.payload {
+            let resolution = Arc::make_mut(resolution);
             resolution.payout_by_outcome_index_json =
                 BinaryPayoutVector::fifty_fifty().canonical_json();
         }
@@ -18058,7 +18936,7 @@ mod tests {
                     account_id: account_id.clone(),
                     seq: 3,
                     timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
-                    payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                    payload: LiveJournalPayload::OrderPrepared(prepared.clone().into()),
                 },
                 finality_matched_event(
                     &account_id,
@@ -18078,6 +18956,7 @@ mod tests {
         let mut losing_resolution = resolution_event(&account_id, 5);
         if let LiveJournalPayload::ResolutionFinalized(resolution) = &mut losing_resolution.payload
         {
+            let resolution = Arc::make_mut(resolution);
             resolution.payout_by_outcome_index_json =
                 BinaryPayoutVector::winner(1).unwrap().canonical_json();
         }
@@ -18096,7 +18975,7 @@ mod tests {
                     account_id: account_id.clone(),
                     seq: 3,
                     timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
-                    payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                    payload: LiveJournalPayload::OrderPrepared(prepared.clone().into()),
                 },
                 finality_matched_event(
                     &account_id,
@@ -18161,7 +19040,7 @@ mod tests {
                 account_id: account_id.clone(),
                 seq: 3,
                 timestamp: OffsetDateTime::from_unix_timestamp(86_401).unwrap(),
-                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             },
             finality_matched_event(
                 &account_id,
@@ -18258,7 +19137,7 @@ mod tests {
                 account_id: account_id.clone(),
                 seq: 3,
                 timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
-                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             },
             finality_matched_event(
                 &account_id,
@@ -18345,12 +19224,12 @@ mod tests {
         let prepared = finality_prepared();
         let recovered = journal_recovery_account(
             &account_id,
-            &[LiveJournalEvent {
+            &[Arc::new(LiveJournalEvent {
                 account_id: account_id.clone(),
                 seq: 1,
                 timestamp: OffsetDateTime::UNIX_EPOCH,
-                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
-            }],
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone().into()),
+            })],
         )
         .unwrap();
         assert_eq!(recovered.account_id, account_id);
@@ -18386,7 +19265,7 @@ mod tests {
                 account_id: account_id.clone(),
                 seq: 3,
                 timestamp: OffsetDateTime::from_unix_timestamp(5).unwrap(),
-                payload: LiveJournalPayload::OrderPrepared(prepared.clone()),
+                payload: LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             },
             finality_matched_event(
                 &account_id,
@@ -18405,6 +19284,7 @@ mod tests {
         }));
         let mut conflicting_fill = repeated_fill.clone();
         if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut conflicting_fill.payload {
+            let finalized = Arc::make_mut(finalized);
             finalized.finalized_head = 101;
         }
         let mut conflicting_events = events.clone();
@@ -18413,6 +19293,7 @@ mod tests {
 
         let mut invented_fill = finalized_fill_event(&account_id, &prepared, 6, 3);
         if let LiveJournalPayload::OrderFillFinalized(finalized) = &mut invented_fill.payload {
+            let finalized = Arc::make_mut(finalized);
             finalized.receipts.clear();
             finalized.blocks.clear();
         }
@@ -18478,7 +19359,7 @@ mod tests {
             account_id: account_id.clone(),
             seq: 8,
             timestamp: OffsetDateTime::from_unix_timestamp(30).unwrap(),
-            payload: LiveJournalPayload::RedemptionCustodyReconciled(Box::new(
+            payload: LiveJournalPayload::RedemptionCustodyReconciled(Arc::new(
                 custody_audit.clone(),
             )),
         });
@@ -18527,7 +19408,7 @@ mod tests {
                 account_id: account_id.clone(),
                 seq: 10,
                 timestamp: OffsetDateTime::from_unix_timestamp(30).unwrap(),
-                payload: LiveJournalPayload::RedemptionCustodyReconciled(Box::new(
+                payload: LiveJournalPayload::RedemptionCustodyReconciled(Arc::new(
                     custody_audit.clone(),
                 )),
             },
@@ -18535,7 +19416,7 @@ mod tests {
                 account_id: account_id.clone(),
                 seq: 11,
                 timestamp: OffsetDateTime::from_unix_timestamp(30).unwrap(),
-                payload: LiveJournalPayload::RedemptionCustodyReconciled(Box::new(custody_audit)),
+                payload: LiveJournalPayload::RedemptionCustodyReconciled(Arc::new(custody_audit)),
             },
         ]);
         let account_b = AccountId::new("account-b").unwrap();
@@ -18556,6 +19437,7 @@ mod tests {
         let mut copied_position_events = events.clone();
         for event in &mut copied_position_events {
             if let LiveJournalPayload::RedemptionCustodyReconciled(custody) = &mut event.payload {
+                let custody = Arc::make_mut(custody);
                 custody.venue_positions.push(CanonicalPositionAudit {
                     condition_id: prepared.prepared.condition_id.clone(),
                     outcome_index: 0,
@@ -18685,6 +19567,19 @@ mod tests {
         )
     }
 
+    /// Wait until a dropped fixture's source-log task has released its writer, so a fresh state
+    /// can reopen the same files.
+    async fn wait_for_source_writer(path: &std::path::Path) {
+        for _ in 0..100 {
+            match crate::source_event_sink::SourceEventSink::open(path) {
+                Ok(_) => return,
+                Err(pe_event_log::LogError::Locked { .. }) => tokio::task::yield_now().await,
+                Err(error) => panic!("source fixture shutdown failed: {error}"),
+            }
+        }
+        panic!("old fixture source writer did not stop");
+    }
+
     fn fanout_state(
         dir: &tempfile::TempDir,
         paper_state: Arc<PaperStateDb>,
@@ -18761,6 +19656,7 @@ mod tests {
                 supabase_secret_key: String::new(),
                 gamma_base_url: "http://127.0.0.1:9".to_owned(),
                 clob_base_url: "http://127.0.0.1:9".to_owned(),
+                relayer_base_url: "http://127.0.0.1:9".to_owned(),
                 data_base_url: "http://127.0.0.1:9".to_owned(),
                 projection_reconcile_interval_secs: 3_600,
                 shutdown: ShutdownController::new().0,
@@ -18776,6 +19672,8 @@ mod tests {
             last_redemption_unix: None,
             last_projection_unix: None,
             last_prune_unix: None,
+            live: std::sync::Mutex::new(LiveState::default()),
+            clock: Arc::new(OffsetDateTime::now_utc),
         }
     }
 
@@ -19772,6 +20670,15 @@ mod tests {
         );
         let account_id = AccountId::new("acct").unwrap();
         let mut prepared = finality_prepared();
+        prepared.identity.idempotency_key =
+            LiveOrderIdentity::idempotency_key_for(&prepared.identity.dispatch_id, &account_id);
+        prepared.account_state = append_recovery_baseline(
+            &state,
+            &account_id,
+            OffsetDateTime::UNIX_EPOCH,
+            CollateralAmount::from_atomic(10_000_000),
+        )
+        .await;
         let _ = bind_activity_observation(
             &mut prepared,
             &account_id,
@@ -19780,15 +20687,16 @@ mod tests {
             OffsetDateTime::UNIX_EPOCH,
             OffsetDateTime::UNIX_EPOCH,
         );
-        let baseline = baseline_event(&account_id, 0);
-        if let LiveJournalPayload::AccountPortfolioMarked(mark) = &baseline.payload {
-            prepared.account_state = mark.account_state.clone();
-        }
-        state
-            .config
-            .journal
-            .append(account_id.clone(), baseline.timestamp, baseline.payload)
-            .unwrap();
+        prepared.economic.risk.price_receipts.clear();
+        bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, OffsetDateTime::UNIX_EPOCH);
+        append_economic_sources(
+            &state,
+            &mut prepared,
+            &account_id,
+            OffsetDateTime::UNIX_EPOCH,
+            None,
+        )
+        .await;
         append_approved_admission(
             state.config.journal.as_ref(),
             &account_id,
@@ -19801,7 +20709,7 @@ mod tests {
             .append(
                 account_id.clone(),
                 OffsetDateTime::UNIX_EPOCH,
-                LiveJournalPayload::OrderPrepared(prepared.clone()),
+                LiveJournalPayload::OrderPrepared(prepared.clone().into()),
             )
             .unwrap();
         let matched_event = state
@@ -19810,7 +20718,7 @@ mod tests {
             .append(
                 account_id.clone(),
                 OffsetDateTime::UNIX_EPOCH,
-                LiveJournalPayload::OrderReconciled(Box::new(finality_matched(
+                LiveJournalPayload::OrderReconciled(Arc::new(finality_matched(
                     &prepared,
                     format!("0x{}", "11".repeat(32)),
                 ))),
@@ -20364,7 +21272,7 @@ mod tests {
                 .append(
                     approved.account_id.clone(),
                     now,
-                    LiveJournalPayload::OrderPrepared(Box::new(prepared)),
+                    LiveJournalPayload::OrderPrepared(Arc::new(prepared)),
                 )
                 .unwrap();
             let before_final_audit = verified_recovery_inventory(&state).unwrap();
@@ -20602,13 +21510,13 @@ mod tests {
         let journal = LiveJournal::open(&path).unwrap();
         let control =
             snapshot.control_observation(Some(&snapshot.accounts[0]), now.unix_timestamp());
-        record_approved_recovery_pause_in_journal(&journal, &path, &target, control).unwrap();
+        record_approved_recovery_pause_in_journal(&journal, &target, control).unwrap();
         drop(journal);
 
         let restarted = LiveJournal::open(&path).unwrap();
         let unchanged =
             snapshot.control_observation(Some(&snapshot.accounts[0]), now.unix_timestamp() + 2);
-        record_approved_recovery_pause_in_journal(&restarted, &path, &target, unchanged).unwrap();
+        record_approved_recovery_pause_in_journal(&restarted, &target, unchanged).unwrap();
         let account_id = AccountId::new("acct").unwrap();
         let count = || {
             replay_account(&path, &account_id)
@@ -20626,7 +21534,7 @@ mod tests {
         snapshot.fetched_at_unix = None;
         let stale =
             snapshot.control_observation(Some(&snapshot.accounts[0]), now.unix_timestamp() + 4);
-        record_approved_recovery_pause_in_journal(&restarted, &path, &target, stale).unwrap();
+        record_approved_recovery_pause_in_journal(&restarted, &target, stale).unwrap();
         assert_eq!(count(), 2);
     }
 
@@ -20991,4 +21899,11 @@ mod tests {
         assert!(venue.calls().is_empty());
         assert!(db.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
     }
+
+    mod credit_and_custody;
+    mod live_state;
+    mod release_bench;
+    mod resolution_and_cutoffs;
+    #[cfg(feature = "scenario")]
+    mod unattended_scenario;
 }
