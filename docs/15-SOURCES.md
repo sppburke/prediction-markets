@@ -333,7 +333,8 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/trading/fees | 2026-09-15 | 2026-11-14 |
 | https://docs.polymarket.com/builders/fees | 2026-09-05 | 2026-11-04 |
 | https://docs.polymarket.com/trading/deposit-wallets | 2026-07-17 | 2026-09-15 |
-| https://docs.polymarket.com/trading/wallets-auth | 2026-10-26 | 2026-12-25 |
+| https://docs.polymarket.com/trading/wallets-auth | 2026-10-27 | 2026-12-26 |
+| https://docs.polymarket.com/resources/onchain-position-data | 2026-10-27 | 2026-12-26 |
 | https://docs.polymarket.com/trading/positions/manage | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/trading/clients/l2 | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/concepts/order-lifecycle | — | — |
@@ -451,6 +452,27 @@ Treat as research inspiration; not a production decision input unless an authori
 | https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
+
+- 2026-10-27 (ordinary-live go-live, #808): re-read the official
+  [Wallets and Authentication](https://docs.polymarket.com/trading/wallets-auth) page (unchanged
+  since 2026-10-26) and [Onchain Position Data](https://docs.polymarket.com/resources/onchain-position-data).
+  - Approvals: besides the pUSD approvals for the two V2 exchanges, negative-risk buys need a pUSD
+    approval for the Neg Risk Adapter `0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296` ("The CLOB
+    rejects buy orders without the pUSD approval"), which `setupTradingApprovals()` does not grant.
+    pe-service places only buy orders, so the exchanges' Conditional Tokens approvals (sell orders)
+    are not required; its redemptions need Conditional Tokens approval for both collateral
+    adapters. Live read (public Polygon RPC): all 35 Deposit Wallets (documented beacon) among the
+    top 40 ranked wallets held every one of these approvals.
+  - Relayer: `GET /v1/account/transactions/params?address=<signer>&type=WALLET` answered 200 with
+    no key and with a dummy key, naming a different address each time. Only an answer naming the
+    signer passes pe-service's nonce check (`crates/venue-polymarket/src/redemption.rs`).
+  - Position systems: Gamma `version` `"v1"` markets use Conditional Tokens and the CTF exchanges
+    (EIP-712 domain version `"2"`); `"v2"` markets (Polymarket Protocol V2) use PositionManager
+    `0x006F54F7f9A22e0000CC2AB60031000000ae9fEF` and the Polymarket V2 Exchange
+    `0xe3333700cA9d93003F00f0F71f8515005F6c00Aa` (domain version `"3"`). The vendored SDK signs
+    only for the CTF exchanges, and the compact-market parser does not read the `v` field. Gamma
+    lists active `"v2"` markets (for example sports and weather markets created on 2026-10-25); all
+    138 markets paper copied in the 7 days to 2026-10-27 were `"v1"`.
 
 - 2026-10-15 (copy-scope gate F, #779 follow-up): the official Gamma OpenAPI
   (`/api-spec/gamma-openapi.yaml`) documents `Market.events` → `Event.series` →
