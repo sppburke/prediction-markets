@@ -327,13 +327,13 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/market-data/websocket/user-channel | 2026-06-03 | 2026-09-01 |
 | https://docs.polymarket.com/market-data/websocket/sports | — | — |
 | https://docs.polymarket.com/market-data/websocket/rtds | 2026-06-03 | 2026-09-01 |
-| https://docs.polymarket.com/v2-migration | 2026-07-17 | 2026-09-15 |
+| https://docs.polymarket.com/v2-migration | 2026-10-26 | 2026-12-25 |
 | https://docs.polymarket.com/trading/overview | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/trading/orders/create | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/trading/fees | 2026-09-15 | 2026-11-14 |
 | https://docs.polymarket.com/builders/fees | 2026-09-05 | 2026-11-04 |
 | https://docs.polymarket.com/trading/deposit-wallets | 2026-07-17 | 2026-09-15 |
-| https://docs.polymarket.com/trading/wallets-auth | 2026-08-11 | 2026-10-10 |
+| https://docs.polymarket.com/trading/wallets-auth | 2026-10-26 | 2026-12-25 |
 | https://docs.polymarket.com/trading/positions/manage | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/trading/clients/l2 | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/concepts/order-lifecycle | — | — |
@@ -345,12 +345,13 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/trading/bridge/supported-assets | — | — |
 | https://docs.polymarket.com/trading/bridge/status | — | — |
 | https://docs.polymarket.com/resources/contracts | 2026-08-11 | 2026-10-10 |
-| https://docs.polymarket.com/api-reference/relayer/submit-a-transaction | 2026-08-11 | 2026-10-10 |
-| https://docs.polymarket.com/api-reference/relayer/get-relayer-address-and-nonce | 2026-08-11 | 2026-10-10 |
-| https://docs.polymarket.com/api-reference/relayer/get-a-transaction-by-id | 2026-08-11 | 2026-10-10 |
+| https://docs.polymarket.com/api-reference/relayer/submit-a-transaction | 2026-10-26 | 2026-12-25 |
+| https://docs.polymarket.com/api-reference/relayer/get-relayer-address-and-nonce | 2026-10-26 | 2026-12-25 |
+| https://docs.polymarket.com/api-reference/relayer/get-a-transaction-by-id | 2026-10-26 | 2026-12-25 |
+| https://docs.polymarket.com/programs/taker-rebates | 2026-10-26 | 2026-12-25 |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-10-10 | 2026-12-09 |
 | https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets | 2026-10-23 | 2026-12-22 |
-| https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-10-13 | 2026-12-12 |
+| https://docs.polymarket.com/api-reference/core/get-user-activity (`TAKER_REBATE` type) | 2026-10-26 | 2026-12-25 |
 | https://docs.polymarket.com/api-reference/feeds/list-account-activity | 2026-09-10 | 2026-11-09 |
 | https://docs.polymarket.com/api-reference/service/get-data-freshness | 2026-09-10 | 2026-11-09 |
 | https://docs.polymarket.com/api-reference/data-api/migrating-from-v1 | 2026-09-10 | 2026-11-09 |

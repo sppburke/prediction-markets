@@ -33,11 +33,16 @@ It shows the running service contract separately from readiness; Request mode st
   the execution service's restricted secrets, and put only its `age1...` recipient string in the
   site's `PE_AGE_RECIPIENT`. The site must not have a decrypt identity. If the env var is absent or
   invalid, credential rotation fails before any RPC or plaintext write.
-- **C1 — rotate the recipient safely.** Provision the new private identity to the execution service
-  first, update `PE_AGE_RECIPIENT` and restart the site, then rotate every account bundle from
-  `/admin/accounts`. Keep the prior private identity available until every account's displayed
-  `key_id` and incremented `bundle_version` confirm rotation. The UI and API expose metadata only;
-  there is no credential readback path.
+- **C1 — rotate the recipient safely.** While any account has a live Baseline, preserve the loaded
+  service identity, site recipient, sealed bundle and its binding, including while mode is `off`;
+  see the [ordinary-live rollback rule](../../docs/35-PE-SERVICE-DEPLOY-RUNBOOK.md#rollback).
+  The service loads one identity (`load_identity_from_credentials_dir` in
+  `crates/service/src/live_credentials.rs`), so recipient rotation needs its own reviewed
+  transition. Only without live Baselines, provision the new service identity, update
+  `PE_AGE_RECIPIENT` and restart the site, then rotate every account bundle from `/admin/accounts`.
+  Keep the prior private identity available until every account's displayed `key_id` and
+  incremented `bundle_version` confirm rotation. The UI and API expose metadata only; there is no
+  credential readback path.
 
 ## Deploy
 

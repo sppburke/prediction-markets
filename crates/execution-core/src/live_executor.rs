@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use pe_core_types::{
     AccountId, CollateralAmount, OutcomeId, PolymarketConditionId, PolymarketTokenId, Price,
@@ -1003,7 +1004,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         self.journal.append(
             request.target.account_id.clone(),
             prepared_at,
-            LiveJournalPayload::OrderPrepared(Box::new(prepared_audit.clone())),
+            LiveJournalPayload::OrderPrepared(Arc::new(prepared_audit.clone())),
         )?;
         Ok(LivePrepareResult::Prepared(PreparedLiveOrder {
             account_id: request.target.account_id,
@@ -1131,7 +1132,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         self.journal.append(
             account_id.clone(),
             clock(),
-            LiveJournalPayload::OrderPrepared(Box::new(prepared_audit.clone())),
+            LiveJournalPayload::OrderPrepared(Arc::new(prepared_audit.clone())),
         )?;
         Ok(LivePrepareResult::Prepared(PreparedLiveOrder {
             account_id,
@@ -1475,7 +1476,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         self.journal.append(
             account_id.clone(),
             now,
-            LiveJournalPayload::OrderReconciled(Box::new(LiveOrderReconciliationAudit {
+            LiveJournalPayload::OrderReconciled(Arc::new(LiveOrderReconciliationAudit {
                 identity: identity.clone(),
                 order_hash: order_hash.to_owned(),
                 source,
@@ -1935,6 +1936,8 @@ mod tests {
         posts: AtomicUsize,
         reconciliations: AtomicUsize,
         post_checked_at: Option<OffsetDateTime>,
+        post_failure: Option<RawTransportFailure>,
+        reconciliation_hashes: Mutex<Vec<String>>,
     }
 
     impl FixtureVenue {
@@ -1948,6 +1951,8 @@ mod tests {
                 posts: AtomicUsize::new(0),
                 reconciliations: AtomicUsize::new(0),
                 post_checked_at: None,
+                post_failure: None,
+                reconciliation_hashes: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1993,6 +1998,9 @@ mod tests {
                     ));
                 }
                 self.posts.fetch_add(1, Ordering::SeqCst);
+                if let Some(failure) = &self.post_failure {
+                    return Err(failure.clone());
+                }
                 let mut response = raw_response("order-post");
                 if let Some(checked_at) = self.post_checked_at {
                     response.observed_at = checked_at;
@@ -2011,7 +2019,7 @@ mod tests {
 
         fn reconcile_and_cancel_by_order_hash<'a>(
             &'a self,
-            _order_hash: &'a str,
+            order_hash: &'a str,
         ) -> Pin<
             Box<
                 dyn Future<Output = Result<LiveVenueReconciliation, LiveVenueReconciliationError>>
@@ -2020,6 +2028,10 @@ mod tests {
             >,
         > {
             self.reconciliations.fetch_add(1, Ordering::SeqCst);
+            self.reconciliation_hashes
+                .lock()
+                .unwrap()
+                .push(order_hash.to_owned());
             let outcome = self.reconciliation.clone();
             Box::pin(async move {
                 Ok(LiveVenueReconciliation {
@@ -2709,6 +2721,72 @@ mod tests {
         assert_eq!(posts, 1);
         assert_eq!(reconciliations, 1);
         assert_common_terminal_evidence(&events);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn post_timeout_reconciles_by_order_hash_without_reposting() {
+        for reconciled in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("live.log");
+            let journal = LiveJournal::open(&path).unwrap();
+            let mut venue = FixtureVenue::new(LivePostClassification::Rejected {
+                venue_order_id: None,
+            });
+            let failure = RawTransportFailure {
+                source_id: "polymarket-clob-v2".to_owned(),
+                endpoint_kind: "order-post".to_owned(),
+                method: "POST".to_owned(),
+                path: "/order".to_owned(),
+                ordered_query: Vec::new(),
+                attempt_ordinal: 1,
+                observed_at: now(),
+                received_at: now(),
+                error_class: TransportErrorClass::Timeout,
+                schema_version: 1,
+                parser_version: 1,
+                adapter_version: pe_venue_polymarket::SDK_VERSION.to_owned(),
+            };
+            venue.post_failure = Some(failure.clone());
+            if reconciled {
+                venue.reconciliation = LiveVenueReconciledOutcome::Killed {
+                    venue_order_id: None,
+                };
+            }
+            let executor = LiveExecutor::new(&venue, &journal);
+            let account_id = AccountId::new("account").unwrap();
+            let LivePrepareResult::Prepared(prepared) =
+                executor.prepare(request(&account_id), now()).await.unwrap()
+            else {
+                unreachable!("fixture admission unexpectedly failed");
+            };
+            let outcome = executor.submit(prepared, now()).await.unwrap();
+            if reconciled {
+                assert!(matches!(outcome, LiveOrderOutcome::Killed { .. }));
+            } else {
+                assert!(matches!(
+                    outcome,
+                    LiveOrderOutcome::Ambiguous {
+                        kind: LiveOrderAmbiguityKind::Timeout,
+                        reconcile_first: true,
+                        ..
+                    }
+                ));
+            }
+            assert_eq!(venue.posts.load(Ordering::SeqCst), 1);
+            assert_eq!(venue.reconciliations.load(Ordering::SeqCst), 1);
+            assert_eq!(*venue.reconciliation_hashes.lock().unwrap(), ["order-hash"]);
+            let events = replay_account(&path, &account_id).unwrap();
+            assert_common_terminal_evidence(&events);
+            assert!(
+                matches!(&events[2].payload, LiveJournalPayload::OrderPosted(audit)
+                if audit.evidence == RawHttpAttempt::TransportFailure(failure))
+            );
+            assert!(
+                matches!(&events[3].payload, LiveJournalPayload::OrderReconciled(audit)
+                if audit.source == LiveReconciliationSource::OrderHashLookupAndCancel
+                    && audit.order_hash == "order-hash")
+            );
+        }
     }
 
     #[tokio::test]

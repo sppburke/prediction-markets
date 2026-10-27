@@ -44,6 +44,9 @@ pub enum RedemptionAttemptState {
         attempt_count: u32,
         redeemable_balance: CollateralAmount,
         request_hash: String,
+        /// Journaled request deadline; once it has passed the relayer can no longer execute the
+        /// unidentified request, so the family may be submitted again (in memory only).
+        deadline_unix: Option<u64>,
     },
     InFlight {
         attempt_count: u32,
@@ -94,6 +97,18 @@ impl RedemptionAttemptState {
             | Self::Complete { attempt_count, .. } => *attempt_count,
         }
     }
+
+    /// A request without a transaction identity whose signed deadline has passed.
+    #[must_use]
+    pub fn submission_deadline_passed(&self, now: OffsetDateTime) -> bool {
+        match self {
+            Self::SubmissionReserved {
+                deadline_unix: Some(deadline),
+                ..
+            } => u64::try_from(now.unix_timestamp()).is_ok_and(|now| now > *deadline),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,20 +120,51 @@ pub struct RedemptionAttempt {
 
 /// Rebuild the latest durable state of every account-scoped redemption family.
 ///
-/// A request without a later transaction identity remains `SubmissionReserved`; callers must
-/// freeze it because the journal cannot prove whether the relayer accepted the submission.
+/// A request without a later transaction identity remains `SubmissionReserved` until its signed
+/// deadline passes: until then the journal cannot prove whether the relayer accepted it.
 #[must_use]
 pub fn reconstruct_redemption_attempts(
     events: &[LiveJournalEvent],
 ) -> HashMap<RedemptionAttemptIdentity, RedemptionAttempt> {
-    let mut attempts = HashMap::new();
+    let mut attempts = RedemptionAttempts::default();
     for event in events {
+        attempts.apply(event);
+    }
+    attempts.into_inner()
+}
+
+/// [`reconstruct_redemption_attempts`] advanced one journal record at a time. The map shares
+/// structure, so copying a long history is cheap.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RedemptionAttempts {
+    attempts: imbl::HashMap<RedemptionAttemptIdentity, RedemptionAttempt>,
+}
+
+impl RedemptionAttempts {
+    #[must_use]
+    pub fn get(&self, identity: &RedemptionAttemptIdentity) -> Option<&RedemptionAttempt> {
+        self.attempts.get(identity)
+    }
+
+    #[must_use]
+    pub fn as_map(&self) -> &imbl::HashMap<RedemptionAttemptIdentity, RedemptionAttempt> {
+        &self.attempts
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> HashMap<RedemptionAttemptIdentity, RedemptionAttempt> {
+        self.attempts.into_iter().collect()
+    }
+
+    pub fn apply(&mut self, event: &LiveJournalEvent) {
+        let attempts = &mut self.attempts;
         match &event.payload {
             LiveJournalPayload::RedemptionRequested(audit) => {
                 let state = RedemptionAttemptState::SubmissionReserved {
                     attempt_count: audit.attempt_count,
                     redeemable_balance: audit.redeemable_balance,
                     request_hash: audit.request.request_hash.clone(),
+                    deadline_unix: audit.request.deadline_unix,
                 };
                 attempts.insert(
                     audit.identity.clone(),
@@ -143,7 +189,7 @@ pub fn reconstruct_redemption_attempts(
             }
             LiveJournalPayload::RedemptionReceiptTransition(audit) => {
                 let Some(prior) = attempts.get(&audit.identity) else {
-                    continue;
+                    return;
                 };
                 let submit_body_hash = match &prior.state {
                     RedemptionAttemptState::InFlight {
@@ -198,7 +244,7 @@ pub fn reconstruct_redemption_attempts(
             }
             LiveJournalPayload::RedemptionCustodyReconciled(audit) => {
                 let Some(prior) = attempts.get(&audit.identity) else {
-                    continue;
+                    return;
                 };
                 let RedemptionAttemptState::ConfirmedAwaitingBalance {
                     attempt_count,
@@ -207,7 +253,7 @@ pub fn reconstruct_redemption_attempts(
                     ..
                 } = &prior.state
                 else {
-                    continue;
+                    return;
                 };
                 attempts.insert(
                     audit.identity.clone(),
@@ -231,6 +277,7 @@ pub fn reconstruct_redemption_attempts(
             | LiveJournalPayload::OrderFillFinalized(_)
             | LiveJournalPayload::ResolutionFinalized(_)
             | LiveJournalPayload::AccountPortfolioMarked(_)
+            | LiveJournalPayload::CollateralCredited(_)
             | LiveJournalPayload::CredentialBindingMismatch { .. }
             | LiveJournalPayload::ModeTransitionApplied(_)
             | LiveJournalPayload::LegacyV1(_)
@@ -239,7 +286,6 @@ pub fn reconstruct_redemption_attempts(
             | LiveJournalPayload::ApprovedRecoveryControlPause(_) => {}
         }
     }
-    attempts
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,16 +390,27 @@ pub fn advance(
                     },
                     vec![RedemptionAction::WaitForBackoff { retry_not_before }],
                 )
-            } else if redeemable_balance > CollateralAmount::ZERO {
-                reserve_submission(attempt_count, redeemable_balance, request_hash)
             } else {
-                (RedemptionAttemptState::Idle { attempt_count }, Vec::new())
+                // Retried even at zero balance: the call is amounts-free and a zero-balance redeem
+                // is a no-op, so a started family always reaches custody.
+                reserve_submission(attempt_count, redeemable_balance, request_hash)
             }
         }
         (
             state @ RedemptionAttemptState::SubmissionReserved { .. },
-            RedemptionEvent::ResolvedWinnerBalanceObserved { .. },
-        ) => (state, vec![RedemptionAction::AwaitTransactionIdentity]),
+            RedemptionEvent::ResolvedWinnerBalanceObserved {
+                now,
+                redeemable_balance,
+                request_hash,
+            },
+        ) => {
+            if state.submission_deadline_passed(now) {
+                // The unidentified request can no longer execute; submit the family again.
+                reserve_submission(state.attempt_count(), redeemable_balance, request_hash)
+            } else {
+                (state, vec![RedemptionAction::AwaitTransactionIdentity])
+            }
+        }
         (
             RedemptionAttemptState::InFlight {
                 attempt_count,
@@ -598,6 +655,7 @@ fn reserve_submission(
             attempt_count,
             redeemable_balance,
             request_hash: request_hash.clone(),
+            deadline_unix: None,
         },
         vec![RedemptionAction::SubmitOnce { request_hash }],
     )
@@ -1511,7 +1569,7 @@ mod tests {
             .append(
                 original.identity.account_id.clone(),
                 now() + Duration::seconds(1),
-                LiveJournalPayload::RedemptionCustodyReconciled(Box::new(
+                LiveJournalPayload::RedemptionCustodyReconciled(std::sync::Arc::new(
                     crate::live_journal::RedemptionCustodyReconciledAudit {
                         identity: original.identity.clone(),
                         account_state: crate::live_journal::LiveAccountStateAudit {
@@ -1549,48 +1607,131 @@ mod tests {
         ));
     }
 
+    /// PASS: a request with no transaction identity stays closed and unsent until its signed
+    /// deadline passes; then the family is submitted again even at zero balance (the call is
+    /// amounts-free), and a legacy request without a deadline stays closed.
     #[tokio::test]
-    async fn requested_without_transaction_identity_restarts_frozen() {
+    async fn requested_without_transaction_identity_resubmits_after_its_deadline() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("live.log");
         let journal = LiveJournal::open(&path).unwrap();
-        let original = attempt(RedemptionAttemptState::SubmissionReserved {
-            attempt_count: 1,
-            redeemable_balance: CollateralAmount::from_atomic(1),
-            request_hash: "request-hash".to_owned(),
-        });
+        let identity = attempt(RedemptionAttemptState::default()).identity;
         journal
             .append(
-                original.identity.account_id.clone(),
+                identity.account_id.clone(),
                 now(),
                 LiveJournalPayload::RedemptionRequested(Box::new(RedemptionRequestedAudit {
-                    identity: original.identity.clone(),
+                    identity: identity.clone(),
                     attempt_count: 1,
                     redeemable_balance: CollateralAmount::from_atomic(1),
                     request: redemption_request_audit(&signed(), "request-hash".to_owned()),
                 })),
             )
             .unwrap();
-        let events = replay_account(&path, &original.identity.account_id).unwrap();
+        let events = replay_account(&path, &identity.account_id).unwrap();
         let resumed = reconstruct_redemption_attempts(&events)
-            .remove(&original.identity)
+            .remove(&identity)
             .unwrap();
+        assert!(matches!(
+            resumed.state,
+            RedemptionAttemptState::SubmissionReserved {
+                deadline_unix: Some(2_000_000_000),
+                ..
+            }
+        ));
         let transport = FixtureTransport::new(SubmitBehavior::Confirmed);
         let status = FixtureStatus::new(StatusBehavior::Pending);
-        let result = run_redemption_pass(
+        let request = signed();
+
+        let waiting = run_redemption_pass(
             &transport,
             &status,
             &journal,
-            input(resumed, now(), CollateralAmount::from_atomic(1), None),
+            input(
+                resumed.clone(),
+                now(),
+                CollateralAmount::ZERO,
+                Some(&request),
+            ),
         )
         .await
         .unwrap();
         assert!(matches!(
-            result.actions.as_slice(),
+            waiting.actions.as_slice(),
             [RedemptionAction::AwaitTransactionIdentity]
         ));
         assert_eq!(transport.submissions.load(Ordering::SeqCst), 0);
+
+        let after_deadline = OffsetDateTime::from_unix_timestamp(2_000_000_001).unwrap();
+        let retried = run_redemption_pass(
+            &transport,
+            &status,
+            &journal,
+            input(
+                resumed,
+                after_deadline,
+                CollateralAmount::ZERO,
+                Some(&request),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(transport.submissions.load(Ordering::SeqCst), 1);
+        assert_eq!(retried.attempt.state.attempt_count(), 2);
+        assert!(matches!(
+            retried.attempt.state,
+            RedemptionAttemptState::ConfirmedAwaitingBalance { .. }
+        ));
         assert_eq!(status.reads.load(Ordering::SeqCst), 0);
+
+        let (legacy, actions) = advance(
+            RedemptionAttemptState::SubmissionReserved {
+                attempt_count: 1,
+                redeemable_balance: CollateralAmount::from_atomic(1),
+                request_hash: "legacy".to_owned(),
+                deadline_unix: None,
+            },
+            RedemptionEvent::ResolvedWinnerBalanceObserved {
+                now: after_deadline,
+                redeemable_balance: CollateralAmount::ZERO,
+                request_hash: "next".to_owned(),
+            },
+        );
+        assert!(matches!(
+            legacy,
+            RedemptionAttemptState::SubmissionReserved { .. }
+        ));
+        assert_eq!(actions, vec![RedemptionAction::AwaitTransactionIdentity]);
+    }
+
+    /// PASS: a failed attempt past its backoff is submitted again even when the wallet no longer
+    /// lists the position, so a started family always reaches custody; a fresh family still needs
+    /// a positive balance.
+    #[test]
+    fn failed_attempt_retries_at_zero_balance_but_fresh_family_does_not_start() {
+        let observed = |request_hash: &str| RedemptionEvent::ResolvedWinnerBalanceObserved {
+            now: now(),
+            redeemable_balance: CollateralAmount::ZERO,
+            request_hash: request_hash.to_owned(),
+        };
+        let (state, actions) = advance(
+            RedemptionAttemptState::Failed {
+                attempt_count: 1,
+                retry_not_before: now(),
+                failure: RedemptionFailureKind::Terminal,
+            },
+            observed("retry"),
+        );
+        assert_eq!(state.attempt_count(), 2);
+        assert_eq!(
+            actions,
+            vec![RedemptionAction::SubmitOnce {
+                request_hash: "retry".to_owned()
+            }]
+        );
+        let (state, actions) = advance(RedemptionAttemptState::default(), observed("fresh"));
+        assert_eq!(state, RedemptionAttemptState::Idle { attempt_count: 0 });
+        assert!(actions.is_empty());
     }
 
     #[tokio::test]

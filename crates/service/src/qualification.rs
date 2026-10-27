@@ -10101,7 +10101,7 @@ mod tests {
             .append(
                 account_id,
                 OffsetDateTime::from_unix_timestamp(2).unwrap(),
-                LiveJournalPayload::OrderPrepared(Box::new(wrapper)),
+                LiveJournalPayload::OrderPrepared(std::sync::Arc::new(wrapper)),
             )
             .unwrap();
         drop(journal);

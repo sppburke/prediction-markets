@@ -41,8 +41,8 @@ pub use live_executor::{
 };
 pub use live_journal::{
     AccountPortfolioMarkedAudit, AdmissionReceipts, CanonicalPositionAudit,
-    CredentialBindingIdentity, LadderAskAudit, LadderPlanAudit, LegacyV1Payload,
-    LiveAccountReadFailure, LiveAccountStateAudit, LiveAdmissionArtifactAudit,
+    CollateralCreditedAudit, CredentialBindingIdentity, LadderAskAudit, LadderPlanAudit,
+    LegacyV1Payload, LiveAccountReadFailure, LiveAccountStateAudit, LiveAdmissionArtifactAudit,
     LiveAdmissionEvaluationAudit, LiveAdmissionRefusal, LiveAdmissionVerdict, LiveControlMode,
     LiveExecutedAmounts, LiveFillProjectionIdentity, LiveJournal, LiveJournalError,
     LiveJournalEvent, LiveJournalOrderOutcome, LiveJournalPayload, LiveMarketEvidenceAudit,
@@ -62,8 +62,8 @@ pub use pe_core_types::{
 };
 pub use redemption_machine::{
     LIVE_REDEMPTION_SURFACE_AFTER_ATTEMPTS, RedemptionAction, RedemptionAttempt,
-    RedemptionAttemptState, RedemptionDriverError, RedemptionEvent, RedemptionFailureKind,
-    RedemptionPassInput, RedemptionPassResult, RedemptionPosture, RedemptionStatusObservation,
-    RedemptionStatusReadError, RedemptionStatusReader, advance, reconstruct_redemption_attempts,
-    redemption_posture, run_redemption_pass,
+    RedemptionAttemptState, RedemptionAttempts, RedemptionDriverError, RedemptionEvent,
+    RedemptionFailureKind, RedemptionPassInput, RedemptionPassResult, RedemptionPosture,
+    RedemptionStatusObservation, RedemptionStatusReadError, RedemptionStatusReader, advance,
+    reconstruct_redemption_attempts, redemption_posture, run_redemption_pass,
 };
