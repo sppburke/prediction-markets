@@ -17,6 +17,9 @@ use serde_json::{Value, json};
 const WALLET: &str = "0x1111111111111111111111111111111111111111";
 const START: i64 = 2_000_000_000;
 const FILL_DEBIT: Decimal = dec!(2.500120);
+/// `2^256 - 1`: the pUSD allowance a polymarket.com Deposit Wallet grants each exchange.
+const UNLIMITED: &str =
+    "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 
 #[derive(Clone)]
 struct Market {
@@ -119,8 +122,8 @@ async fn response(
         "/balance-allowance" => json!({
             "balance": CollateralAmount::from_decimal_exact(script.cash).unwrap().atomic().to_string(),
             "allowances": {
-                pe_venue_polymarket::CanaryV2Client::standard_spender().unwrap(): "1000000000",
-                pe_venue_polymarket::CanaryV2Client::negrisk_spender().unwrap(): "1000000000",
+                pe_venue_polymarket::CanaryV2Client::standard_spender().unwrap(): UNLIMITED,
+                pe_venue_polymarket::CanaryV2Client::negrisk_spender().unwrap(): UNLIMITED,
             },
         }),
         "/positions" => {
@@ -564,7 +567,11 @@ impl Harness {
         prepared.prepared.order_hash = format!("0x{}", format!("{:02x}", 0x22 + index).repeat(32));
         prepared.economic.balance.cash_before = self.cash();
         prepared.account_state =
-            account_state_fixture_for_binding(self.cash(), self.now, self.venue.account_binding());
+            unlimited_account_state(self.cash(), self.now, self.venue.account_binding());
+        assert_eq!(
+            prepared.account_state.allowance,
+            CollateralAmount::from_atomic(u64::MAX)
+        );
         bind_empty_live_risk_to_paper_prefix(&self.state, &mut prepared, self.now);
         append_economic_sources(
             &self.state,
@@ -737,6 +744,43 @@ impl Harness {
         }
         self.assert_oracle();
     }
+}
+
+/// The account audit the production classifier derives from a Deposit Wallet's answer: the
+/// fixture's evidence carrying the wallet's unlimited allowances.
+fn unlimited_account_state(
+    cash: CollateralAmount,
+    observed_at: OffsetDateTime,
+    binding: &LiveAccountBindingAudit,
+) -> pe_execution_core::LiveAccountStateAudit {
+    let mut evidence = account_state_fixture_for_binding(cash, observed_at, binding).evidence;
+    for attempt in &mut evidence {
+        if let RawHttpAttempt::Response(response) = attempt
+            && response.endpoint_kind == "balance-allowance"
+        {
+            response.body = serde_json::to_vec(&json!({
+                "balance": cash.atomic().to_string(),
+                "allowances": {
+                    pe_venue_polymarket::CanaryV2Client::standard_spender().unwrap(): UNLIMITED,
+                    pe_venue_polymarket::CanaryV2Client::negrisk_spender().unwrap(): UNLIMITED,
+                },
+            }))
+            .unwrap();
+        }
+    }
+    let spender = pe_venue_polymarket::CanaryV2Client::standard_spender().unwrap();
+    let request_descriptor_hashes = account_request_descriptor_hashes(&evidence, binding);
+    let LiveAccountResponseClassification::State(state) = classify_live_account_responses(
+        &evidence,
+        &spender,
+        &request_descriptor_hashes,
+        None,
+        binding,
+    )
+    .unwrap() else {
+        panic!("an unlimited allowance must classify as account state")
+    };
+    state.audit().unwrap()
 }
 
 fn assert_summary(actual: &ProjectionDerivation, expected: &ProjectionDerivation) {
@@ -1178,6 +1222,36 @@ async fn redemption_driver_unattended_end_to_end() {
     assert_eq!(
         credits,
         [CollateralAmount::from_decimal_exact(dec!(3)).unwrap()]
+    );
+    // Every recorded account read carries the wallets' unlimited allowance as u64::MAX: the
+    // admissions and orders built from it, and the marks, custody and credit from the venue reads.
+    let mut account_reads = BTreeMap::<&str, usize>::new();
+    for event in h.records() {
+        let (kind, allowance) = match &event.payload {
+            LiveJournalPayload::AdmissionEvaluated(admission) => (
+                "admission",
+                admission.account_state.as_ref().unwrap().allowance,
+            ),
+            LiveJournalPayload::OrderPrepared(prepared) => {
+                ("prepared", prepared.account_state.allowance)
+            }
+            LiveJournalPayload::AccountPortfolioMarked(mark) => {
+                ("mark", mark.account_state.allowance)
+            }
+            LiveJournalPayload::RedemptionCustodyReconciled(custody) => {
+                ("custody", custody.account_state.allowance)
+            }
+            LiveJournalPayload::CollateralCredited(credit) => {
+                ("credit", credit.account_state.allowance)
+            }
+            _ => continue,
+        };
+        assert_eq!(allowance, CollateralAmount::from_atomic(u64::MAX), "{kind}");
+        *account_reads.entry(kind).or_default() += 1;
+    }
+    assert_eq!(
+        account_reads.keys().copied().collect::<Vec<_>>(),
+        ["admission", "credit", "custody", "mark", "prepared"]
     );
     let saved = serde_json::json!({
         "fixture": h.dir.path(),

@@ -14790,15 +14790,16 @@ mod tests {
     }
 
     /// PASS: every runtime-success classification produces an audit accepted by the reducer for
-    /// every response ordering; an absent selected allowance is canonical zero, while a malformed
-    /// selected allowance or absent allowance map fails before an audit can be appended.
+    /// every response ordering; an absent selected allowance is canonical zero and a uint256
+    /// allowance above `u64::MAX` (polymarket.com's unlimited approval) reads as `u64::MAX`, while a
+    /// malformed or out-of-range selected allowance or absent allowance map fails before an audit
+    /// can be appended.
     #[test]
     fn runtime_account_success_always_round_trips_through_reducer() {
         #[derive(Clone, Copy)]
         enum AllowanceShape {
-            Valid,
+            Selected(&'static str),
             SelectedMissing,
-            SelectedMalformed,
             MapMissing,
         }
 
@@ -14812,17 +14813,40 @@ mod tests {
             [2, 0, 1],
             [2, 1, 0],
         ];
+        let saturated = Some(CollateralAmount::from_atomic(u64::MAX));
         let cases = [
             (
-                AllowanceShape::Valid,
+                AllowanceShape::Selected("500000"),
                 Some(CollateralAmount::from_atomic(500_000)),
             ),
             (
                 AllowanceShape::SelectedMissing,
                 Some(CollateralAmount::ZERO),
             ),
-            (AllowanceShape::SelectedMalformed, None),
+            (AllowanceShape::Selected("not-an-integer"), None),
             (AllowanceShape::MapMissing, None),
+            // polymarket.com's unlimited approval, 2^256 - 1, as the CLOB reports it.
+            (
+                AllowanceShape::Selected(
+                    "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+                ),
+                saturated,
+            ),
+            (AllowanceShape::Selected("18446744073709551615"), saturated),
+            (AllowanceShape::Selected("18446744073709551616"), saturated),
+            // Forms the u64 parse already accepted keep their value.
+            (
+                AllowanceShape::Selected("+500000"),
+                Some(CollateralAmount::from_atomic(500_000)),
+            ),
+            (AllowanceShape::Selected(""), None),
+            // 2^256 is not a uint256.
+            (
+                AllowanceShape::Selected(
+                    "115792089237316195423570985008687907853269984665640564039457584007913129639936",
+                ),
+                None,
+            ),
         ];
 
         for (shape, expected_allowance) in cases {
@@ -14842,17 +14866,13 @@ mod tests {
                     })
                     .unwrap();
                 let body = match shape {
-                    AllowanceShape::Valid => serde_json::json!({
+                    AllowanceShape::Selected(allowance) => serde_json::json!({
                         "balance": "1000000",
-                        "allowances": { spender.clone(): "500000" },
+                        "allowances": { spender.clone(): allowance },
                     }),
                     AllowanceShape::SelectedMissing => serde_json::json!({
                         "balance": "1000000",
                         "allowances": {},
-                    }),
-                    AllowanceShape::SelectedMalformed => serde_json::json!({
-                        "balance": "1000000",
-                        "allowances": { spender.clone(): "not-an-integer" },
                     }),
                     AllowanceShape::MapMissing => serde_json::json!({
                         "balance": "1000000",
