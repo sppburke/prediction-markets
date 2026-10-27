@@ -1664,24 +1664,32 @@ effective-mode transition after the updated service starts; request `off` to dis
 ### D3 — Ordinary live go-live
 
 1. Deploy with the account's requested and effective modes `off`.
-2. Owner: use a polymarket.com account with a Deposit Wallet deployed on or after 2026-05-04,
-   with $1,000 pUSD deposited and no positions: the first live Baseline fails on a nonempty venue
-   inventory or a zero balance. From that deposit wallet, approve pUSD for both V2 exchanges
-   (`0xE111180000d2663C0091e4f400237545B87B996B` and
-   `0xe2222d279d744050d28e00520010520000310F59`) and the Neg Risk Adapter
-   (`0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296`; the CLOB rejects negative-risk buys without
-   it), and Conditional Tokens `isApprovedForAll` for both collateral adapters
-   (`0xAdA100Db00Ca00073811820692005400218FcE1f` and
-   `0xadA2005600Dec949baf300f4C6120000bDB6eAab`). Active polymarket.com deposit wallets held
-   all of these on 2026-10-27 ([15-SOURCES](15-SOURCES.md#last-research-pass)).
-   Create the Relayer key for the signer address of `private_key` and check it before sealing:
-   a nonce read (`GET /v1/account/transactions/params?address=<signer>&type=WALLET` with the
-   key's `RELAYER_API_KEY` and `RELAYER_API_KEY_ADDRESS` headers) must name the signer's
-   address, as pe-service requires. A 200 answer alone proves nothing: the endpoint also answers
-   200 for a missing or wrong key, naming another address. Seal one bundle in `/admin/accounts`
-   with `private_key`, `deposit_wallet`, `api_key`, `api_secret`, `api_passphrase`, and
-   `relayer_api_key`. Leave **Sizing mode** unset. Plaintext must never enter `.env`, Supabase,
-   logs, or shell history.
+2. Owner, before sealing:
+   - Use a polymarket.com account with a Deposit Wallet deployed on or after 2026-05-04, holding
+     $1,000 pUSD and no positions: the first live Baseline fails on a nonempty venue inventory or
+     a zero balance.
+   - From that deposit wallet, approve pUSD for both V2 exchanges
+     (`0xE111180000d2663C0091e4f400237545B87B996B` and
+     `0xe2222d279d744050d28e00520010520000310F59`) and the Neg Risk Adapter
+     (`0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296`; the CLOB rejects negative-risk buys without
+     it), and Conditional Tokens `isApprovedForAll` for both collateral adapters
+     (`0xAdA100Db00Ca00073811820692005400218FcE1f` and
+     `0xadA2005600Dec949baf300f4C6120000bDB6eAab`). Active polymarket.com deposit wallets held
+     all of these on 2026-10-27, the pUSD ones unlimited
+     ([15-SOURCES](15-SOURCES.md#last-research-pass)).
+   - Refresh the CLOB's cached balance and allowances (`GET /balance-allowance/update` with
+     `asset_type=COLLATERAL` and `signature_type=3`, L2-authenticated): the CLOB checks orders
+     against that cache, and pe-service reads it before every order. The CLOB's
+     `GET /balance-allowance` answer must then report the on-chain balance, and allowances of at
+     least that balance for both exchanges and the Neg Risk Adapter.
+   - Create the Relayer key for the signer address of `private_key` and check it: a nonce read
+     (`GET /v1/account/transactions/params?address=<signer>&type=WALLET` with the key's
+     `RELAYER_API_KEY` and `RELAYER_API_KEY_ADDRESS` headers) must name the signer's address, as
+     pe-service requires. A 200 answer alone proves nothing: the endpoint also answers 200 for a
+     missing or wrong key, naming another address.
+   - Seal one bundle in `/admin/accounts` with `private_key`, `deposit_wallet`, `api_key`,
+     `api_secret`, `api_passphrase`, and `relayer_api_key`. Leave **Sizing mode** unset.
+     Plaintext must never enter `.env`, Supabase, logs, or shell history.
 3. Operator pre-arm check (read-only): verify the service's loaded age identity matches the site's
    `PE_AGE_RECIPIENT`, the allowances and approvals above are present on chain, the venue
    inventory is empty, and sealed bundle metadata matches the account binding. Confirm account

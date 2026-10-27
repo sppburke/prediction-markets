@@ -439,7 +439,7 @@ fn classify_raw_account_responses(
         .iter()
         .find(|(spender, _)| spender.eq_ignore_ascii_case(selected_spender))
     {
-        Some((_, value)) => account_atomic_amount(Some(value))
+        Some((_, value)) => account_allowance_amount(value)
             .ok_or_else(|| account_error(LiveAccountReadFailure::Protocol))?,
         None => CollateralAmount::ZERO,
     };
@@ -531,6 +531,26 @@ fn account_atomic_amount(value: Option<&Value>) -> Option<CollateralAmount> {
         .parse::<u64>()
         .ok()
         .map(CollateralAmount::from_atomic)
+}
+
+/// `2^256 - 1`, the unlimited pUSD allowance polymarket.com grants; the CLOB reports allowances
+/// as decimal strings.
+const UINT256_MAX_DECIMAL: &str =
+    "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+
+/// The selected spender's allowance. Everything `account_atomic_amount` reads keeps its value. A
+/// digit-only string above `u64::MAX` but within uint256 covers any order, so it reads as
+/// `u64::MAX` instead of failing the account read; anything else stays unreadable.
+fn account_allowance_amount(value: &Value) -> Option<CollateralAmount> {
+    if let Some(amount) = account_atomic_amount(Some(value)) {
+        return Some(amount);
+    }
+    let digits = value.as_str()?;
+    let significant = digits.trim_start_matches('0');
+    let within_uint256 = significant.len() < UINT256_MAX_DECIMAL.len()
+        || (significant.len() == UINT256_MAX_DECIMAL.len() && significant <= UINT256_MAX_DECIMAL);
+    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) && within_uint256)
+        .then_some(CollateralAmount::from_atomic(u64::MAX))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
