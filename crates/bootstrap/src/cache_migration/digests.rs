@@ -170,10 +170,7 @@ mod tests {
                  scope_drops_json TEXT NOT NULL)",
             )
             .unwrap();
-        assert_eq!(
-            certificate_digest(&connection).unwrap(),
-            CERTIFICATE_DIGEST
-        );
+        assert_eq!(certificate_digest(&connection).unwrap(), CERTIFICATE_DIGEST);
         connection
             .execute(
                 "INSERT INTO activity_seed_drops_v3 VALUES
