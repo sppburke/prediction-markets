@@ -47,15 +47,6 @@ pub struct SeedPlan {
     carried: Carried,
 }
 
-/// [`SeedPlan::read`] then [`SeedPlan::init`]; the caller holds the target's mutation lock.
-pub fn init_seeded_cache(
-    config: &BootstrapConfig,
-    wallets_path: &Path,
-    drops_from: &Path,
-) -> Result<SeededCacheReport, BootstrapError> {
-    SeedPlan::read(wallets_path, drops_from)?.init(config)
-}
-
 impl SeedPlan {
     /// The seed list (`wallets_path`) and what the finalized format-three cache `drops_from`
     /// hands on (see [`Carried`]), both validated.
@@ -321,13 +312,7 @@ impl Carried {
 }
 
 /// The only tables initialization writes; in an uncollected cache every other table is empty.
-const INIT_TABLES: [&str; 5] = [
-    "wallets",
-    "purged_wallets",
-    SEED_DROPS_TABLE,
-    "wallet_activation_batches",
-    "wallet_activation_batch_wallets",
-];
+const INIT_TABLES: [&str; 3] = ["wallets", "purged_wallets", SEED_DROPS_TABLE];
 
 /// `None` unless PATH is still schema one with no migration state, every table that
 /// initialization does not write empty, and every wallet's collection fields at their

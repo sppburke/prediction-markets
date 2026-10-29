@@ -139,6 +139,12 @@ class RankAndPushScenario(unittest.TestCase):
             '  printf missing >> pe_bootstrap_cycle.log\n'
             'fi\n'
             'printf "\\n" >> pe_bootstrap_cycle.log\n'
+            'if [[ -n "${STUB_WAIT_SAMPLE:-}" && "$1" == "$STUB_WAIT_SAMPLE" ]]; then\n'
+            '  for _ in $(seq 300); do\n'
+            '    for f in data/eval-results/cron-*/capacity_samples.jsonl; do [[ -s "$f" ]] && break 2; done\n'
+            '    sleep 0.1\n'
+            '  done\n'
+            'fi\n'
             'sub="$1"\n'
             'key="STUB_EXIT_${sub//-/_}"\n'
             'code="${!key:-0}"\n'
@@ -634,6 +640,7 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIn(f"FATAL: capacity: free_bytes={need - 1} need_bytes={need} ", short.stderr)
         self.assertFalse(cycle.exists())
         self.assertIsNone(self._log("rank.log"))
+        self.assertIsNone(self._log("pe_bootstrap.log"))  # nothing staged: no bootstrap stage ran
         for bad in ("ten", "020", "1000000"):  # not a number, octal to Bash, past the overflow-safe six digits
             r = self._run(exit_env={"PE_RANK_MIN_FREE_GB": bad})
             self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
@@ -644,10 +651,12 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertTrue(cycle.exists())
         (run_dir,) = self.root.glob("data/eval-results/cron-*")
         # Retained before its candidate copy existed: the resume makes the copy, so it is gated.
+        stages_before = self._log("pe_bootstrap.log")
         unstaged = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(need - 1)})
         self.assertEqual(unstaged.returncode, 2, unstaged.stdout + unstaged.stderr)
         self.assertIn("FATAL: capacity", unstaged.stderr)
         self.assertTrue(cycle.exists())
+        self.assertEqual(self._log("pe_bootstrap.log"), stages_before)  # refused before any stage
         side = Path(os.path.realpath(self.root / "data" / "wallet_cache.db")).parent / f"wallet_cache.{run_dir.name}.side.db"
         side.write_bytes(b"")
         staged = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(0)})
@@ -671,7 +680,9 @@ class RankAndPushScenario(unittest.TestCase):
     def test_capacity_sampler_keeps_a_transient_peak_and_ends_with_the_run(self):
         transient = self.root / "data" / "wallet_cache.transient.db"
         sampler = self.root / "scripts" / "capacity_sampler.py"
-        retained = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "1", "STUB_EXIT_events": "75"})
+        # The failing stage waits for the sampler's first line, so the run never ends before a sample exists.
+        retained = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "1", "STUB_EXIT_events": "75",
+                                       "STUB_WAIT_SAMPLE": "events"})
         self.assertEqual(retained.returncode, 75, retained.stdout + retained.stderr)
         (run_dir,) = self.root.glob("data/eval-results/cron-*")
         samples = run_dir / "capacity_samples.jsonl"
@@ -692,6 +703,7 @@ class RankAndPushScenario(unittest.TestCase):
         summary = json.loads(folded.stdout)
         self.assertEqual(summary["peak_bytes"]["wallet_cache.transient.db"], 1_000_000)
         self.assertEqual(summary["min_free_bytes"], min(line["free_bytes"] for line in lines))
+        self.assertEqual((summary["first_free_bytes"], summary["first_files"]), (lines[0]["free_bytes"], lines[0]["files"]))
         self.assertEqual(summary["samples"], len(lines))
         self.assertEqual((summary["first_t"], summary["last_t"]), (lines[0]["t"], lines[-1]["t"]))
         self.assertGreaterEqual(summary["largest_gap_s"], 0)

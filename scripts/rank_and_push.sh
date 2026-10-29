@@ -630,10 +630,9 @@ echo "RANK_AND_PUSH_RUN_DIR=$OUT_DIR"
 # PE_RANK_CAPACITY_SAMPLE_SECS while this run lives; a resumed run of the cycle appends. Unset = none. The sampler holds
 # none of the run's locks (descriptors 8 and 9), so it can never block a recovery.
 if [[ -n "${PE_RANK_CAPACITY_SAMPLE_SECS:-}" ]]; then
-  SAMPLER_ARGS=(sample --parent "$$" --cache-dir "$(dirname -- "$(readlink -f -- "$DB")")"
-    --out "$OUT_DIR/capacity_samples.jsonl" --interval "$PE_RANK_CAPACITY_SAMPLE_SECS" --dir "parquet=$PARQUET_DIR")
-  [[ -z "${SQLITE_TMPDIR:-}" ]] || SAMPLER_ARGS+=(--dir "sqlite_tmp=$SQLITE_TMPDIR")
-  "$PYTHON_BIN" scripts/capacity_sampler.py "${SAMPLER_ARGS[@]}" 8>&- 9>&- &
+  "$PYTHON_BIN" scripts/capacity_sampler.py sample --parent "$$" --cache-dir "$(dirname -- "$(readlink -f -- "$DB")")" \
+    --out "$OUT_DIR/capacity_samples.jsonl" --interval "$PE_RANK_CAPACITY_SAMPLE_SECS" --dir "parquet=$PARQUET_DIR" \
+    8>&- 9>&- &
   SAMPLER_PID=$!
 fi
 

@@ -4,12 +4,13 @@
 `sample`: every --interval seconds, while --parent (the wrapper's PID) is this process's parent, append one JSON line to
 --out: the time, the free bytes of the cache folder's filesystem (statvfs; the quantity `df --output=avail` shows), the
 size of every regular file directly in that folder (the installed cache, candidates, their -wal/-shm files, spools) and
-the byte total of each extra folder (--dir NAME=PATH, for example SQLite's temporary folder and the export folder). A
-resumed run of the same cycle appends to the same file, after dropping a last line a crash left unfinished. It never
-opens a database or reads any file's contents.
+the byte total of each extra folder (--dir NAME=PATH; the wrapper passes the export folder). Free bytes measure
+everything the run consumes, SQLite's sort scratch included: SQLite unlinks those files as it opens them, so no folder
+total sees them. A resumed run of the same cycle appends to the same file, after dropping a last line a crash left
+unfinished. It never opens a database or reads any file's contents.
 
-`summarize SAMPLES`: the samples file folded into one JSON object: the smallest free bytes and when, each name's largest
-size, the sample count, the first and last sample times and the largest gap between consecutive samples (a gap much
+`summarize SAMPLES`: the samples file folded into one JSON object: the first sample's free bytes and file sizes (before
+the run's candidate copy), the smallest free bytes and when, each name's largest size, the sample count, the first and last sample times and the largest gap between consecutive samples (a gap much
 longer than the interval means nothing was sampled then). A peak is caught when it lasts at least one interval. The
 samples file is the record; the summary is computed from it whenever it is needed (docs/26, capacity).
 """
@@ -72,6 +73,8 @@ def summarize(path):
             peaks[name] = max(size, peaks.get(name, 0))
     times = [record["t"] for record in records]
     return {
+        "first_free_bytes": records[0]["free_bytes"],
+        "first_files": records[0]["files"],
         "min_free_bytes": lowest["free_bytes"],
         "min_free_at": lowest["t"],
         "peak_bytes": peaks,

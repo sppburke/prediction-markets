@@ -20802,7 +20802,8 @@ async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
     };
     let init = |seeds_text: &str, from: &std::path::Path, config: &BootstrapConfig| {
         std::fs::write(&seeds, seeds_text).unwrap();
-        pe_bootstrap::cache_migration::init_seeded_cache(config, &seeds, from)
+        pe_bootstrap::cache_migration::SeedPlan::read(&seeds, from)
+            .and_then(|plan| plan.init(config))
     };
     let error = init("not-a-wallet\n", &old, &config).unwrap_err();
     assert!(error.to_string().contains("seed list line 1"), "{error}");
@@ -20963,6 +20964,10 @@ async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
         (
             "cursor.db",
             "INSERT INTO source_cursor VALUES ('clob_closed', '', 1)",
+        ),
+        (
+            "batched.db",
+            "INSERT INTO wallet_activation_batches VALUES ('unexpected', 1, 0, 0)",
         ),
     ] {
         let config = BootstrapConfig {
@@ -21252,15 +21257,14 @@ async fn real_wrapper_seeded_loop_prepares_and_publishes() {
         format!("{WALLET}\n{quiet}\n{PUBLICATION_PRINT_WALLET}\n"),
     )
     .unwrap();
-    let report = pe_bootstrap::cache_migration::init_seeded_cache(
-        &BootstrapConfig {
-            cache_path: fixed.clone(),
-            ..Default::default()
-        },
-        &seeds,
-        &old,
-    )
-    .unwrap();
+    let report = pe_bootstrap::cache_migration::SeedPlan::read(&seeds, &old)
+        .and_then(|plan| {
+            plan.init(&BootstrapConfig {
+                cache_path: fixed.clone(),
+                ..Default::default()
+            })
+        })
+        .unwrap();
     assert_eq!((report.wallets, report.wallets_with_drops), (3, 1));
     let scope_events = markets
         .iter()

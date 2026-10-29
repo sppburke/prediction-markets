@@ -665,7 +665,8 @@ Latency shift uses the canonical print window; deterministic first-entry order r
   launched through this wrapper still defers global activation;
   `--skip-discovery` also skips `activate-next`, so it activates no new wallet.
 - `--skip-rank` — reuse existing CSVs in `--out-dir`; just (re-)push. Preparing the request
-  refuses an oracle manifest without the 15-minute market scope (#784).
+  refuses an oracle manifest without its market scope (15-minute series by default, #784;
+  `_GLOSSARY.md` `ranker_market_scope`).
 - `--skip-purge` — backward-compatible no-op; automatic wallet deletion is retired.
 - Pure re-push: `--skip-discovery --skip-backfill --skip-rank --out-dir <prior run>`.
 
@@ -1804,7 +1805,7 @@ git clone /mnt/storage/prediction-markets /mnt/storage/prediction-markets-15m5m
 git -C /mnt/storage/prediction-markets-15m5m checkout --detach <release commit>
 ln -s /mnt/storage/prediction-markets-15m5m ~/prediction-markets-15m5m && cd ~/prediction-markets-15m5m
 python3 -m venv .venv && .venv/bin/pip install -r scripts/requirements.txt
-install -m 0755 <the release's pe-bootstrap> target/release/pe-bootstrap   # the old checkout's binary
+install -D -m 0755 <the release's pe-bootstrap> target/release/pe-bootstrap   # the old checkout's binary
 cp ~/prediction-markets/.env .env                                          # then append the settings above
 mkdir -p data/eval-results /mnt/t7/cache-15m5m && : > data/wallet_cache.db.lock
 ln -s /mnt/t7/cache-15m5m/wallet_cache.db data/wallet_cache.db
@@ -1850,19 +1851,25 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
 1. Stop the old loop at its next publication boundary: write `stop` to its flag only after that
    cycle has published (both pointers cleared, its `accepted_cycle_manifest.json` present), while the
    supervisor waits 60 s before the next cycle; or keep the boundary where the drive-limit watcher
-   already stopped it. Confirm `LOOP_STOP`, no cycle or pending pointer, no descendants or locks;
+   already stopped it. If the stop instead reaches the next cycle in its first retry wait (that cycle
+   unprepared, its pointer retained), leave the loop stopped and set that cycle aside by the guarded
+   abandonment under "Recovery" below. Confirm `LOOP_STOP`, no cycle or pending pointer, no
+   `.forge_pause.json`, no descendants or locks; the old flag `stop` (atomic write, if it is not) and
    `systemctl --user disable pe-rank-loop`.
 2. One `bash scripts/rank_and_push.sh --resume-pending` in the old checkout retires its displaced
    copy and spool; record `df -B1`.
 3. Install and verify this release in the old checkout by "Forge release deployment" above while
-   both loops are inactive (the pause helper sees every ranker process). Keep its flag `stop`.
+   both loops are inactive (the pause helper sees every ranker process), and add the research pin to
+   its `.env` until 11/30 01:00 UTC (`PE_RANK_MARKET_SERIES` as above, `PE_RANK_MARKET_RECURRENCES=15m`),
+   so a revert's cycles meet the frozen merger's list contract. Keep its flag `stop`.
 4. Capacity: proceed only if free bytes ≥ 3 × S + the old loop's last payout tables, spool and
    exports + 50 GB, S being the seeds' certified complete-history size. These are estimates; the
-   first cycle's samples record the actual minimum free bytes and peaks (installed, candidate, WAL,
-   spool, exports, SQLite temporary files): `python3 scripts/capacity_sampler.py summarize
+   first cycle's samples record the actual first and lowest free bytes (everything the cycle consumed,
+   SQLite's sort scratch included: SQLite unlinks those files as it opens them) and the visible files'
+   peaks (installed, candidate, WAL, spool, exports): `python3 scripts/capacity_sampler.py summarize
    <cycle>/capacity_samples.jsonl` folds them, and its `largest_gap_s` (at most about three sample
-   intervals) and `first_t`/`last_t` (around the cycle's start and publication) show that the samples
-   cover the whole cycle.
+   intervals) and `first_t`/`last_t` (around the cycle's start and its end) must show that the samples
+   cover the whole run, or the envelope does not qualify.
 5. `cache-init` as above (rerun it right before the first cycle: it must report
    `already_initialized`).
 6. First cycle, supervisor off: set `PE_RANK_SCHEMA_TWO_CUTOVER=prepare` and
@@ -1876,17 +1883,25 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    coverage); record pe-service's mode. Then set `PE_RANK_SCHEMA_TWO_CUTOVER=1` in the new `.env` and
    run `--resume-pending` (a prepared request resumes only under `1`).
 7. After pe-service applies the batch and the research fetch accepts the linked cycle, set
-   `PE_RANK_MIN_FREE_GB` to the first cycle's peak use above the installed size (its samples) plus
-   20 GB (`_GLOSSARY.md` `rank_min_free_gb`; the gate is a forecast from measured cycles), write `run`
-   to the new flag and `systemctl --user enable --now pe-rank-loop-15m5m` with the activation batch
-   at 0. Admission stays at 0 until a nonzero batch has its own envelope: between cycles, list the
-   wallets the next batch would admit (`activate-next`'s selection: inactive, not infrastructure, not
+   `PE_RANK_MIN_FREE_GB` by the formula in `_GLOSSARY.md` `rank_min_free_gb` from the first cycle's
+   samples (conservative: that drop includes the root's whole collection), write `run` to the new flag
+   and `systemctl --user enable --now pe-rank-loop-15m5m` with the activation batch at 0. Admission
+   stays at 0 until a nonzero batch has its own envelope. To qualify one, first stop the supervisor
+   at a publication boundary: write `stop` to its flag (atomic) while a cycle runs, so it stops in that
+   cycle's success wait; if it stops in a retry wait instead (its cycle retained), write `run`, start
+   the unit to finish that cycle and repeat; then confirm with `PE_FORGE_CHECKOUT` set that
+   `forge_pause.sh status` shows the unit inactive with no descendants or held locks, and that no
+   cycle or pending pointer exists. Then list the wallets the next batch would admit (`activate-next`'s selection: inactive, not infrastructure, not
    tombstoned, in its preference order; read-only), size their complete histories from the old
    cache's certificates (a wallet it lacks at the venue sample's upper estimate), and only if that
    plus the measured transient peak fits above installed + margin, run one cycle with that batch as
-   a supervised one-shot under `prepare` (set `1` and `--resume-pending` after its checks), publish
-   it, set the margin from its samples plus its admission growth plus 20 GB, then restore
-   supervision with that batch. Repeat for any change of admission scope or count. The gate runs
+   an operator-run one-shot under `prepare` with participant discovery off for that cycle
+   (`PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS=0`; the leaderboard and datadash are already off), so nothing
+   enters the pile between the preview and `activate-next`; check the committed batch's audit against
+   the preview (set `1` and `--resume-pending` after its checks), publish it, set the margin by the
+   glossary's formula from its samples (the batch's growth is inside its measured drop), then restore
+   discovery and supervision with that batch (flag `run`, start the unit); otherwise keep 0, restore
+   supervision and ask the owner. Repeat for any change of admission scope or count. The gate runs
    wherever a candidate copy is about to be made, new or retained cycle; a resume whose candidate
    exists is not gated, so before restarting such a cycle after an operator stop, compare free bytes
    with its remaining envelope from its samples.
@@ -1895,12 +1910,18 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
 resumes; a full drive mid-cycle rolls the transaction back and fails the stage (free space, then
 resume); a top-up exhausted before preparation takes the guarded abandonment in "Recovery and
 damage boundaries", then a fresh cycle (never a second top-up); a prepared request resumes exactly.
+Begin a guarded abandonment only once the loop's unit is inactive, so the pause it requires records
+it inactive; after the cycle is set aside, `forge_pause.sh restore` (with `PE_FORGE_CHECKOUT` for
+the 15/5-minute checkout) puts back the recorded flag and enablement, leaves the unit inactive and
+deletes the pause record. `.forge_pause.json` must be absent before retirement or a fresh cycle: a
+remaining record holds both (the wrapper exits 0 without retiring or admitting).
 
 **Revert** (owner's choice): flag-stop and disable the new loop at a boundary; prove the old loop's
 headroom (installed size + catch-up growth + spool + WAL + 50 GB) with the new loop's cache and
 research artifacts (cycle folders, links, requests, manifests, ranking CSVs) all kept. If it does not
-fit, move the closed new cache to `/mnt/storage` with the verified mover (`move.sh`) or hold the revert
-and report the shortfall; deleting any of it needs the owner's yes. Run the old loop's first cycle
+fit, hold the revert and report the shortfall: every retained cache role stays at its recorded path
+(activation and recovery need its regular files on one filesystem at the recorded paths); deleting any
+of it needs the owner's yes. Run the old loop's first cycle
 under `prepare`, pass the frozen merger check and `research-coverage` against it (the root holds the
 new loop's linked cycles; any reported wallet holds the publication for the owner), set
 `PE_RANK_SCHEMA_TWO_CUTOVER=1` and run `--resume-pending`, verify the publication, set the old
