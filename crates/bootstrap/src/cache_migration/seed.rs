@@ -74,7 +74,11 @@ pub fn require_init_roles(
         ("--db's unfinished copy", unfinished.as_path()),
         ("--db's lock", lock.as_path()),
     ];
-    roles.extend(sidecars.iter().map(|(label, path)| (*label, path.as_path())));
+    roles.extend(
+        sidecars
+            .iter()
+            .map(|(label, path)| (*label, path.as_path())),
+    );
     require_distinct_files(&roles)
 }
 
