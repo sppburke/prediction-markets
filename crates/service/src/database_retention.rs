@@ -16,13 +16,17 @@ use crate::watchlist_admission::AdmissionPreparer;
 
 /// Superseded proofs blanked per transaction. A transaction's hold grows with the proof bytes it
 /// clears (about 0.047 s per MB on the production VPS on 10/8, where 16-row batches of 2.9 MB proofs
-/// held the shared connection for up to 5.3 s), so each transaction clears one proof. Each run's
-/// transactions resume after the last key blanked.
+/// held the shared connection for up to 5.3 s), so each transaction clears one proof, read first on
+/// the maintenance connection so the hold pays no cold reads (#813). Each run's transactions resume
+/// after the last key blanked.
 const BLANK_BATCH_ROWS: usize = 1;
 /// A page walks every row of its wallets' tables; one 128-wallet page held 0.53 s in production on 10/8.
+/// Each page is read first on the maintenance connection: read cold, the first 32-wallet page held
+/// 355 ms on 10/28 (#813).
 const CANDIDATE_PAGE_WALLETS: usize = 32;
-/// Trade ids a drain transaction removes (about four row deletions each; 2.6 ms per trade id in
-/// production on 10/8, so about 0.17 s per transaction).
+/// Trade ids a drain transaction removes (about four row deletions each). Drains are not warmed: in
+/// production on 10/28, drains without an automatic checkpoint inside held a median 42 ms and at most
+/// 191 ms (#813).
 const DRAIN_TRADE_IDS: usize = 64;
 /// Every retention transaction and eligibility check is followed by a pause at least as long as it
 /// held the shared connection, and never shorter than this. That bounds the job's duty cycle only;
@@ -413,7 +417,9 @@ async fn run_database_retention_steps(
                 report.wallets_waiting.push((wallet, reason));
                 continue;
             }
-            // A cancel that arrived during the check's pause starts no removal.
+            // Read the removal's rows here, so the orchestrator's transaction finds them cached (#813).
+            state.paper_state.warm_retirement(wallet)?;
+            // A cancel that arrived during the check's pause or the read starts no removal.
             if cancel.load(Ordering::Acquire) {
                 report.cancelled = true;
                 return Ok(());

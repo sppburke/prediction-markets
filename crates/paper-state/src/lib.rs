@@ -803,6 +803,10 @@ const ASSET_IDENTITY_CONDITION_LOOKUP: &str = "SELECT token, condition_id, outco
 /// Crash-safe SQLite mirror. Cheap to share behind an `Arc`; all methods take `&self`.
 pub struct PaperStateDb {
     conn: Mutex<Connection>,
+    /// A second connection to the same file that never writes rows. It runs WAL checkpoints and the
+    /// retention job's warm reads, so neither holds the shared connection (#813). Lock order is
+    /// maintenance before shared; nothing takes them the other way round.
+    maintenance: Mutex<Connection>,
 }
 
 /// Durable reasons a departed wallet must keep its working state.
@@ -870,20 +874,34 @@ SELECT wallet_hex FROM (
         FROM json_each((SELECT value FROM meta WHERE key = 'feed_history_frontiers'), '$.frontiers')
         WHERE wallet_hex > ?1 ORDER BY 1 LIMIT ?2)
 ) ORDER BY wallet_hex LIMIT ?2";
-/// Blank at most `?1` superseded nonblank proofs after the cursor key `(?2, ?3)`, in key order, and return
-/// their keys. The row-value bound seeks the primary-key index from the cursor, so a run never rereads the
-/// blank rows its earlier transactions passed. A blank proof is the 2-byte `{}`, and every written proof is a
-/// longer JSON document: testing the length reads only the record header, so passing a blank row never walks
-/// its `balances_json` overflow pages to reach `proof_json`, the last column.
-const BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL: &str =
-    "UPDATE position_anchors SET proof_json = '{}' WHERE rowid IN (
-    SELECT old.rowid FROM position_anchors old
+/// At most `?1` superseded nonblank proofs after the cursor key `(?2, ?3)`, in key order: the selection the
+/// blanking transaction and its warm read share. The row-value bound seeks the primary-key index from the
+/// cursor, so a run never rereads the blank rows its earlier transactions passed. A blank proof is the 2-byte
+/// `{}`, and every written proof is a longer JSON document: testing the length reads only the record header, so
+/// passing a blank row never walks its `balances_json` overflow pages to reach `proof_json`, the last column.
+macro_rules! superseded_anchor_proof_rowids {
+    () => {
+        "SELECT old.rowid FROM position_anchors old
     WHERE (old.wallet_hex, old.anchor_seq) > (?2, ?3)
       AND octet_length(old.proof_json) > 2
       AND old.anchor_seq < (SELECT MAX(newest.anchor_seq)
           FROM position_anchors newest WHERE newest.wallet_hex = old.wallet_hex)
-    ORDER BY old.wallet_hex, old.anchor_seq LIMIT ?1)
-RETURNING wallet_hex, anchor_seq";
+    ORDER BY old.wallet_hex, old.anchor_seq LIMIT ?1"
+    };
+}
+/// Blank the selected proofs and return their keys.
+const BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL: &str = concat!(
+    "UPDATE position_anchors SET proof_json = '{}' WHERE rowid IN (\n    ",
+    superseded_anchor_proof_rowids!(),
+    ")\nRETURNING wallet_hex, anchor_seq"
+);
+/// Read the selected proofs whole (`length` of TEXT walks the row's overflow chain), so the blanking
+/// transaction finds their pages cached.
+const WARM_SUPERSEDED_ANCHOR_PROOFS_SQL: &str = concat!(
+    "SELECT length(proof_json) FROM position_anchors WHERE rowid IN (\n    ",
+    superseded_anchor_proof_rowids!(),
+    ")"
+);
 /// Up to `?2` of a listed wallet's group trade ids, through the wallet index.
 const DRAIN_GROUP_IDS_SQL: &str = "INSERT INTO wallet_drain_trade_ids
     SELECT source_trade_id FROM activity_groups WHERE wallet_hex = ?1 LIMIT ?2";
@@ -894,6 +912,21 @@ const RETIREMENT_DECISION_IDS_SQL: &str = "INSERT INTO wallet_retirement_trade_i
     SELECT source_trade_id FROM decision_pending WHERE wallet_hex = ?1";
 const RETIREMENT_TERMINAL_DECISIONS_SQL: &str =
     "DELETE FROM decision_pending WHERE wallet_hex = ?1 AND state = 'terminal'";
+/// Seen-trade, no-copy and revision rows, keyed by source trade id: a removal deletes those of the
+/// wallet's decisions and a drain those of its groups and gate results.
+const TRADE_ROW_TABLES: [&str; 3] = [
+    "seen_trades_v2",
+    "no_copy_dispositions",
+    "activity_group_revisions",
+];
+/// The wallet-keyed working state a removal deletes.
+const WALLET_STATE_TABLES: [&str; 5] = [
+    "position_anchors",
+    "position_validations",
+    "wallet_history_status_v2",
+    "leader_positions",
+    "poll_cursors",
+];
 /// Durable reasons a wallet waits, checked in order through wallet indexes.
 const RETENTION_WAIT_QUERIES: [(&str, WalletRetentionWait); 5] = [
     (
@@ -973,6 +1006,24 @@ fn write_retirement_drains(conn: &Connection, wallets: &[String]) -> Result<(), 
     Ok(())
 }
 
+/// A `wal_checkpoint` row: busy, WAL frames, frames checkpointed.
+fn checkpoint_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, i64, i64)> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+}
+
+/// A competing checkpoint makes a passive one return `busy`; partial backfill behind another
+/// process's reader is ordinary progress.
+fn passive_checkpoint((busy, log, checkpointed): (i64, i64, i64)) -> Result<(), PaperStateError> {
+    if busy != 0 {
+        return Err(PaperStateError::MigrationCheckpointIncomplete {
+            busy,
+            log,
+            checkpointed,
+        });
+    }
+    Ok(())
+}
+
 impl PaperStateDb {
     /// Blank only superseded nonblank proofs after `after`; balances and cutoff columns stay intact.
     /// Each call owns one bounded transaction and releases the connection before returning. Returns
@@ -985,6 +1036,10 @@ impl PaperStateDb {
     ) -> Result<RetentionTransaction<(usize, AnchorProofCursor)>, PaperStateError> {
         let limit =
             i64::try_from(limit).map_err(|error| PaperStateError::Internal(error.to_string()))?;
+        self.warm(
+            WARM_SUPERSEDED_ANCHOR_PROOFS_SQL,
+            params![limit, after.wallet_hex, after.anchor_seq],
+        )?;
         let mut conn = self.lock();
         let started = std::time::Instant::now();
         if !conn.is_autocommit() {
@@ -1022,16 +1077,12 @@ impl PaperStateDb {
     ) -> Result<RetentionTransaction<Vec<WalletAddress>>, PaperStateError> {
         let limit =
             i64::try_from(limit).map_err(|error| PaperStateError::Internal(error.to_string()))?;
+        let after = after.map_or_else(String::new, |wallet| wallet.to_string());
+        self.warm(RETENTION_CANDIDATES_SQL, params![after, limit])?;
         let conn = self.lock();
         let started = std::time::Instant::now();
         let mut stmt = conn.prepare(RETENTION_CANDIDATES_SQL)?;
-        let rows = stmt.query_map(
-            params![
-                after.map_or_else(String::new, |wallet| wallet.to_string()),
-                limit
-            ],
-            |row| row.get::<_, String>(0),
-        )?;
+        let rows = stmt.query_map(params![after, limit], |row| row.get::<_, String>(0))?;
         let result = rows
             .map(|row| {
                 WalletAddress::from_hex(&row?)
@@ -1059,6 +1110,29 @@ impl PaperStateDb {
             result,
             lock_time: started.elapsed(),
         })
+    }
+
+    /// Read every row [`Self::retire_wallet`] deletes for `wallet` on the maintenance connection, so
+    /// its transaction finds them cached (#813). Advisory: the removal still rechecks and selects fresh.
+    pub fn warm_retirement(&self, wallet: WalletAddress) -> Result<(), PaperStateError> {
+        let wallet_hex = wallet.to_string();
+        for table in TRADE_ROW_TABLES {
+            self.warm(&format!("SELECT * FROM {table} WHERE source_trade_id IN (SELECT source_trade_id FROM decision_pending WHERE wallet_hex = ?1)"), params![wallet_hex])?;
+        }
+        self.warm(
+            "SELECT * FROM decision_pending WHERE wallet_hex = ?1",
+            params![wallet_hex],
+        )?;
+        for table in WALLET_STATE_TABLES {
+            self.warm(
+                &format!("SELECT * FROM {table} WHERE wallet_hex = ?1"),
+                params![wallet_hex],
+            )?;
+        }
+        self.warm(
+            "SELECT value FROM meta WHERE key = 'feed_history_frontiers'",
+            [],
+        )
     }
 
     /// The orchestrator calls this only after its structural-membership recheck.
@@ -1090,21 +1164,11 @@ impl PaperStateDb {
         // A temporary indexed set avoids a wallet-sized Rust allocation or SQLite parameter list.
         tx.execute_batch("CREATE TEMP TABLE wallet_retirement_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL);")?;
         tx.execute(RETIREMENT_DECISION_IDS_SQL, params![wallet_hex])?;
-        for table in [
-            "seen_trades_v2",
-            "no_copy_dispositions",
-            "activity_group_revisions",
-        ] {
+        for table in TRADE_ROW_TABLES {
             tx.execute(&format!("DELETE FROM {table} WHERE source_trade_id IN (SELECT source_trade_id FROM wallet_retirement_trade_ids)"), [])?;
         }
         tx.execute(RETIREMENT_TERMINAL_DECISIONS_SQL, params![wallet_hex])?;
-        for table in [
-            "position_anchors",
-            "position_validations",
-            "wallet_history_status_v2",
-            "leader_positions",
-            "poll_cursors",
-        ] {
+        for table in WALLET_STATE_TABLES {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE wallet_hex = ?1"),
                 params![wallet_hex],
@@ -1208,12 +1272,7 @@ impl PaperStateDb {
             drains.retain(|listed| listed != &wallet_hex);
             write_retirement_drains(&tx, &drains)?;
         } else {
-            for table in [
-                "seen_trades_v2",
-                "no_copy_dispositions",
-                "activity_group_revisions",
-                owner,
-            ] {
+            for table in TRADE_ROW_TABLES.into_iter().chain([owner]) {
                 tx.execute(&format!("DELETE FROM {table} WHERE source_trade_id IN (SELECT source_trade_id FROM wallet_drain_trade_ids)"), [])?;
             }
         }
@@ -1306,24 +1365,47 @@ impl PaperStateDb {
                 conn.execute(alter, [])?;
             }
         }
+        let maintenance = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )?;
+        maintenance.busy_timeout(std::time::Duration::from_secs(5))?;
 
         Ok(Self {
             conn: Mutex::new(conn),
+            maintenance: Mutex::new(maintenance),
         })
     }
 
-    /// Checkpoint dispositions before source work is removed from a runtime checkpoint.
+    /// Stop SQLite's automatic WAL checkpoints inside shared-connection commits; the caller then runs
+    /// [`Self::checkpoint_wal`] (#813). Returns the setting read back.
+    pub fn stop_auto_checkpoint(&self) -> Result<i64, PaperStateError> {
+        Ok(self
+            .lock()
+            .pragma_update_and_check(None, "wal_autocheckpoint", 0, |row| row.get(0))?)
+    }
+
+    /// One passive WAL checkpoint on the maintenance connection, never taking the shared connection.
+    pub fn checkpoint_wal(&self) -> Result<(), PaperStateError> {
+        passive_checkpoint(self.maintenance().query_row(
+            "PRAGMA wal_checkpoint(PASSIVE)",
+            [],
+            checkpoint_row,
+        )?)
+    }
+
+    /// Checkpoint dispositions before source work is removed from a runtime checkpoint. The
+    /// maintenance lock keeps the background checkpoint from racing it.
     pub fn sync_checkpoint_dispositions(&self) -> Result<(), PaperStateError> {
+        let _maintenance = self.maintenance();
         let conn = self.lock();
         if !conn.is_autocommit() {
             return Err(PaperStateError::Internal(
                 "checkpoint barrier during a paper-state batch".to_owned(),
             ));
         }
-        let (busy, log, checkpointed): (i64, i64, i64) =
-            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
+        let (busy, log, checkpointed) =
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], checkpoint_row)?;
         if busy != 0 || log != checkpointed {
             return Err(PaperStateError::MigrationCheckpointIncomplete {
                 busy,
@@ -1364,8 +1446,11 @@ impl PaperStateDb {
                 expected: SCHEMA_VERSION,
             });
         }
+        let maintenance = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        maintenance.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            maintenance: Mutex::new(maintenance),
         })
     }
 
@@ -1374,6 +1459,23 @@ impl PaperStateDb {
     /// back on drop), so a recovered guard never exposes a half-applied write.
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Lock the maintenance connection, recovering the guard as [`Self::lock`] does.
+    fn maintenance(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.maintenance
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Run a read on the maintenance connection and discard its rows, so a following hold finds
+    /// their pages in the operating system's cache.
+    fn warm(&self, sql: &str, params: impl rusqlite::Params) -> Result<(), PaperStateError> {
+        let conn = self.maintenance();
+        let mut statement = conn.prepare(sql)?;
+        let mut rows = statement.query(params)?;
+        while rows.next()?.is_some() {}
+        Ok(())
     }
 
     /// Begin one caller-owned batch spanning multiple activity-bucket savepoints.
@@ -7623,6 +7725,116 @@ mod tests {
         ));
         db.rollback_batch().unwrap();
         db.sync_checkpoint_dispositions().unwrap();
+    }
+
+    /// The WAL-index header's `mxFrame` (offset 16) and `nBackfill` (offset 96), as SQLite 3.46 lays them out.
+    fn wal_frames(dir: &tempfile::TempDir) -> (u32, u32) {
+        let shm = std::fs::read(dir.path().join("paper_state.db-shm")).unwrap();
+        let word = |offset: usize| u32::from_ne_bytes(shm[offset..offset + 4].try_into().unwrap());
+        (word(16), word(96))
+    }
+
+    #[test]
+    fn stopped_auto_checkpoint_keeps_frames_until_checkpoint_wal_backfills_them() {
+        let write = |db: &PaperStateDb| {
+            let conn = db.lock();
+            conn.execute_batch("CREATE TABLE frames (bytes BLOB NOT NULL)")
+                .unwrap();
+            for _ in 0..1_600 {
+                conn.execute("INSERT INTO frames VALUES (?1)", params![vec![7_u8; 3_000]])
+                    .unwrap();
+            }
+        };
+        let (dir, stopped) = db();
+        assert_eq!(stopped.stop_auto_checkpoint().unwrap(), 0);
+        write(&stopped);
+        let (frames, backfilled) = wal_frames(&dir);
+        assert!(frames >= 1_500, "{frames}");
+        assert_eq!(backfilled, 0);
+        stopped.checkpoint_wal().unwrap();
+        assert_eq!(wal_frames(&dir), (frames, frames));
+
+        let (dir, automatic) = db();
+        write(&automatic);
+        let (frames, _) = wal_frames(&dir);
+        assert!(frames < 1_500, "{frames}");
+    }
+
+    #[test]
+    fn background_checkpoints_leave_barriers_complete_and_writes_working() {
+        let (_dir, db) = db();
+        db.stop_auto_checkpoint().unwrap();
+        db.lock()
+            .execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
+            .unwrap();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let checkpoints = scope.spawn(|| {
+                let mut count = 0_u32;
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    db.checkpoint_wal().unwrap();
+                    count += 1;
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                count
+            });
+            for n in 0..200 {
+                db.lock()
+                    .execute("INSERT INTO writes VALUES (?1)", params![n])
+                    .unwrap();
+                db.sync_checkpoint_dispositions().unwrap();
+            }
+            done.store(true, std::sync::atomic::Ordering::Release);
+            assert!(checkpoints.join().unwrap() > 0);
+        });
+        assert!(matches!(
+            passive_checkpoint((1, -1, -1)),
+            Err(PaperStateError::MigrationCheckpointIncomplete { busy: 1, .. })
+        ));
+        passive_checkpoint((0, 5, 3)).unwrap();
+    }
+
+    #[test]
+    fn warm_reads_never_take_the_shared_connection_or_write() {
+        let (dir, db) = db();
+        let conn = Connection::open(dir.path().join("paper_state.db")).unwrap();
+        insert_anchor(&conn, 1, 1, "{\"proof\": 1}");
+        insert_anchor(&conn, 1, 2, "{\"proof\": 2}");
+        let wallet = WalletAddress([1; 20]);
+        conn.execute(
+            "INSERT INTO decision_pending VALUES ('decision', 'r', ?1, 1, '{}', '{}', 'terminal', 'no_copy', 1)",
+            params![wallet.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO seen_trades_v2 VALUES ('decision', 2, 'tx')",
+            [],
+        )
+        .unwrap();
+        let start = AnchorProofCursor::start();
+        std::thread::scope(|scope| {
+            let shared = db.lock();
+            let (sent, received) = std::sync::mpsc::channel();
+            let db = &db;
+            scope.spawn(move || {
+                sent.send((
+                    db.warm_retirement(wallet),
+                    db.warm(
+                        WARM_SUPERSEDED_ANCHOR_PROOFS_SQL,
+                        params![1, start.wallet_hex, start.anchor_seq],
+                    ),
+                    db.warm(RETENTION_CANDIDATES_SQL, params!["", 32]),
+                ))
+                .unwrap();
+            });
+            let warmed = received.recv_timeout(std::time::Duration::from_secs(10));
+            drop(shared);
+            let (retirement, blanking, candidates) = warmed.unwrap();
+            retirement.unwrap();
+            blanking.unwrap();
+            candidates.unwrap();
+        });
+        assert_eq!(db.maintenance().total_changes(), 0);
     }
 
     fn wallet() -> WalletAddress {

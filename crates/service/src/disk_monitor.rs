@@ -1,11 +1,16 @@
-//! Free-space guard for the filesystems holding ordinary-service durable state.
+//! Free-space guard for the filesystems holding ordinary-service durable state, and the paper-state
+//! WAL checkpointer: the service's shared paper-state connection never checkpoints automatically, so
+//! this owner checkpoints on the maintenance connection every `PAPER_CHECKPOINT_SECS` (#813).
 
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use pe_paper_state::{PaperStateDb, PaperStateError};
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::config::ServiceConfig;
@@ -16,6 +21,59 @@ use crate::supervisor::{ShutdownPhase, ShutdownReceiver, TaskExit, TaskFailure, 
 pub const DISK_FREE_WARN_BYTES: u64 = 15_000_000_000;
 pub const DISK_FREE_FLOOR_BYTES: u64 = 5_000_000_000;
 pub const DISK_SAMPLE_SECS: u64 = 60;
+pub const PAPER_CHECKPOINT_SECS: u64 = 1;
+
+/// The monitor and main share this slot, so aborting the monitor never detaches a running checkpoint.
+#[derive(Clone, Default)]
+pub struct PaperCheckpointSlot {
+    job: Arc<tokio::sync::Mutex<Option<JoinHandle<Result<(), PaperStateError>>>>>,
+}
+
+impl PaperCheckpointSlot {
+    async fn run(
+        &self,
+        checkpoint: impl FnOnce() -> Result<(), PaperStateError> + Send + 'static,
+    ) -> Result<()> {
+        let mut slot = self.job.lock().await;
+        let result = slot.insert(tokio::task::spawn_blocking(checkpoint)).await;
+        *slot = None;
+        Ok(result??)
+    }
+
+    /// Join a checkpoint left running after the monitor was joined or aborted. Main supplies the bound.
+    pub async fn join(&self) -> Result<(), tokio::task::JoinError> {
+        let mut slot = self.job.lock().await;
+        let result = match slot.as_mut() {
+            Some(job) => job.await.map(|_| ()),
+            None => Ok(()),
+        };
+        *slot = None;
+        result
+    }
+}
+
+/// Checkpoint every `PAPER_CHECKPOINT_SECS`, one at a time. A failed checkpoint never ends the owner:
+/// the WAL grows safely until a later one succeeds.
+async fn checkpoint_paper_state(
+    slot: PaperCheckpointSlot,
+    checkpoint: impl Fn() -> Result<(), PaperStateError> + Clone + Send + 'static,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(PAPER_CHECKPOINT_SECS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut failing = false;
+    loop {
+        ticker.tick().await;
+        let result = slot.run(checkpoint.clone()).await;
+        match (&result, failing) {
+            (Ok(()), true) => info!("paper-state WAL checkpoint recovered"),
+            (Err(error), false) => {
+                error!(error = %error, "paper-state WAL checkpoint failed; retrying every tick");
+            }
+            _ => {}
+        }
+        failing = result.is_err();
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum DiskTransition {
@@ -104,9 +162,23 @@ impl DiskMonitor {
         Ok(())
     }
 
-    pub async fn run(self, health: SharedHealth, shutdown: ShutdownReceiver) -> TaskResult {
-        self.run_with(health, shutdown, |path| fs2::available_space(path))
-            .await
+    pub async fn run(
+        self,
+        health: SharedHealth,
+        shutdown: ShutdownReceiver,
+        paper_state: Arc<PaperStateDb>,
+        checkpoints: PaperCheckpointSlot,
+    ) -> TaskResult {
+        let stopping_state = Arc::clone(&paper_state);
+        self.run_with(
+            health,
+            shutdown,
+            |path| fs2::available_space(path),
+            move || stopping_state.stop_auto_checkpoint(),
+            checkpoints,
+            move || paper_state.checkpoint_wal(),
+        )
+        .await
     }
 
     async fn run_with(
@@ -114,16 +186,34 @@ impl DiskMonitor {
         health: SharedHealth,
         shutdown: ShutdownReceiver,
         mut available_space: impl FnMut(&Path) -> io::Result<u64>,
+        stop_auto_checkpoint: impl FnOnce() -> Result<i64, PaperStateError>,
+        checkpoints: PaperCheckpointSlot,
+        checkpoint: impl Fn() -> Result<(), PaperStateError> + Clone + Send + 'static,
     ) -> TaskResult {
         let mut ticker = tokio::time::interval(Duration::from_secs(DISK_SAMPLE_SECS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let stopping = shutdown.wait_for(ShutdownPhase::StopProducers);
         tokio::pin!(stopping);
         info!(sample_secs = DISK_SAMPLE_SECS, directories = ?self.directories, "disk space monitoring started");
+        match stop_auto_checkpoint() {
+            Ok(pages) => {
+                info!(
+                    wal_autocheckpoint = pages,
+                    checkpoint_secs = PAPER_CHECKPOINT_SECS,
+                    "paper-state WAL checkpoints moved to the maintenance connection"
+                );
+            }
+            Err(error) => {
+                error!(error = %error, "paper-state automatic checkpoints could not be stopped");
+            }
+        }
+        let checkpointing = checkpoint_paper_state(checkpoints, checkpoint);
+        tokio::pin!(checkpointing);
         loop {
             tokio::select! {
                 biased;
                 () = &mut stopping => return Ok(TaskExit::CleanShutdown),
+                () = &mut checkpointing => {}
                 _ = ticker.tick() => { self.sample_with(&health, &mut available_space)?; }
             }
         }
@@ -370,9 +460,14 @@ mod tests {
         let (shutdown, _) = ShutdownController::new();
         supervisor.spawn(
             TaskName::DiskMonitor,
-            monitor.run_with(health.clone(), shutdown.subscribe(), |_| {
-                Ok(DISK_FREE_FLOOR_BYTES - 1)
-            }),
+            monitor.run_with(
+                health.clone(),
+                shutdown.subscribe(),
+                |_| Ok(DISK_FREE_FLOOR_BYTES - 1),
+                || Ok(0),
+                PaperCheckpointSlot::default(),
+                || Ok(()),
+            ),
         );
         let event = supervisor.observe_next().await.unwrap();
         assert_eq!(event.name, TaskName::DiskMonitor);
@@ -395,14 +490,21 @@ mod tests {
         let sampled = samples.clone();
         supervisor.spawn(
             TaskName::DiskMonitor,
-            monitor.run_with(health.clone(), shutdown.subscribe(), move |_| {
-                let sample = sampled.fetch_add(1, Ordering::SeqCst);
-                if sample == 0 {
-                    Err(io::Error::other("injected first sample error"))
-                } else {
-                    Ok(DISK_FREE_WARN_BYTES - 1)
-                }
-            }),
+            monitor.run_with(
+                health.clone(),
+                shutdown.subscribe(),
+                move |_| {
+                    let sample = sampled.fetch_add(1, Ordering::SeqCst);
+                    if sample == 0 {
+                        Err(io::Error::other("injected first sample error"))
+                    } else {
+                        Ok(DISK_FREE_WARN_BYTES - 1)
+                    }
+                },
+                || Ok(0),
+                PaperCheckpointSlot::default(),
+                || Ok(()),
+            ),
         );
         tokio::task::yield_now().await;
         assert_eq!(samples.load(Ordering::SeqCst), 1);
@@ -422,5 +524,109 @@ mod tests {
         assert!(supervisor.observe_next().await.unwrap().failure.is_none());
         tokio::time::advance(Duration::from_secs(DISK_SAMPLE_SECS)).await;
         assert_eq!(samples.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paper_checkpoints_tick_after_stopping_auto_checkpoint_and_survive_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let monitor = DiskMonitor::from_config(&config_at(directory.path())).unwrap();
+        let health = new_shared_health(false);
+        let status = health.lock().unwrap().task_status.clone();
+        let mut supervisor = TaskSupervisor::new(status.clone());
+        let (shutdown, _) = ShutdownController::new();
+        let stops = Arc::new(AtomicUsize::new(0));
+        let stopped = stops.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (ticked, mut ticks) = tokio::sync::mpsc::unbounded_channel();
+        supervisor.spawn(
+            TaskName::DiskMonitor,
+            monitor.run_with(
+                health.clone(),
+                shutdown.subscribe(),
+                |_| Ok(DISK_FREE_WARN_BYTES),
+                move || {
+                    stopped.fetch_add(1, Ordering::SeqCst);
+                    Ok(0)
+                },
+                PaperCheckpointSlot::default(),
+                move || {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    ticked.send(call).unwrap();
+                    if call == 1 {
+                        return Err(PaperStateError::MigrationCheckpointIncomplete {
+                            busy: 1,
+                            log: -1,
+                            checkpointed: -1,
+                        });
+                    }
+                    Ok(())
+                },
+            ),
+        );
+        assert_eq!(ticks.recv().await, Some(0));
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        for call in 1..=3 {
+            tokio::time::advance(Duration::from_secs(PAPER_CHECKPOINT_SECS)).await;
+            assert_eq!(ticks.recv().await, Some(call));
+        }
+        assert!(!supervisor.status().critical_failed());
+        status.advance_phase(ShutdownPhase::StopProducers);
+        shutdown.advance(ShutdownPhase::StopProducers);
+        assert!(supervisor.observe_next().await.unwrap().failure.is_none());
+        tokio::time::advance(Duration::from_secs(PAPER_CHECKPOINT_SECS)).await;
+        assert_eq!(ticks.recv().await, None);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parked_paper_checkpoint_keeps_sampling_and_is_joined_after_owner_abort() {
+        let directory = tempfile::tempdir().unwrap();
+        let monitor = DiskMonitor::from_config(&config_at(directory.path())).unwrap();
+        let health = new_shared_health(false);
+        let (shutdown, _) = ShutdownController::new();
+        let samples = Arc::new(AtomicUsize::new(0));
+        let sampled = samples.clone();
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = Arc::new(std::sync::Mutex::new(wait));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let finishes = finished.clone();
+        let slot = PaperCheckpointSlot::default();
+        let task = tokio::spawn(monitor.run_with(
+            health,
+            shutdown.subscribe(),
+            move |_| {
+                sampled.fetch_add(1, Ordering::SeqCst);
+                Ok(DISK_FREE_WARN_BYTES)
+            },
+            || Ok(0),
+            slot.clone(),
+            move || {
+                started.send(()).unwrap();
+                wait.lock().unwrap().recv().unwrap();
+                finishes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+        starts.recv().await.unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(samples.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(DISK_SAMPLE_SECS)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(samples.load(Ordering::SeqCst), 2);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        // The parked checkpoint stays joinable after the owner is aborted.
+        {
+            let joining = tokio::time::timeout(Duration::from_secs(1), slot.join());
+            tokio::pin!(joining);
+            assert!(futures::poll!(&mut joining).is_pending());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(joining.await.is_err());
+        }
+        assert_eq!(finished.load(Ordering::SeqCst), 0);
+        release.send(()).unwrap();
+        slot.join().await.unwrap();
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
     }
 }

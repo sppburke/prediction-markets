@@ -1,8 +1,9 @@
 //! SQLite schema for the paper-trader crash-safe state mirror.
 //!
 //! `journal_mode = WAL` + `synchronous = NORMAL` gives per-commit durability
-//! without full-fsync cost (matching `bootstrap`'s wallet cache). The schema is
-//! versioned via `PRAGMA user_version`; see [`SCHEMA_VERSION`].
+//! without full-fsync cost (matching `bootstrap`'s wallet cache). The service
+//! checkpoints the WAL on a second connection instead of inside commits (#813).
+//! The schema is versioned via `PRAGMA user_version`; see [`SCHEMA_VERSION`].
 
 /// Current on-disk schema version, written to `PRAGMA user_version` on create
 /// and checked on open. Bump when the table layout changes incompatibly.
