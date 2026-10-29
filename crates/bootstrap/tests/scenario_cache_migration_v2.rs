@@ -20975,7 +20975,10 @@ async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
     // The carried drops classify as the triggers did: the same entries survive and the same are suppressed.
     for wallet in [WALLET, WALLET_B] {
         let expected = wallet_projection(&old, wallet);
-        assert!(!expected.is_empty(), "{wallet} has no projected entry to compare");
+        assert!(
+            !expected.is_empty(),
+            "{wallet} has no projected entry to compare"
+        );
         assert_eq!(wallet_projection(&fresh, wallet), expected, "{wallet}");
     }
 
