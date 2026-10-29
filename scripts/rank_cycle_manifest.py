@@ -753,6 +753,32 @@ def research_coverage(root: Path, since: str, candidate: Path) -> list[str]:
     return sorted(union - universe(candidate))
 
 
+def scope_drops(db: Path) -> dict[tuple[str, str, str], dict]:
+    """Every certified or carried scope drop of the format-three cache `db`, read-only, keyed by (wallet, scope kind,
+    scope id). A carried row counts until its wallet's first certificate takes it over."""
+    connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        drops = {}
+        rows = itertools.chain(
+            ((row["wallet_hex"], row["scope_drops_json"]) for row in certificate_rows(connection)),
+            ((row["wallet_hex"], row["carried_scope_drops_json"]) for row in carried_drop_rows(connection)))
+        for wallet, raw in rows:
+            for drop in decode_scope_drops(raw):
+                drops[(wallet, drop["scope_kind"], drop["scope_id"])] = drop
+        return drops
+    finally:
+        connection.close()
+
+
+def uncovered_drops(source: Path, target: Path) -> list[dict]:
+    """The drops of `source` that `target` does not keep as early: drops are cumulative per wallet and keep their
+    earliest second (docs/_GLOSSARY.md), so a drop counts as kept only by one of the same wallet and scope starting no
+    later. Sorted by wallet and scope."""
+    kept = scope_drops(target)
+    return [{"wallet_hex": key[0], **drop} for key, drop in sorted(scope_drops(source).items())
+            if key not in kept or kept[key]["dropped_at_unix"] > drop["dropped_at_unix"]]
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -789,6 +815,11 @@ def parse_args():
     coverage.add_argument("--root", required=True, type=Path)
     coverage.add_argument("--since", required=True, help="the first accepted cycle's folder name")
     coverage.add_argument("--candidate", required=True, type=Path)
+    drops = subparsers.add_parser(
+        "drops-cover",
+        help="print the scope drops of the --source cache that the --target cache does not keep as early; exit 1 if any")
+    drops.add_argument("--source", required=True, type=Path)
+    drops.add_argument("--target", required=True, type=Path)
     return parser.parse_args()
 
 
@@ -815,6 +846,11 @@ def main() -> int:
         for wallet in missing:
             print(wallet)
         return 1 if missing else 0
+    if args.command == "drops-cover":
+        uncovered = uncovered_drops(args.source, args.target)
+        for drop in uncovered:
+            print(json.dumps(drop, sort_keys=True))
+        return 1 if uncovered else 0
     if args.command == "capture":
         versions = json.loads(args.versions_file.read_text(encoding="utf-8"))
         configuration = json.loads(args.configuration_file.read_text(encoding="utf-8"))

@@ -521,19 +521,24 @@ fi
 FRESH_LANE="0"
 # Capacity gate (docs/26): a candidate copy is made only while the installed cache's filesystem holds the cache's size
 # plus PE_RANK_MIN_FREE_GB (10^9 bytes); otherwise stop here, before anything is staged (a new cycle also before its
-# pointer is written). A resume whose candidate exists, or a publication resume, makes no copy and is never gated.
+# pointer is written). A resume whose candidate exists, or a publication resume, makes no copy and is never gated. For a
+# retained cycle ($1, its candidate's path), an interrupted copy's `<candidate>.pending` counts as free: staging removes
+# it before it copies again.
 capacity_gate() {
   [[ -n "${PE_RANK_MIN_FREE_GB:-}" ]] || return 0
-  local installed_real installed_bytes free_bytes need_bytes
+  local installed_real installed_bytes free_bytes need_bytes pending_bytes=0
   installed_real="$(readlink -f -- "$DB")"
   installed_bytes="$(stat -c %s -- "$installed_real")"
   free_bytes="$(df -B1 --output=avail -- "$installed_real" | tail -n 1 | tr -d ' ')"
-  [[ "$installed_bytes" =~ ^[0-9]+$ && "$free_bytes" =~ ^[0-9]+$ ]] || {
+  if [[ -n "${1:-}" && -f "$1.pending" && ! -L "$1.pending" ]]; then
+    pending_bytes="$(stat -c %s -- "$1.pending")"
+  fi
+  [[ "$installed_bytes" =~ ^[0-9]+$ && "$free_bytes" =~ ^[0-9]+$ && "$pending_bytes" =~ ^[0-9]+$ ]] || {
     echo "FATAL: capacity gate cannot read the installed cache's size or free space" >&2; exit 2;
   }
   need_bytes=$((installed_bytes + PE_RANK_MIN_FREE_GB * 1000000000))
-  if (( free_bytes < need_bytes )); then
-    echo "FATAL: capacity: free_bytes=$free_bytes need_bytes=$need_bytes (installed $installed_bytes + PE_RANK_MIN_FREE_GB=$PE_RANK_MIN_FREE_GB); no candidate copy made" >&2
+  if (( free_bytes + pending_bytes < need_bytes )); then
+    echo "FATAL: capacity: free_bytes=$free_bytes need_bytes=$need_bytes (installed $installed_bytes + PE_RANK_MIN_FREE_GB=$PE_RANK_MIN_FREE_GB; interrupted copy $pending_bytes reclaimable); no candidate copy made" >&2
     exit 2
   fi
 }
@@ -542,7 +547,8 @@ if [[ "$PRODUCTION_CYCLE" == "1" ]]; then
     OUT_DIR="$(validate_cycle_pointer)" || exit $?
     CYCLE_RESUMED="1"
     # A cycle retained before its candidate copy completed makes that copy again.
-    [[ -e "$(dirname -- "$(readlink -f -- "$DB")")/wallet_cache.$(basename -- "$OUT_DIR").side.db" ]] || capacity_gate
+    RETAINED_SIDE="$(dirname -- "$(readlink -f -- "$DB")")/wallet_cache.$(basename -- "$OUT_DIR").side.db"
+    [[ -e "$RETAINED_SIDE" ]] || capacity_gate "$RETAINED_SIDE"
     [[ -f "$OUT_DIR/cycle_manifest.json" && ! -L "$OUT_DIR/cycle_manifest.json" ]] || {
       echo "FATAL: resumed production cycle omitted its frozen cycle manifest" >&2
       exit 2

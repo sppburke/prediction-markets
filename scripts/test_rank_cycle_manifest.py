@@ -10,8 +10,8 @@ import sys
 import tempfile
 import unittest
 
-from rank_cycle_manifest import (TOP_UP_RESERVE_HOURS, _fresh_identity, activation_batch_recorded,
-                                 candidate_targets, research_coverage)
+from rank_cycle_manifest import (CERTIFICATE_COLUMNS, TOP_UP_RESERVE_HOURS, _fresh_identity,
+                                 activation_batch_recorded, candidate_targets, research_coverage, uncovered_drops)
 import test_rank_and_push as wrapper_tests
 
 
@@ -485,6 +485,45 @@ class ResearchCoverageTest(unittest.TestCase):
             self.assertEqual((covered.returncode, covered.stdout), (0, ""))
             with self.assertRaises(ValueError):
                 research_coverage(root, "cron-20261102T000000Z", candidate)  # not an accepted cycle
+
+
+class DropsCoverTest(unittest.TestCase):
+    """A revert publishes the old loop only if its candidate keeps every drop the new loop certified or carries."""
+
+    @staticmethod
+    def cache(path, certified, carried=None):
+        with sqlite3.connect(path) as c:
+            c.execute(f"CREATE TABLE activity_wallet_history_v3 ({', '.join(CERTIFICATE_COLUMNS)})")
+            for wallet, drops in certified.items():
+                c.execute(f"INSERT INTO activity_wallet_history_v3 VALUES ({', '.join('?' * len(CERTIFICATE_COLUMNS))})",
+                          (wallet, 1, 0, 0, 0, 0, "d", json.dumps(drops, sort_keys=True, separators=(",", ":"))))
+            if carried is not None:
+                c.execute("CREATE TABLE activity_seed_drops_v3 (wallet_hex TEXT PRIMARY KEY, scope_drops_json TEXT)")
+                for wallet, drops in carried.items():
+                    c.execute("INSERT INTO activity_seed_drops_v3 VALUES (?, ?)",
+                              (wallet, json.dumps(drops, sort_keys=True, separators=(",", ":"))))
+        return path
+
+    def test_reports_drops_the_target_lacks_or_starts_later(self):
+        def drop(scope, second):
+            return {"cause": "unmapped", "dropped_at_unix": second, "scope_id": scope, "scope_kind": "market"}
+        a, b, c = ("0x" + digit * 40 for digit in "abc")
+        with tempfile.TemporaryDirectory() as tmp:
+            new = self.cache(Path(tmp) / "new.db", {a: [drop("0x1", 100), drop("0x2", 100)], b: []},
+                             carried={c: [drop("0x3", 50)]})  # c waits for admission; its drop counts too
+            # OLD keeps a's 0x1 earlier, a's 0x2 only later, and has nothing for c.
+            old = self.cache(Path(tmp) / "old.db", {a: [drop("0x1", 90), drop("0x2", 120)], b: []})
+            self.assertEqual(uncovered_drops(new, old),
+                             [{"wallet_hex": a, **drop("0x2", 100)}, {"wallet_hex": c, **drop("0x3", 50)}])
+            run = lambda target: subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("rank_cycle_manifest.py")), "drops-cover",
+                 "--source", str(new), "--target", str(target)], capture_output=True, text=True)
+            held = run(old)
+            self.assertEqual(held.returncode, 1, held.stderr)
+            self.assertEqual([json.loads(line)["scope_id"] for line in held.stdout.splitlines()], ["0x2", "0x3"])
+            keeps = self.cache(Path(tmp) / "keeps.db", {a: [drop("0x1", 100), drop("0x2", 99)], c: [drop("0x3", 50)]})
+            covered = run(keeps)
+            self.assertEqual((covered.returncode, covered.stdout), (0, ""), covered.stderr)
 
 
 if __name__ == "__main__":

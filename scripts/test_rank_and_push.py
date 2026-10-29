@@ -671,6 +671,22 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(exact.returncode, 0, exact.stdout + exact.stderr)
         print("PASS: capacity gate refuses a copy one byte short; staged resumes and exact room proceed")
 
+    def test_capacity_gate_counts_a_retained_cycles_interrupted_copy_as_free(self):
+        installed = os.stat(os.path.realpath(self.root / "data" / "wallet_cache.db")).st_size
+        need = installed + 1_000_000_000  # PE_RANK_MIN_FREE_GB=1
+        retained = self._run(exit_env={"STUB_EXIT_events": "75"})
+        self.assertEqual(retained.returncode, 75, retained.stdout + retained.stderr)
+        (run_dir,) = self.root.glob("data/eval-results/cron-*")
+        side = Path(os.path.realpath(self.root / "data" / "wallet_cache.db")).parent / f"wallet_cache.{run_dir.name}.side.db"
+        Path(f"{side}.pending").write_bytes(b"xx")  # an interrupted copy, which staging removes before copying again
+        short = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(need - 3)})
+        self.assertEqual(short.returncode, 2, short.stdout + short.stderr)
+        self.assertIn(f"FATAL: capacity: free_bytes={need - 3} need_bytes={need} ", short.stderr)
+        self.assertIn("interrupted copy 2 reclaimable", short.stderr)
+        fits = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(need - 2)})
+        self.assertEqual(fits.returncode, 0, fits.stdout + fits.stderr)
+        print("PASS: capacity gate counts a retained cycle's interrupted copy as free space")
+
     def test_capacity_sampler_is_off_unless_configured(self):
         r = self._run()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)

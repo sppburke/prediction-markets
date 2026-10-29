@@ -48,22 +48,34 @@ pub struct SeedPlan {
 }
 
 /// Before anything is read or written: neither input may be a file that initializing `target` writes, removes or
-/// truncates (the cache, its unfinished copy and that copy's journals, the lock file), by path or by inode.
+/// truncates (the cache, its unfinished copy, the lock file, and both databases' write-ahead, shared-memory and
+/// rollback-journal files, which SQLite creates, truncates or deletes when it opens them; a rollback journal beside an
+/// empty database is deleted unread), by path or by inode.
 pub fn require_init_roles(
     target: &Path,
     wallets_path: &Path,
     drops_from: &Path,
 ) -> Result<(), BootstrapError> {
     let unfinished = sidecar_path(target, ".init");
-    require_distinct_files(&[
+    let lock = lock_target_path(target)?;
+    let sidecars: Vec<(&str, PathBuf)> = [
+        ("--db's sidecar", target),
+        ("--db's unfinished copy's sidecar", unfinished.as_path()),
+    ]
+    .into_iter()
+    .flat_map(|(label, path)| {
+        ["-wal", "-shm", "-journal"].map(move |suffix| (label, sidecar_path(path, suffix)))
+    })
+    .collect();
+    let mut roles = vec![
         ("--drops-from", drops_from),
         ("--wallets", wallets_path),
         ("--db", target),
-        ("--db's unfinished copy", &unfinished),
-        ("its WAL", &sidecar_path(&unfinished, "-wal")),
-        ("its shared memory", &sidecar_path(&unfinished, "-shm")),
-        ("--db's lock", &lock_target_path(target)?),
-    ])
+        ("--db's unfinished copy", unfinished.as_path()),
+        ("--db's lock", lock.as_path()),
+    ];
+    roles.extend(sidecars.iter().map(|(label, path)| (*label, path.as_path())));
+    require_distinct_files(&roles)
 }
 
 impl SeedPlan {

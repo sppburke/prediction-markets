@@ -103,7 +103,10 @@ intent stopped until its explicit owner-consent points.
    generations, receipts and artifacts. Replay a compatible prepared publication request unchanged;
    never rebuild it from the new clock, cache or code revision. A pre-release request stays with
    its prior release; the tested branch-to-main handoff retains its format-3 request.
-6. Run `bash scripts/deploy/forge_pause.sh status` first. Invoke `pause` and `restore` only when
+6. With two checkouts ("Second loop" below), set `PE_FORGE_CHECKOUT` to the checkout being deployed for
+   every `status`, `pause` and `restore` of this procedure: the helper selects its checkout and unit
+   from that setting (default `$HOME/prediction-markets`), never from the working directory.
+   Run `bash scripts/deploy/forge_pause.sh status` first. Invoke `pause` and `restore` only when
    no pause record exists, or when the record belongs to this deployment's interrupted procedure:
    its `recorded_at` must match the deployment record. If another operator's record exists or
    ownership is unknown, preserve the record and paused state and obtain an explicit handoff.
@@ -1247,7 +1250,8 @@ handoff.
 #### Recovery and damage boundaries
 
 Before a prepared request exists, abandon a cycle only after
-`scripts/deploy/forge_pause.sh pause` reports the loop inactive with no cycle descendant and
+`scripts/deploy/forge_pause.sh pause` (with `PE_FORGE_CHECKOUT` naming that loop's checkout, as for
+every `status` and `restore` of this procedure) reports the loop inactive with no cycle descendant and
 no held lock; then confirm `rank_and_push.pending` is absent and the cycle directory holds no
 `ranking_publish_request.json`, remove `rank_and_push.cycle`, and delete only that cycle's
 candidate, its projection spool (including uncommitted/temporary spool) and staging metadata.
@@ -1885,8 +1889,11 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    and its recorded sha256 and a one-cycle inventory naming the prepared `market_scope.json` (it must
    exit 0); run `scripts/rank_cycle_manifest.py research-coverage --root
    /mnt/storage/prediction-markets/data/eval-results --since <gen 26's cycle> --candidate <the prepared
-   cycle>` and hold the switch for the owner if it reports any wallet (an exclusion record is not
-   coverage); record pe-service's mode. Then set `PE_RANK_SCHEMA_TWO_CUTOVER=1` in the new `.env` and
+   cycle>` and explain every wallet it lists (an exclusion record is not coverage): a wallet missing
+   because of the cache change (not seeded, excluded only by the new cache, or its history read
+   differently) holds the switch for the owner, while one that only left the ranking window does not
+   (whole universes churn between cycles; the frozen tools compare chosen wallets, with their
+   registered fallback, and decide research coverage); record pe-service's mode. Then set `PE_RANK_SCHEMA_TWO_CUTOVER=1` in the new `.env` and
    run `--resume-pending` (a prepared request resumes only under `1`).
 7. After pe-service applies the batch and the research fetch accepts the linked cycle, enable
    supervision only once a summary qualified (step 4): set `PE_RANK_MIN_FREE_GB` by the formula in
@@ -1897,7 +1904,8 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    step 6. Admission stays at 0 until a nonzero batch has its own envelope. To qualify one, first stop
    the supervisor at a publication boundary as in step 1, for this checkout and unit: the flag stays
    `run` through the cycle's retries before publication, and `stop` is written only after it has
-   published, within the supervisor's 60-s wait; then confirm with `PE_FORGE_CHECKOUT` set that
+   published, within the supervisor's 60-s wait (a late stop that retains a cycle is resolved as in
+   step 1 before any admission or discovery setting changes); then confirm with `PE_FORGE_CHECKOUT` set that
    `forge_pause.sh status` shows the unit inactive with no descendants or held locks, and that no
    cycle or pending pointer exists. Then list the wallets the next batch would admit (`activate-next`'s selection: inactive, not infrastructure, not
    tombstoned, in its preference order; read-only), size their complete histories from the old
@@ -1917,13 +1925,17 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    with its remaining envelope from its samples.
 
 **Recovery** follows the sections above: a failed `cache-init` reruns; a slow or failed root
-resumes; a full drive mid-cycle rolls the transaction back and fails the stage (free space, then
-resume); a top-up exhausted before preparation takes the guarded abandonment in "Recovery and
+resumes; a full drive during collection or finalization rolls the open transaction back and fails
+the stage with the previous generation still installed (free space, then resume); during activation
+or the publication tail it can leave an activation rename gap or the new generation installed:
+preserve every recorded cache role, request and pointer, reclaim only verified disposable space, and
+take the rename-gap resume or the exact-request recovery (with its consumption check where
+required). A top-up exhausted before preparation takes the guarded abandonment in "Recovery and
 damage boundaries", then a fresh cycle (never a second top-up); a prepared request resumes exactly.
 Begin a guarded abandonment only once the loop's unit is inactive, so the pause it requires records
-it inactive; after the cycle is set aside, `forge_pause.sh restore` (with `PE_FORGE_CHECKOUT` for
-the 15/5-minute checkout) puts back the recorded flag and enablement, leaves the unit inactive and
-deletes the pause record. `.forge_pause.json` must be absent before retirement or a fresh cycle: a
+it inactive; set `PE_FORGE_CHECKOUT` to the 15/5-minute checkout for that pause, every `status` and
+the restore. After the cycle is set aside, `forge_pause.sh restore` puts back the recorded flag and
+enablement, leaves the unit inactive and deletes the pause record. `.forge_pause.json` must be absent before retirement or a fresh cycle: a
 remaining record holds both (the wrapper exits 0 without retiring or admitting).
 
 **Revert** (owner's choice): flag-stop and disable the new loop at a boundary; prove the old loop's
@@ -1933,7 +1945,11 @@ fit, hold the revert and report the shortfall: every retained cache role stays a
 (activation and recovery need its regular files on one filesystem at the recorded paths); deleting any
 of it needs the owner's yes. Run the old loop's first cycle
 under `prepare`, pass the frozen merger check and `research-coverage` against it (the root holds the
-new loop's linked cycles; any reported wallet holds the publication for the owner), set
+new loop's linked cycles; a wallet missing because of the switch back holds the publication for the
+owner), and run `scripts/rank_cycle_manifest.py drops-cover --source
+/mnt/t7/cache-15m5m/wallet_cache.db --target <the old loop's prepared candidate>`: any drop the
+candidate does not keep as early holds the publication for the owner with both loops stopped (drops
+are cumulative and never removed; catching up from the venue cannot restore a deleted trigger). Then set
 `PE_RANK_SCHEMA_TWO_CUTOVER=1` and run `--resume-pending`, verify the publication, and once a summary
 qualified (that cycle's, or the next one-shot's, as in step 7) set the old loop's `PE_RANK_MIN_FREE_GB`
 from the latest qualified summary (its `.env` gets `PE_RANK_CAPACITY_SAMPLE_SECS=10` before that cycle),

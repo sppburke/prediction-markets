@@ -382,6 +382,7 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-10-15 | 2026-12-14 |
 | https://docs.polymarket.com/api-spec/gamma-openapi.yaml (`Market.events`, `Event.series`, `Series.recurrence`) | 2026-10-15 | 2026-12-14 |
 | https://gamma-api.polymarket.com/series?exclude_events=true&limit=50&offset={k} | 2026-10-28 | 2026-12-27 |
+| https://gamma-api.polymarket.com/series/{id} (the pinned ranking scope, `PE_RANK_MARKET_SERIES`) | 2026-10-28 | 2026-12-27 |
 | https://gamma-api.polymarket.com/events/keyset?series_id={id}&end_date_min={iso}&limit=100&after_cursor={cursor} (documented in gamma-openapi.yaml) | 2026-10-15 | 2026-12-14 |
 | https://gamma-api.polymarket.com/markets?clob_token_ids={token}&closed=true | 2026-09-02 | 2026-11-01 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
@@ -390,9 +391,11 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 
 - 2026-10-28 (15/5-minute loop): `/series?exclude_events=true` (paged, 2,525 rows at 17:10 CT) listed
   recurrence `15m` on 10 series (the eight crypto windows plus `gold` and `silver`) and `5m` on 8
-  (`eth, btc, xrp, sol, doge, bnb, hype, zec`). Participant discovery and the ranking scope now
-  filter the same listing, each by its own recurrence set (`bootstrap_market_recurrences` and the
-  wrapper's `PE_RANK_MARKET_RECURRENCES`, both in `_GLOSSARY.md`). A market of each
+  (`eth, btc, xrp, sol, doge, bnb, hype, zec`). Participant discovery and the ranking scope
+  filter that listing, each by its own recurrence set (`bootstrap_market_recurrences` and the
+  wrapper's `PE_RANK_MARKET_RECURRENCES`, both in `_GLOSSARY.md`), except while
+  `PE_RANK_MARKET_SERIES` pins the ranking scope: then each pinned series is read by id
+  (`/series/{id}`, one request per series) and the listing is not used for ranking. A market of each
   of the 18 series (16 at 21:40 CT; the two `zec` series, which that paged listing did not
   return, fetched by id at 23:47 CT) carried `feeType` `crypto_fees_v2` with `feeSchedule`
   `{"exponent":1,"rate":0.07,"takerOnly":true,"rebateRate":0.2}`, equal to pass 2's taker rate.
