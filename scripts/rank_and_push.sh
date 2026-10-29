@@ -262,6 +262,13 @@ fi
 # would leave the push stage without credentials.
 set -a; source ./.env; set +a
 MIN_TTR_SECS=60
+# Drive-room settings (docs/26), checked before anything runs so a bad value is never silently ignored.
+[[ -z "${PE_RANK_MIN_FREE_GB:-}" || "$PE_RANK_MIN_FREE_GB" =~ ^[0-9]+$ ]] || {
+  echo "FATAL: PE_RANK_MIN_FREE_GB must be a whole number of GB" >&2; exit 2;
+}
+[[ -z "${PE_RANK_CAPACITY_SAMPLE_SECS:-}" || "$PE_RANK_CAPACITY_SAMPLE_SECS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "FATAL: PE_RANK_CAPACITY_SAMPLE_SECS must be a whole number of seconds" >&2; exit 2;
+}
 
 # Neutralize PE_BOOTSTRAP_FETCH_RESOLUTIONS for the `backfill` stage (issue #383). `.env` sets
 # it =1 (.env:30) and the `set -a; source ./.env` above exports it GLOBALLY, so without this unset
@@ -386,12 +393,15 @@ PIPELINE_VERSIONS_TMP=""
 CYCLE_CONFIG_TMP=""
 CURRENT_CYCLE_TMP=""
 CAPTURE_PID=""
+SAMPLER_PID=""
 cleanup_rank_and_push() {
   local status=$?
-  if [[ -n "$CAPTURE_PID" ]]; then
-    kill "$CAPTURE_PID" 2>/dev/null || true
-    wait "$CAPTURE_PID" 2>/dev/null || true
-  fi
+  local pid
+  for pid in "$CAPTURE_PID" "$SAMPLER_PID"; do
+    [[ -n "$pid" ]] || continue
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
   [[ -z "$CYCLE_TMP" ]] || rm -f "$CYCLE_TMP"
   [[ -z "$PIPELINE_VERSIONS_TMP" ]] || rm -f "$PIPELINE_VERSIONS_TMP"
   [[ -z "$CYCLE_CONFIG_TMP" ]] || rm -f "$CYCLE_CONFIG_TMP"
@@ -516,9 +526,6 @@ print(1 if configuration.get("cache_lane") == "fresh_v2" else 0)' "$OUT_DIR/cycl
     # PE_RANK_MIN_FREE_GB (10^9 bytes); otherwise stop here, between cycles, before anything is staged. A resumed
     # cycle was budgeted when it began and is never gated.
     if [[ -n "${PE_RANK_MIN_FREE_GB:-}" ]]; then
-      [[ "$PE_RANK_MIN_FREE_GB" =~ ^[0-9]+$ ]] || {
-        echo "FATAL: PE_RANK_MIN_FREE_GB must be a whole number of GB" >&2; exit 2;
-      }
       INSTALLED_REAL="$(readlink -f -- "$DB")"
       INSTALLED_BYTES="$(stat -c %s -- "$INSTALLED_REAL")"
       FREE_BYTES="$(df -B1 --output=avail -- "$INSTALLED_REAL" | tail -n 1 | tr -d ' ')"
@@ -612,6 +619,17 @@ fi
 
 mkdir -p "$OUT_DIR"
 echo "RANK_AND_PUSH_RUN_DIR=$OUT_DIR"
+
+# Capacity samples for the drive-room margin (docs/26): free bytes and file sizes only, every
+# PE_RANK_CAPACITY_SAMPLE_SECS while this run lives; a resumed run of the cycle appends. Unset = none.
+if [[ -n "${PE_RANK_CAPACITY_SAMPLE_SECS:-}" ]]; then
+  SAMPLER_ARGS=(--cache-dir "$(dirname -- "$(readlink -f -- "$DB")")" --out "$OUT_DIR/capacity_samples.jsonl"
+    --summary "$OUT_DIR/capacity_summary.json" --interval "$PE_RANK_CAPACITY_SAMPLE_SECS"
+    --dir "parquet=$PARQUET_DIR")
+  [[ -z "${SQLITE_TMPDIR:-}" ]] || SAMPLER_ARGS+=(--dir "sqlite_tmp=$SQLITE_TMPDIR")
+  "$PYTHON_BIN" scripts/capacity_sampler.py "${SAMPLER_ARGS[@]}" &
+  SAMPLER_PID=$!
+fi
 
 # Frozen cycle settings take precedence over the .env loaded on this invocation.
 # Pure re-push tails have no cycle manifest or frozen configuration to restore.

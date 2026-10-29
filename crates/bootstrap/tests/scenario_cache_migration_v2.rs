@@ -20776,6 +20776,8 @@ async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
         .await
         .unwrap();
     projection_v3_payouts(&old);
+    let collected_old = dir.path().join("collected-old.db");
+    std::fs::copy(&old, &collected_old).unwrap();
     finalize_cache_v2_unbound(&old, None, FRESH_END + 1).unwrap();
     let certified = |wallet| certificate_row(&old, wallet).pop().unwrap();
     let (seed_drops, later_drops) = (certified(WALLET), certified(WALLET_B));
@@ -20911,6 +20913,31 @@ async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
         error.to_string().contains("certificate digest mismatch"),
         "{error}"
     );
+    // Only a finalized format-three cache with its certificate commitment supplies drops.
+    let plain = dir.path().join("plain.db");
+    drop(
+        WalletCache::open_configured(&BootstrapConfig {
+            cache_path: plain.clone(),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+    let error = init(&format!("{WALLET}\n"), &plain, &other).unwrap_err();
+    assert!(error.to_string().contains("format-three"), "{error}");
+    let error = init(&format!("{WALLET}\n"), &collected_old, &other).unwrap_err();
+    assert!(error.to_string().contains("finalized cache"), "{error}");
+    let uncommitted = dir.path().join("uncommitted.db");
+    std::fs::copy(&old, &uncommitted).unwrap();
+    history_v3_damage_connection(&uncommitted)
+        .execute(
+            "UPDATE cache_v2_migration_state SET ranker_projection_inputs_json =
+             json_remove(ranker_projection_inputs_json, '$.certificate_digest')",
+            [],
+        )
+        .unwrap();
+    let error = init(&format!("{WALLET}\n"), &uncommitted, &other).unwrap_err();
+    assert!(error.to_string().contains("commitment missing"), "{error}");
+    assert!(!other.cache_path.exists());
 
     // A collected cache is never accepted as initialized.
     let collected = BootstrapConfig {

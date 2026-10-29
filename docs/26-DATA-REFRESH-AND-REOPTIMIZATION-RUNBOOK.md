@@ -1785,6 +1785,7 @@ PE_RANK_MARKET_SERIES=10191:eth-up-or-down-15m,10192:btc-up-or-down-15m,10422:xr
 PE_BOOTSTRAP_LEADERBOARD_TOP_N=0               # leaderboard off
 PE_BOOTSTRAP_DATADASH_API_URL=                 # datadash off
 PE_RANK_RESEARCH_LINK_DIR=/mnt/storage/prediction-markets/data/eval-results
+PE_RANK_CAPACITY_SAMPLE_SECS=10                # capacity samples for the drive-room margin
 ```
 
 Each cycle records the four new settings in `cycle_configuration.json` and restores them on resume
@@ -1826,8 +1827,9 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
 3. Install and verify this release in the old checkout by "Forge release deployment" above while
    both loops are inactive (the pause helper sees every ranker process). Keep its flag `stop`.
 4. Capacity: proceed only if free bytes ≥ 3 × S + the old loop's last payout tables, spool and
-   exports + 50 GB, S being the seeds' certified complete-history size. These are estimates; record
-   the first cycle's actual peaks (file sizes, WAL, sort scratch, spool, exports).
+   exports + 50 GB, S being the seeds' certified complete-history size. These are estimates; the
+   first cycle's `capacity_summary.json` records the actual minimum free bytes and peaks (installed,
+   candidate, WAL, spool, exports, SQLite temporary files).
 5. `cache-init` as above (rerun it right before the first cycle: it must report
    `already_initialized`).
 6. First cycle, supervisor off: set `PE_RANK_SCHEMA_TWO_CUTOVER=prepare` and
@@ -1835,22 +1837,35 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    `RANK_AND_PUSH_PREPARED_ONLY` (exit 2) with nothing published. Compare with the old loop's last
    batch; run the research tree's frozen `tools-v26f/merge_scopes.py` with gen 26's registered list
    and its recorded sha256 and a one-cycle inventory naming the prepared `market_scope.json` (it must
-   exit 0); record pe-service's mode. Then set the selector to `1` and run `--resume-pending`.
+   exit 0); run `scripts/rank_cycle_manifest.py research-coverage --root
+   /mnt/storage/prediction-markets/data/eval-results --since <gen 26's cycle> --candidate <the prepared
+   cycle>` and hold the switch for the owner if it reports any wallet (an exclusion record is not
+   coverage); record pe-service's mode. Then set the selector to `1` and run `--resume-pending`.
 7. After pe-service applies the batch and the research fetch accepts the linked cycle, set
-   `PE_RANK_MIN_FREE_GB` from the first cycle's measured peak above the installed size plus 20 GB (the
-   wrapper then refuses to begin a cycle that would not fit, `_GLOSSARY.md` `rank_min_free_gb`), write
-   `run` to the new flag and `systemctl --user enable --now pe-rank-loop-15m5m` with the activation
-   batch still 0; restore the recorded batch once a supervised successor's stage reports show its peak
-   inside the gate.
+   `PE_RANK_MIN_FREE_GB` to the first cycle's peak use above the installed size (its samples) plus
+   20 GB (`_GLOSSARY.md` `rank_min_free_gb`; the gate is a forecast from measured cycles), write `run`
+   to the new flag and `systemctl --user enable --now pe-rank-loop-15m5m` with the activation batch
+   at 0. Admission stays at 0 until a nonzero batch has its own envelope: between cycles, list the
+   wallets the next batch would admit (`activate-next`'s selection: inactive, not infrastructure, not
+   tombstoned, in its preference order; read-only), size their complete histories from the old
+   cache's certificates (a wallet it lacks at the venue sample's upper estimate), and only if that
+   plus the measured transient peak fits above installed + margin, run one cycle with that batch as
+   a supervised one-shot under `prepare`, publish it, set the margin from its samples plus its
+   admission growth plus 20 GB, then restore supervision with that batch. Repeat for any change of
+   admission scope or count. Resumed cycles are not gated; before restarting after an operator stop,
+   compare free bytes with the retained cycle's remaining envelope from its samples.
 
 **Recovery** follows the sections above: a failed `cache-init` reruns; a slow or failed root
 resumes; a full drive mid-cycle rolls the transaction back and fails the stage (free space, then
 resume); a top-up exhausted before preparation takes the guarded abandonment in "Recovery and
 damage boundaries", then a fresh cycle (never a second top-up); a prepared request resumes exactly.
 
-**Revert** (owner's choice): flag-stop and disable the new loop at a boundary; write `run` and
-`enable --now` the old loop only if free bytes cover its next candidate (installed size + catch-up
-growth + spool + WAL + 50 GB); otherwise delete the new loop's retained copies first.
+**Revert** (owner's choice): flag-stop and disable the new loop at a boundary; prove the old loop's
+headroom (installed size + catch-up growth + spool + WAL + 50 GB). Deleting the new loop's retained
+copies to make room needs the owner's yes (it forecloses switching back). Run the old loop's first
+cycle under `prepare`, pass the frozen merger check and `research-coverage` against it (the root
+holds the new loop's linked cycles; any reported wallet holds the publication and any deletion for
+the owner), publish it, then write `run` and `enable --now` the old loop.
 
 ---
 

@@ -206,6 +206,18 @@ impl Carried {
         if fresh_collection_record(&connection)?.is_none_or(|record| record.version != 4) {
             return invalid("cumulative drops come only from a format-three cache".to_owned());
         }
+        // A finalized cache's commitment is its finalize inputs' certificate digest, which the
+        // verifier requires; an earlier phase would be checked against a provisional one.
+        let phase: String = connection.query_row(
+            "SELECT phase FROM cache_v2_migration_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if phase != "finalized" {
+            return invalid(format!(
+                "cumulative drops come only from a finalized cache (phase {phase})"
+            ));
+        }
         verify_history_certificates(&connection)?;
         let mut drops = BTreeMap::new();
         let mut statement = connection.prepare(

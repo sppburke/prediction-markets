@@ -11,7 +11,7 @@ import tempfile
 import unittest
 
 from rank_cycle_manifest import (TOP_UP_RESERVE_HOURS, _fresh_identity, activation_batch_recorded,
-                                 candidate_targets)
+                                 candidate_targets, research_coverage)
 import test_rank_and_push as wrapper_tests
 
 
@@ -448,6 +448,43 @@ class ActivationBatchTest(unittest.TestCase):
         result = self.cli("run-a")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
+
+
+class ResearchCoverageTest(unittest.TestCase):
+    def test_reports_wallets_that_only_another_checkout_published(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "eval-results"
+            root.mkdir()
+
+            def cycle(name, wallets, accepted=True, base=root):
+                folder = base / name
+                folder.mkdir(parents=True)
+                (folder / "latency_shift_ranked.csv").write_text(
+                    "wallet,score\n" + "".join(f"{wallet},1\n" for wallet in wallets))
+                if accepted:
+                    (folder / "accepted_cycle_manifest.json").write_text("{}\n")
+                return folder
+
+            cycle("cron-20261020T000000Z", ["0x" + "9" * 40])  # before the research window
+            cycle("cron-20261023T000000Z", ["0x" + "A" * 40, "0x" + "b" * 40])
+            # Published by the other checkout and linked here; OLD's candidate never selected its wallet.
+            other = cycle("cron-20261101T000000Z", ["0x" + "c" * 40], base=Path(tmp) / "other")
+            (root / other.name).symlink_to(other)
+            cycle("cron-20261102T000000Z", ["0x" + "d" * 40], accepted=False)  # prepared, never published
+            candidate = cycle("cron-20261103T000000Z", ["0x" + "a" * 40, "0x" + "b" * 40], accepted=False)
+            self.assertEqual(research_coverage(root, "cron-20261023T000000Z", candidate), ["0x" + "c" * 40])
+            run = lambda: subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("rank_cycle_manifest.py")), "research-coverage",
+                 "--root", str(root), "--since", "cron-20261023T000000Z", "--candidate", str(candidate)],
+                capture_output=True, text=True)
+            missing = run()
+            self.assertEqual((missing.returncode, missing.stdout), (1, "0x" + "c" * 40 + "\n"))
+            with open(candidate / "latency_shift_ranked.csv", "a") as handle:
+                handle.write("0x" + "C" * 40 + ",1\n")
+            covered = run()
+            self.assertEqual((covered.returncode, covered.stdout), (0, ""))
+            with self.assertRaises(ValueError):
+                research_coverage(root, "cron-20261102T000000Z", candidate)  # not an accepted cycle
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 """Freeze and compare the purge-free Forge source watermark (#544)."""
 
 import argparse
+import csv
 import hashlib
 import itertools
 import json
@@ -736,6 +737,22 @@ def activation_batch_recorded(side_path: Path, batch_id: str) -> bool:
                                "WHERE batch_id = ?)", (batch_id,)))
 
 
+def research_coverage(root: Path, since: str, candidate: Path) -> list[str]:
+    """Wallets in the pass-two universe of an accepted cycle named `since` or later under `root` (linked cycles of
+    another checkout included) that `candidate`'s universe lacks, sorted. The universe is `latency_shift_ranked.csv`'s
+    `wallet` column, lowercased, as the frozen research readers take it."""
+    def universe(cycle: Path) -> set[str]:
+        with open(cycle / "latency_shift_ranked.csv", newline="", encoding="utf-8") as handle:
+            return {row["wallet"].lower() for row in csv.DictReader(handle)}
+
+    published = sorted(cycle for cycle in root.glob("cron-*")
+                       if cycle.name >= since and (cycle / "accepted_cycle_manifest.json").is_file())
+    if not published or published[0].name != since:
+        raise ValueError(f"{since} is not an accepted cycle under {root}")
+    union = set().union(*(universe(cycle) for cycle in published))
+    return sorted(union - universe(candidate))
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -766,6 +783,12 @@ def parse_args():
                                   help="print 1 when the side cache records the activation batch, else 0")
     batch.add_argument("--db", type=Path, required=True)
     batch.add_argument("--batch-id", required=True)
+    coverage = subparsers.add_parser(
+        "research-coverage",
+        help="print the wallets of accepted cycles since --since that --candidate's universe lacks; exit 1 if any")
+    coverage.add_argument("--root", required=True, type=Path)
+    coverage.add_argument("--since", required=True, help="the first accepted cycle's folder name")
+    coverage.add_argument("--candidate", required=True, type=Path)
     return parser.parse_args()
 
 
@@ -787,6 +810,11 @@ def main() -> int:
     if args.command == "activation-batch":
         print(int(activation_batch_recorded(args.db, args.batch_id)))
         return 0
+    if args.command == "research-coverage":
+        missing = research_coverage(args.root, args.since, args.candidate)
+        for wallet in missing:
+            print(wallet)
+        return 1 if missing else 0
     if args.command == "capture":
         versions = json.loads(args.versions_file.read_text(encoding="utf-8"))
         configuration = json.loads(args.configuration_file.read_text(encoding="utf-8"))

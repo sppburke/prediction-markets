@@ -110,6 +110,7 @@ class RankAndPushScenario(unittest.TestCase):
         shutil.copy(WRAPPER.parent / "rank_cycle_manifest.py", self.root / "scripts")
         shutil.copy(WRAPPER.parent / "partial_backfill_wallets.py", self.root / "scripts")
         shutil.copy(WRAPPER.parent / "ranker_decay.py", self.root / "scripts")
+        shutil.copy(WRAPPER.parent / "capacity_sampler.py", self.root / "scripts")
 
         # The fake publisher below does not contact this syntactically valid endpoint.
         (self.root / ".env").write_text(
@@ -154,6 +155,10 @@ class RankAndPushScenario(unittest.TestCase):
             'a = sys.argv[1:]; out = a[a.index("--out-dir") + 1]\n'
             'os.makedirs(out, exist_ok=True)\n'
             'json.dump({"version": int(os.environ.get("STUB_EXPORT_VERSION", "2"))}, open(os.path.join(out, "schema_v2_export_manifest.json"), "w"))\n'
+            'transient = os.environ.get("STUB_TRANSIENT")\n'
+            'if transient:\n'
+            '    import time\n'
+            '    open(transient, "wb").write(b"x" * 1_000_000); time.sleep(2.5); os.unlink(transient)\n'
             'raise SystemExit(int(os.environ.get("STUB_EXIT_export", "0")))\n',
         )
         _write_exec(
@@ -628,6 +633,45 @@ class RankAndPushScenario(unittest.TestCase):
         roomy = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "0"})
         self.assertEqual(roomy.returncode, 0, roomy.stdout + roomy.stderr)
         print("PASS: capacity gate stops before a new cycle; resumes and roomy drives proceed")
+
+    def test_capacity_sampler_is_off_unless_configured(self):
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(list(self.root.glob("data/eval-results/cron-*/capacity_*")), [])
+        self.assertNotIn("capacity_sampler.py", self.python_log.read_text())
+        bad = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "0"})
+        self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
+        self.assertIn("PE_RANK_CAPACITY_SAMPLE_SECS must be a whole number", bad.stderr)
+        print("PASS: no capacity samples unless PE_RANK_CAPACITY_SAMPLE_SECS is set")
+
+    def test_capacity_sampler_keeps_a_transient_peak_and_ends_with_the_run(self):
+        transient = self.root / "data" / "wallet_cache.transient.db"
+        sampler = str(self.root / "scripts" / "capacity_sampler.py")
+        retained = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "1", "STUB_EXIT_events": "75"})
+        self.assertEqual(retained.returncode, 75, retained.stdout + retained.stderr)
+        (run_dir,) = self.root.glob("data/eval-results/cron-*")
+        samples = run_dir / "capacity_samples.jsonl"
+        first = len(samples.read_text().splitlines())
+        self.assertGreaterEqual(first, 1)
+        resumed = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "1", "STUB_TRANSIENT": str(transient)})
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        lines = [json.loads(line) for line in samples.read_text().splitlines()]
+        self.assertGreater(len(lines), first + 1)  # the resumed run appended
+        for line in lines:
+            self.assertEqual(sorted(line), ["dirs", "files", "free_bytes", "t"])
+            self.assertGreater(line["free_bytes"], 0)
+        summary = json.loads((run_dir / "capacity_summary.json").read_text())
+        self.assertFalse(transient.exists())
+        self.assertEqual(summary["peak_bytes"]["wallet_cache.transient.db"], 1_000_000)
+        self.assertEqual(summary["min_free_bytes"], min(line["free_bytes"] for line in lines))
+        self.assertEqual(summary["samples"], len(lines))
+        for proc in Path("/proc").iterdir():
+            try:
+                cmdline = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+            except (OSError, ValueError):
+                continue
+            self.assertNotIn(sampler, cmdline, "the sampler outlived its run")
+        print("PASS: capacity samples keep a transient peak, carry over a resume and end with the run")
 
     def test_backfill_partial_exit2_does_not_abort(self):
         r = self._run(exit_env={"STUB_EXIT_backfill": "2"})

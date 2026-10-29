@@ -628,8 +628,18 @@ def assert_certified_seeded_publication_equivalence(
         for name in ("ranked_72hr_buyandhold.csv", "latency_shift_ranked.csv", "oracle_outcomes.csv"):
             assert (a_out / name).read_bytes() == (b_out / name).read_bytes(), name
         assert a["entries"] == b["entries"], "the extra wallet changed published entries"
-        assert any(row["survives"] for row in a["entries"]), "no survivor to compare"
-        print("PASS: a seeds-only cache publishes exact entries")
+        survivors = {row["wallet_hex"] for row in a["entries"] if row["survives"]}
+        assert survivors, "no survivor to compare"
+        # The survivor's entries are priced from the shared tape: each sample is the retained print
+        # wallet's reference (0.25 + i in market i), not the survivor's own entry print (0.20 + i).
+        with open(b_out / "oracle_outcomes.csv", newline="", encoding="utf-8") as handle:
+            priced = [row for row in csv.DictReader(handle)
+                      if row["wallet"] in survivors and row["outcome"] == "repriced"]
+        assert priced, "no survivor entry priced from the shared tape"
+        for row in priced:
+            index = int(row["market_id"], 16) - 100
+            assert abs(float(row["sample_price"]) - (25 + index) / 100) < 1e-9, row
+        print("PASS: a seeds-only cache publishes exact entries, priced from another seed's prints")
 
 
 def assert_certified_excluded_newest_is_stale(db: str, excluded: str, process_now: int) -> None:
