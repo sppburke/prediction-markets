@@ -25,7 +25,9 @@ pub const PAPER_CHECKPOINT_SECS: u64 = 1;
 
 type CheckpointJob = JoinHandle<Result<(), PaperStateError>>;
 
-/// The monitor and main share this slot, so aborting the monitor never detaches a running checkpoint.
+/// The monitor and main share this slot: at coordinated shutdown main joins a checkpoint the monitor
+/// left running when it stopped or was aborted (an early boot error leaves it to the runtime's
+/// shutdown bound).
 #[derive(Clone, Default)]
 pub struct PaperCheckpointSlot {
     job: Arc<tokio::sync::Mutex<Option<CheckpointJob>>>,
@@ -67,7 +69,7 @@ async fn checkpoint_paper_state(
         ticker.tick().await;
         let result = slot.run(checkpoint.clone()).await;
         match (&result, failing) {
-            (Ok(()), true) => info!("paper-state WAL checkpoint recovered"),
+            (Ok(()), true) => info!("paper-state WAL checkpoint error cleared"),
             (Err(error), false) => {
                 error!(error = %error, "paper-state WAL checkpoint failed; retrying every tick");
             }
@@ -197,18 +199,19 @@ impl DiskMonitor {
         let stopping = shutdown.wait_for(ShutdownPhase::StopProducers);
         tokio::pin!(stopping);
         info!(sample_secs = DISK_SAMPLE_SECS, directories = ?self.directories, "disk space monitoring started");
-        match stop_auto_checkpoint() {
-            Ok(pages) => {
-                info!(
-                    wal_autocheckpoint = pages,
-                    checkpoint_secs = PAPER_CHECKPOINT_SECS,
-                    "paper-state WAL checkpoints moved out of commits"
-                );
-            }
-            Err(error) => {
-                error!(error = %error, "paper-state automatic checkpoints could not be stopped");
-            }
+        // Checkpoints inside commits would put them back into retention holds: the owner fails instead.
+        let pages = stop_auto_checkpoint().map_err(|error| {
+            TaskFailure::typed(format!("stop paper-state automatic checkpoints: {error}"))
+        })?;
+        if pages != 0 {
+            return Err(TaskFailure::typed(format!(
+                "paper-state automatic checkpoints still every {pages} pages"
+            )));
         }
+        info!(
+            checkpoint_secs = PAPER_CHECKPOINT_SECS,
+            "paper-state WAL checkpoints moved out of commits"
+        );
         let checkpointing = checkpoint_paper_state(checkpoints, checkpoint);
         tokio::pin!(checkpointing);
         loop {
@@ -584,6 +587,50 @@ mod tests {
         tokio::time::advance(Duration::from_secs(PAPER_CHECKPOINT_SECS)).await;
         assert_eq!(ticks.recv().await, None);
         assert_eq!(stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paper_checkpoint_owner_fails_while_automatic_checkpoints_stay_on() {
+        for stopped in [
+            Ok(1_000),
+            Err(PaperStateError::Internal(
+                "injected pragma failure".to_owned(),
+            )),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let monitor = DiskMonitor::from_config(&config_at(directory.path())).unwrap();
+            let health = new_shared_health(false);
+            let status = health.lock().unwrap().task_status.clone();
+            let mut supervisor = TaskSupervisor::new(status);
+            let (shutdown, _) = ShutdownController::new();
+            let checkpoints = Arc::new(AtomicUsize::new(0));
+            let counted = checkpoints.clone();
+            supervisor.spawn(
+                TaskName::DiskMonitor,
+                monitor.run_with(
+                    health.clone(),
+                    shutdown.subscribe(),
+                    |_| Ok(DISK_FREE_WARN_BYTES),
+                    move || stopped,
+                    PaperCheckpointSlot::default(),
+                    move || {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                ),
+            );
+            // A monitor that kept running would never report: the paused clock bounds the wait.
+            let event = tokio::time::timeout(
+                Duration::from_secs(DISK_SAMPLE_SECS),
+                supervisor.observe_next(),
+            )
+            .await
+            .expect("the monitor must fail at once")
+            .unwrap();
+            assert!(event.initiates_shutdown());
+            assert!(supervisor.status().critical_failed());
+            assert_eq!(checkpoints.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test(start_paused = true)]
