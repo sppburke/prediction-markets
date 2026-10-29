@@ -109,7 +109,9 @@ intent stopped until its explicit owner-consent points.
    ownership is unknown, preserve the record and paused state and obtain an explicit handoff.
    The helper's `pause` reuses an existing record and `restore` consumes it. Then run
    `bash scripts/deploy/forge_pause.sh pause` and require `status` to report `paused_complete`.
-   Record the helper's `recorded_at` in the deployment record. Preserve the prior binary once,
+   A `status` or `pause` whose process probe itself fails exits nonzero instead of reporting no
+   cycle descendant; treat it as not drained. Record the helper's `recorded_at` in the deployment
+   record. Preserve the prior binary once,
    atomically replace the executable, install the matching checkout, and verify both identities.
    Installation is the operator step between `pause` and `restore`; the helper has no `install`
    command. A partial binary/checkout pair stays paused. Do not overwrite the original rollback
