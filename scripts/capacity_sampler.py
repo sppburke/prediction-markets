@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Sample the ranking cache's drive while one rank-and-push run is alive (metadata only).
 
-`sample`: every --interval seconds, while --parent (the wrapper's PID) is this process's parent, append one JSON line to
+`sample`: every --interval seconds (once and exit with --once), while --parent (the wrapper's PID) is this process's
+parent, append one JSON line to
 --out: the time, the free bytes of the cache folder's filesystem (statvfs; the quantity `df --output=avail` shows), the
 size of every regular file directly in that folder (the installed cache, candidates, their -wal/-shm files, spools) and
 the byte total of each extra folder (--dir NAME=PATH; the wrapper passes the export folder). Free bytes measure
@@ -94,6 +95,7 @@ def main():
     run.add_argument("--out", required=True)
     run.add_argument("--interval", type=float, required=True)
     run.add_argument("--dir", action="append", default=[], metavar="NAME=PATH")
+    run.add_argument("--once", action="store_true")
     fold = commands.add_parser("summarize")
     fold.add_argument("samples")
     args = parser.parse_args()
@@ -106,6 +108,8 @@ def main():
         record = sample(args.cache_dir, folders)
         with open(args.out, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
+        if args.once:
+            break
         time.sleep(args.interval)
     return 0
 

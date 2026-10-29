@@ -1864,7 +1864,8 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    so a revert's cycles meet the frozen merger's list contract. Keep its flag `stop`.
 4. Capacity: proceed only if free bytes ≥ 3 × S + the old loop's last payout tables, spool and
    exports + 50 GB, S being the seeds' certified complete-history size. These are estimates; the
-   first cycle's samples record the actual first and lowest free bytes (everything the cycle consumed,
+   first cycle's samples record the actual first free bytes (written before anything is staged) and the lowest
+   (everything the cycle consumed,
    SQLite's sort scratch included: SQLite unlinks those files as it opens them) and the visible files'
    peaks (installed, candidate, WAL, spool, exports): `python3 scripts/capacity_sampler.py summarize
    <cycle>/capacity_samples.jsonl` folds them, and its `largest_gap_s` (at most about three sample

@@ -45,6 +45,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 WRAPPER = Path(__file__).resolve().parent / "rank_and_push.sh"
 
@@ -131,6 +132,10 @@ class RankAndPushScenario(unittest.TestCase):
             '  exit 0\n'
             'fi\n'
             'echo "$*" >> pe_bootstrap.log\n'
+            'if [[ -n "${STUB_RECORD_SAMPLED:-}" && ! -e sampled.log ]]; then\n'
+            '  found=no; for f in data/eval-results/cron-*/capacity_samples.jsonl; do [[ -s "$f" ]] && found=yes; done\n'
+            '  echo "$found" > sampled.log\n'
+            'fi\n'
             'echo "${PE_BOOTSTRAP_FETCH_RESOLUTIONS:-}" >> pe_bootstrap_env.log\n'
             'echo "${PE_BOOTSTRAP_PURGE_DECISION_CSV:-}" >> pe_bootstrap_purge_csv.log\n'
             'if [[ -f data/eval-results/rank_and_push.cycle ]]; then\n'
@@ -726,6 +731,26 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(ended.returncode, 0, ended.stderr)
         self.assertFalse(out.exists() and out.read_text(), "an orphaned sampler recorded samples")
         print("PASS: a sampler whose named parent is not its parent ends before sampling")
+
+    def test_capacity_sampler_first_sample_precedes_every_stage(self):
+        # The background sampler starts 3 s late here; the margin's F0 and S0 must still be sampled before any stage.
+        scripts = self.root / "scripts"
+        shutil.move(scripts / "capacity_sampler.py", scripts / "capacity_sampler_real.py")
+        _write_exec(
+            scripts / "capacity_sampler.py",
+            "#!/usr/bin/env python3\n"
+            "import os, sys, time\n"
+            'if "--once" not in sys.argv:\n'
+            "    time.sleep(3)\n"
+            'real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "capacity_sampler_real.py")\n'
+            "os.execv(sys.executable, [sys.executable, real, *sys.argv[1:]])\n",
+        )
+        r = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "1", "STUB_RECORD_SAMPLED": "1"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((self.root / "sampled.log").read_text().strip(), "yes")
+        (run_dir,) = self.root.glob("data/eval-results/cron-*")
+        self.assertGreaterEqual(len((run_dir / "capacity_samples.jsonl").read_text().splitlines()), 1)
+        print("PASS: the first capacity sample is written before any stage runs, even with a late sampler")
 
     def test_backfill_partial_exit2_does_not_abort(self):
         r = self._run(exit_env={"STUB_EXIT_backfill": "2"})
@@ -3668,6 +3693,47 @@ raise SystemExit(real_ranker.main())
         self.assertEqual(result.returncode,1,result.stdout+result.stderr)
         self.assertNotIn("LOOP_TEMPFAIL",result.stdout)
         self.assertEqual(len((self.root/"due.log").read_text().splitlines()),1)
+
+
+class CapacitySamplerUnitTest(unittest.TestCase):
+    """capacity_sampler.py's summary arithmetic and sampling cadence, with no real sleeps."""
+
+    def setUp(self):
+        sys.path.insert(0, str(WRAPPER.parent))
+        self.addCleanup(sys.path.remove, str(WRAPPER.parent))
+        import capacity_sampler
+        self.sampler = capacity_sampler
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def test_summary_folds_first_lowest_peaks_and_largest_gap(self):
+        samples = self.tmp / "s.jsonl"
+        records = [
+            {"t": 100.0, "free_bytes": 900, "files": {"wallet_cache.db": 50}, "dirs": {"parquet": 1}},
+            {"t": 110.0, "free_bytes": 700, "files": {"wallet_cache.db": 50, "c.db": 200}, "dirs": {"parquet": 5}},
+            {"t": 135.5, "free_bytes": 800, "files": {"wallet_cache.db": 60}, "dirs": {"parquet": 2}},
+        ]
+        samples.write_text("".join(json.dumps(record) + "\n" for record in records) + '{"t": 1')  # torn last line
+        self.assertEqual(self.sampler.summarize(samples), {
+            "first_free_bytes": 900, "first_files": {"wallet_cache.db": 50},
+            "min_free_bytes": 700, "min_free_at": 110.0,
+            "peak_bytes": {"wallet_cache.db": 60, "c.db": 200, "parquet": 5},
+            "samples": 3, "first_t": 100.0, "last_t": 135.5, "largest_gap_s": 25.5,
+        })
+
+    def _main(self, out, parents, *extra):
+        sleeps = []
+        argv = ["capacity_sampler.py", "sample", "--parent", "4242", "--cache-dir", str(self.tmp),
+                "--out", str(out), "--interval", "7", *extra]
+        with mock.patch.object(self.sampler.os, "getppid", lambda: next(parents)), \
+                mock.patch.object(self.sampler.time, "sleep", sleeps.append), \
+                mock.patch.object(sys, "argv", argv):
+            self.assertEqual(self.sampler.main(), 0)
+        return len(out.read_text().splitlines()), sleeps
+
+    def test_sampler_writes_once_per_interval_until_its_parent_changes(self):
+        self.assertEqual(self._main(self.tmp / "loop.jsonl", iter([4242, 4242, 4242, 1])), (3, [7.0, 7.0, 7.0]))
+        self.assertEqual(self._main(self.tmp / "once.jsonl", iter([4242]), "--once"), (1, []))
 
 
 if __name__ == "__main__":
