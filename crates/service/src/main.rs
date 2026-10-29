@@ -1267,9 +1267,15 @@ async fn run() -> Result<()> {
     let mut supervisor = TaskSupervisor::new(task_status.clone());
     supervisor.register_external(TaskName::JsonTracingFullAppender);
     supervisor.register_external(TaskName::JsonTracingErrorAppender);
+    let paper_checkpoints = pe_service::disk_monitor::PaperCheckpointSlot::default();
     supervisor.spawn(
         TaskName::DiskMonitor,
-        disk_monitor.run(health.clone(), shutdown.subscribe()),
+        disk_monitor.run(
+            health.clone(),
+            shutdown.subscribe(),
+            Arc::clone(&paper_state),
+            paper_checkpoints.clone(),
+        ),
     );
     pe_service::source_checkpoint::install_retention_fence(&cfg.source_event_log_path)
         .map_err(|error| {
@@ -2222,6 +2228,14 @@ async fn run() -> Result<()> {
     #[cfg(feature = "scenario")]
     let checkpoint_joined =
         checkpoint_joined && std::env::var_os("PE_SCENARIO_CHECKPOINT_JOB_JOIN_TIMEOUT").is_none();
+    let paper_checkpoint_joined = matches!(
+        tokio::time::timeout(
+            pe_service::supervisor::POST_ABORT_JOIN_BOUND,
+            paper_checkpoints.join()
+        )
+        .await,
+        Ok(Ok(()))
+    );
     let invalidation_failed = task_status.snapshot().iter().any(|task| {
         task.name == TaskName::SourceCheckpoint
             && task.failure.as_ref().is_some_and(|failure| {
@@ -2233,7 +2247,7 @@ async fn run() -> Result<()> {
     if invalidation_failed || checkpoint_slot.quarantine_failed() {
         std::process::exit(78);
     }
-    if !owners_joined || !checkpoint_joined {
+    if !owners_joined || !checkpoint_joined || !paper_checkpoint_joined {
         eprintln!(
             "pe-service: final join bound expired with unjoined owners or checkpoint job; forcing exit"
         );
