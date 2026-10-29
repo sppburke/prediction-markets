@@ -2,7 +2,7 @@
 //!
 //! `journal_mode = WAL` + `synchronous = NORMAL` gives per-commit durability
 //! without full-fsync cost (matching `bootstrap`'s wallet cache). The service
-//! checkpoints the WAL on a second connection instead of inside commits (#813).
+//! checkpoints the WAL every second instead of inside commits (#813).
 //! The schema is versioned via `PRAGMA user_version`; see [`SCHEMA_VERSION`].
 
 /// Current on-disk schema version, written to `PRAGMA user_version` on create

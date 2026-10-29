@@ -26,6 +26,8 @@
 //! `synchronous = NORMAL`). The orchestrator consumes trades sequentially, so a
 //! short blocking call on the async worker is acceptable for v1; revisit with
 //! `spawn_blocking` if RTDS volume (issue #282 Phase 2) makes it material.
+//! Retention transactions, their warm reads and WAL checkpoints take longer; the
+//! service runs checkpoints in a blocking task.
 
 mod migration;
 mod schema;
@@ -803,9 +805,10 @@ const ASSET_IDENTITY_CONDITION_LOOKUP: &str = "SELECT token, condition_id, outco
 /// Crash-safe SQLite mirror. Cheap to share behind an `Arc`; all methods take `&self`.
 pub struct PaperStateDb {
     conn: Mutex<Connection>,
-    /// A second connection to the same file that never writes rows. It runs WAL checkpoints and the
-    /// retention job's warm reads, so neither holds the shared connection (#813). Lock order is
-    /// maintenance before shared; nothing takes them the other way round.
+    /// A second connection to the same file, used only for the retention job's warm reads, so they
+    /// never hold the shared connection (#813). It never writes or checkpoints: with the bundled
+    /// SQLite (3.46), a checkpoint on one connection racing another connection's WAL reset can
+    /// corrupt the database (sqlite.org/wal.html, "WAL-Reset Bug").
     maintenance: Mutex<Connection>,
 }
 
@@ -1006,11 +1009,6 @@ fn write_retirement_drains(conn: &Connection, wallets: &[String]) -> Result<(), 
     Ok(())
 }
 
-/// A `wal_checkpoint` row: busy, WAL frames, frames checkpointed.
-fn checkpoint_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, i64, i64)> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-}
-
 impl PaperStateDb {
     /// Blank only superseded nonblank proofs after `after`; balances and cutoff columns stay intact.
     /// Each call owns one bounded transaction and releases the connection before returning. Returns
@@ -1090,6 +1088,13 @@ impl PaperStateDb {
         recent_since_unix: i64,
         latest_prepared: Option<EventSeq>,
     ) -> Result<RetentionTransaction<Option<WalletRetentionWait>>, PaperStateError> {
+        // The same check on the maintenance connection first, so the hold reads its pages cached.
+        tx_wallet_retention_wait(
+            &self.maintenance(),
+            wallet,
+            recent_since_unix,
+            latest_prepared,
+        )?;
         let conn = self.lock();
         let started = std::time::Instant::now();
         let result = tx_wallet_retention_wait(&conn, wallet, recent_since_unix, latest_prepared)?;
@@ -1372,27 +1377,30 @@ impl PaperStateDb {
             .pragma_update_and_check(None, "wal_autocheckpoint", 0, |row| row.get(0))?)
     }
 
-    /// One passive WAL checkpoint on the maintenance connection, never taking the shared connection.
-    /// It copies what it can: a reader elsewhere limits it, and a concurrent commit or checkpoint can
-    /// make it report busy and copy nothing; the next one continues. Only an SQL error fails it.
+    /// One passive WAL checkpoint on the shared connection, as its own short hold; it skips while a
+    /// caller-owned batch is open (a checkpoint cannot run inside a transaction). It copies what it
+    /// can: a reader elsewhere limits it, and a checkpoint in another process can make it report busy
+    /// and copy nothing; the next one continues. Only an SQL error fails it.
     pub fn checkpoint_wal(&self) -> Result<(), PaperStateError> {
-        self.maintenance()
-            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
+        let conn = self.lock();
+        if conn.is_autocommit() {
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
+        }
         Ok(())
     }
 
-    /// Checkpoint dispositions before source work is removed from a runtime checkpoint. The
-    /// maintenance lock keeps the background checkpoint from racing it.
+    /// Checkpoint dispositions before source work is removed from a runtime checkpoint.
     pub fn sync_checkpoint_dispositions(&self) -> Result<(), PaperStateError> {
-        let _maintenance = self.maintenance();
         let conn = self.lock();
         if !conn.is_autocommit() {
             return Err(PaperStateError::Internal(
                 "checkpoint barrier during a paper-state batch".to_owned(),
             ));
         }
-        let (busy, log, checkpointed) =
-            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], checkpoint_row)?;
+        let (busy, log, checkpointed): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
         if busy != 0 || log != checkpointed {
             return Err(PaperStateError::MigrationCheckpointIncomplete {
                 busy,
@@ -7715,6 +7723,8 @@ mod tests {
     }
 
     /// The WAL-index header's `mxFrame` (offset 16) and `nBackfill` (offset 96), as SQLite 3.46 lays them out.
+    /// Reading the file through another descriptor drops this process's POSIX locks on it, which only
+    /// matters to other processes: tests only.
     fn wal_frames(dir: &tempfile::TempDir) -> (u32, u32) {
         let shm = std::fs::read(dir.path().join("paper_state.db-shm")).unwrap();
         let word = |offset: usize| u32::from_ne_bytes(shm[offset..offset + 4].try_into().unwrap());
@@ -7784,6 +7794,25 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_wal_skips_an_open_batch() {
+        let (dir, db) = db();
+        db.stop_auto_checkpoint().unwrap();
+        db.lock()
+            .execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
+            .unwrap();
+        db.begin_batch().unwrap();
+        db.lock()
+            .execute("INSERT INTO writes VALUES (1)", [])
+            .unwrap();
+        db.checkpoint_wal().unwrap();
+        db.commit_batch().unwrap();
+        let (frames, backfilled) = wal_frames(&dir);
+        assert!(backfilled < frames, "{backfilled} of {frames}");
+        db.checkpoint_wal().unwrap();
+        assert_eq!(wal_frames(&dir), (frames, frames));
+    }
+
+    #[test]
     fn warm_reads_never_take_the_shared_connection_or_write() {
         let (dir, db) = db();
         let conn = Connection::open(dir.path().join("paper_state.db")).unwrap();
@@ -7813,17 +7842,50 @@ mod tests {
                         params![1, start.wallet_hex, start.anchor_seq],
                     ),
                     db.warm(RETENTION_CANDIDATES_SQL, params!["", 32]),
+                    tx_wallet_retention_wait(&db.maintenance(), wallet, 0, None),
                 ))
                 .unwrap();
             });
             let warmed = received.recv_timeout(std::time::Duration::from_secs(10));
             drop(shared);
-            let (retirement, blanking, candidates) = warmed.unwrap();
+            let (retirement, blanking, candidates, eligibility) = warmed.unwrap();
             retirement.unwrap();
             blanking.unwrap();
             candidates.unwrap();
+            eligibility.unwrap();
         });
         assert_eq!(db.maintenance().total_changes(), 0);
+    }
+
+    #[test]
+    fn retention_reads_warm_on_the_maintenance_connection() {
+        let (dir, db) = db();
+        let conn = Connection::open(dir.path().join("paper_state.db")).unwrap();
+        insert_anchor(&conn, 1, 1, "{\"proof\": 1}");
+        insert_anchor(&conn, 1, 2, "{\"proof\": 2}");
+        TRACED_STATEMENTS.lock().unwrap().clear();
+        db.maintenance().trace(Some(record_traced_statement));
+        db.blank_superseded_anchor_proofs(&AnchorProofCursor::start(), 1)
+            .unwrap();
+        db.retention_wallets(None, 32).unwrap();
+        db.wallet_retention_wait(WalletAddress([1; 20]), 0, None)
+            .unwrap();
+        db.maintenance().trace(None);
+        let statements = std::mem::take(&mut *TRACED_STATEMENTS.lock().unwrap());
+        // The trace expands bound parameters, so each statement is matched up to its first one.
+        for warm in [
+            WARM_SUPERSEDED_ANCHOR_PROOFS_SQL,
+            RETENTION_CANDIDATES_SQL,
+            RETENTION_WAIT_QUERIES[0].0,
+        ] {
+            let prefix = warm.split('?').next().unwrap();
+            assert!(
+                statements
+                    .iter()
+                    .any(|statement| statement.starts_with(prefix)),
+                "{prefix} not run on the maintenance connection: {statements:?}"
+            );
+        }
     }
 
     fn wallet() -> WalletAddress {

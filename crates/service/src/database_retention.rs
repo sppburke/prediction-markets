@@ -17,7 +17,7 @@ use crate::watchlist_admission::AdmissionPreparer;
 /// Superseded proofs blanked per transaction. A transaction's hold grows with the proof bytes it
 /// clears (about 0.047 s per MB on the production VPS on 10/8, where 16-row batches of 2.9 MB proofs
 /// held the shared connection for up to 5.3 s), so each transaction clears one proof, read first on
-/// the maintenance connection so the hold pays no cold reads (#813). Each run's transactions resume
+/// the maintenance connection so the hold pays fewer cold reads (#813). Each run's transactions resume
 /// after the last key blanked.
 const BLANK_BATCH_ROWS: usize = 1;
 /// A page walks every row of its wallets' tables; one 128-wallet page held 0.53 s in production on 10/8.

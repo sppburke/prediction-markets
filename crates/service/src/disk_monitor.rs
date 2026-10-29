@@ -1,6 +1,6 @@
 //! Free-space guard for the filesystems holding ordinary-service durable state, and the paper-state
-//! WAL checkpointer: the service's shared paper-state connection never checkpoints automatically, so
-//! this owner checkpoints on the maintenance connection every `PAPER_CHECKPOINT_SECS` (#813).
+//! WAL checkpointer: the service's shared paper-state connection never checkpoints inside its commits,
+//! so this owner checkpoints it every `PAPER_CHECKPOINT_SECS` as a short hold of its own (#813).
 
 use std::collections::HashSet;
 use std::io;
@@ -202,7 +202,7 @@ impl DiskMonitor {
                 info!(
                     wal_autocheckpoint = pages,
                     checkpoint_secs = PAPER_CHECKPOINT_SECS,
-                    "paper-state WAL checkpoints moved to the maintenance connection"
+                    "paper-state WAL checkpoints moved out of commits"
                 );
             }
             Err(error) => {
@@ -544,6 +544,9 @@ mod tests {
         let stopped = stops.clone();
         let calls = Arc::new(AtomicUsize::new(0));
         let (ticked, mut ticks) = tokio::sync::mpsc::unbounded_channel();
+        let started = Instant::now();
+        // Each checkpoint reports its call number and the whole seconds elapsed on the paused clock.
+        let tick = move |(call, at): (usize, Instant)| (call, (at - started).as_secs());
         supervisor.spawn(
             TaskName::DiskMonitor,
             monitor.run_with(
@@ -557,7 +560,7 @@ mod tests {
                 PaperCheckpointSlot::default(),
                 move || {
                     let call = calls.fetch_add(1, Ordering::SeqCst);
-                    ticked.send(call).unwrap();
+                    ticked.send((call, Instant::now())).unwrap();
                     if call == 1 {
                         return Err(PaperStateError::Internal(
                             "injected checkpoint failure".to_owned(),
@@ -567,11 +570,12 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(ticks.recv().await, Some(0));
+        assert_eq!(ticks.recv().await.map(tick), Some((0, 0)));
         assert_eq!(stops.load(Ordering::SeqCst), 1);
         for call in 1..=3 {
             tokio::time::advance(Duration::from_secs(PAPER_CHECKPOINT_SECS)).await;
-            assert_eq!(ticks.recv().await, Some(call));
+            let elapsed = PAPER_CHECKPOINT_SECS * u64::try_from(call).unwrap();
+            assert_eq!(ticks.recv().await.map(tick), Some((call, elapsed)));
         }
         assert!(!supervisor.status().critical_failed());
         status.advance_phase(ShutdownPhase::StopProducers);
