@@ -23,10 +23,12 @@ pub const DISK_FREE_FLOOR_BYTES: u64 = 5_000_000_000;
 pub const DISK_SAMPLE_SECS: u64 = 60;
 pub const PAPER_CHECKPOINT_SECS: u64 = 1;
 
+type CheckpointJob = JoinHandle<Result<(), PaperStateError>>;
+
 /// The monitor and main share this slot, so aborting the monitor never detaches a running checkpoint.
 #[derive(Clone, Default)]
 pub struct PaperCheckpointSlot {
-    job: Arc<tokio::sync::Mutex<Option<JoinHandle<Result<(), PaperStateError>>>>>,
+    job: Arc<tokio::sync::Mutex<Option<CheckpointJob>>>,
 }
 
 impl PaperCheckpointSlot {
@@ -488,6 +490,10 @@ mod tests {
         let (shutdown, _) = ShutdownController::new();
         let samples = Arc::new(AtomicUsize::new(0));
         let sampled = samples.clone();
+        // Holding the slot keeps checkpoints waiting: a blocking checkpoint finishing on another thread could
+        // otherwise delay the monitor past the single yields this sample count relies on.
+        let checkpoints = PaperCheckpointSlot::default();
+        let _held = checkpoints.job.lock().await;
         supervisor.spawn(
             TaskName::DiskMonitor,
             monitor.run_with(
@@ -502,7 +508,7 @@ mod tests {
                     }
                 },
                 || Ok(0),
-                PaperCheckpointSlot::default(),
+                checkpoints.clone(),
                 || Ok(()),
             ),
         );
@@ -553,11 +559,9 @@ mod tests {
                     let call = calls.fetch_add(1, Ordering::SeqCst);
                     ticked.send(call).unwrap();
                     if call == 1 {
-                        return Err(PaperStateError::MigrationCheckpointIncomplete {
-                            busy: 1,
-                            log: -1,
-                            checkpointed: -1,
-                        });
+                        return Err(PaperStateError::Internal(
+                            "injected checkpoint failure".to_owned(),
+                        ));
                     }
                     Ok(())
                 },

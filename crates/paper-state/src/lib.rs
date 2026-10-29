@@ -1011,19 +1011,6 @@ fn checkpoint_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, i64, i64)> 
     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
 }
 
-/// A competing checkpoint makes a passive one return `busy`; partial backfill behind another
-/// process's reader is ordinary progress.
-fn passive_checkpoint((busy, log, checkpointed): (i64, i64, i64)) -> Result<(), PaperStateError> {
-    if busy != 0 {
-        return Err(PaperStateError::MigrationCheckpointIncomplete {
-            busy,
-            log,
-            checkpointed,
-        });
-    }
-    Ok(())
-}
-
 impl PaperStateDb {
     /// Blank only superseded nonblank proofs after `after`; balances and cutoff columns stay intact.
     /// Each call owns one bounded transaction and releases the connection before returning. Returns
@@ -1386,12 +1373,12 @@ impl PaperStateDb {
     }
 
     /// One passive WAL checkpoint on the maintenance connection, never taking the shared connection.
+    /// It copies what it can: a reader elsewhere limits it, and a concurrent commit or checkpoint can
+    /// make it report busy and copy nothing; the next one continues. Only an SQL error fails it.
     pub fn checkpoint_wal(&self) -> Result<(), PaperStateError> {
-        passive_checkpoint(self.maintenance().query_row(
-            "PRAGMA wal_checkpoint(PASSIVE)",
-            [],
-            checkpoint_row,
-        )?)
+        self.maintenance()
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
+        Ok(())
     }
 
     /// Checkpoint dispositions before source work is removed from a runtime checkpoint. The
@@ -7768,30 +7755,32 @@ mod tests {
             .execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
             .unwrap();
         let done = std::sync::atomic::AtomicBool::new(false);
-        std::thread::scope(|scope| {
+        let (checkpoints, barriers) = std::thread::scope(|scope| {
             let checkpoints = scope.spawn(|| {
-                let mut count = 0_u32;
+                let mut results = Vec::new();
                 while !done.load(std::sync::atomic::Ordering::Acquire) {
-                    db.checkpoint_wal().unwrap();
-                    count += 1;
+                    results.push(db.checkpoint_wal());
                     std::thread::sleep(std::time::Duration::from_micros(200));
                 }
-                count
+                results
             });
-            for n in 0..200 {
-                db.lock()
-                    .execute("INSERT INTO writes VALUES (?1)", params![n])
-                    .unwrap();
-                db.sync_checkpoint_dispositions().unwrap();
-            }
+            // Results are collected so a failure still stops the checkpoint thread.
+            let barriers: Vec<_> = (0..200)
+                .map(|n| {
+                    let written = db
+                        .lock()
+                        .execute("INSERT INTO writes VALUES (?1)", params![n]);
+                    written
+                        .map_err(PaperStateError::from)
+                        .and_then(|_| db.sync_checkpoint_dispositions())
+                })
+                .collect();
             done.store(true, std::sync::atomic::Ordering::Release);
-            assert!(checkpoints.join().unwrap() > 0);
+            (checkpoints.join().unwrap(), barriers)
         });
-        assert!(matches!(
-            passive_checkpoint((1, -1, -1)),
-            Err(PaperStateError::MigrationCheckpointIncomplete { busy: 1, .. })
-        ));
-        passive_checkpoint((0, 5, 3)).unwrap();
+        assert!(!checkpoints.is_empty());
+        assert!(checkpoints.iter().all(Result::is_ok), "{checkpoints:?}");
+        assert!(barriers.iter().all(Result::is_ok), "{barriers:?}");
     }
 
     #[test]
