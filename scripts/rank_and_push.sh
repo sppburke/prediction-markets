@@ -512,6 +512,25 @@ configuration = json.load(open(sys.argv[1], encoding="utf-8"))
 print(1 if configuration.get("cache_lane") == "fresh_v2" else 0)' "$OUT_DIR/cycle_configuration.json")"
     echo "RANK_AND_PUSH_CYCLE_RESUME=$OUT_DIR"
   else
+    # Capacity gate: a new cycle starts only while the installed cache's filesystem holds the cache's size plus
+    # PE_RANK_MIN_FREE_GB (10^9 bytes); otherwise stop here, between cycles, before anything is staged. A resumed
+    # cycle was budgeted when it began and is never gated.
+    if [[ -n "${PE_RANK_MIN_FREE_GB:-}" ]]; then
+      [[ "$PE_RANK_MIN_FREE_GB" =~ ^[0-9]+$ ]] || {
+        echo "FATAL: PE_RANK_MIN_FREE_GB must be a whole number of GB" >&2; exit 2;
+      }
+      INSTALLED_REAL="$(readlink -f -- "$DB")"
+      INSTALLED_BYTES="$(stat -c %s -- "$INSTALLED_REAL")"
+      FREE_BYTES="$(df -B1 --output=avail -- "$INSTALLED_REAL" | tail -n 1 | tr -d ' ')"
+      [[ "$INSTALLED_BYTES" =~ ^[0-9]+$ && "$FREE_BYTES" =~ ^[0-9]+$ ]] || {
+        echo "FATAL: capacity gate cannot read the installed cache's size or free space" >&2; exit 2;
+      }
+      NEED_BYTES=$((INSTALLED_BYTES + PE_RANK_MIN_FREE_GB * 1000000000))
+      if (( FREE_BYTES < NEED_BYTES )); then
+        echo "FATAL: capacity: free_bytes=$FREE_BYTES need_bytes=$NEED_BYTES (installed $INSTALLED_BYTES + PE_RANK_MIN_FREE_GB=$PE_RANK_MIN_FREE_GB); no new cycle started" >&2
+        exit 2
+      fi
+    fi
     INSTALLED_SCHEMA="$("$PYTHON_BIN" -c 'import sqlite3, sys
 with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
     schema = int(connection.execute("PRAGMA user_version").fetchone()[0])

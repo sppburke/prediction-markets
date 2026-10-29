@@ -1921,6 +1921,7 @@ SH
 cat > "$forge_bin/pgrep" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+[[ ! -e "${FORGE_TEST_STATE:?}/probe-error" ]] || exit 2
 [[ -e "${FORGE_TEST_STATE:?}/descendant-running" ]]
 SH
 chmod +x "$forge_bin/systemctl" "$forge_bin/pgrep"
@@ -1941,6 +1942,13 @@ forge_run status > "$forge_state/status-descendant.out"
 grep -q '"paused_complete": false' "$forge_state/status-descendant.out" ||
   fail "Forge status ignored a live cycle descendant"
 rm "$forge_state/descendant-running"
+: > "$forge_state/probe-error"
+if forge_run status > "$forge_state/status-probe-error.out" 2>&1; then
+  fail "Forge status read a failed descendant probe as no descendant"
+fi
+grep -q 'descendant probe failed (pgrep exit 2)' "$forge_state/status-probe-error.out" ||
+  fail "Forge status did not report the failed descendant probe"
+rm "$forge_state/probe-error"
 
 rank_lock="$forge_repo/data/eval-results/.rank_and_push.lock"
 : > "$forge_state/hold-rank-lock"

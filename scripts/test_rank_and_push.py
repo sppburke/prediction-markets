@@ -608,6 +608,27 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual([e for s, e in pairs if s == "events"], [""], "events saw a leaked var")
         print("PASS: FETCH_RESOLUTIONS unset for discovery/backfill/events, =1 only for resolutions")
 
+    def test_capacity_gate_stops_before_a_new_cycle_and_never_gates_a_resume(self):
+        cycle = self.root / "data/eval-results/rank_and_push.cycle"
+        short = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "999999999"})
+        self.assertEqual(short.returncode, 2, short.stdout + short.stderr)
+        self.assertIn("FATAL: capacity: free_bytes=", short.stderr)
+        self.assertFalse(cycle.exists())
+        self.assertIsNone(self._log("rank.log"))
+        bad = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "ten"})
+        self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
+        self.assertIn("PE_RANK_MIN_FREE_GB must be a whole number", bad.stderr)
+        self.assertFalse(cycle.exists())
+        retained = self._run(exit_env={"STUB_EXIT_events": "75"})
+        self.assertEqual(retained.returncode, 75, retained.stdout + retained.stderr)
+        self.assertTrue(cycle.exists())
+        resumed = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "999999999"})
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertNotIn("FATAL: capacity", resumed.stderr)
+        roomy = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "0"})
+        self.assertEqual(roomy.returncode, 0, roomy.stdout + roomy.stderr)
+        print("PASS: capacity gate stops before a new cycle; resumes and roomy drives proceed")
+
     def test_backfill_partial_exit2_does_not_abort(self):
         r = self._run(exit_env={"STUB_EXIT_backfill": "2"})
         self.assertEqual(r.returncode, 0, f"exit 2 aborted the run\nstderr={r.stderr}")

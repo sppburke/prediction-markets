@@ -1834,9 +1834,12 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    batch; run the research tree's frozen `tools-v26f/merge_scopes.py` with gen 26's registered list
    and its recorded sha256 and a one-cycle inventory naming the prepared `market_scope.json` (it must
    exit 0); record pe-service's mode. Then set the selector to `1` and run `--resume-pending`.
-7. After pe-service applies the batch and the research fetch accepts the linked cycle, restore the
-   activation batch, write `run` to the new flag and `systemctl --user enable --now
-   pe-rank-loop-15m5m`.
+7. After pe-service applies the batch and the research fetch accepts the linked cycle, set
+   `PE_RANK_MIN_FREE_GB` from the first cycle's measured peak above the installed size plus 20 GB (the
+   wrapper then refuses to begin a cycle that would not fit, `_GLOSSARY.md` `rank_min_free_gb`), write
+   `run` to the new flag and `systemctl --user enable --now pe-rank-loop-15m5m` with the activation
+   batch still 0; restore the recorded batch once a supervised successor's stage reports show its peak
+   inside the gate.
 
 **Recovery** follows the sections above: a failed `cache-init` reruns; a slow or failed root
 resumes; a full drive mid-cycle rolls the transaction back and fails the stage (free space, then

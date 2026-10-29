@@ -156,8 +156,12 @@ delete_pause_record() {
   fsync_directory "$parent"
 }
 
+# 0 = a descendant runs, 1 = none; a failed probe (pgrep status above 1) stops the caller.
 cycle_descendant_running() {
-  pgrep -f 'rank_and_push_loop[.]sh|rank_and_push[.]sh|[p]e-bootstrap|[l]atency_shift_rerank[.]py|[r]ank_72hr_buyandhold[.]py' >/dev/null
+  local rc=0
+  pgrep -f 'rank_and_push_loop[.]sh|rank_and_push[.]sh|[p]e-bootstrap|[l]atency_shift_rerank[.]py|[r]ank_72hr_buyandhold[.]py' >/dev/null || rc=$?
+  [[ "$rc" -le 1 ]] || die "the cycle descendant probe failed (pgrep exit $rc)"
+  return "$rc"
 }
 
 rank_locks_unheld() {

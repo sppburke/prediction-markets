@@ -20972,6 +20972,12 @@ async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
         count(&fresh, "SELECT COUNT(*) FROM activity_seed_drops_v3"),
         0
     );
+    // The carried drops classify as the triggers did: the same entries survive and the same are suppressed.
+    for wallet in [WALLET, WALLET_B] {
+        let expected = wallet_projection(&old, wallet);
+        assert!(!expected.is_empty(), "{wallet} has no projected entry to compare");
+        assert_eq!(wallet_projection(&fresh, wallet), expected, "{wallet}");
+    }
 
     // Until discovery admits WALLET_B, its carried drops wait under the same commitment.
     let only_seed = DatasetFetcher {
@@ -21019,9 +21025,27 @@ async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
         later_drops
     );
     assert_eq!(
+        wallet_projection(&delayed, WALLET_B),
+        wallet_projection(&old, WALLET_B)
+    );
+    assert_eq!(
         count(&delayed, "SELECT COUNT(*) FROM activity_seed_drops_v3"),
         0
     );
+}
+
+/// A wallet's projected entries without generation fields, for comparing caches built separately.
+fn wallet_projection(path: &std::path::Path, wallet: &str) -> Vec<Value> {
+    projection_v3_rows(path)
+        .into_iter()
+        .filter(|row| row["wallet_hex"] == wallet)
+        .map(|mut row| {
+            if let Some(object) = row.as_object_mut() {
+                object.retain(|key, _| !key.contains("generation"));
+            }
+            row
+        })
+        .collect()
 }
 
 fn sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
