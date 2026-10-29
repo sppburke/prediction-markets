@@ -180,7 +180,7 @@ impl DiskMonitor {
             |path| fs2::available_space(path),
             move || stopping_state.stop_auto_checkpoint(),
             checkpoints,
-            move || paper_state.checkpoint_wal(),
+            move || paper_state.checkpoint_wal().map(|_held| ()),
         )
         .await
     }

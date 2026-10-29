@@ -1380,13 +1380,15 @@ impl PaperStateDb {
     /// One passive WAL checkpoint on the shared connection, as its own short hold; it skips while a
     /// caller-owned batch is open (a checkpoint cannot run inside a transaction). It copies what it
     /// can: a reader elsewhere limits it, and a checkpoint in another process can make it report busy
-    /// and copy nothing; the next one continues. Only an SQL error fails it.
-    pub fn checkpoint_wal(&self) -> Result<(), PaperStateError> {
+    /// and copy nothing; the next one continues. Only an SQL error fails it. Returns how long it held
+    /// the shared connection.
+    pub fn checkpoint_wal(&self) -> Result<std::time::Duration, PaperStateError> {
         let conn = self.lock();
+        let started = std::time::Instant::now();
         if conn.is_autocommit() {
             conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
         }
-        Ok(())
+        Ok(started.elapsed())
     }
 
     /// Checkpoint dispositions before source work is removed from a runtime checkpoint.
@@ -7169,6 +7171,13 @@ mod tests {
         TRACED_STATEMENTS.lock().unwrap().push(statement.to_owned());
     }
 
+    /// The warm-order test's own trace sink, so it never shares statements with another test.
+    static WARM_STATEMENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn record_warm_statement(statement: &str) {
+        WARM_STATEMENTS.lock().unwrap().push(statement.to_owned());
+    }
+
     fn db() -> (tempfile::TempDir, PaperStateDb) {
         let dir = tempfile::tempdir().unwrap();
         let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
@@ -7766,14 +7775,21 @@ mod tests {
             .unwrap();
         let done = std::sync::atomic::AtomicBool::new(false);
         let (checkpoints, barriers) = std::thread::scope(|scope| {
-            let checkpoints = scope.spawn(|| {
+            let (started, first) = std::sync::mpsc::channel();
+            let (db, done) = (&db, &done);
+            let checkpoints = scope.spawn(move || {
                 let mut results = Vec::new();
                 while !done.load(std::sync::atomic::Ordering::Acquire) {
                     results.push(db.checkpoint_wal());
+                    let _ = started.send(());
                     std::thread::sleep(std::time::Duration::from_micros(200));
                 }
                 results
             });
+            // Writes and barriers start only once checkpoints are running.
+            first
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
             // Results are collected so a failure still stops the checkpoint thread.
             let barriers: Vec<_> = (0..200)
                 .map(|n| {
@@ -7866,13 +7882,13 @@ mod tests {
     ) {
         // The trace expands bound parameters, so the statement is matched up to its first one.
         let prefix = warm.split('?').next().unwrap();
-        TRACED_STATEMENTS.lock().unwrap().clear();
+        WARM_STATEMENTS.lock().unwrap().clear();
         std::thread::scope(|scope| {
             let shared = db.lock();
             let caller = scope.spawn(|| call(db));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             let warmed = loop {
-                let traced = TRACED_STATEMENTS.lock().unwrap();
+                let traced = WARM_STATEMENTS.lock().unwrap();
                 if traced.iter().any(|statement| statement.starts_with(prefix)) {
                     break true;
                 }
@@ -7897,7 +7913,7 @@ mod tests {
         let conn = Connection::open(dir.path().join("paper_state.db")).unwrap();
         insert_anchor(&conn, 1, 1, "{\"proof\": 1}");
         insert_anchor(&conn, 1, 2, "{\"proof\": 2}");
-        db.maintenance().trace(Some(record_traced_statement));
+        db.maintenance().trace(Some(record_warm_statement));
         assert_warms_before_lock(&db, WARM_SUPERSEDED_ANCHOR_PROOFS_SQL, |db| {
             db.blank_superseded_anchor_proofs(&AnchorProofCursor::start(), 1)
                 .unwrap();
