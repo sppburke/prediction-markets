@@ -13,6 +13,7 @@ Run: `python3 scripts/test_push_ranking_filter.py`
   or: `pytest scripts/test_push_ranking_filter.py -v`
 """
 import io
+import itertools
 import json
 import hashlib
 import os
@@ -1003,13 +1004,13 @@ class ManifestBindingTest(unittest.TestCase):
         self.assertIsNotNone(req["batch"]["config_hash"])
         print("PASS: matching manifest digest -> config_hash populated")
 
-    def test_new_publication_requires_the_15_minute_scope(self) -> None:
+    def test_new_publication_requires_the_market_scope(self) -> None:
         def drop(key):
             return lambda value: value["market_scope"].pop(key)
         cases = {
             "version 7": lambda value: value.update(oracle_version=7),
             "no scope": lambda value: value.pop("market_scope"),
-            "5m scope": lambda value: value["market_scope"].update(recurrence="5m"),
+            "unknown recurrence": lambda value: value["market_scope"].update(recurrence="hourly"),
             "zero count": lambda value: value["market_scope"].update(count=0),
             "bad digest": lambda value: value["market_scope"].update(digest="x"),
             "no floor": drop("end_date_min_unix"),
@@ -1022,7 +1023,7 @@ class ManifestBindingTest(unittest.TestCase):
                 value = json.loads(Path(a.manifest_file).read_text())
                 mutate(value)
                 Path(a.manifest_file).write_text(json.dumps(value))
-                with self.assertRaisesRegex(ValueError, "lacks the 15-minute market scope"):
+                with self.assertRaisesRegex(ValueError, "lacks the market scope"):
                     pr.prepare_publish_request(a, NOW)
         # A request saved before the manifest changed resumes untouched: resumption never re-prepares.
         a = self._prep(tamper=False)
@@ -1031,6 +1032,26 @@ class ManifestBindingTest(unittest.TestCase):
         pr.save_publish_request(str(saved), request)
         Path(a.manifest_file).write_text("{}")
         self.assertEqual(pr.load_publish_request(str(saved)), request)
+
+    def test_known_recurrence_lists_are_accepted(self) -> None:
+        for recurrence in ("15m", "5m", "15m,5m"):
+            with self.subTest(recurrence=recurrence):
+                a = self._prep(tamper=False)
+                value = json.loads(Path(a.manifest_file).read_text())
+                value["market_scope"]["recurrence"] = recurrence
+                Path(a.manifest_file).write_text(json.dumps(value))
+                request = pr.prepare_publish_request(a, NOW)
+                self.assertIsNotNone(request["batch"]["config_hash"])
+
+    def test_invalid_recurrence_lists_are_refused(self) -> None:
+        for recurrence in ("", ",", "15m,", ",5m", "15m,hourly", "15m,15m", None, []):
+            with self.subTest(recurrence=recurrence):
+                a = self._prep(tamper=False)
+                value = json.loads(Path(a.manifest_file).read_text())
+                value["market_scope"]["recurrence"] = recurrence
+                Path(a.manifest_file).write_text(json.dumps(value))
+                with self.assertRaisesRegex(ValueError, "lacks the market scope"):
+                    pr.prepare_publish_request(a, NOW)
 
     def test_mismatched_manifest_refuses_to_publish(self) -> None:
         with self.assertRaises(ValueError) as ctx:
@@ -1091,6 +1112,40 @@ class ManifestBindingTest(unittest.TestCase):
                 self.assertEqual(output.read_text(), "retained snapshot")
 
 
+class CertificateDigestCompatibilityTest(unittest.TestCase):
+    """The Python twin of digests.rs's certificate_digest_keeps_its_pinned_bytes."""
+
+    PINNED = "6b1e572a222ca687fc9cdf10454f2dc0554776fabf858dfda9ccd44f169755e9"
+
+    def test_certificate_bytes_are_pinned(self):
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE activity_wallet_history_v3 (wallet_hex TEXT PRIMARY KEY, generation INTEGER NOT NULL, "
+                    "newest_source_unix INTEGER NULL, newest_trade_unix INTEGER NULL, aggregate_count INTEGER NOT NULL, "
+                    "source_row_count INTEGER NOT NULL, ordered_digest TEXT NOT NULL, scope_drops_json TEXT NOT NULL)")
+        con.execute("INSERT INTO activity_wallet_history_v3 VALUES "
+                    "('0x1111111111111111111111111111111111111111', 1, 1800000000, NULL, 3, 4, ?, '[]')", ("a" * 64,))
+        self.assertEqual(rank_cycle_manifest.certificate_digest(rank_cycle_manifest.certificate_rows(con)), self.PINNED)
+
+    def test_carried_drops_follow_the_certificates_as_rust_commits_them(self):
+        """Twin of digests.rs's certificate_digest_commits_carried_drops."""
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE activity_wallet_history_v3 (wallet_hex TEXT PRIMARY KEY, generation INTEGER NOT NULL, "
+                    "newest_source_unix INTEGER NULL, newest_trade_unix INTEGER NULL, aggregate_count INTEGER NOT NULL, "
+                    "source_row_count INTEGER NOT NULL, ordered_digest TEXT NOT NULL, scope_drops_json TEXT NOT NULL)")
+        con.execute("INSERT INTO activity_wallet_history_v3 VALUES "
+                    "('0x1111111111111111111111111111111111111111', 1, 1800000000, NULL, 3, 4, ?, '[]')", ("a" * 64,))
+        con.execute("CREATE TABLE activity_seed_drops_v3 (wallet_hex TEXT PRIMARY KEY, scope_drops_json TEXT NOT NULL)")
+
+        def digest():
+            return rank_cycle_manifest.certificate_digest(itertools.chain(
+                rank_cycle_manifest.certificate_rows(con), rank_cycle_manifest.carried_drop_rows(con)))
+
+        self.assertEqual(digest(), self.PINNED)
+        con.execute("INSERT INTO activity_seed_drops_v3 VALUES ('0x2222222222222222222222222222222222222222', ?)",
+                    ('[{"cause":"conversion","dropped_at_unix":7,"scope_id":"0xe","scope_kind":"market"}]',))
+        self.assertEqual(digest(), "70db2b47614ff22f4bb229b227401a4ab438bfad821b4842b93d9e034c4f92ac")
+
+
 class FormatThreePublicationTest(unittest.TestCase):
     def setUp(self):
         from test_ranker_duck_parity import build_format_three_cache, W
@@ -1113,9 +1168,7 @@ class FormatThreePublicationTest(unittest.TestCase):
                                                  "--manifest-file", str(self.manifest), "--keep-batches", "0"])
 
     def rebind_certificates(self, connection):
-        columns = rank_cycle_manifest.CERTIFICATE_COLUMNS
-        rows = [dict(zip(columns, row, strict=True)) for row in connection.execute(
-            f"SELECT {', '.join(columns)} FROM activity_wallet_history_v3 ORDER BY wallet_hex")]
+        rows = list(rank_cycle_manifest.certificate_rows(connection))
         inputs = json.loads(connection.execute("SELECT ranker_projection_inputs_json FROM cache_v2_migration_state").fetchone()[0])
         inputs["certificate_digest"] = hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":"),
                                                                 ensure_ascii=False).encode()).hexdigest()

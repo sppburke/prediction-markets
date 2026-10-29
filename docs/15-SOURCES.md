@@ -381,12 +381,21 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-10-13 | 2026-12-12 |
 | https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-10-15 | 2026-12-14 |
 | https://docs.polymarket.com/api-spec/gamma-openapi.yaml (`Market.events`, `Event.series`, `Series.recurrence`) | 2026-10-15 | 2026-12-14 |
-| https://gamma-api.polymarket.com/series?exclude_events=true&limit=50&offset={k} | 2026-10-15 | 2026-12-14 |
+| https://gamma-api.polymarket.com/series?exclude_events=true&limit=50&offset={k} | 2026-10-28 | 2026-12-27 |
 | https://gamma-api.polymarket.com/events/keyset?series_id={id}&end_date_min={iso}&limit=100&after_cursor={cursor} (documented in gamma-openapi.yaml) | 2026-10-15 | 2026-12-14 |
 | https://gamma-api.polymarket.com/markets?clob_token_ids={token}&closed=true | 2026-09-02 | 2026-11-01 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 
 ## Public sources
+
+- 2026-10-28 (15/5-minute loop): `/series?exclude_events=true` (paged, 2,525 rows at 17:10 CT) listed
+  recurrence `15m` on 10 series (the eight crypto windows plus `gold` and `silver`) and `5m` on 8
+  (`eth, btc, xrp, sol, doge, bnb, hype, zec`). Participant discovery and the ranking scope now
+  filter the same listing by a recurrence set (`bootstrap_market_recurrences`). A market of each
+  of the 18 series (16 at 21:40 CT; the two `zec` series, which that paged listing did not
+  return, fetched by id at 23:47 CT) carried `feeType` `crypto_fees_v2` with `feeSchedule`
+  `{"exponent":1,"rate":0.07,"takerOnly":true,"rebateRate":0.2}`, equal to pass 2's taker rate.
+  Re-capture every 15m/5m series and its fees before ranking `15m,5m`.
 
 | Link | Last checked | Re-verify by |
 |---|---|---|

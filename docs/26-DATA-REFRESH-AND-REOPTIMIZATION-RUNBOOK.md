@@ -1770,6 +1770,83 @@ Run28 fixed `k=25` and did not sweep watchlist width. Earlier fixed paper widths
 operator-directed experiments; the current all-survivor default is the #757 owner decision,
 not a run28-backed N choice.
 
+### 15/5-minute loop: seeded cache, switch and revert
+
+A second checkout runs the same code with its own cache, flag, locks and cycle folders
+(`~/prediction-markets-15m5m` → `/mnt/storage/prediction-markets-15m5m`, unit
+`pe-rank-loop-15m5m`, cache `/mnt/t7/cache-15m5m`). Its `.env` adds:
+
+```
+PE_BOOTSTRAP_MARKET_RECURRENCES='["15m"]'      # participant discovery; ["15m","5m"] once the owner admits 5-minute traders
+PE_RANK_MARKET_RECURRENCES=15m                 # ranking scope; 15m,5m only after gate F copies 5-minute markets
+PE_RANK_MARKET_SERIES=10191:eth-up-or-down-15m,10192:btc-up-or-down-15m,10422:xrp-up-or-down-15m,10423:sol-up-or-down-15m,11328:doge-up-or-down-15m,11329:hype-up-or-down-15m,11330:bnb-up-or-down-15m,12518:zec-up-or-down-15m,12967:gold-up-or-down-15m,12968:silver-up-or-down-15m  # gen 26's series, until 11/30 01:00 UTC
+PE_BOOTSTRAP_LEADERBOARD_TOP_N=0               # leaderboard off
+PE_BOOTSTRAP_DATADASH_API_URL=                 # datadash off
+PE_RANK_RESEARCH_LINK_DIR=/mnt/storage/prediction-markets/data/eval-results
+```
+
+Each cycle records the four new settings in `cycle_configuration.json` and restores them on resume
+(meaning and defaults: `_GLOSSARY.md`, `bootstrap_market_recurrences`, `rank_market_series`,
+`rank_research_link_dir`). The cache keeps complete histories, read and certified as in the old
+loop; it differs only in which wallets it holds. The series pin keeps every
+linked cycle's market list on the November research's contract (recurrence `15m`, exactly gen 26's
+series); remove it, with `PE_RANK_MARKET_RECURRENCES=15m,5m`, at a boundary after 11/30 01:00 UTC. Admitting 5-minute
+participants is a capacity decision: tens of thousands of wallets trade those markets each month,
+many with long histories. Measure their certified sizes in the old cache first.
+
+**Provisioning.** With both loops stopped, write the seed list (one wallet per line): every wallet in
+pass 2's universe (`latency_shift_ranked.csv`) of each published cycle since gen 26, plus the wallets
+with an admitted, payout-eligible 15-minute entry in the old loop's last `projection.parquet`, minus
+the wallets the old cache tombstones or flags (record them). The research window's batches chose only
+from those universes, and the frozen tools read each wallet from a later cycle's universe. Size it from the old cache's
+certificates (the seeds' source rows × the old cache's bytes per source row), and run, under the
+cache lock, `pe-bootstrap cache-init --db /mnt/t7/cache-15m5m/wallet_cache.db --wallets SEEDS
+--drops-from /mnt/t7/cache/wallet_cache.db`. It verifies the old cache's certificates, carries every
+certified non-empty cumulative drop (for any wallet discovery may admit later), every tombstone and
+every infrastructure flag, activates exactly the seeds, and appears at its path only when complete.
+A seed the old cache tombstones or flags is refused. A rerun reports `already_initialized` only while
+the file is still that initialized, never-collected cache (schema one, the same wallet rows,
+tombstones and carried drops); anything else is refused and left as it is. Carried drops are
+history-guarded and committed inside the certificate digest after the certificates, so every stable
+proof authenticates them; a wallet's first certificate takes its drops over and removes the carried
+row. The first wrapper cycle then stages, migrates and collects a bulk root as in "Fresh bulk root"
+above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the seeds.
+
+**Switch** (a publication boundary of the old loop; post on #588 first):
+
+1. Stop the old loop at its next publication boundary: write `stop` to its flag only after that
+   cycle has published (both pointers cleared, its `accepted_cycle_manifest.json` present), while the
+   supervisor waits 60 s before the next cycle; or keep the boundary where the drive-limit watcher
+   already stopped it. Confirm `LOOP_STOP`, no cycle or pending pointer, no descendants or locks;
+   `systemctl --user disable pe-rank-loop`.
+2. One `bash scripts/rank_and_push.sh --resume-pending` in the old checkout retires its displaced
+   copy and spool; record `df -B1`.
+3. Install and verify this release in the old checkout by "Forge release deployment" above while
+   both loops are inactive (the pause helper sees every ranker process). Keep its flag `stop`.
+4. Capacity: proceed only if free bytes ≥ 3 × S + the old loop's last payout tables, spool and
+   exports + 50 GB, S being the seeds' certified complete-history size. These are estimates; record
+   the first cycle's actual peaks (file sizes, WAL, sort scratch, spool, exports).
+5. `cache-init` as above (rerun it right before the first cycle: it must report
+   `already_initialized`).
+6. First cycle, supervisor off: set `PE_RANK_SCHEMA_TWO_CUTOVER=prepare` and
+   `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` in the new `.env`, run the wrapper, and require
+   `RANK_AND_PUSH_PREPARED_ONLY` (exit 2) with nothing published. Compare with the old loop's last
+   batch; run the research tree's frozen `tools-v26f/merge_scopes.py` with gen 26's registered list
+   and its recorded sha256 and a one-cycle inventory naming the prepared `market_scope.json` (it must
+   exit 0); record pe-service's mode. Then set the selector to `1` and run `--resume-pending`.
+7. After pe-service applies the batch and the research fetch accepts the linked cycle, restore the
+   activation batch, write `run` to the new flag and `systemctl --user enable --now
+   pe-rank-loop-15m5m`.
+
+**Recovery** follows the sections above: a failed `cache-init` reruns; a slow or failed root
+resumes; a full drive mid-cycle rolls the transaction back and fails the stage (free space, then
+resume); a top-up exhausted before preparation takes the guarded abandonment in "Recovery and
+damage boundaries", then a fresh cycle (never a second top-up); a prepared request resumes exactly.
+
+**Revert** (owner's choice): flag-stop and disable the new loop at a boundary; write `run` and
+`enable --now` the old loop only if free bytes cover its next candidate (installed size + catch-up
+growth + spool + WAL + 50 GB); otherwise delete the new loop's retained copies first.
+
 ---
 
 ## Output artifacts

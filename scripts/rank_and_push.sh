@@ -153,6 +153,7 @@ RESUME_PENDING="0"                # internal supervisor recovery path; never sta
 PENDING_FILE="data/eval-results/rank_and_push.pending"
 CYCLE_FILE="data/eval-results/rank_and_push.cycle"
 PRODUCTION_CYCLE="0"
+CYCLE_RESUMED="0"
 CACHE_STAGE_RECORD=""
 FIXED_DB=""
 PRIOR_CACHE_BACKUP=""
@@ -501,6 +502,7 @@ FRESH_LANE="0"
 if [[ "$PRODUCTION_CYCLE" == "1" ]]; then
   if [[ -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
     OUT_DIR="$(validate_cycle_pointer)" || exit $?
+    CYCLE_RESUMED="1"
     [[ -f "$OUT_DIR/cycle_manifest.json" && ! -L "$OUT_DIR/cycle_manifest.json" ]] || {
       echo "FATAL: resumed production cycle omitted its frozen cycle manifest" >&2
       exit 2
@@ -532,6 +534,7 @@ with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
       "$MIN_TRL" "$MIN_AVG_PER_MONTH" "$MIN_ACTIVE_MONTHS" "$LATENCY_SHIFT_SECS" \
       "$FILL_WINDOW_SECS" "$TOP_N" "$FRESH_LANE" <<'PY'
 import json
+import os
 import sys
 
 keys = [
@@ -545,6 +548,14 @@ configuration = dict(zip(keys, sys.argv[2:-1], strict=True))
 # unchanged-day gate; the one-time cutover keeps it.
 if sys.argv[-1] == "1":
     configuration["cache_lane"] = "fresh_v2"
+for key, variable in (
+    ("market_recurrences", "PE_BOOTSTRAP_MARKET_RECURRENCES"),
+    ("rank_market_recurrences", "PE_RANK_MARKET_RECURRENCES"),
+    ("rank_market_series", "PE_RANK_MARKET_SERIES"),
+    ("research_link_dir", "PE_RANK_RESEARCH_LINK_DIR"),
+):
+    if variable in os.environ:
+        configuration[key] = os.environ[variable]
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(configuration, handle, sort_keys=True)
     handle.write("\n")
@@ -582,6 +593,47 @@ fi
 
 mkdir -p "$OUT_DIR"
 echo "RANK_AND_PUSH_RUN_DIR=$OUT_DIR"
+
+# Frozen cycle settings take precedence over the .env loaded on this invocation.
+# Pure re-push tails have no cycle manifest or frozen configuration to restore.
+if [[ "$CYCLE_RESUMED" == "1" || ( "$RESUME_PENDING" == "1" && -f "$OUT_DIR/cycle_manifest.json" ) ]]; then
+  FROZEN_CYCLE_ENV="$("$PYTHON_BIN" - "$OUT_DIR/cycle_configuration.json" <<'PY'
+import json
+import shlex
+import sys
+
+configuration = json.load(open(sys.argv[1], encoding="utf-8"))
+for key, variable in (
+    ("market_recurrences", "PE_BOOTSTRAP_MARKET_RECURRENCES"),
+    ("rank_market_recurrences", "PE_RANK_MARKET_RECURRENCES"),
+    ("rank_market_series", "PE_RANK_MARKET_SERIES"),
+    ("research_link_dir", "PE_RANK_RESEARCH_LINK_DIR"),
+):
+    if key in configuration:
+        print(f"export {variable}={shlex.quote(configuration[key])}")
+    else:
+        print(f"unset {variable}")
+PY
+)"
+  eval "$FROZEN_CYCLE_ENV"
+fi
+
+if [[ -v PE_RANK_RESEARCH_LINK_DIR ]]; then
+  mkdir -p -- "$PE_RANK_RESEARCH_LINK_DIR" || {
+    echo "FATAL: cannot create research link directory: $PE_RANK_RESEARCH_LINK_DIR" >&2
+    exit 2
+  }
+  RESEARCH_LINK="$PE_RANK_RESEARCH_LINK_DIR/$(basename -- "$OUT_DIR")"
+  RUN_DIR_REAL="$(readlink -f -- "$OUT_DIR")"
+  # symlink(2) never replaces an existing name, so a concurrent creator cannot be clobbered.
+  if [[ ! -e "$RESEARCH_LINK" && ! -L "$RESEARCH_LINK" ]]; then
+    ln -s -- "$RUN_DIR_REAL" "$RESEARCH_LINK" || true
+  fi
+  [[ -L "$RESEARCH_LINK" && "$(readlink -- "$RESEARCH_LINK")" == "$RUN_DIR_REAL" ]] || {
+    echo "FATAL: research link collision: $RESEARCH_LINK (expected target $RUN_DIR_REAL)" >&2
+    exit 2
+  }
+fi
 
 CUTOVER_MODE="0"
 BEFORE_RANKING_JSON=""
@@ -645,14 +697,24 @@ if [[ "$CUTOVER_MODE" == "1" && ! -f "$OUT_DIR/cycle_manifest.json" ]]; then
     "$FLOOR_TSTAT" "$MIN_TRL" "$MIN_AVG_PER_MONTH" "$MIN_ACTIVE_MONTHS" \
     "$LATENCY_SHIFT_SECS" "$FILL_WINDOW_SECS" "$TOP_N" <<'PY'
 import json
+import os
 import sys
 keys = [
     "half_life_days", "ttr_hours", "price_min", "price_max", "floor_tstat",
     "min_trl", "min_avg_per_month", "min_active_months", "latency_shift_secs",
     "fill_window_secs", "top_n",
 ]
+configuration = dict(zip(keys, sys.argv[2:], strict=True))
+for key, variable in (
+    ("market_recurrences", "PE_BOOTSTRAP_MARKET_RECURRENCES"),
+    ("rank_market_recurrences", "PE_RANK_MARKET_RECURRENCES"),
+    ("rank_market_series", "PE_RANK_MARKET_SERIES"),
+    ("research_link_dir", "PE_RANK_RESEARCH_LINK_DIR"),
+):
+    if variable in os.environ:
+        configuration[key] = os.environ[variable]
 with open(sys.argv[1], "w", encoding="utf-8") as destination:
-    json.dump(dict(zip(keys, sys.argv[2:], strict=True)), destination, sort_keys=True)
+    json.dump(configuration, destination, sort_keys=True)
     destination.write("\n")
 PY
   "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture --db "$DB" \
@@ -972,9 +1034,9 @@ else
   refresh_data
 fi
 if [[ "$SKIP_RANK" == "0" ]]; then
-  # Rank only first entries in markets whose Gamma series recurs every 15 minutes, the markets
-  # gate F copies (#782, #784). Resolve the window end once, here, so the scope, pass one and the
-  # default decay anchor share it; an explicit --as-of still wins.
+  # Rank only first entries in the requested Gamma series (#784). Resolve the window end once,
+  # here, so the scope, pass one and the default decay anchor share it; an explicit --as-of
+  # still wins.
   RANK_WIN_END="${WIN_END:-$(date -u +%Y-%m-%d)}"
   AS_OF="${AS_OF:-$RANK_WIN_END}"
   RANK_WIN_ARGS=(--win-end "$RANK_WIN_END")
@@ -987,9 +1049,10 @@ from ranker_decay import window_bounds
 print(window_bounds(sys.argv[1] or None, sys.argv[2])[0] - 86_400)
 PY
 )" || exit $?
-  echo "── Market scope: 15-minute series markets from Gamma → $MARKET_SCOPE_FILE ──"
+  echo "── Market scope: ${PE_RANK_MARKET_RECURRENCES:-15m} series markets from Gamma → $MARKET_SCOPE_FILE ──"
   run_refresh_stage "market-scope" "$PE_BOOTSTRAP_BIN" market-scope --out "$MARKET_SCOPE_FILE" \
-    --end-date-min "$scope_floor" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    --end-date-min "$scope_floor" --recurrences "${PE_RANK_MARKET_RECURRENCES:-15m}" \
+    ${PE_RANK_MARKET_SERIES:+--series "$PE_RANK_MARKET_SERIES"} "${BOOTSTRAP_CONFIG_ARGS[@]}"
 fi
 if [[ "$CUTOVER_MODE" == "1" ]]; then
   require_cutover_inputs

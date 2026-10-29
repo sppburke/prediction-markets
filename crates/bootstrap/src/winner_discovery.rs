@@ -107,3 +107,30 @@ pub async fn run_winner_discovery_with_policy(
     );
     Ok(report)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn leaderboard_zero_continues_to_enabled_participants() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        let config = BootstrapConfig {
+            leaderboard_top_n: 0,
+            leaderboard_base_url: Some("invalid URL must never be fetched".into()),
+            datadash_api_url: None,
+            gamma_base_url: "invalid URL fails before network I/O".into(),
+            participant_lookback_secs: 5,
+            ..BootstrapConfig::default()
+        };
+        let report = run_winner_discovery(&config, &mut cache).await.unwrap();
+        assert_eq!(
+            (report.leaderboard_unique, report.leaderboard_activated),
+            (0, 0)
+        );
+        assert_eq!((report.datadash_unique, report.datadash_activated), (0, 0));
+        assert_eq!(report.participants_status, "failed:gamma");
+    }
+}

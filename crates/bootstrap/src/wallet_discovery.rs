@@ -66,6 +66,9 @@ pub async fn run_source_discovery_with_policy(
 ) -> Result<SourceDiscoveryResult, BootstrapError> {
     match source {
         WalletDiscoverySource::Leaderboard => {
+            if config.leaderboard_top_n == 0 {
+                return Ok(SourceDiscoveryResult::default());
+            }
             let base_url = config
                 .leaderboard_base_url
                 .as_deref()
@@ -141,7 +144,7 @@ pub async fn run_source_discovery_with_policy(
                 activation_policy,
                 now,
                 participant_fetcher,
-                |lo| recent_market_scope(config, lo),
+                |lo| recent_market_scope(config, lo, &config.market_recurrences, None),
             )
             .await
         }
@@ -380,6 +383,38 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn leaderboard_zero_skips_and_participants_still_run() {
+        let (_dir, mut cache) = tmp_cache();
+        let config = BootstrapConfig {
+            leaderboard_top_n: 0,
+            leaderboard_base_url: Some("invalid URL must never be fetched".into()),
+            participant_lookback_secs: 5,
+            ..BootstrapConfig::default()
+        };
+        let result = run_source_discovery(WalletDiscoverySource::Leaderboard, &config, &mut cache)
+            .await
+            .unwrap();
+        assert_eq!((result.unique_wallets, result.activated), (0, 0));
+        assert_eq!(cache.wallet_pile_size().unwrap(), 0);
+        let fetcher = fetcher(|_: &str| Ok(json!([{"proxyWallet": wallet(1)}])));
+        let participants = run_participant_discovery(
+            &config,
+            &mut cache,
+            ActivationPolicy::Immediate,
+            NOW,
+            || Ok(fetcher),
+            |_| async { Ok(scope(1)) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(participants.status, "ok");
+        assert_eq!(
+            (participants.unique_wallets, participants.activated),
+            (1, 1)
+        );
+    }
+
     /// Datadash is on by default (URL set from the compiled default) but skips
     /// silently with **no HTTP call** when the URL is unset. Mirrors the retired
     /// Radion gate test: an unset URL must yield `Ok(default())`, not a fetch.
@@ -453,7 +488,7 @@ mod tests {
             source_id: "polymarket-gamma",
             schema_version: 1,
             parser_version: 1,
-            recurrence: "15m",
+            recurrence: "15m".into(),
             end_date_min_unix: 100,
             started_at_unix: NOW,
             completed_at_unix: NOW,

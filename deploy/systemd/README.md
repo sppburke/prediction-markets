@@ -35,6 +35,16 @@ cycle configuration in flight. After exact-request activation/publication, the o
 ordinary batch and explicitly consents to restart. Ordinary cycles keep the interim bound through
 the quiet-wallet re-read wave; remove it between cycles once the glossary's removal condition holds.
 
+## pe-rank-loop-15m5m
+
+The same unit for the 15/5-minute loop's checkout at `~/prediction-markets-15m5m` (its own cache,
+flag, locks and cycle folders); only the checkout path differs. One loop publishes at a time: each
+loop's own flag keeps a stopped loop stopped (`LOOP_STOP` before any cycle), and the stopped unit is
+disabled. There is deliberately no `Conflicts=`: starting either unit would stop the other, and the
+supervisor's TERM trap ends a running cycle. `scripts/deploy/forge_pause.sh` serves either loop with
+`PE_FORGE_CHECKOUT=$HOME/prediction-markets-15m5m`. Switch and revert steps live in
+[`docs/26`](../../docs/26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md) ("15/5-minute loop").
+
 ## Install
 
 ```bash

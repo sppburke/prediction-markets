@@ -14128,12 +14128,16 @@ async fn staging_interruption_refuses_source_drift_and_checks_before_copying() {
 const PUBLICATION_PRINT_WALLET: &str = "0x5555555555555555555555555555555555555555";
 
 fn publication_dataset(now: i64, quiet: &str) -> (Vec<Value>, Vec<Value>) {
+    publication_dataset_sized(now, quiet, 20)
+}
+
+fn publication_dataset_sized(now: i64, quiet: &str, size: i64) -> (Vec<Value>, Vec<Value>) {
     let mut rows = Vec::new();
     let mut markets = Vec::new();
     // Whole hours keep each entry clear of the same-day horizon's floor before UTC midnight; ten
     // days give the survivor the distinct entry days its day-clustered t needs.
     let old = (now - 40 * 86_400).div_euclid(3_600) * 3_600;
-    for index in 0..20 {
+    for index in 0..size {
         let market = format!("0x{:064x}", index + 100);
         let token = (1000 + 2 * index).to_string();
         let entry = old + (index % 10) * 86_400 + (index / 10) * 3_600;
@@ -14362,9 +14366,6 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
     );
     let legacy_root = scenario == PublicationScenario::LegacyRoot;
     let recovery = scenario == PublicationScenario::Recovery;
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
-    use std::sync::atomic::AtomicBool;
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let quiet = format!(
         "0x{}{:012x}",
@@ -14541,146 +14542,17 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         .map(|id| serde_json::json!({"series":[{"id":"7","recurrence":"15m"}],"markets":[{"conditionId":id}]}))
         .collect::<Vec<_>>();
     let activity_rows = Arc::new(Mutex::new(rows));
-    let server_rows = Arc::clone(&activity_rows);
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let address = listener.local_addr().unwrap();
-    let requests = Arc::new(Mutex::new(Vec::<String>::new()));
-    let batches = Arc::new(Mutex::new(Vec::<Value>::new()));
-    let stopped = Arc::new(AtomicBool::new(false));
-    let (server_requests, server_batches, server_stopped) = (
-        Arc::clone(&requests),
-        Arc::clone(&batches),
-        Arc::clone(&stopped),
+    let venue = FixtureVenue::start(
+        Arc::clone(&activity_rows),
+        markets,
+        serde_json::json!([{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"}]),
+        scope_events,
     );
-    let server = std::thread::spawn(move || {
-        while !server_stopped.load(Ordering::SeqCst) {
-            let (mut stream, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    continue;
-                }
-                Err(error) => panic!("loopback accept: {error}"),
-            };
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                .unwrap();
-            let mut request = Vec::new();
-            let header_end = loop {
-                let mut buffer = [0_u8; 4096];
-                let read = stream.read(&mut buffer).unwrap();
-                assert!(read > 0, "incomplete fixture request");
-                request.extend_from_slice(&buffer[..read]);
-                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break end + 4;
-                }
-            };
-            let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    line.split_once(':')
-                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
-                })
-                .unwrap_or(0);
-            while request.len() < header_end + content_length {
-                let mut buffer = [0_u8; 4096];
-                let read = stream.read(&mut buffer).unwrap();
-                assert!(read > 0, "incomplete fixture request body");
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let first = headers.lines().next().unwrap();
-            let route = first.split_whitespace().nth(1).unwrap();
-            let url = reqwest::Url::parse(&format!("http://fixture{route}")).unwrap();
-            let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
-            server_requests.lock().unwrap().push(first.to_owned());
-            let (status, body) = match url.path() {
-                "/v1/leaderboard" => ("200 OK", serde_json::json!([{"proxyWallet":WALLET}])),
-                "/activity" => {
-                    let start = query["start"].parse::<i64>().unwrap();
-                    let end = query["end"].parse::<i64>().unwrap();
-                    let offset = query["offset"].parse::<usize>().unwrap();
-                    let mut selected = server_rows
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|row| {
-                            row["proxyWallet"] == query["user"]
-                                && row["timestamp"].as_i64().unwrap() >= start
-                                && row["timestamp"].as_i64().unwrap() <= end
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    selected
-                        .sort_by_key(|row| std::cmp::Reverse(row["timestamp"].as_i64().unwrap()));
-                    (
-                        "200 OK",
-                        Value::from(
-                            selected
-                                .into_iter()
-                                .skip(offset)
-                                .take(500)
-                                .collect::<Vec<_>>(),
-                        ),
-                    )
-                }
-                "/markets" => (
-                    "200 OK",
-                    serde_json::json!({"data":markets,"next_cursor":"LTE="}),
-                ),
-                "/series" => (
-                    "200 OK",
-                    serde_json::json!([{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"}]),
-                ),
-                "/events/keyset" => ("200 OK", serde_json::json!({"events":scope_events})),
-                "/rest/v1/rpc/publish_ranking_batch_v2" => {
-                    let payload: Value =
-                        serde_json::from_slice(&request[header_end..header_end + content_length])
-                            .unwrap();
-                    let mut batches = server_batches.lock().unwrap();
-                    batches.push(payload);
-                    ("200 OK", Value::from(u64::try_from(batches.len()).unwrap()))
-                }
-                "/rest/v1/latest_ranking" | "/rest/v1/ranking_entries" => {
-                    let batches = server_batches.lock().unwrap();
-                    let latest = batches.last().map_or(Vec::new(), |batch| {
-                        batch["p_entries"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .map(|entry| {
-                                let mut entry = entry.clone();
-                                entry["batch_id"] =
-                                    Value::from(u64::try_from(batches.len()).unwrap());
-                                entry
-                            })
-                            .collect::<Vec<_>>()
-                    });
-                    ("200 OK", Value::from(latest))
-                }
-                "/rest/v1/ranking_batches" => {
-                    let batches = server_batches.lock().unwrap();
-                    let result = if query
-                        .get("select")
-                        .is_some_and(|value| value == "config_hash")
-                    {
-                        vec![
-                            serde_json::json!({"config_hash":batches.last().unwrap()["p_batch"]["config_hash"]}),
-                        ]
-                    } else {
-                        Vec::new()
-                    };
-                    ("200 OK", Value::from(result))
-                }
-                _ => ("404 Not Found", serde_json::json!({"unexpected":first})),
-            };
-            let body = serde_json::to_vec(&body).unwrap();
-            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
-            stream.write_all(&body).unwrap();
-        }
-    });
+    let (address, requests, batches) = (
+        venue.address,
+        Arc::clone(&venue.requests),
+        Arc::clone(&venue.batches),
+    );
     let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     // The production reviewed-clears list runs through the real command on each fresh copy.
     for tree in ["scripts", "deploy"] {
@@ -15259,8 +15131,196 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
     }
     // A bulk-root resume skips setup; every other scenario stages at least one fresh copy.
     assert!(bulk_root || clears_run > 0);
-    stopped.store(true, Ordering::SeqCst);
-    server.join().unwrap();
+    venue.stop();
+}
+
+/// A loopback stand-in for the data API, CLOB, Gamma and Supabase that the real wrapper calls.
+struct FixtureVenue {
+    address: std::net::SocketAddr,
+    requests: Arc<Mutex<Vec<String>>>,
+    batches: Arc<Mutex<Vec<Value>>>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+    server: std::thread::JoinHandle<()>,
+}
+
+impl FixtureVenue {
+    fn start(
+        server_rows: Arc<Mutex<Vec<Value>>>,
+        markets: Vec<Value>,
+        series: Value,
+        scope_events: Vec<Value>,
+    ) -> Self {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicBool;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let batches = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let (server_requests, server_batches, server_stopped) = (
+            Arc::clone(&requests),
+            Arc::clone(&batches),
+            Arc::clone(&stopped),
+        );
+        let server = std::thread::spawn(move || {
+            while !server_stopped.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("loopback accept: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let header_end = loop {
+                    let mut buffer = [0_u8; 4096];
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0, "incomplete fixture request");
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let mut buffer = [0_u8; 4096];
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0, "incomplete fixture request body");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let first = headers.lines().next().unwrap();
+                let route = first.split_whitespace().nth(1).unwrap();
+                let url = reqwest::Url::parse(&format!("http://fixture{route}")).unwrap();
+                let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+                server_requests.lock().unwrap().push(first.to_owned());
+                let (status, body) = match url.path() {
+                    "/v1/leaderboard" => ("200 OK", serde_json::json!([{"proxyWallet":WALLET}])),
+                    "/activity" => {
+                        let start = query["start"].parse::<i64>().unwrap();
+                        let end = query["end"].parse::<i64>().unwrap();
+                        let offset = query["offset"].parse::<usize>().unwrap();
+                        let mut selected = server_rows
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|row| {
+                                row["proxyWallet"] == query["user"]
+                                    && row["timestamp"].as_i64().unwrap() >= start
+                                    && row["timestamp"].as_i64().unwrap() <= end
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        selected.sort_by_key(|row| {
+                            std::cmp::Reverse(row["timestamp"].as_i64().unwrap())
+                        });
+                        (
+                            "200 OK",
+                            Value::from(
+                                selected
+                                    .into_iter()
+                                    .skip(offset)
+                                    .take(500)
+                                    .collect::<Vec<_>>(),
+                            ),
+                        )
+                    }
+                    "/markets" => (
+                        "200 OK",
+                        serde_json::json!({"data":markets,"next_cursor":"LTE="}),
+                    ),
+                    "/series" => ("200 OK", series.clone()),
+                    // A pinned series read by id (`market-scope --series`).
+                    path if path.starts_with("/series/") => series
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|row| row["id"].as_str() == path.strip_prefix("/series/"))
+                        .map_or(("404 Not Found", Value::Null), |row| {
+                            ("200 OK", row.clone())
+                        }),
+                    "/events/keyset" => {
+                        // Each walked series sees only the events it leads.
+                        let events = scope_events
+                            .iter()
+                            .filter(|event| event["series"][0]["id"] == query["series_id"].as_str())
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        ("200 OK", serde_json::json!({"events":events}))
+                    }
+                    "/rest/v1/rpc/publish_ranking_batch_v2" => {
+                        let payload: Value = serde_json::from_slice(
+                            &request[header_end..header_end + content_length],
+                        )
+                        .unwrap();
+                        let mut batches = server_batches.lock().unwrap();
+                        batches.push(payload);
+                        ("200 OK", Value::from(u64::try_from(batches.len()).unwrap()))
+                    }
+                    "/rest/v1/latest_ranking" | "/rest/v1/ranking_entries" => {
+                        let batches = server_batches.lock().unwrap();
+                        let latest = batches.last().map_or(Vec::new(), |batch| {
+                            batch["p_entries"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|entry| {
+                                    let mut entry = entry.clone();
+                                    entry["batch_id"] =
+                                        Value::from(u64::try_from(batches.len()).unwrap());
+                                    entry
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                        ("200 OK", Value::from(latest))
+                    }
+                    "/rest/v1/ranking_batches" => {
+                        let batches = server_batches.lock().unwrap();
+                        let result = if query
+                            .get("select")
+                            .is_some_and(|value| value == "config_hash")
+                        {
+                            vec![
+                                serde_json::json!({"config_hash":batches.last().unwrap()["p_batch"]["config_hash"]}),
+                            ]
+                        } else {
+                            Vec::new()
+                        };
+                        ("200 OK", Value::from(result))
+                    }
+                    _ => ("404 Not Found", serde_json::json!({"unexpected":first})),
+                };
+                let body = serde_json::to_vec(&body).unwrap();
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        Self {
+            address,
+            requests,
+            batches,
+            stopped,
+            server,
+        }
+    }
+
+    fn stop(self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.server.join().unwrap();
+    }
 }
 
 // ── #739: format-three history and admission ────────────────────────────────
@@ -20669,4 +20729,588 @@ async fn chunked_finalize_history_check_failure_after_rows_rolls_back_and_drains
         .unwrap();
     finalize_cache_v2_with_projection_chunk_for_test(&side, FRESH_END + 1, 3).unwrap();
     assert_eq!(projection_v3_rows(&side), expected);
+}
+
+fn certificate_row(path: &std::path::Path, wallet: &str) -> Vec<rusqlite::types::Value> {
+    query_values(
+        path,
+        &format!(
+            "SELECT generation, newest_source_unix, newest_trade_unix, aggregate_count,
+                    source_row_count, ordered_digest, scope_drops_json
+             FROM activity_wallet_history_v3 WHERE wallet_hex = '{wallet}'"
+        ),
+    )
+    .remove(0)
+}
+
+/// FAIL: cache-init accepts bad input, an unverified source cache or a tombstoned seed, activates
+/// fewer than all seeds, cannot resume after an interruption, loses the old cache's tombstones or
+/// infrastructure flags, or a first finalize loses a certified drop whose trigger is absent from the
+/// new cache's history, for a seed or for a wallet discovery admits later.
+#[tokio::test]
+async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
+    let dir = TempDir::new().unwrap();
+    let old = dataset_candidate(&dir, "old.db", &[WALLET_B]);
+    let history = |wallet: &str, conversion: bool| {
+        let row = |market: &str, id: &str, epoch: i64| {
+            let mut row = dataset_row(wallet, market, &format!("{wallet}-{id}"), "BUY", epoch);
+            row["asset"] = Value::from(if market == "0xb" { "200" } else { "100" });
+            row
+        };
+        let mut rows = vec![
+            row("0xa", "before-drop", FRESH_END - 3),
+            row("0xb", "beside-drop", FRESH_END - 2),
+        ];
+        if conversion {
+            let mut conversion = row("\\xe", "conversion", FRESH_END - 2);
+            conversion["type"] = Value::from("CONVERSION");
+            rows.push(conversion);
+        }
+        rows
+    };
+    let trigger = DatasetFetcher {
+        rows: [history(WALLET, true), history(WALLET_B, true)].concat(),
+        ..Default::default()
+    };
+    history_v3_collect(&old, &trigger, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&old);
+    finalize_cache_v2_unbound(&old, None, FRESH_END + 1).unwrap();
+    let certified = |wallet| certificate_row(&old, wallet).pop().unwrap();
+    let (seed_drops, later_drops) = (certified(WALLET), certified(WALLET_B));
+    assert_ne!(seed_drops, rusqlite::types::Value::Text("[]".to_owned()));
+    // Exclusions live outside certificates: a tombstone and an infrastructure flag.
+    let connection = Connection::open(&old).unwrap();
+    connection
+        .execute(
+            "INSERT INTO purged_wallets VALUES (?1, 7, 'proven_loser')",
+            [WALLET_D],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO wallets (wallet_hex, source_bits, is_infra) VALUES (?1, 0, 1)",
+            [WALLET_C],
+        )
+        .unwrap();
+    drop(connection);
+
+    let seeds = dir.path().join("seeds.txt");
+    let fresh = dir.path().join("fresh.db");
+    let config = BootstrapConfig {
+        cache_path: fresh.clone(),
+        ..Default::default()
+    };
+    let init = |seeds_text: &str, from: &std::path::Path, config: &BootstrapConfig| {
+        std::fs::write(&seeds, seeds_text).unwrap();
+        pe_bootstrap::cache_migration::init_seeded_cache(config, &seeds, from)
+    };
+    let error = init("not-a-wallet\n", &old, &config).unwrap_err();
+    assert!(error.to_string().contains("seed list line 1"), "{error}");
+    let error = init(&format!("{WALLET}\n{WALLET_D}\n"), &old, &config).unwrap_err();
+    assert!(error.to_string().contains("tombstoned"), "{error}");
+    assert!(!fresh.exists());
+
+    let many: String = (0..5_001_u32)
+        .map(|index| format!("0x{index:040x}\n"))
+        .chain([format!("{}\n", WALLET.to_uppercase().replace("0X", "0x"))])
+        .collect();
+    std::fs::write(sidecar(&fresh, ".init"), b"interrupted").unwrap();
+    let report = init(&many, &old, &config).unwrap();
+    assert_eq!(
+        (
+            report.wallets,
+            report.wallets_with_drops,
+            report.tombstones,
+            report.infrastructure_flags,
+            report.already_initialized
+        ),
+        (5_002, 2, 1, 1, false)
+    );
+    assert!(!sidecar(&fresh, ".init").exists());
+    assert_eq!(
+        count(
+            &fresh,
+            "SELECT COUNT(*) FROM wallets WHERE is_active = 1 AND source_bits & 256 != 0"
+        ),
+        5_002
+    );
+    assert!(init(&many, &old, &config).unwrap().already_initialized);
+    let error = init(&format!("{WALLET}\n"), &old, &config).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not this initialized, uncollected"),
+        "{error}"
+    );
+    // An extra active wallet from another source is not this cache; the file stays as it was.
+    let extra = dir.path().join("extra.db");
+    std::fs::copy(&fresh, &extra).unwrap();
+    Connection::open(&extra)
+        .unwrap()
+        .execute(
+            "INSERT INTO wallets (wallet_hex, source_bits, is_infra, is_active) VALUES (?1, 2, 0, 1)",
+            [WALLET_E],
+        )
+        .unwrap();
+    let before = std::fs::read(&extra).unwrap();
+    let extra_config = BootstrapConfig {
+        cache_path: extra.clone(),
+        ..Default::default()
+    };
+    let error = init(&many, &old, &extra_config).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not this initialized, uncollected"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&extra).unwrap(), before);
+    // A seed flagged as infrastructure in the old cache cannot be activated.
+    let error = init(&format!("{WALLET}\n{WALLET_C}\n"), &old, &extra_config).unwrap_err();
+    assert!(
+        error.to_string().contains("infrastructure-flagged"),
+        "{error}"
+    );
+    // Discovery cannot re-admit an excluded wallet.
+    let mut cache = WalletCache::open(&fresh).unwrap();
+    cache
+        .upsert_wallets_bulk(&[
+            (WALLET_C.to_owned(), 256, false, None, None, None, 0),
+            (WALLET_D.to_owned(), 256, false, None, None, None, 0),
+        ])
+        .unwrap();
+    pe_bootstrap::pile::apply_activation_rules(&mut cache).unwrap();
+    drop(cache);
+    assert_eq!(
+        count(
+            &fresh,
+            &format!(
+                "SELECT COUNT(*) FROM wallets WHERE wallet_hex IN ('{WALLET_C}', '{WALLET_D}')
+                 AND is_active = 1"
+            )
+        ),
+        0
+    );
+
+    let tampered = dir.path().join("tampered.db");
+    std::fs::copy(&old, &tampered).unwrap();
+    history_v3_damage_connection(&tampered)
+        .execute(
+            "UPDATE activity_wallet_history_v3 SET scope_drops_json = '[]'",
+            [],
+        )
+        .unwrap();
+    let other = BootstrapConfig {
+        cache_path: dir.path().join("other.db"),
+        ..Default::default()
+    };
+    let error = init(&format!("{WALLET}\n"), &tampered, &other).unwrap_err();
+    assert!(
+        error.to_string().contains("certificate digest mismatch"),
+        "{error}"
+    );
+
+    // A collected cache is never accepted as initialized.
+    let collected = BootstrapConfig {
+        cache_path: dir.path().join("collected.db"),
+        ..Default::default()
+    };
+    init(&format!("{WALLET}\n"), &old, &collected).unwrap();
+    migrate_cache_v2(
+        &collected.cache_path,
+        &write_build_manifest(&dir, &collected.cache_path),
+    )
+    .unwrap();
+    let error = init(&format!("{WALLET}\n"), &old, &collected).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not this initialized, uncollected"),
+        "{error}"
+    );
+
+    // The new cache's history lacks the conversion that triggered each drop; WALLET_B arrives
+    // through discovery after initialization (and, in `delayed`, only a generation later).
+    migrate_cache_v2(&fresh, &write_build_manifest(&dir, &fresh)).unwrap();
+    let delayed = dir.path().join("delayed.db");
+    std::fs::copy(&fresh, &delayed).unwrap();
+    admit_dataset_wallet(&fresh, WALLET_B);
+    let without_trigger = DatasetFetcher {
+        rows: [history(WALLET, false), history(WALLET_B, false)].concat(),
+        ..Default::default()
+    };
+    history_v3_collect(&fresh, &without_trigger, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    // Carried drops are committed with the certificates: a change before their wallet's first
+    // finalize stops that finalize.
+    let early = dir.path().join("early.db");
+    std::fs::copy(&fresh, &early).unwrap();
+    history_v3_damage_connection(&early)
+        .execute(
+            "UPDATE activity_seed_drops_v3 SET scope_drops_json = '[]' WHERE wallet_hex = ?1",
+            [WALLET],
+        )
+        .unwrap();
+    projection_v3_payouts(&early);
+    let error = finalize_cache_v2_unbound(&early, None, FRESH_END + 1).unwrap_err();
+    assert!(
+        error.to_string().contains("certificate digest mismatch"),
+        "{error}"
+    );
+    projection_v3_payouts(&fresh);
+    finalize_cache_v2_unbound(&fresh, None, FRESH_END + 1).unwrap();
+    assert_eq!(certificate_row(&fresh, WALLET).pop().unwrap(), seed_drops);
+    assert_eq!(
+        certificate_row(&fresh, WALLET_B).pop().unwrap(),
+        later_drops
+    );
+    // Each first certificate took over its wallet's carried drops.
+    assert_eq!(
+        count(&fresh, "SELECT COUNT(*) FROM activity_seed_drops_v3"),
+        0
+    );
+
+    // Until discovery admits WALLET_B, its carried drops wait under the same commitment.
+    let only_seed = DatasetFetcher {
+        rows: history(WALLET, false),
+        ..Default::default()
+    };
+    history_v3_collect(&delayed, &only_seed, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&delayed);
+    finalize_cache_v2_unbound(&delayed, None, FRESH_END + 1).unwrap();
+    assert_eq!(
+        count(&delayed, "SELECT COUNT(*) FROM activity_seed_drops_v3"),
+        1
+    );
+    for (name, edit) in [
+        (
+            "changed.db",
+            "UPDATE activity_seed_drops_v3 SET scope_drops_json = '[]'",
+        ),
+        ("deleted.db", "DELETE FROM activity_seed_drops_v3"),
+    ] {
+        let damaged = dir.path().join(name);
+        std::fs::copy(&delayed, &damaged).unwrap();
+        history_v3_damage_connection(&damaged)
+            .execute_batch(edit)
+            .unwrap();
+        admit_dataset_wallet(&damaged, WALLET_B);
+        let error = history_v3_collect(&damaged, &without_trigger, 2, FRESH_END + 2, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("certificate digest mismatch"),
+            "{name}: {error}"
+        );
+    }
+    admit_dataset_wallet(&delayed, WALLET_B);
+    history_v3_collect(&delayed, &without_trigger, 2, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&delayed);
+    finalize_cache_v2_unbound(&delayed, None, FRESH_END + 3).unwrap();
+    assert_eq!(
+        certificate_row(&delayed, WALLET_B).pop().unwrap(),
+        later_drops
+    );
+    assert_eq!(
+        count(&delayed, "SELECT COUNT(*) FROM activity_seed_drops_v3"),
+        0
+    );
+}
+
+fn sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}{suffix}", path.display()))
+}
+
+/// FAIL: a cache holding only the seeds ranks or publishes anything other than one that also holds a
+/// wallet trading no ranked market (AC5).
+#[tokio::test]
+async fn seeded_cache_publishes_exact_entries() {
+    let dir = TempDir::new().unwrap();
+    let now = FRESH_END;
+    let (mut rows, markets) = publication_dataset(now, WALLET_C);
+    let mut unranked = dataset_row(WALLET_D, "0xff", "unranked", "BUY", now - 10 * 86_400);
+    unranked["asset"] = Value::from("9000");
+    rows.push(unranked);
+    let complete = dataset_candidate(
+        &dir,
+        "complete.db",
+        &[WALLET_C, PUBLICATION_PRINT_WALLET, WALLET_D],
+    );
+    let seeded = dataset_candidate(&dir, "seeded.db", &[WALLET_C, PUBLICATION_PRINT_WALLET]);
+    let source = DatasetFetcher {
+        rows,
+        ..Default::default()
+    };
+    let records = [
+        dir.path().join("complete.final.json"),
+        dir.path().join("seeded.final.json"),
+    ];
+    for (generation, end) in [(1, now - 100), (2, now - 80)] {
+        let publish = generation == 2;
+        for (index, path) in [&complete, &seeded].into_iter().enumerate() {
+            populate_activity_fresh_v2(
+                path,
+                &source,
+                "https://data.example",
+                generation,
+                end,
+                end + 1,
+            )
+            .await
+            .unwrap();
+            publication_payouts(path, &markets, if publish { now } else { end + 1 });
+            finalize_cache_v2(
+                path,
+                publish.then(|| records[index].as_path()),
+                if publish { now + 1 } else { end + 1 },
+            )
+            .unwrap();
+        }
+    }
+    let extra = format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET_D}'");
+    assert_eq!((count(&complete, &extra), count(&seeded, &extra)), (1, 0));
+    let bridge = Command::new("python3").current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).args(["-c",
+        "import sys; sys.path.insert(0, 'scripts'); from test_ranker_duck_parity import assert_certified_seeded_publication_equivalence; assert_certified_seeded_publication_equivalence(*sys.argv[1:5], int(sys.argv[5]))"])
+        .arg(&complete).arg(&seeded).arg(&records[0]).arg(&records[1]).arg(now.to_string()).output().unwrap();
+    assert!(
+        bridge.status.success(),
+        "seeded publication bridge:\n{}\n{}",
+        String::from_utf8_lossy(&bridge.stdout),
+        String::from_utf8_lossy(&bridge.stderr)
+    );
+}
+
+/// FAIL (end to end, real wrapper): a cache provisioned by `cache-init` (carrying drops) does not
+/// collect a bulk root with complete histories, stop at `prepare` with nothing published, publish the
+/// saved request on resume, run an ordinary successor, and keep a research link for each cycle; or
+/// the leaderboard is still requested, discovery does not walk the 5-minute series, or ranking leaves
+/// the pinned 15-minute series.
+#[tokio::test]
+async fn real_wrapper_seeded_loop_prepares_and_publishes() {
+    const DAY: i64 = 86_400;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let quiet = format!(
+        "0x{}{:012x}",
+        "22".repeat(14),
+        (-(now + 3 * 86_400)).rem_euclid(604_800)
+    );
+    let (mut rows, mut markets) = publication_dataset(now, &quiet);
+    // History older than the ranking window stays: the new cache keeps complete histories.
+    let old_market = format!("0x{:064x}", 0x0dd);
+    for index in 0..3 {
+        let mut old = dataset_row(
+            WALLET,
+            &old_market,
+            &format!("old-{index}"),
+            "BUY",
+            now - 300 * DAY + index,
+        );
+        old["asset"] = Value::from("7700");
+        rows.push(old);
+    }
+    markets.push(serde_json::json!({"condition_id":old_market,"closed":true,"neg_risk":false,
+        "is_50_50_outcome":false,"end_date_iso":time::OffsetDateTime::from_unix_timestamp(now - 299 * DAY)
+            .unwrap().format(&time::format_description::well_known::Rfc3339).unwrap(),
+        "tokens":[{"token_id":"7700","outcome":"Yes","price":"1","winner":true},
+                  {"token_id":"7701","outcome":"No","price":"0","winner":false}]}));
+    let dir = tempfile::Builder::new()
+        .prefix("pe-real-seeded-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(data.join("eval-results")).unwrap();
+    // The old loop's finalized cache supplies certified drops; the new cache holds only the seeds.
+    let old = dataset_candidate(&dir, "old.db", &[]);
+    let mut conversion = projection_v3_row("\\xe", "conversion", FRESH_END - 2);
+    conversion["type"] = Value::from("CONVERSION");
+    history_v3_collect(
+        &old,
+        &DatasetFetcher {
+            rows: vec![
+                projection_v3_row("0xa", "before-drop", FRESH_END - 3),
+                conversion,
+            ],
+            ..Default::default()
+        },
+        1,
+        FRESH_END,
+        &[],
+    )
+    .await
+    .unwrap();
+    projection_v3_payouts(&old);
+    finalize_cache_v2_unbound(&old, None, FRESH_END + 1).unwrap();
+    let carried = certificate_row(&old, WALLET).pop().unwrap();
+    let fixed = data.join("wallet_cache.db");
+    let seeds = dir.path().join("seeds.txt");
+    std::fs::write(
+        &seeds,
+        format!("{WALLET}\n{quiet}\n{PUBLICATION_PRINT_WALLET}\n"),
+    )
+    .unwrap();
+    let report = pe_bootstrap::cache_migration::init_seeded_cache(
+        &BootstrapConfig {
+            cache_path: fixed.clone(),
+            ..Default::default()
+        },
+        &seeds,
+        &old,
+    )
+    .unwrap();
+    assert_eq!((report.wallets, report.wallets_with_drops), (3, 1));
+    let scope_events = markets
+        .iter()
+        .filter_map(|market| market["condition_id"].as_str())
+        .filter(|id| id.len() == 66)
+        .map(|id| serde_json::json!({"series":[{"id":"7","recurrence":"15m"}],"markets":[{"conditionId":id}]}))
+        .chain([serde_json::json!({"series":[{"id":"8","recurrence":"5m"}],
+            "markets":[{"conditionId":format!("0x{:064x}", 0x5)}]})])
+        .collect::<Vec<_>>();
+    let activity_rows = Arc::new(Mutex::new(rows));
+    let venue = FixtureVenue::start(
+        Arc::clone(&activity_rows),
+        markets,
+        serde_json::json!([{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"},
+                           {"id":"8","slug":"btc-up-or-down-5m","recurrence":"5m"}]),
+        scope_events,
+    );
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for tree in ["scripts", "deploy"] {
+        assert!(
+            Command::new("cp")
+                .arg("-a")
+                .arg(repository.join(tree))
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let release = dir.path().join("target/release");
+    std::fs::create_dir_all(&release).unwrap();
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_pe-bootstrap"),
+        release.join("pe-bootstrap"),
+    )
+    .unwrap();
+    let research = dir.path().join("research");
+    let address = venue.address;
+    let env = |cutover: &str| {
+        std::fs::write(dir.path().join(".env"), format!(
+            "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_TOP_N=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER={cutover}\nPE_RANKER_ENGINE=duck\nPE_BOOTSTRAP_MARKET_RECURRENCES='[\"15m\",\"5m\"]'\nPE_RANK_MARKET_RECURRENCES=15m\nPE_RANK_MARKET_SERIES=7:btc-up-or-down-15m\nPE_RANK_RESEARCH_LINK_DIR={}\n",
+            dir.path().join("watchlist.json").display(), research.display())).unwrap();
+    };
+    let python = Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .unwrap();
+    let python = String::from_utf8(python.stdout).unwrap();
+    let run_wrapper = |args: &str| {
+        Command::new("bash").args(["-c", &format!("exec 9<>data/eval-results/.rank_and_push_loop.lock; flock -n 9; printf '%s\\n' \"$$\" > data/eval-results/.rank_and_push_loop.lock; exec bash scripts/rank_and_push.sh {args}")])
+            .current_dir(dir.path()).env("PE_PYTHON", python.trim()).env("RUST_LOG", "info").env_remove("PYTHONPATH").output().unwrap()
+    };
+    let run_dir = |stdout: &str| {
+        dir.path().join(
+            stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("RANK_AND_PUSH_RUN_DIR="))
+                .unwrap(),
+        )
+    };
+    let linked = |out: &std::path::Path| {
+        let link = research.join(out.file_name().unwrap());
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+            && std::fs::read_link(&link).unwrap() == out.canonicalize().unwrap()
+    };
+    let old_rows = || {
+        count(
+            &fixed,
+            &format!(
+                "SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}'
+                 AND source_time_unix < {}",
+                now - 299 * DAY
+            ),
+        )
+    };
+    // 1: prepare only.
+    env("prepare");
+    let prepared = run_wrapper("");
+    let stdout = String::from_utf8(prepared.stdout).unwrap();
+    assert_eq!(
+        prepared.status.code(),
+        Some(2),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    assert!(stdout.contains("RANK_AND_PUSH_PREPARED_ONLY"), "{stdout}");
+    assert!(venue.batches.lock().unwrap().is_empty());
+    let first = run_dir(&stdout);
+    assert!(first.join("ranking_publish_request.json").is_file());
+    assert!(data.join("eval-results/rank_and_push.pending").exists());
+    assert!(linked(&first));
+    let scope: Value =
+        serde_json::from_slice(&std::fs::read(first.join("market_scope.json")).unwrap()).unwrap();
+    assert_eq!(scope["recurrence"], "15m");
+    // The research period's pin: exactly the pinned series, as the frozen merger requires.
+    assert_eq!(
+        scope["series"],
+        serde_json::json!([{"id": "7", "slug": "btc-up-or-down-15m"}])
+    );
+    // Read by id, not listed: one series read, for the pinned series.
+    let reads: Vec<&Value> = scope["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|page| page["kind"] == "series")
+        .collect();
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0]["series_id"], "7");
+    assert!(reads[0]["url"].as_str().unwrap().ends_with("/series/7"));
+    // 1, resumed: the saved request publishes.
+    env("1");
+    let published = run_wrapper("--resume-pending");
+    assert!(
+        published.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&published.stdout),
+        String::from_utf8_lossy(&published.stderr)
+    );
+    assert_eq!(venue.batches.lock().unwrap().len(), 1);
+    assert_eq!(old_rows(), 3);
+    // The seed's carried drop, whose trigger the venue never shows, is certified.
+    assert_eq!(certificate_row(&fixed, WALLET).pop().unwrap(), carried);
+    // 2: an ordinary successor.
+    let successor = run_wrapper("");
+    let stdout = String::from_utf8(successor.stdout).unwrap();
+    assert!(
+        successor.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&successor.stderr)
+    );
+    assert_eq!(venue.batches.lock().unwrap().len(), 2);
+    assert_eq!(old_rows(), 3);
+    assert!(linked(&run_dir(&stdout)));
+    let requests = venue.requests.lock().unwrap().clone();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.contains("/v1/leaderboard")),
+        "{requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("/events/keyset") && request.contains("series_id=8"))
+    );
+    venue.stop();
 }

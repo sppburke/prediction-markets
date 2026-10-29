@@ -3,9 +3,10 @@ use pe_bootstrap::{
     cache::WalletCache,
     cache_migration::{
         CacheActivationRequest, PriorCacheBinding, SupabasePublicationProbe,
-        activate_cache_v2_with_handoff, finalize_cache_v2_with_export_manifest, migrate_cache_v2,
-        populate_activity_bulk_root_v2_with_clock, populate_activity_fresh_v2_with_clock,
-        populate_activity_v2, restore_prior_cache_with_final_stage_record, stage_cache_cycle_v2,
+        activate_cache_v2_with_handoff, finalize_cache_v2_with_export_manifest, init_seeded_cache,
+        migrate_cache_v2, populate_activity_bulk_root_v2_with_clock,
+        populate_activity_fresh_v2_with_clock, populate_activity_v2,
+        restore_prior_cache_with_final_stage_record, stage_cache_cycle_v2,
         verify_frozen_payload_v1,
     },
     config, coverage,
@@ -74,6 +75,7 @@ async fn main() {
                 | "clear-infra-exclusion"
                 | "recover-reclamation"
                 | "reclamation-evidence"
+                | "cache-init"
                 | "cache-migrate-v2"
                 | "cache-verify-frozen-v1"
                 | "cache-populate-activity-v2"
@@ -120,6 +122,8 @@ async fn main() {
         let mut wallet_arg: Option<&str> = None;
         let mut purged_at_arg: Option<&str> = None;
         let mut db_arg: Option<std::path::PathBuf> = None;
+        let mut wallets_file_arg: Option<std::path::PathBuf> = None;
+        let mut drops_from_arg: Option<std::path::PathBuf> = None;
         let mut manifest_arg: Option<std::path::PathBuf> = None;
         let mut frozen_payload_arg: Option<std::path::PathBuf> = None;
         let mut export_manifest_arg: Option<std::path::PathBuf> = None;
@@ -147,6 +151,8 @@ async fn main() {
         let mut side_arg: Option<std::path::PathBuf> = None;
         let mut out_arg: Option<std::path::PathBuf> = None;
         let mut end_date_min_arg: Option<i64> = None;
+        let mut recurrences_arg = "15m";
+        let mut series_arg: Option<&str> = None;
         let mut flag_values: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
         let mut i = 0;
@@ -210,6 +216,14 @@ async fn main() {
                 dump_ledgers_path = Some(std::path::PathBuf::from(rest[i]));
             } else if let Some(v) = a.strip_prefix("--dump-ledgers=") {
                 dump_ledgers_path = Some(std::path::PathBuf::from(v));
+            } else if a == "--wallets" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                wallets_file_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if a == "--drops-from" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                drops_from_arg = Some(std::path::PathBuf::from(rest[i]));
             } else if a == "--db" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -354,6 +368,26 @@ async fn main() {
                 out_arg = Some(std::path::PathBuf::from(rest[i]));
             } else if let Some(v) = a.strip_prefix("--out=") {
                 out_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--recurrences" {
+                let Some(value) = rest.get(i + 1) else {
+                    tracing::error!("market recurrences require a value for --recurrences");
+                    std::process::exit(1);
+                };
+                i += 1;
+                flag_values.insert(value);
+                recurrences_arg = value;
+            } else if let Some(v) = a.strip_prefix("--recurrences=") {
+                recurrences_arg = v;
+            } else if a == "--series" {
+                let Some(value) = rest.get(i + 1) else {
+                    tracing::error!("pinned market series require a value for --series");
+                    std::process::exit(1);
+                };
+                i += 1;
+                flag_values.insert(value);
+                series_arg = Some(value);
+            } else if let Some(v) = a.strip_prefix("--series=") {
+                series_arg = Some(v);
             } else if a == "--end-date-min" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -411,7 +445,8 @@ async fn main() {
 
         if matches!(
             sub,
-            "cache-migrate-v2"
+            "cache-init"
+                | "cache-migrate-v2"
                 | "cache-verify-frozen-v1"
                 | "cache-populate-activity-v2"
                 | "cache-populate-payout-v2"
@@ -422,6 +457,18 @@ async fn main() {
         ) {
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
             let result = match sub {
+                "cache-init" => match (wallets_file_arg.as_deref(), drops_from_arg.as_deref()) {
+                    (Some(wallets), Some(drops_from)) => {
+                        pe_bootstrap::lock::CacheMutationLock::acquire(&bootstrap_config.cache_path)
+                            .and_then(|_lock| {
+                                init_seeded_cache(&bootstrap_config, wallets, drops_from)
+                                    .and_then(json_report)
+                            })
+                    }
+                    _ => Err(BootstrapError::Invalid {
+                        message: "cache-init requires --wallets and --drops-from".to_owned(),
+                    }),
+                },
                 "cache-migrate-v2" => manifest_arg
                     .as_deref()
                     .ok_or_else(|| BootstrapError::Invalid {
@@ -724,12 +771,25 @@ async fn main() {
         // `market-scope` (#784) reads only Gamma and writes one file: no cache
         // lock or open.
         if sub == "market-scope" {
+            let recurrences: Vec<String> = recurrences_arg.split(',').map(str::to_owned).collect();
+            let pinned = match series_arg
+                .map(pe_bootstrap::market_scope::parse_pinned_series)
+                .transpose()
+            {
+                Ok(pinned) => pinned,
+                Err(error) => {
+                    tracing::error!(error = %error, "market-scope: unusable --series");
+                    std::process::exit(1);
+                }
+            };
             let exit = match (out_arg.as_deref(), end_date_min_arg) {
                 (Some(out), Some(end_date_min)) => {
                     match pe_bootstrap::market_scope::run_market_scope(
                         &bootstrap_config,
                         out,
                         end_date_min,
+                        &recurrences,
+                        pinned.as_deref(),
                     )
                     .await
                     {

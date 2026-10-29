@@ -135,9 +135,9 @@ def _load_v2_export_manifest(parquet_dir: str) -> dict:
 
 
 
-# The 15-minute market scope (#784): `pe-bootstrap market-scope` writes it into the cycle
+# The market scope (#784): `pe-bootstrap market-scope` writes it into the cycle
 # directory; pass one scores only its markets and pass two re-checks it.
-MARKET_SCOPE_RECURRENCE = "15m"
+MARKET_SCOPE_RECURRENCES = {"15m", "5m"}
 _SCOPE_SERIES_PAGE_ROWS = 50
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
@@ -156,9 +156,13 @@ def load_market_scope(path: str) -> tuple[frozenset[str], dict]:
             raise MarketScopeError(f"market scope {path}: {what}")
 
     need(isinstance(value, dict), "not an object")
+    recurrence = value.get("recurrence")
+    recurrences = recurrence.split(",") if isinstance(recurrence, str) else []
     need(all(type(value.get(key)) is int for key in ("version", "schema_version", "parser_version"))
-         and (value["version"], value.get("source_id"), value["schema_version"], value["parser_version"],
-              value.get("recurrence")) == (1, "polymarket-gamma", 1, 1, MARKET_SCOPE_RECURRENCE), "identity")
+         and (value["version"], value.get("source_id"), value["schema_version"], value["parser_version"])
+         == (1, "polymarket-gamma", 1, 1)
+         and recurrences and set(recurrences) <= MARKET_SCOPE_RECURRENCES
+         and len(recurrences) == len(set(recurrences)), "identity")
     need(all(type(value.get(key)) is int for key in
              ("end_date_min_unix", "started_at_unix", "completed_at_unix", "count"))
          and value["started_at_unix"] <= value["completed_at_unix"], "times or count")
@@ -184,13 +188,19 @@ def load_market_scope(path: str) -> tuple[frozenset[str], dict]:
              and (page.get("source_at_unix") is None or type(page["source_at_unix"]) is int),
              f"page {ordinal}")
     listing = [page for page in pages if page["kind"] == "series"]
-    need(listing and pages[:len(listing)] == listing and all(
-        page["series_id"] is None and page["request_cursor"] is None
-        and page["returned_next_cursor"] is None
-        and page["url"].endswith(f"&offset={index * _SCOPE_SERIES_PAGE_ROWS}")
-        and (page["rows"] == _SCOPE_SERIES_PAGE_ROWS if index < len(listing) - 1
-             else 0 <= page["rows"] < _SCOPE_SERIES_PAGE_ROWS)
-        for index, page in enumerate(listing)), "series listing incomplete")
+    need(listing and pages[:len(listing)] == listing
+         and all(page["request_cursor"] is None and page["returned_next_cursor"] is None for page in listing),
+         "series pages")
+    if listing[0]["series_id"] is None:  # the catalog listing: contiguous offsets, only the last page short
+        need(all(page["series_id"] is None
+                 and page["url"].endswith(f"&offset={index * _SCOPE_SERIES_PAGE_ROWS}")
+                 and (page["rows"] == _SCOPE_SERIES_PAGE_ROWS if index < len(listing) - 1
+                      else 0 <= page["rows"] < _SCOPE_SERIES_PAGE_ROWS)
+                 for index, page in enumerate(listing)), "series listing incomplete")
+    else:  # pinned series (`market-scope --series`): one read by id per listed series, in its order
+        need(len(listing) == len(series) and all(
+            page["series_id"] == listed["id"] and page["url"].endswith(f"/series/{listed['id']}")
+            and page["rows"] == 1 for page, listed in zip(listing, series)), "pinned series reads")
     walk = iter(pages[len(listing):])
     for listed in series:
         cursor = None

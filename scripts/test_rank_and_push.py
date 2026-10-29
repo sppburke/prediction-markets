@@ -52,6 +52,12 @@ WRAPPER = Path(__file__).resolve().parent / "rank_and_push.sh"
 # co-updates the wrapper literal AND this constant in the same commit (issue #370 PR2 lands
 # the 0→30 flip as its own commit).
 EXPECTED_DEFAULT_HALF_LIFE = "30"
+CYCLE_SETTINGS = {
+    "market_recurrences": "PE_BOOTSTRAP_MARKET_RECURRENCES",
+    "rank_market_recurrences": "PE_RANK_MARKET_RECURRENCES",
+    "rank_market_series": "PE_RANK_MARKET_SERIES",
+    "research_link_dir": "PE_RANK_RESEARCH_LINK_DIR",
+}
 
 
 def _write_exec(path: Path, body: str) -> None:
@@ -276,6 +282,8 @@ class RankAndPushScenario(unittest.TestCase):
     def _run(self, *args, exit_env=None):
         env = dict(os.environ)
         env.pop("PE_PYTHON", None)
+        for variable in CYCLE_SETTINGS.values():
+            env.pop(variable, None)
         env.update(exit_env or {})
         return subprocess.run(
             ["bash", str(self.wrapper), *args],
@@ -418,6 +426,31 @@ class RankAndPushScenario(unittest.TestCase):
                 for log in ("export.log", "rank.log", "rerank.log", "push.log"):
                     self.assertIsNone(self._log(log), log)
 
+    def test_ranking_recurrences_are_independent_of_discovery(self):
+        for ranking in (None, "15m,5m"):
+            with self.subTest(ranking=ranking):
+                self.tearDown(); self.setUp()
+                env = {"PE_BOOTSTRAP_MARKET_RECURRENCES": '["5m"]',
+                       "PE_RANK_MARKET_RECURRENCES": ranking or ""}
+                result = self._run(exit_env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
+                self.assertEqual(scope[scope.index("--recurrences") + 1], ranking or "15m")
+
+    def test_pinned_ranking_series_reach_market_scope_only_when_set(self):
+        pin = "10192:btc-up-or-down-15m,12518:zec-up-or-down-15m"
+        for series in (None, pin):
+            with self.subTest(series=series):
+                self.tearDown(); self.setUp()
+                result = self._run(exit_env={"PE_RANK_MARKET_SERIES": series} if series else {})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
+                if series:
+                    self.assertEqual(scope[scope.index("--series") + 1], pin)
+                else:
+                    self.assertNotIn("--series", scope)
+        print("PASS: PE_RANK_MARKET_SERIES pins market-scope's series only when set")
+
     def test_refresh_crossing_utc_midnight_moves_window_end_scope_and_anchor_together(self):
         sys.path.insert(0, str(WRAPPER.parent))
         from ranker_decay import window_bounds
@@ -485,7 +518,8 @@ class RankAndPushScenario(unittest.TestCase):
         out_dir = (self.root / "data" / "eval-results").glob("cron-*")
         scope_file = str(next(out_dir).relative_to(self.root) / "market_scope.json")
         self.assertEqual(scope, ["market-scope", "--out", scope_file,
-                                 "--end-date-min", str(window_bounds(None, win_end)[0] - 86_400)])
+                                 "--end-date-min", str(window_bounds(None, win_end)[0] - 86_400),
+                                 "--recurrences", "15m"])
         for args in (rank_args, rerank_args):
             self.assertEqual(args[args.index("--market-scope") + 1], scope_file)
 
@@ -856,6 +890,201 @@ class RankAndPushScenario(unittest.TestCase):
             "cycle retry created another production run directory",
         )
         self.assertFalse(cycle.exists(), "completed retried cycle did not clear its pointer")
+
+    def _install_cycle_probe(self):
+        probe = self.root / "scripts" / "_cycle_probe.py"
+        probe.write_text(
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            'if "--validate-request" in sys.argv: raise SystemExit(0)\n'
+            f"variables = {list(CYCLE_SETTINGS.values())!r}\n"
+            'settings = {key: os.environ[key] for key in variables if key in os.environ}\n'
+            'with open("cycle_probe.log", "a") as handle:\n'
+            '    handle.write(json.dumps({"stage": sys.argv[1], "settings": settings}) + "\\n")\n'
+            'if "STUB_REQUIRE_RESEARCH_LINK" in os.environ:\n'
+            '    cycle = Path(Path("data/eval-results/rank_and_push.cycle").read_text().strip())\n'
+            '    link = Path(os.environ["STUB_REQUIRE_RESEARCH_LINK"]) / cycle.name\n'
+            '    assert link.is_symlink(), f"missing research link before {sys.argv[1]}"\n'
+            '    assert os.readlink(link) == str(cycle.resolve())\n'
+        )
+        bootstrap = self.root / "target" / "release" / "pe-bootstrap"
+        body = bootstrap.read_text()
+        bootstrap.write_text(body.replace(
+            'echo "$*" >> pe_bootstrap.log\n',
+            f'{shlex.quote(sys.executable)} scripts/_cycle_probe.py "$@" || exit $?\n'
+            'echo "$*" >> pe_bootstrap.log\n',
+        ))
+        publisher = self.root / "scripts" / "push_ranking_to_supabase.py"
+        body = publisher.read_text()
+        publisher.write_text(body.replace(
+            '    a = sys.argv[1:]\n',
+            '    a = sys.argv[1:]\n'
+            '    import subprocess\n'
+            '    subprocess.run([sys.executable, "scripts/_cycle_probe.py", "publish", *a], check=True)\n',
+        ))
+
+    def test_research_link_precedes_staging_and_publication_on_every_entry(self):
+        for entry in ("new", "cycle", "pending", "recovered", "recovered-explicit"):
+            with self.subTest(entry=entry):
+                self.tearDown(); self.setUp()
+                self._install_candidate_layout(schema=2)
+                self._install_candidate_stub()
+                self._install_cycle_probe()
+                research = self.root / "research links"
+                with (self.root / ".env").open("a") as handle:
+                    handle.write(f"PE_RANK_RESEARCH_LINK_DIR={shlex.quote(str(research))}\n")
+                probe_env = {"STUB_REQUIRE_RESEARCH_LINK": str(research)}
+                failure = {} if entry == "new" else (
+                    {"STUB_EXIT_cache_populate_activity_v2": "75"} if entry == "cycle"
+                    else {"STUB_PUSH_EXIT": "75"}
+                )
+                first = self._run(exit_env={**probe_env, **failure})
+                self.assertEqual(first.returncode, 0 if entry == "new" else 75,
+                                 first.stderr + first.stdout)
+                cycle_dir = next((self.root / "data/eval-results").glob("cron-*"))
+                link = research / cycle_dir.name
+                self.assertEqual(os.readlink(link), str(cycle_dir.resolve()))
+                if entry != "new":
+                    link.unlink()
+                    if entry.startswith("recovered"):
+                        (self.root / "data/eval-results/rank_and_push.pending").unlink()
+                    args = ("--resume-pending",) if entry in ("pending", "recovered-explicit") else ()
+                    resumed = self._run(*args, exit_env=probe_env)
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+                    self.assertEqual(os.readlink(link), str(cycle_dir.resolve()))
+                self.assertEqual(list(research.glob("*.tmp.*")), [])
+                probes = [json.loads(line) for line in self._log("cycle_probe.log").splitlines()]
+                self.assertIn("cache-stage-v2", [probe["stage"] for probe in probes])
+                self.assertIn("publish", [probe["stage"] for probe in probes])
+
+    def test_research_link_collisions_stop_before_pipeline_stages(self):
+        research = self.root / "research"
+        research.mkdir()
+        out = self.root / "data/eval-results/research-cycle"
+        link = research / out.name
+        for collision in ("file", "directory", "wrong-link", "dangling-link"):
+            with self.subTest(collision=collision):
+                if collision == "file":
+                    link.write_text("keep me\n")
+                elif collision == "directory":
+                    link.mkdir()
+                else:
+                    link.symlink_to(self.root if collision == "wrong-link" else self.root / "missing")
+                inode = link.lstat().st_ino
+                result = self._run("--out-dir", str(out), exit_env={
+                    "PE_RANK_RESEARCH_LINK_DIR": str(research),
+                })
+                self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+                self.assertIn("FATAL: research link collision", result.stderr)
+                self.assertEqual(link.lstat().st_ino, inode, "collision was replaced")
+                if collision == "file":
+                    self.assertEqual(link.read_text(), "keep me\n")
+                elif collision.endswith("link"):
+                    self.assertEqual(os.readlink(link), str(
+                        self.root if collision == "wrong-link" else self.root / "missing"
+                    ))
+                for log in ("pipeline_versions.log", "pe_bootstrap.log", "export.log",
+                            "rank.log", "rerank.log", "push.log"):
+                    self.assertIsNone(self._log(log), f"{log} ran despite the collision")
+                if collision == "directory":
+                    link.rmdir()
+                else:
+                    link.unlink()
+
+    def test_existing_correct_research_link_is_accepted(self):
+        out = self.root / "data/eval-results/research-cycle"
+        out.mkdir()
+        research = self.root / "research"
+        research.mkdir()
+        link = research / out.name
+        link.symlink_to(out)
+        inode = link.lstat().st_ino
+        result = self._run("--out-dir", str(out), exit_env={
+            "PE_RANK_RESEARCH_LINK_DIR": str(research),
+        })
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(link.lstat().st_ino, inode)
+        self.assertIsNotNone(self._log("push.log"))
+
+    def test_research_link_collision_stops_resumed_candidate_before_staging(self):
+        self._install_candidate_layout(schema=2)
+        self._install_candidate_stub()
+        research = self.root / "research"
+        with (self.root / ".env").open("a") as handle:
+            handle.write(f"PE_RANK_RESEARCH_LINK_DIR={shlex.quote(str(research))}\n")
+        first = self._run(exit_env={"STUB_EXIT_cache_populate_activity_v2": "75"})
+        self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+        cycle = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
+        link = research / cycle.name
+        link.unlink()
+        link.write_text("keep me\n")
+        before = self._log("pe_bootstrap.log")
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 2, resumed.stderr + resumed.stdout)
+        self.assertIn("FATAL: research link collision", resumed.stderr)
+        self.assertEqual(self._log("pe_bootstrap.log"), before)
+        self.assertIsNone(self._log("push.log"))
+        self.assertEqual(link.read_text(), "keep me\n")
+
+    def test_cycle_settings_override_changed_env_and_unset_absent_keys_on_every_resume(self):
+        for entry in ("cycle", "pending", "recovered", "recovered-explicit"):
+            for recorded in (True, False):
+                with self.subTest(entry=entry, recorded=recorded):
+                    self.tearDown(); self.setUp()
+                    self._install_cycle_probe()
+                    settings = dict(zip(CYCLE_SETTINGS.values(), (
+                        "15m,5m", "", "10192:btc-up-or-down-15m",
+                        str(self.root / "research 'links $(literal)"),
+                    ), strict=True)) if recorded else {}
+                    with (self.root / ".env").open("a") as handle:
+                        for variable, value in settings.items():
+                            handle.write(f"{variable}={shlex.quote(value)}\n")
+                    first = self._run(exit_env={
+                        "STUB_EXIT_events" if entry == "cycle" else "STUB_PUSH_EXIT": "75",
+                    })
+                    self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+                    cycle = self.root / "data/eval-results/rank_and_push.cycle"
+                    out = self.root / cycle.read_text().strip()
+                    configuration = out / "cycle_configuration.json"
+                    before = configuration.read_bytes()
+                    value = json.loads(before)
+                    self.assertEqual({variable: value[key] for key, variable in CYCLE_SETTINGS.items()
+                                      if key in value}, settings)
+                    changed = {variable: str(self.root / "changed research") if key == "research_link_dir"
+                               else "changed" for key, variable in CYCLE_SETTINGS.items()}
+                    with (self.root / ".env").open("a") as handle:
+                        for variable, value in changed.items():
+                            handle.write(f"{variable}={shlex.quote(value)}\n")
+                    if entry.startswith("recovered"):
+                        (self.root / "data/eval-results/rank_and_push.pending").unlink()
+                    (self.root / "cycle_probe.log").unlink()
+                    args = ("--resume-pending",) if entry in ("pending", "recovered-explicit") else ()
+                    resumed = self._run(*args, exit_env=changed)
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+                    probes = [json.loads(line) for line in self._log("cycle_probe.log").splitlines()]
+                    self.assertTrue(probes)
+                    self.assertTrue(all(probe["settings"] == settings for probe in probes), probes)
+                    self.assertEqual(configuration.read_bytes(), before)
+                    self.assertFalse((self.root / "changed research").exists())
+
+    def test_unset_cycle_settings_preserve_configuration_bytes(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        configuration = next((self.root / "data/eval-results").glob("cron-*/cycle_configuration.json"))
+        self.assertEqual(configuration.read_bytes(), (
+            b'{"fill_window_secs": "120", "floor_tstat": "3.0", "half_life_days": "30", '
+            b'"latency_shift_secs": "2", "min_active_months": "0", "min_avg_per_month": "0", '
+            b'"min_trl": "20", "price_max": "0.65", "price_min": "0.15", "top_n": "200", '
+            b'"ttr_hours": "24"}\n'
+        ))
+
+    def test_research_service_matches_default_unit(self):
+        # Only the checkout differs: each loop's own stop flag keeps the stopped one stopped.
+        units = WRAPPER.parent.parent / "deploy/systemd"
+        expected = (units / "pe-rank-loop.service").read_text().replace(
+            "%h/prediction-markets/", "%h/prediction-markets-15m5m/",
+        )
+        self.assertEqual((units / "pe-rank-loop-15m5m.service").read_text(), expected)
 
     def test_direct_zero_arg_prefers_pending_publication_over_cycle_replay(self):
         first = self._run(exit_env={"STUB_PUSH_EXIT": "75"})

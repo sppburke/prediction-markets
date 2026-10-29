@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -41,6 +42,22 @@ CERTIFICATE_COLUMNS = (
 )
 DROP_CAUSES = {"conversion", "order_dependent", "overflow", "underflow",
                "unknown_condition", "unknown_type", "unmapped"}
+
+
+def certificate_rows(connection: sqlite3.Connection):
+    for values in connection.execute(
+            f"SELECT {', '.join(CERTIFICATE_COLUMNS)} FROM activity_wallet_history_v3 ORDER BY wallet_hex"):
+        yield dict(zip(CERTIFICATE_COLUMNS, values, strict=True))
+
+
+def carried_drop_rows(connection: sqlite3.Connection):
+    """A seeded cache's carried drops, committed after the certificates until their wallet's first one."""
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                          "AND name = 'activity_seed_drops_v3'").fetchone() is None:
+        return
+    for wallet, drops in connection.execute(
+            "SELECT wallet_hex, scope_drops_json FROM activity_seed_drops_v3 ORDER BY wallet_hex"):
+        yield {"carried_scope_drops_json": drops, "wallet_hex": wallet}
 
 
 def certificate_digest(rows) -> str:
@@ -102,9 +119,7 @@ def finalized_certificates(connection: sqlite3.Connection) -> dict | None:
 
     def rows():
         nonlocal count, source_rows, newest
-        for values in connection.execute(
-                f"SELECT {', '.join(CERTIFICATE_COLUMNS)} FROM activity_wallet_history_v3 ORDER BY wallet_hex"):
-            row = dict(zip(CERTIFICATE_COLUMNS, values, strict=True))
+        for row in certificate_rows(connection):
             yield row
             if row["generation"] == generation:
                 current[row["wallet_hex"]] = row
@@ -114,7 +129,7 @@ def finalized_certificates(connection: sqlite3.Connection) -> dict | None:
                 if trade is not None:
                     newest = trade if newest is None else max(newest, trade)
 
-    if certificate_digest(rows()) != inputs.get("certificate_digest"):
+    if certificate_digest(itertools.chain(rows(), carried_drop_rows(connection))) != inputs.get("certificate_digest"):
         raise ValueError("activity_wallet_history_v3 certificate digest mismatch")
     for row in current.values():
         decode_scope_drops(row["scope_drops_json"])

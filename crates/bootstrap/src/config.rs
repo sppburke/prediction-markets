@@ -7,7 +7,7 @@ use figment::{
     providers::{Env, Format, Toml},
     value::{Dict, Map},
 };
-use pe_source_polymarket_public::LeaderboardCategory;
+use pe_source_polymarket_public::{FIFTEEN_MINUTE_RECURRENCE, LeaderboardCategory};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -326,7 +326,7 @@ pub struct BootstrapConfig {
     )]
     pub leaderboard_request_interval_ms: u64,
 
-    /// List depth per leaderboard (category × sort × window) slice.
+    /// List depth per leaderboard (category × sort × window) slice; 0 disables the source.
     /// Default 1,050, read in 50-row pages through offset 1,000.
     /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
     /// `PE_BOOTSTRAP_LEADERBOARD_TOP_N` overrides.
@@ -345,6 +345,15 @@ pub struct BootstrapConfig {
         alias = "bootstrap_leaderboard_categories"
     )]
     pub leaderboard_categories: Vec<LeaderboardCategory>,
+
+    /// Participant discovery's market recurrences. Default = `["15m"]`.
+    /// `PE_BOOTSTRAP_MARKET_RECURRENCES` overrides (a TOML array, e.g. `["15m", "5m"]`).
+    #[serde(
+        default = "default_market_recurrences",
+        alias = "bootstrap_market_recurrences",
+        deserialize_with = "deserialize_market_recurrences"
+    )]
+    pub market_recurrences: Vec<String>,
 
     // (The Radion trader-analysis discovery source was retired once its upstream
     // `traders/analysis` endpoint was removed; its `radion_*` config knobs and the
@@ -617,6 +626,10 @@ fn default_leaderboard_categories() -> Vec<LeaderboardCategory> {
     LeaderboardCategory::ALL.to_vec()
 }
 
+fn default_market_recurrences() -> Vec<String> {
+    vec![FIFTEEN_MINUTE_RECURRENCE.to_owned()]
+}
+
 const fn default_participant_lookback_secs() -> u64 {
     DEFAULT_PARTICIPANT_LOOKBACK_SECS
 }
@@ -701,6 +714,7 @@ impl Default for BootstrapConfig {
             leaderboard_request_interval_ms: default_leaderboard_request_interval_ms(),
             leaderboard_top_n: default_leaderboard_top_n(),
             leaderboard_categories: default_leaderboard_categories(),
+            market_recurrences: default_market_recurrences(),
             participant_lookback_secs: default_participant_lookback_secs(),
             datadash_api_url: default_datadash_api_url(),
             datadash_request_interval_ms: default_datadash_request_interval_ms(),
@@ -840,6 +854,14 @@ pub fn load(path: Option<&Path>) -> Result<BootstrapConfig, BootstrapError> {
 }
 
 // ── Custom deserializers ──────────────────────────────────────────────────────
+
+fn deserialize_market_recurrences<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let recurrences = Vec::<String>::deserialize(d)?;
+    crate::market_scope::canonical_recurrences(&recurrences).map_err(serde::de::Error::custom)
+}
 
 fn deserialize_bool_or_01<'de, D>(d: D) -> Result<bool, D::Error>
 where
@@ -994,6 +1016,47 @@ where
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn market_recurrences_default_and_env_override() {
+        assert_eq!(BootstrapConfig::default().market_recurrences, ["15m"]);
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                "output_path = '/tmp/watchlist.json'\nmarket_recurrences = ['5m']",
+            )?;
+            let path = Some(Path::new("config.toml"));
+            assert_eq!(load(path).unwrap().market_recurrences, ["5m"]);
+            jail.set_env("PE_BOOTSTRAP_MARKET_RECURRENCES", r#"["15m","5m"]"#);
+            assert_eq!(load(path).unwrap().market_recurrences, ["15m", "5m"]);
+            jail.set_env("PE_BOOTSTRAP_MARKET_RECURRENCES", r#"["5m","15m"]"#);
+            assert_eq!(load(path).unwrap().market_recurrences, ["15m", "5m"]);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn market_recurrences_refuse_invalid_toml_and_env() {
+        for value in [
+            "[]",
+            r#"["hourly"]"#,
+            r#"["15m","15m"]"#,
+            r#"[""]"#,
+            "'15m,5m'",
+        ] {
+            figment::Jail::expect_with(|jail| {
+                jail.create_file(
+                    "config.toml",
+                    &format!("output_path = '/tmp/watchlist.json'\nmarket_recurrences = {value}"),
+                )?;
+                assert!(load(Some(Path::new("config.toml"))).is_err(), "{value}");
+                jail.set_env("PE_BOOTSTRAP_OUTPUT", "/tmp/watchlist.json");
+                jail.set_env("PE_BOOTSTRAP_MARKET_RECURRENCES", value);
+                assert!(load(None).is_err(), "{value}");
+                Ok(())
+            });
+        }
+    }
 
     /// datadash defaults: the source is on by default (`Some(url)`), the magnitude
     /// cap and exclusions match the canonical `_GLOSSARY.md` values.

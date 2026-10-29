@@ -472,6 +472,7 @@ pub(super) fn rebuild_ranker_projection(
         .open(&temp)?;
     let mut writer = std::io::BufWriter::new(file);
     let payout = BoundPayouts::read(transaction)?;
+    let carried = seed::has_seed_drops(transaction)?;
     let mut report = ClassificationReport {
         neg_risk_markets_without_group_id: payout.neg_risk_markets_without_group_id,
         ..Default::default()
@@ -545,7 +546,11 @@ pub(super) fn rebuild_ranker_projection(
                 let total = report.drops_by_cause.entry(cause).or_insert(0);
                 *total = checked_activity_count(*total, added)?;
             }
-            classified.certificate.write(transaction)
+            classified.certificate.write(transaction)?;
+            if carried {
+                seed::consume_seed_drops(transaction, &classified.certificate.wallet_hex)?;
+            }
+            Ok(())
         };
         let pass = aggregate_scan::scoped(|scan| {
             let mut pending = false;
@@ -569,8 +574,10 @@ pub(super) fn rebuild_ranker_projection(
                 if receipt.excluded() {
                     continue;
                 }
-                let drops = incremental::HistoryCertificate::load(transaction, wallet)?
-                    .map_or_else(|| "[]".to_owned(), |old| old.scope_drops_json);
+                let drops = match incremental::HistoryCertificate::load(transaction, wallet)? {
+                    Some(old) => old.scope_drops_json,
+                    None => seed::seed_drops(transaction, wallet)?,
+                };
                 let mut classifier =
                     Some(WalletClassifier::new(wallet, identity.generation, &drops)?);
                 let chain = incremental::HistoryChain::load(
