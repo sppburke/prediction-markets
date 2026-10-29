@@ -625,7 +625,7 @@ mod tests {
                 supervisor.observe_next(),
             )
             .await
-            .expect("the monitor must fail at once")
+            .unwrap()
             .unwrap();
             assert!(event.initiates_shutdown());
             assert!(supervisor.status().critical_failed());

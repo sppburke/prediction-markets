@@ -7857,6 +7857,40 @@ mod tests {
         assert_eq!(db.maintenance().total_changes(), 0);
     }
 
+    /// Run `call` on another thread while this one holds the shared connection, and require `warm`
+    /// on the maintenance connection before the shared one is released.
+    fn assert_warms_before_lock(
+        db: &PaperStateDb,
+        warm: &str,
+        call: impl Fn(&PaperStateDb) + Sync,
+    ) {
+        // The trace expands bound parameters, so the statement is matched up to its first one.
+        let prefix = warm.split('?').next().unwrap();
+        TRACED_STATEMENTS.lock().unwrap().clear();
+        std::thread::scope(|scope| {
+            let shared = db.lock();
+            let caller = scope.spawn(|| call(db));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let warmed = loop {
+                let traced = TRACED_STATEMENTS.lock().unwrap();
+                if traced.iter().any(|statement| statement.starts_with(prefix)) {
+                    break true;
+                }
+                drop(traced);
+                if std::time::Instant::now() > deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            drop(shared);
+            caller.join().unwrap();
+            assert!(
+                warmed,
+                "{prefix} did not run before the shared connection was free"
+            );
+        });
+    }
+
     #[test]
     fn retention_reads_warm_before_taking_the_shared_connection() {
         let (dir, db) = db();
@@ -7864,47 +7898,17 @@ mod tests {
         insert_anchor(&conn, 1, 1, "{\"proof\": 1}");
         insert_anchor(&conn, 1, 2, "{\"proof\": 2}");
         db.maintenance().trace(Some(record_traced_statement));
-        let calls: [(&str, &(dyn Fn(&PaperStateDb) + Sync)); 3] = [
-            (WARM_SUPERSEDED_ANCHOR_PROOFS_SQL, &|db| {
-                db.blank_superseded_anchor_proofs(&AnchorProofCursor::start(), 1)
-                    .unwrap();
-            }),
-            (RETENTION_CANDIDATES_SQL, &|db| {
-                db.retention_wallets(None, 32).unwrap();
-            }),
-            (RETENTION_WAIT_QUERIES[0].0, &|db| {
-                db.wallet_retention_wait(WalletAddress([1; 20]), 0, None)
-                    .unwrap();
-            }),
-        ];
-        for (warm, call) in calls {
-            // The trace expands bound parameters, so the statement is matched up to its first one.
-            let prefix = warm.split('?').next().unwrap();
-            TRACED_STATEMENTS.lock().unwrap().clear();
-            std::thread::scope(|scope| {
-                let shared = db.lock();
-                let caller = scope.spawn(|| call(&db));
-                // The warm read must reach the maintenance connection while the shared one is held.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                let warmed = loop {
-                    let traced = TRACED_STATEMENTS.lock().unwrap();
-                    if traced.iter().any(|statement| statement.starts_with(prefix)) {
-                        break true;
-                    }
-                    drop(traced);
-                    if std::time::Instant::now() > deadline {
-                        break false;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                };
-                drop(shared);
-                caller.join().unwrap();
-                assert!(
-                    warmed,
-                    "{prefix} did not run before the shared connection was free"
-                );
-            });
-        }
+        assert_warms_before_lock(&db, WARM_SUPERSEDED_ANCHOR_PROOFS_SQL, |db| {
+            db.blank_superseded_anchor_proofs(&AnchorProofCursor::start(), 1)
+                .unwrap();
+        });
+        assert_warms_before_lock(&db, RETENTION_CANDIDATES_SQL, |db| {
+            db.retention_wallets(None, 32).unwrap();
+        });
+        assert_warms_before_lock(&db, RETENTION_WAIT_QUERIES[0].0, |db| {
+            db.wallet_retention_wait(WalletAddress([1; 20]), 0, None)
+                .unwrap();
+        });
         db.maintenance().trace(None);
     }
 
