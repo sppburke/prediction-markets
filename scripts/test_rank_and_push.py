@@ -701,7 +701,7 @@ class RankAndPushScenario(unittest.TestCase):
         lines = [json.loads(line) for line in samples.read_text().splitlines()]  # every line complete again
         self.assertGreater(len(lines), first)  # the resumed run appended
         for line in lines:
-            self.assertEqual(sorted(set(line) - {"mark"}), ["dirs", "files", "free_bytes", "t"])
+            self.assertEqual(sorted(set(line) - {"mark"}), ["dirs", "files", "free_bytes", "interval", "t"])
             self.assertGreater(line["free_bytes"], 0)
         folded = subprocess.run(["python3", str(sampler), "summarize", str(samples)],
                                 capture_output=True, text=True, check=True)
@@ -3749,7 +3749,7 @@ class CapacitySamplerUnitTest(unittest.TestCase):
             "first_free_bytes": 900, "first_files": {"wallet_cache.db": 50},
             "min_free_bytes": 700, "min_free_at": 110.0,
             "peak_bytes": {"wallet_cache.db": 60, "c.db": 200, "parquet": 5},
-            "samples": 3, "first_t": 100.0, "last_t": 135.5, "largest_gap_s": 25.5,
+            "samples": 3, "first_t": 100.0, "last_t": 135.5, "largest_gap_s": 25.5, "qualified": False,
         })
 
     def test_summary_counts_gaps_within_attempts_and_flags_an_unended_one(self):
@@ -3761,6 +3761,25 @@ class CapacitySamplerUnitTest(unittest.TestCase):
         samples.write_text("".join(json.dumps(line) + "\n" for line in first + second))
         summary = self.sampler.summarize(samples)
         self.assertEqual((summary["attempts"], summary["unterminated_attempts"], summary["largest_gap_s"]), (2, 1, 10.0))
+
+    def test_summary_qualifies_only_ended_attempts_sampled_within_three_intervals(self):
+        def summary(*attempts):
+            samples = self.tmp / "q.jsonl"
+            lines = []
+            for attempt in attempts:
+                for i, (t, interval) in enumerate(attempt):
+                    mark = {0: "start", len(attempt) - 1: "end"}.get(i)
+                    record = {"t": t, "free_bytes": 500, "files": {}, "dirs": {}, "interval": interval}
+                    lines.append({**record, **({"mark": mark} if mark else {})})
+            samples.write_text("".join(json.dumps(line) + "\n" for line in lines))
+            return self.sampler.summarize(samples)["qualified"]
+        ended = [(0.0, 10.0), (10.0, 10.0), (40.0, 10.0)]  # a 30-s gap: exactly three intervals
+        self.assertTrue(summary(ended, [(500.0, 5.0), (515.0, 5.0)]))  # the gap between attempts does not count
+        self.assertFalse(summary(ended, [(500.0, 5.0), (515.1, 5.0)]))  # one gap over three of its intervals
+        self.assertFalse(summary([(0.0, 10.0), (10.0, None), (20.0, 10.0)]))  # a sample without its interval
+        unended = self.tmp / "unended.jsonl"
+        unended.write_text(json.dumps({"t": 0.0, "free_bytes": 1, "files": {}, "dirs": {}, "interval": 10.0, "mark": "start"}) + "\n")
+        self.assertFalse(self.sampler.summarize(unended)["qualified"])  # an attempt without its end sample
 
     def _main(self, out, parents, *extra):
         sleeps = []

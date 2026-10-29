@@ -2,22 +2,22 @@
 """Sample the ranking cache's drive while one rank-and-push run is alive (metadata only).
 
 `sample`: every --interval seconds (once and exit with --once), while --parent (the wrapper's PID) is this process's
-parent, append one JSON line to
---out: the time, the free bytes of the cache folder's filesystem (statvfs; the quantity `df --output=avail` shows), the
-size of every regular file directly in that folder (the installed cache, candidates, their -wal/-shm files, spools) and
-the byte total of each extra folder (--dir NAME=PATH; the wrapper passes the export folder). Free bytes measure
-everything the run consumes, SQLite's sort scratch included: SQLite unlinks those files as it opens them, so no folder
-total sees them. A resumed run of the same cycle appends to the same file, after dropping a last line a crash left
-unfinished. The wrapper marks each run's first sample `start` (taken before anything is staged) and the sample its exit
-trap takes after the run's children ended `end` (`--once --mark`). It never opens a database or reads any file's
-contents.
+parent, append one JSON line to --out: the time, the configured interval, the free bytes of the cache folder's
+filesystem (statvfs; the quantity `df --output=avail` shows), the size of every regular file directly in that folder
+(the installed cache, candidates, their -wal/-shm files, spools) and the byte total of each extra folder (--dir
+NAME=PATH; the wrapper passes the export folder). Free bytes measure everything the run consumes, SQLite's sort scratch
+included: SQLite unlinks those files as it opens them, so no folder total sees them. A resumed run of the same cycle
+appends to the same file, after dropping a last line a crash left unfinished. The wrapper marks each run's first sample
+`start` (taken before anything is staged) and the sample its exit trap takes after the run's children ended `end`
+(`--once --mark`). It never opens a database or reads any file's contents.
 
 `summarize SAMPLES`: the samples file folded into one JSON object: the run attempts (each from a `start` sample) and how
 many lack their `end` sample, the first sample's free bytes and file sizes (before the cycle's candidate copy), the
-smallest free bytes and when, each name's largest size, the sample count, the first and last sample times, and the
-largest gap between consecutive samples of one attempt (a gap much longer than the interval means nothing was sampled
-then; between attempts no wrapper ran). A peak is caught when it lasts at least one interval. The samples file is the
-record; the summary is computed from it whenever it is needed (docs/26, capacity).
+smallest free bytes and when, each name's largest size, the sample count, the first and last sample times, the
+largest gap between consecutive samples of one attempt (between attempts no wrapper ran), and `qualified`: true only
+when every attempt ended and no gap within an attempt exceeds three times that attempt's recorded interval. Values are
+sampled: a peak between two samples can be missed, and one lasting longer than the largest gap is caught. The samples
+file is the record; the summary is computed from it whenever it is needed (docs/26, capacity).
 """
 
 import argparse
@@ -77,6 +77,15 @@ def summarize(path):
             attempts.append([])
         attempts[-1].append(record)
     gaps = [later["t"] - earlier["t"] for attempt in attempts for earlier, later in zip(attempt, attempt[1:])]
+    unterminated = sum(attempt[-1].get("mark") != "end" for attempt in attempts)
+
+    def covered(attempt):
+        intervals = [record.get("interval") for record in attempt]
+        if not all(isinstance(interval, (int, float)) and interval > 0 for interval in intervals):
+            return False  # a sample without its interval cannot show its coverage
+        limit = 3 * max(intervals)
+        return all(later["t"] - earlier["t"] <= limit for earlier, later in zip(attempt, attempt[1:]))
+
     lowest = min(records, key=lambda record: record["free_bytes"])
     peaks = {}
     for record in records:
@@ -84,7 +93,7 @@ def summarize(path):
             peaks[name] = max(size, peaks.get(name, 0))
     return {
         "attempts": len(attempts),
-        "unterminated_attempts": sum(attempt[-1].get("mark") != "end" for attempt in attempts),
+        "unterminated_attempts": unterminated,
         "first_free_bytes": records[0]["free_bytes"],
         "first_files": records[0]["files"],
         "min_free_bytes": lowest["free_bytes"],
@@ -94,6 +103,7 @@ def summarize(path):
         "first_t": records[0]["t"],
         "last_t": records[-1]["t"],
         "largest_gap_s": round(max(gaps, default=0.0), 1),
+        "qualified": unterminated == 0 and all(covered(attempt) for attempt in attempts),
     }
 
 
@@ -118,6 +128,7 @@ def main():
     drop_unfinished_line(args.out)
     while os.getppid() == args.parent:
         record = sample(args.cache_dir, folders)
+        record["interval"] = args.interval
         if args.mark:
             record["mark"] = args.mark
         with open(args.out, "a", encoding="utf-8") as handle:

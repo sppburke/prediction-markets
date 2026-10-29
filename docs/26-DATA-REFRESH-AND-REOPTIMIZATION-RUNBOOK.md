@@ -1851,9 +1851,12 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
 1. Stop the old loop at its next publication boundary: write `stop` to its flag only after that
    cycle has published (both pointers cleared, its `accepted_cycle_manifest.json` present), while the
    supervisor waits 60 s before the next cycle; or keep the boundary where the drive-limit watcher
-   already stopped it. If the stop instead reaches the next cycle in its first retry wait (that cycle
-   unprepared, its pointer retained), leave the loop stopped and set that cycle aside by the guarded
-   abandonment under "Recovery" below. Confirm `LOOP_STOP`, no cycle or pending pointer, no
+   already stopped it. If the stop instead reaches the next cycle in a retry wait (that cycle retained),
+   leave the loop stopped and inspect both pointers and that cycle's durable request and activation
+   evidence: only when no request exists, set the cycle aside by the guarded abandonment under
+   "Recovery" below; otherwise resolve it by the branch for its state (a prepared request resumes
+   exactly with `--resume-pending`; an activation rename gap or unknown consumption takes those paths)
+   and continue from the boundary that reaches. Confirm `LOOP_STOP`, no cycle or pending pointer, no
    `.forge_pause.json`, no descendants or locks; the old flag `stop` (atomic write, if it is not) and
    `systemctl --user disable pe-rank-loop`.
 2. One `bash scripts/rank_and_push.sh --resume-pending` in the old checkout retires its displaced
@@ -1869,9 +1872,10 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    sort scratch included: SQLite unlinks those files as it opens them) and the visible files' peaks
    (installed, candidate, WAL, spool, exports). Right after the prepare run, before the publication resume,
    record `python3 scripts/capacity_sampler.py summarize <cycle>/capacity_samples.jsonl`: it qualifies the
-   envelope only with every attempt ended (`unterminated_attempts` 0) and a `largest_gap_s` within attempts
-   of at most about three sample intervals (between attempts no wrapper ran). Otherwise, keep the margin
-   from the estimate above and qualify the next cycle the same way, run as a one-shot under `prepare`.
+   envelope only with `qualified: true` (every attempt ended, `unterminated_attempts` 0, and no gap within an
+   attempt over 3 × the recorded sample interval; between attempts no wrapper ran). The summary holds
+   sampled values: a peak between two samples can be missed. Otherwise, keep the margin from the estimate
+   above and qualify the next cycle the same way, run as a one-shot under `prepare`.
 5. `cache-init` as above (rerun it right before the first cycle: it must report
    `already_initialized`).
 6. First cycle, supervisor off: set `PE_RANK_SCHEMA_TWO_CUTOVER=prepare` and
@@ -1884,14 +1888,16 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    cycle>` and hold the switch for the owner if it reports any wallet (an exclusion record is not
    coverage); record pe-service's mode. Then set `PE_RANK_SCHEMA_TWO_CUTOVER=1` in the new `.env` and
    run `--resume-pending` (a prepared request resumes only under `1`).
-7. After pe-service applies the batch and the research fetch accepts the linked cycle, set
-   `PE_RANK_MIN_FREE_GB` by the formula in `_GLOSSARY.md` `rank_min_free_gb` from the first cycle's
-   recorded summary (conservative: that drop includes the root's whole collection), write `run` to the new flag
-   and `systemctl --user enable --now pe-rank-loop-15m5m` with the activation batch at 0. Admission
-   stays at 0 until a nonzero batch has its own envelope. To qualify one, first stop the supervisor
-   at a publication boundary: write `stop` to its flag (atomic) while a cycle runs, so it stops in that
-   cycle's success wait; if it stops in a retry wait instead (its cycle retained), write `run`, start
-   the unit to finish that cycle and repeat; then confirm with `PE_FORGE_CHECKOUT` set that
+7. After pe-service applies the batch and the research fetch accepts the linked cycle, enable
+   supervision only once a summary qualified (step 4): set `PE_RANK_MIN_FREE_GB` by the formula in
+   `_GLOSSARY.md` `rank_min_free_gb` from the latest qualified cycle's summary (the first cycle's when it
+   qualified; conservative: that drop includes the root's whole collection), write `run` to the new flag
+   and `systemctl --user enable --now pe-rank-loop-15m5m` with the activation batch at 0. Until a
+   summary qualifies, keep the estimated margin and run each cycle as an operator-run one-shot as in
+   step 6. Admission stays at 0 until a nonzero batch has its own envelope. To qualify one, first stop
+   the supervisor at a publication boundary as in step 1, for this checkout and unit: the flag stays
+   `run` through the cycle's retries before publication, and `stop` is written only after it has
+   published, within the supervisor's 60-s wait; then confirm with `PE_FORGE_CHECKOUT` set that
    `forge_pause.sh status` shows the unit inactive with no descendants or held locks, and that no
    cycle or pending pointer exists. Then list the wallets the next batch would admit (`activate-next`'s selection: inactive, not infrastructure, not
    tombstoned, in its preference order; read-only), size their complete histories from the old
@@ -1900,11 +1906,12 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    an operator-run one-shot under `prepare` with participant discovery off for that cycle
    (`PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS=0`; the leaderboard and datadash are already off), so nothing
    enters the pile between the preview and `activate-next`; check the committed batch's audit against
-   the preview (set `1` and `--resume-pending` after its checks), publish it, set the margin by the
-   glossary's formula from its summary recorded right after the prepare run and qualified as in step 4
-   (the batch's growth is inside its measured drop), then restore
-   discovery and supervision with that batch (flag `run`, start the unit); otherwise keep 0, restore
-   supervision and ask the owner. Repeat for any change of admission scope or count. The gate runs
+   the preview (set `1` and `--resume-pending` after its checks), publish it, and only if its summary,
+   recorded right after the prepare run, qualified as in step 4 (the batch's growth is inside its
+   measured drop), set the margin by the glossary's formula from it, then restore discovery and
+   supervision with that batch (flag `run`, start the unit); if it did not qualify, run the next cycle
+   with that batch the same way; if the batch does not fit, keep 0, restore supervision and ask the
+   owner. Repeat for any change of admission scope or count. The gate runs
    wherever a candidate copy is about to be made, new or retained cycle; a resume whose candidate
    exists is not gated, so before restarting such a cycle after an operator stop, compare free bytes
    with its remaining envelope from its samples.
@@ -1927,9 +1934,10 @@ fit, hold the revert and report the shortfall: every retained cache role stays a
 of it needs the owner's yes. Run the old loop's first cycle
 under `prepare`, pass the frozen merger check and `research-coverage` against it (the root holds the
 new loop's linked cycles; any reported wallet holds the publication for the owner), set
-`PE_RANK_SCHEMA_TWO_CUTOVER=1` and run `--resume-pending`, verify the publication, set the old
-loop's `PE_RANK_MIN_FREE_GB` from that cycle's samples as in step 7 (its `.env` gets
-`PE_RANK_CAPACITY_SAMPLE_SECS=10` before that cycle), then write `run` and `enable --now` the old loop.
+`PE_RANK_SCHEMA_TWO_CUTOVER=1` and run `--resume-pending`, verify the publication, and once a summary
+qualified (that cycle's, or the next one-shot's, as in step 7) set the old loop's `PE_RANK_MIN_FREE_GB`
+from the latest qualified summary (its `.env` gets `PE_RANK_CAPACITY_SAMPLE_SECS=10` before that cycle),
+then write `run` and `enable --now` the old loop.
 
 ---
 
