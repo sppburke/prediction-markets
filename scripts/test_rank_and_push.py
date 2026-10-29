@@ -701,7 +701,7 @@ class RankAndPushScenario(unittest.TestCase):
         lines = [json.loads(line) for line in samples.read_text().splitlines()]  # every line complete again
         self.assertGreater(len(lines), first)  # the resumed run appended
         for line in lines:
-            self.assertEqual(sorted(line), ["dirs", "files", "free_bytes", "t"])
+            self.assertEqual(sorted(set(line) - {"mark"}), ["dirs", "files", "free_bytes", "t"])
             self.assertGreater(line["free_bytes"], 0)
         folded = subprocess.run(["python3", str(sampler), "summarize", str(samples)],
                                 capture_output=True, text=True, check=True)
@@ -709,6 +709,8 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(summary["peak_bytes"]["wallet_cache.transient.db"], 1_000_000)
         self.assertEqual(summary["min_free_bytes"], min(line["free_bytes"] for line in lines))
         self.assertEqual((summary["first_free_bytes"], summary["first_files"]), (lines[0]["free_bytes"], lines[0]["files"]))
+        self.assertEqual((summary["attempts"], summary["unterminated_attempts"]), (2, 0))
+        self.assertEqual([line.get("mark") for line in lines if "mark" in line], ["start", "end", "start", "end"])
         self.assertEqual(summary["samples"], len(lines))
         self.assertEqual((summary["first_t"], summary["last_t"]), (lines[0]["t"], lines[-1]["t"]))
         self.assertGreaterEqual(summary["largest_gap_s"], 0)
@@ -733,15 +735,17 @@ class RankAndPushScenario(unittest.TestCase):
         print("PASS: a sampler whose named parent is not its parent ends before sampling")
 
     def test_capacity_sampler_first_sample_precedes_every_stage(self):
-        # The background sampler starts 3 s late here; the margin's F0 and S0 must still be sampled before any stage.
+        # The background sampler starts only once the first stage has recorded what it saw, so the margin's F0 and S0
+        # exist at that stage only if the wrapper sampled before running it.
         scripts = self.root / "scripts"
         shutil.move(scripts / "capacity_sampler.py", scripts / "capacity_sampler_real.py")
         _write_exec(
             scripts / "capacity_sampler.py",
             "#!/usr/bin/env python3\n"
             "import os, sys, time\n"
-            'if "--once" not in sys.argv:\n'
-            "    time.sleep(3)\n"
+            'deadline = time.time() + 30\n'
+            'while "--once" not in sys.argv and not os.path.exists("sampled.log") and time.time() < deadline:\n'
+            "    time.sleep(0.05)\n"
             'real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "capacity_sampler_real.py")\n'
             "os.execv(sys.executable, [sys.executable, real, *sys.argv[1:]])\n",
         )
@@ -1041,7 +1045,7 @@ class RankAndPushScenario(unittest.TestCase):
             "import json, os, sys\n"
             "from pathlib import Path\n"
             'if "--validate-request" in sys.argv: raise SystemExit(0)\n'
-            f"variables = {list(CYCLE_SETTINGS.values())!r}\n"
+            f"variables = {[*CYCLE_SETTINGS.values(), 'PE_MARKET_RECURRENCES']!r}\n"
             'settings = {key: os.environ[key] for key in variables if key in os.environ}\n'
             'with open("cycle_probe.log", "a") as handle:\n'
             '    handle.write(json.dumps({"stage": sys.argv[1], "settings": settings}) + "\\n")\n'
@@ -1210,6 +1214,30 @@ class RankAndPushScenario(unittest.TestCase):
                     self.assertTrue(all(probe["settings"] == settings for probe in probes), probes)
                     self.assertEqual(configuration.read_bytes(), before)
                     self.assertFalse((self.root / "changed research").exists())
+
+    def test_cycle_settings_record_the_discovery_alias_and_clear_it_when_absent(self):
+        # The bootstrap configuration also reads PE_MARKET_RECURRENCES (config.rs `load`): a cycle records the value
+        # discovery used, and a resume restores it through the canonical variable or clears both spellings.
+        for recorded in ('["15m","5m"]', None):
+            with self.subTest(recorded=recorded):
+                self.tearDown(); self.setUp()
+                self._install_cycle_probe()
+                if recorded:
+                    with (self.root / ".env").open("a") as handle:
+                        handle.write(f"PE_MARKET_RECURRENCES={shlex.quote(recorded)}\n")
+                first = self._run(exit_env={"STUB_EXIT_events": "75"})
+                self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+                out = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
+                self.assertEqual(json.loads((out / "cycle_configuration.json").read_text()).get("market_recurrences"),
+                                 recorded)
+                with (self.root / ".env").open("a") as handle:
+                    handle.write("PE_MARKET_RECURRENCES='[\"5m\"]'\n")
+                (self.root / "cycle_probe.log").unlink()
+                resumed = self._run(exit_env={"PE_MARKET_RECURRENCES": '["5m"]'})
+                self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+                probes = [json.loads(line)["settings"] for line in self._log("cycle_probe.log").splitlines()]
+                want = {"PE_BOOTSTRAP_MARKET_RECURRENCES": recorded} if recorded else {}
+                self.assertTrue(probes and all(probe == want for probe in probes), probes)
 
     def test_unset_cycle_settings_preserve_configuration_bytes(self):
         result = self._run()
@@ -3715,11 +3743,22 @@ class CapacitySamplerUnitTest(unittest.TestCase):
         ]
         samples.write_text("".join(json.dumps(record) + "\n" for record in records) + '{"t": 1')  # torn last line
         self.assertEqual(self.sampler.summarize(samples), {
+            "attempts": 1, "unterminated_attempts": 1,
             "first_free_bytes": 900, "first_files": {"wallet_cache.db": 50},
             "min_free_bytes": 700, "min_free_at": 110.0,
             "peak_bytes": {"wallet_cache.db": 60, "c.db": 200, "parquet": 5},
             "samples": 3, "first_t": 100.0, "last_t": 135.5, "largest_gap_s": 25.5,
         })
+
+    def test_summary_counts_gaps_within_attempts_and_flags_an_unended_one(self):
+        samples = self.tmp / "attempts.jsonl"
+        def record(t, mark=None):
+            return {"t": t, "free_bytes": 500, "files": {}, "dirs": {}, **({"mark": mark} if mark else {})}
+        first = [record(0.0, "start"), record(10.0), record(12.0, "end")]
+        second = [record(200.0, "start"), record(209.0), record(215.0)]  # no end: the run did not end through its trap
+        samples.write_text("".join(json.dumps(line) + "\n" for line in first + second))
+        summary = self.sampler.summarize(samples)
+        self.assertEqual((summary["attempts"], summary["unterminated_attempts"], summary["largest_gap_s"]), (2, 1, 10.0))
 
     def _main(self, out, parents, *extra):
         sleeps = []

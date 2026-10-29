@@ -1863,14 +1863,15 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    its `.env` until 11/30 01:00 UTC (`PE_RANK_MARKET_SERIES` as above, `PE_RANK_MARKET_RECURRENCES=15m`),
    so a revert's cycles meet the frozen merger's list contract. Keep its flag `stop`.
 4. Capacity: proceed only if free bytes ≥ 3 × S + the old loop's last payout tables, spool and
-   exports + 50 GB, S being the seeds' certified complete-history size. These are estimates; the
-   first cycle's samples record the actual first free bytes (written before anything is staged) and the lowest
-   (everything the cycle consumed,
-   SQLite's sort scratch included: SQLite unlinks those files as it opens them) and the visible files'
-   peaks (installed, candidate, WAL, spool, exports): `python3 scripts/capacity_sampler.py summarize
-   <cycle>/capacity_samples.jsonl` folds them, and its `largest_gap_s` (at most about three sample
-   intervals) and `first_t`/`last_t` (around the cycle's start and its end) must show that the samples
-   cover the whole run, or the envelope does not qualify.
+   exports + the operator reserve (`_GLOSSARY.md` `rank_capacity_operator_reserve_gb`), S being the seeds'
+   certified complete-history size. These are estimates; the first cycle's samples record the actual first
+   free bytes (written before anything is staged) and the lowest (everything the cycle consumed, SQLite's
+   sort scratch included: SQLite unlinks those files as it opens them) and the visible files' peaks
+   (installed, candidate, WAL, spool, exports). Right after the prepare run, before the publication resume,
+   record `python3 scripts/capacity_sampler.py summarize <cycle>/capacity_samples.jsonl`: it qualifies the
+   envelope only with every attempt ended (`unterminated_attempts` 0) and a `largest_gap_s` within attempts
+   of at most about three sample intervals (between attempts no wrapper ran). Otherwise, keep the margin
+   from the estimate above and qualify the next cycle the same way, run as a one-shot under `prepare`.
 5. `cache-init` as above (rerun it right before the first cycle: it must report
    `already_initialized`).
 6. First cycle, supervisor off: set `PE_RANK_SCHEMA_TWO_CUTOVER=prepare` and
@@ -1885,7 +1886,7 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    run `--resume-pending` (a prepared request resumes only under `1`).
 7. After pe-service applies the batch and the research fetch accepts the linked cycle, set
    `PE_RANK_MIN_FREE_GB` by the formula in `_GLOSSARY.md` `rank_min_free_gb` from the first cycle's
-   samples (conservative: that drop includes the root's whole collection), write `run` to the new flag
+   recorded summary (conservative: that drop includes the root's whole collection), write `run` to the new flag
    and `systemctl --user enable --now pe-rank-loop-15m5m` with the activation batch at 0. Admission
    stays at 0 until a nonzero batch has its own envelope. To qualify one, first stop the supervisor
    at a publication boundary: write `stop` to its flag (atomic) while a cycle runs, so it stops in that
@@ -1900,7 +1901,8 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    (`PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS=0`; the leaderboard and datadash are already off), so nothing
    enters the pile between the preview and `activate-next`; check the committed batch's audit against
    the preview (set `1` and `--resume-pending` after its checks), publish it, set the margin by the
-   glossary's formula from its samples (the batch's growth is inside its measured drop), then restore
+   glossary's formula from its summary recorded right after the prepare run and qualified as in step 4
+   (the batch's growth is inside its measured drop), then restore
    discovery and supervision with that batch (flag `run`, start the unit); otherwise keep 0, restore
    supervision and ask the owner. Repeat for any change of admission scope or count. The gate runs
    wherever a candidate copy is about to be made, new or retained cycle; a resume whose candidate
@@ -1918,7 +1920,7 @@ deletes the pause record. `.forge_pause.json` must be absent before retirement o
 remaining record holds both (the wrapper exits 0 without retiring or admitting).
 
 **Revert** (owner's choice): flag-stop and disable the new loop at a boundary; prove the old loop's
-headroom (installed size + catch-up growth + spool + WAL + 50 GB) with the new loop's cache and
+headroom (installed size + catch-up growth + spool + WAL + the operator reserve) with the new loop's cache and
 research artifacts (cycle folders, links, requests, manifests, ranking CSVs) all kept. If it does not
 fit, hold the revert and report the shortfall: every retained cache role stays at its recorded path
 (activation and recovery need its regular files on one filesystem at the recorded paths); deleting any

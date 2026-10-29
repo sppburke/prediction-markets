@@ -8,12 +8,16 @@ size of every regular file directly in that folder (the installed cache, candida
 the byte total of each extra folder (--dir NAME=PATH; the wrapper passes the export folder). Free bytes measure
 everything the run consumes, SQLite's sort scratch included: SQLite unlinks those files as it opens them, so no folder
 total sees them. A resumed run of the same cycle appends to the same file, after dropping a last line a crash left
-unfinished. It never opens a database or reads any file's contents.
+unfinished. The wrapper marks each run's first sample `start` (taken before anything is staged) and the sample its exit
+trap takes after the run's children ended `end` (`--once --mark`). It never opens a database or reads any file's
+contents.
 
-`summarize SAMPLES`: the samples file folded into one JSON object: the first sample's free bytes and file sizes (before
-the run's candidate copy), the smallest free bytes and when, each name's largest size, the sample count, the first and last sample times and the largest gap between consecutive samples (a gap much
-longer than the interval means nothing was sampled then). A peak is caught when it lasts at least one interval. The
-samples file is the record; the summary is computed from it whenever it is needed (docs/26, capacity).
+`summarize SAMPLES`: the samples file folded into one JSON object: the run attempts (each from a `start` sample) and how
+many lack their `end` sample, the first sample's free bytes and file sizes (before the cycle's candidate copy), the
+smallest free bytes and when, each name's largest size, the sample count, the first and last sample times, and the
+largest gap between consecutive samples of one attempt (a gap much longer than the interval means nothing was sampled
+then; between attempts no wrapper ran). A peak is caught when it lasts at least one interval. The samples file is the
+record; the summary is computed from it whenever it is needed (docs/26, capacity).
 """
 
 import argparse
@@ -67,22 +71,29 @@ def summarize(path):
     records = [json.loads(line) for line in complete]
     if not records:
         raise SystemExit(f"{path}: no samples")
+    attempts = []
+    for record in records:
+        if record.get("mark") == "start" or not attempts:
+            attempts.append([])
+        attempts[-1].append(record)
+    gaps = [later["t"] - earlier["t"] for attempt in attempts for earlier, later in zip(attempt, attempt[1:])]
     lowest = min(records, key=lambda record: record["free_bytes"])
     peaks = {}
     for record in records:
         for name, size in [*record["files"].items(), *record["dirs"].items()]:
             peaks[name] = max(size, peaks.get(name, 0))
-    times = [record["t"] for record in records]
     return {
+        "attempts": len(attempts),
+        "unterminated_attempts": sum(attempt[-1].get("mark") != "end" for attempt in attempts),
         "first_free_bytes": records[0]["free_bytes"],
         "first_files": records[0]["files"],
         "min_free_bytes": lowest["free_bytes"],
         "min_free_at": lowest["t"],
         "peak_bytes": peaks,
         "samples": len(records),
-        "first_t": times[0],
-        "last_t": times[-1],
-        "largest_gap_s": round(max((b - a for a, b in zip(times, times[1:])), default=0.0), 1),
+        "first_t": records[0]["t"],
+        "last_t": records[-1]["t"],
+        "largest_gap_s": round(max(gaps, default=0.0), 1),
     }
 
 
@@ -96,6 +107,7 @@ def main():
     run.add_argument("--interval", type=float, required=True)
     run.add_argument("--dir", action="append", default=[], metavar="NAME=PATH")
     run.add_argument("--once", action="store_true")
+    run.add_argument("--mark", choices=("start", "end"))
     fold = commands.add_parser("summarize")
     fold.add_argument("samples")
     args = parser.parse_args()
@@ -106,6 +118,8 @@ def main():
     drop_unfinished_line(args.out)
     while os.getppid() == args.parent:
         record = sample(args.cache_dir, folders)
+        if args.mark:
+            record["mark"] = args.mark
         with open(args.out, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
         if args.once:

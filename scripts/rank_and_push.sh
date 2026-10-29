@@ -130,6 +130,13 @@ MIN_ACTIVE_MONTHS="0"
 LATENCY_SHIFT_SECS="2"
 FILL_WINDOW_SECS="120"
 TOP_N="200"
+# Settings recorded in each cycle's cycle_configuration.json when set and restored on its resumes, one per line: the key,
+# the variable the wrapper exports, then any alias the bootstrap configuration also reads (config.rs `load` reads
+# PE_<name> under PE_BOOTSTRAP_<name>), recorded by its effective value and cleared on restore.
+RANK_CYCLE_SETTINGS="market_recurrences PE_BOOTSTRAP_MARKET_RECURRENCES PE_MARKET_RECURRENCES
+rank_market_recurrences PE_RANK_MARKET_RECURRENCES
+rank_market_series PE_RANK_MARKET_SERIES
+research_link_dir PE_RANK_RESEARCH_LINK_DIR"
 # DuckDB read-layer (issue #375). Empty => resolved after .env (flag > .env > default).
 # ENGINE: auto (DuckDB over a fresh Parquet snapshot, else SQLite) | duck (require it) |
 # sqlite (force SQLite, skip the export). SKIP_EXPORT bypasses the Step-0a rewrite.
@@ -403,6 +410,8 @@ cleanup_rank_and_push() {
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
+  # The run's last capacity sample, once its children ended, closes its attempt (capacity_sampler.py summarize).
+  [[ -z "$SAMPLER_PID" ]] || "$PYTHON_BIN" "${SAMPLER[@]}" --once --mark end 8>&- 9>&- || true
   [[ -z "$CYCLE_TMP" ]] || rm -f "$CYCLE_TMP"
   [[ -z "$PIPELINE_VERSIONS_TMP" ]] || rm -f "$PIPELINE_VERSIONS_TMP"
   [[ -z "$CYCLE_CONFIG_TMP" ]] || rm -f "$CYCLE_CONFIG_TMP"
@@ -561,7 +570,7 @@ with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
     CYCLE_CONFIG_TMP="data/eval-results/.cycle_configuration.$$.json"
     CURRENT_CYCLE_TMP="data/eval-results/.cycle_manifest.$$.json"
     "$PE_BOOTSTRAP_BIN" pipeline-versions > "$PIPELINE_VERSIONS_TMP"
-    "$PYTHON_BIN" - "$CYCLE_CONFIG_TMP" \
+    RANK_CYCLE_SETTINGS="$RANK_CYCLE_SETTINGS" "$PYTHON_BIN" - "$CYCLE_CONFIG_TMP" \
       "$HALF_LIFE_DAYS" "$TTR_HOURS" "$PRICE_MIN" "$PRICE_MAX" "$FLOOR_TSTAT" \
       "$MIN_TRL" "$MIN_AVG_PER_MONTH" "$MIN_ACTIVE_MONTHS" "$LATENCY_SHIFT_SECS" \
       "$FILL_WINDOW_SECS" "$TOP_N" "$FRESH_LANE" <<'PY'
@@ -580,14 +589,10 @@ configuration = dict(zip(keys, sys.argv[2:-1], strict=True))
 # unchanged-day gate; the one-time cutover keeps it.
 if sys.argv[-1] == "1":
     configuration["cache_lane"] = "fresh_v2"
-for key, variable in (
-    ("market_recurrences", "PE_BOOTSTRAP_MARKET_RECURRENCES"),
-    ("rank_market_recurrences", "PE_RANK_MARKET_RECURRENCES"),
-    ("rank_market_series", "PE_RANK_MARKET_SERIES"),
-    ("research_link_dir", "PE_RANK_RESEARCH_LINK_DIR"),
-):
-    if variable in os.environ:
-        configuration[key] = os.environ[variable]
+for key, *variables in (line.split() for line in os.environ["RANK_CYCLE_SETTINGS"].splitlines()):
+    value = next((os.environ[variable] for variable in variables if variable in os.environ), None)
+    if value is not None:
+        configuration[key] = value
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(configuration, handle, sort_keys=True)
     handle.write("\n")
@@ -626,14 +631,14 @@ fi
 mkdir -p "$OUT_DIR"
 echo "RANK_AND_PUSH_RUN_DIR=$OUT_DIR"
 
-# Capacity samples for the drive-room margin (docs/26): free bytes and file sizes only, the first written before anything
-# is staged (the margin's F0 and S0), then every PE_RANK_CAPACITY_SAMPLE_SECS while this run lives; a resumed run of the
-# cycle appends. Unset = none. The sampler holds none of the run's locks (descriptors 8 and 9), so it can never block a
-# recovery.
+# Capacity samples for the drive-room margin (docs/26): free bytes and file sizes only, the first (`start`) written before
+# anything is staged (the margin's F0 and S0), then every PE_RANK_CAPACITY_SAMPLE_SECS while this run lives, and the last
+# (`end`) from the exit trap; a resumed run of the cycle appends. Unset = none. The sampler holds none of the run's locks
+# (descriptors 8 and 9), so it can never block a recovery.
 if [[ -n "${PE_RANK_CAPACITY_SAMPLE_SECS:-}" ]]; then
   SAMPLER=(scripts/capacity_sampler.py sample --parent "$$" --cache-dir "$(dirname -- "$(readlink -f -- "$DB")")"
     --out "$OUT_DIR/capacity_samples.jsonl" --interval "$PE_RANK_CAPACITY_SAMPLE_SECS" --dir "parquet=$PARQUET_DIR")
-  "$PYTHON_BIN" "${SAMPLER[@]}" --once 8>&- 9>&- ||
+  "$PYTHON_BIN" "${SAMPLER[@]}" --once --mark start 8>&- 9>&- ||
     { echo "FATAL: the capacity sampler could not write its first sample" >&2; exit 2; }
   "$PYTHON_BIN" "${SAMPLER[@]}" 8>&- 9>&- &
   SAMPLER_PID=$!
@@ -642,21 +647,18 @@ fi
 # Frozen cycle settings take precedence over the .env loaded on this invocation.
 # Pure re-push tails have no cycle manifest or frozen configuration to restore.
 if [[ "$CYCLE_RESUMED" == "1" || ( "$RESUME_PENDING" == "1" && -f "$OUT_DIR/cycle_manifest.json" ) ]]; then
-  FROZEN_CYCLE_ENV="$("$PYTHON_BIN" - "$OUT_DIR/cycle_configuration.json" <<'PY'
+  FROZEN_CYCLE_ENV="$(RANK_CYCLE_SETTINGS="$RANK_CYCLE_SETTINGS" "$PYTHON_BIN" - "$OUT_DIR/cycle_configuration.json" <<'PY'
 import json
+import os
 import shlex
 import sys
 
 configuration = json.load(open(sys.argv[1], encoding="utf-8"))
-for key, variable in (
-    ("market_recurrences", "PE_BOOTSTRAP_MARKET_RECURRENCES"),
-    ("rank_market_recurrences", "PE_RANK_MARKET_RECURRENCES"),
-    ("rank_market_series", "PE_RANK_MARKET_SERIES"),
-    ("research_link_dir", "PE_RANK_RESEARCH_LINK_DIR"),
-):
+for key, *variables in (line.split() for line in os.environ["RANK_CYCLE_SETTINGS"].splitlines()):
     if key in configuration:
-        print(f"export {variable}={shlex.quote(configuration[key])}")
-    else:
+        print(f"export {variables[0]}={shlex.quote(configuration[key])}")
+        variables = variables[1:]
+    for variable in variables:
         print(f"unset {variable}")
 PY
 )"
@@ -737,7 +739,7 @@ if [[ "$SKIP_RANK" == "0" && ! -f "$PIPELINE_VERSIONS_FILE" ]]; then
   "$PE_BOOTSTRAP_BIN" pipeline-versions > "$PIPELINE_VERSIONS_FILE"
 fi
 if [[ "$CUTOVER_MODE" == "1" && ! -f "$OUT_DIR/cycle_manifest.json" ]]; then
-  "$PYTHON_BIN" - "$OUT_DIR/cycle_configuration.json" \
+  RANK_CYCLE_SETTINGS="$RANK_CYCLE_SETTINGS" "$PYTHON_BIN" - "$OUT_DIR/cycle_configuration.json" \
     "$HALF_LIFE_DAYS" "$TTR_HOURS" "$PRICE_MIN" "$PRICE_MAX" \
     "$FLOOR_TSTAT" "$MIN_TRL" "$MIN_AVG_PER_MONTH" "$MIN_ACTIVE_MONTHS" \
     "$LATENCY_SHIFT_SECS" "$FILL_WINDOW_SECS" "$TOP_N" <<'PY'
@@ -750,14 +752,10 @@ keys = [
     "fill_window_secs", "top_n",
 ]
 configuration = dict(zip(keys, sys.argv[2:], strict=True))
-for key, variable in (
-    ("market_recurrences", "PE_BOOTSTRAP_MARKET_RECURRENCES"),
-    ("rank_market_recurrences", "PE_RANK_MARKET_RECURRENCES"),
-    ("rank_market_series", "PE_RANK_MARKET_SERIES"),
-    ("research_link_dir", "PE_RANK_RESEARCH_LINK_DIR"),
-):
-    if variable in os.environ:
-        configuration[key] = os.environ[variable]
+for key, *variables in (line.split() for line in os.environ["RANK_CYCLE_SETTINGS"].splitlines()):
+    value = next((os.environ[variable] for variable in variables if variable in os.environ), None)
+    if value is not None:
+        configuration[key] = value
 with open(sys.argv[1], "w", encoding="utf-8") as destination:
     json.dump(configuration, destination, sort_keys=True)
     destination.write("\n")
