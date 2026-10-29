@@ -746,6 +746,8 @@ class RankAndPushScenario(unittest.TestCase):
             'deadline = time.time() + 30\n'
             'while "--once" not in sys.argv and not os.path.exists("sampled.log") and time.time() < deadline:\n'
             "    time.sleep(0.05)\n"
+            'if "--once" not in sys.argv and not os.path.exists("sampled.log"):\n'
+            "    raise SystemExit(0)  # never sample before the first stage recorded what it saw\n"
             'real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "capacity_sampler_real.py")\n'
             "os.execv(sys.executable, [sys.executable, real, *sys.argv[1:]])\n",
         )

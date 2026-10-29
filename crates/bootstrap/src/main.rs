@@ -458,7 +458,12 @@ async fn main() {
             let result = match sub {
                 "cache-init" => match (wallets_file_arg.as_deref(), drops_from_arg.as_deref()) {
                     // The inputs are verified before the lock file is created: bad input touches nothing.
-                    (Some(wallets), Some(drops_from)) => SeedPlan::read(wallets, drops_from)
+                    (Some(wallets), Some(drops_from)) => pe_bootstrap::cache_migration::require_init_roles(
+                        &bootstrap_config.cache_path,
+                        wallets,
+                        drops_from,
+                    )
+                    .and_then(|()| SeedPlan::read(wallets, drops_from))
                         .and_then(|plan| {
                             pe_bootstrap::lock::CacheMutationLock::acquire(
                                 &bootstrap_config.cache_path,

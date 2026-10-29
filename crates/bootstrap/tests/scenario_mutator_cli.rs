@@ -106,6 +106,33 @@ fn cache_init_cli_refuses_bad_input_before_touching_the_target() {
     // Neither the cache nor its lock file exists: the inputs were refused before the lock.
     assert!(!cache_path.exists());
     assert!(!pe_bootstrap::lock::lock_path_for(&cache_path).exists());
+
+    // An input that is a file initialization removes (the unfinished copy) or truncates (the lock) is refused
+    // before anything changes, so a source cache placed there survives.
+    std::fs::write(root.join("seeds.txt"), format!("{}\n", wallet_hex(0x61))).unwrap();
+    for collision in ["fresh.db.init", "fresh.db.lock"] {
+        std::fs::write(root.join(collision), b"old cache bytes").unwrap();
+        let output = run_cli(
+            root,
+            &cache_path,
+            &[
+                "cache-init",
+                "--wallets",
+                "seeds.txt",
+                "--drops-from",
+                collision,
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert!(stderr.contains("is not an independent file"), "{stderr}");
+        assert_eq!(
+            std::fs::read(root.join(collision)).unwrap(),
+            b"old cache bytes"
+        );
+        assert!(!cache_path.exists());
+        std::fs::remove_file(root.join(collision)).unwrap();
+    }
 }
 
 #[test]

@@ -47,6 +47,25 @@ pub struct SeedPlan {
     carried: Carried,
 }
 
+/// Before anything is read or written: neither input may be a file that initializing `target` writes, removes or
+/// truncates (the cache, its unfinished copy and that copy's journals, the lock file), by path or by inode.
+pub fn require_init_roles(
+    target: &Path,
+    wallets_path: &Path,
+    drops_from: &Path,
+) -> Result<(), BootstrapError> {
+    let unfinished = sidecar_path(target, ".init");
+    require_distinct_files(&[
+        ("--drops-from", drops_from),
+        ("--wallets", wallets_path),
+        ("--db", target),
+        ("--db's unfinished copy", &unfinished),
+        ("its WAL", &sidecar_path(&unfinished, "-wal")),
+        ("its shared memory", &sidecar_path(&unfinished, "-shm")),
+        ("--db's lock", &lock_target_path(target)?),
+    ])
+}
+
 impl SeedPlan {
     /// The seed list (`wallets_path`) and what the finalized format-three cache `drops_from`
     /// hands on (see [`Carried`]), both validated.

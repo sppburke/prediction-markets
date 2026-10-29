@@ -14726,7 +14726,9 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 ));
                 abandon_candidate(&out, &side, &error);
             }
-            let (out, side, _, _) = prepare_cycle(i64::from(cycle) + 30);
+            // A day ahead: a cycle the wrapper names by the current second can never take a prepared cycle's name
+            // (and its staging evidence), however long the run takes.
+            let (out, side, _, _) = prepare_cycle(i64::from(cycle) + 86_400);
             let source = DatasetFetcher {
                 rows: activity_rows.lock().unwrap().clone(),
                 ..Default::default()
