@@ -157,8 +157,12 @@ class RankAndPushScenario(unittest.TestCase):
             'json.dump({"version": int(os.environ.get("STUB_EXPORT_VERSION", "2"))}, open(os.path.join(out, "schema_v2_export_manifest.json"), "w"))\n'
             'transient = os.environ.get("STUB_TRANSIENT")\n'
             'if transient:\n'
-            '    import time\n'
-            '    open(transient, "wb").write(b"x" * 1_000_000); time.sleep(2.5); os.unlink(transient)\n'
+            '    import glob, time\n'
+            '    open(transient, "wb").write(b"x" * 1_000_000)\n'
+            '    name = os.path.basename(transient); deadline = time.time() + 30\n'
+            '    while time.time() < deadline and not any(name in line for path in glob.glob("data/eval-results/cron-*/capacity_samples.jsonl") for line in open(path)):\n'
+            '        time.sleep(0.05)\n'
+            '    os.unlink(transient)\n'
             'raise SystemExit(int(os.environ.get("STUB_EXIT_export", "0")))\n',
         )
         _write_exec(
@@ -613,65 +617,103 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual([e for s, e in pairs if s == "events"], [""], "events saw a leaked var")
         print("PASS: FETCH_RESOLUTIONS unset for discovery/backfill/events, =1 only for resolutions")
 
-    def test_capacity_gate_stops_before_a_new_cycle_and_never_gates_a_resume(self):
+    def _df_stub(self, avail):
+        """A `df` first on PATH that reports AVAIL free bytes for any path (the gate's only free-space source)."""
+        stub = self.root / "stub-bin"
+        stub.mkdir(exist_ok=True)
+        _write_exec(stub / "df", f'#!/usr/bin/env bash\nprintf "Avail\\n%s\\n" "{avail}"\n')
+        return {"PATH": f"{stub}:{os.environ['PATH']}"}
+
+    def test_capacity_gate_refuses_a_copy_without_room_and_never_gates_a_staged_resume(self):
         cycle = self.root / "data/eval-results/rank_and_push.cycle"
-        short = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "999999999"})
+        installed = os.stat(os.path.realpath(self.root / "data" / "wallet_cache.db")).st_size
+        need = installed + 1_000_000_000  # PE_RANK_MIN_FREE_GB=1
+        # One byte short, though far more than the margin alone: the installed cache's size counts.
+        short = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(need - 1)})
         self.assertEqual(short.returncode, 2, short.stdout + short.stderr)
-        self.assertIn("FATAL: capacity: free_bytes=", short.stderr)
+        self.assertIn(f"FATAL: capacity: free_bytes={need - 1} need_bytes={need} ", short.stderr)
         self.assertFalse(cycle.exists())
         self.assertIsNone(self._log("rank.log"))
-        bad = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "ten"})
-        self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
-        self.assertIn("PE_RANK_MIN_FREE_GB must be a whole number", bad.stderr)
+        for bad in ("ten", "020", "1000000"):  # not a number, octal to Bash, past the overflow-safe six digits
+            r = self._run(exit_env={"PE_RANK_MIN_FREE_GB": bad})
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("PE_RANK_MIN_FREE_GB must be a whole number of GB", r.stderr)
         self.assertFalse(cycle.exists())
         retained = self._run(exit_env={"STUB_EXIT_events": "75"})
         self.assertEqual(retained.returncode, 75, retained.stdout + retained.stderr)
         self.assertTrue(cycle.exists())
-        resumed = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "999999999"})
-        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
-        self.assertNotIn("FATAL: capacity", resumed.stderr)
-        roomy = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "0"})
-        self.assertEqual(roomy.returncode, 0, roomy.stdout + roomy.stderr)
-        print("PASS: capacity gate stops before a new cycle; resumes and roomy drives proceed")
+        (run_dir,) = self.root.glob("data/eval-results/cron-*")
+        # Retained before its candidate copy existed: the resume makes the copy, so it is gated.
+        unstaged = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(need - 1)})
+        self.assertEqual(unstaged.returncode, 2, unstaged.stdout + unstaged.stderr)
+        self.assertIn("FATAL: capacity", unstaged.stderr)
+        self.assertTrue(cycle.exists())
+        side = Path(os.path.realpath(self.root / "data" / "wallet_cache.db")).parent / f"wallet_cache.{run_dir.name}.side.db"
+        side.write_bytes(b"")
+        staged = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(0)})
+        self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+        self.assertNotIn("FATAL: capacity", staged.stderr)
+        exact = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(need)})
+        self.assertEqual(exact.returncode, 0, exact.stdout + exact.stderr)
+        print("PASS: capacity gate refuses a copy one byte short; staged resumes and exact room proceed")
 
     def test_capacity_sampler_is_off_unless_configured(self):
         r = self._run()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(list(self.root.glob("data/eval-results/cron-*/capacity_*")), [])
         self.assertNotIn("capacity_sampler.py", self.python_log.read_text())
-        bad = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "0"})
-        self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
-        self.assertIn("PE_RANK_CAPACITY_SAMPLE_SECS must be a whole number", bad.stderr)
+        for bad in ("0", "010", "1000000"):
+            r = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": bad})
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("PE_RANK_CAPACITY_SAMPLE_SECS must be a whole number", r.stderr)
         print("PASS: no capacity samples unless PE_RANK_CAPACITY_SAMPLE_SECS is set")
 
     def test_capacity_sampler_keeps_a_transient_peak_and_ends_with_the_run(self):
         transient = self.root / "data" / "wallet_cache.transient.db"
-        sampler = str(self.root / "scripts" / "capacity_sampler.py")
+        sampler = self.root / "scripts" / "capacity_sampler.py"
         retained = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "1", "STUB_EXIT_events": "75"})
         self.assertEqual(retained.returncode, 75, retained.stdout + retained.stderr)
         (run_dir,) = self.root.glob("data/eval-results/cron-*")
         samples = run_dir / "capacity_samples.jsonl"
         first = len(samples.read_text().splitlines())
         self.assertGreaterEqual(first, 1)
+        with open(samples, "a", encoding="utf-8") as handle:
+            handle.write('{"t": 1')  # a line a crash left unfinished
         resumed = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "1", "STUB_TRANSIENT": str(transient)})
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
-        lines = [json.loads(line) for line in samples.read_text().splitlines()]
-        self.assertGreater(len(lines), first + 1)  # the resumed run appended
+        self.assertFalse(transient.exists())
+        lines = [json.loads(line) for line in samples.read_text().splitlines()]  # every line complete again
+        self.assertGreater(len(lines), first)  # the resumed run appended
         for line in lines:
             self.assertEqual(sorted(line), ["dirs", "files", "free_bytes", "t"])
             self.assertGreater(line["free_bytes"], 0)
-        summary = json.loads((run_dir / "capacity_summary.json").read_text())
-        self.assertFalse(transient.exists())
+        folded = subprocess.run(["python3", str(sampler), "summarize", str(samples)],
+                                capture_output=True, text=True, check=True)
+        summary = json.loads(folded.stdout)
         self.assertEqual(summary["peak_bytes"]["wallet_cache.transient.db"], 1_000_000)
         self.assertEqual(summary["min_free_bytes"], min(line["free_bytes"] for line in lines))
         self.assertEqual(summary["samples"], len(lines))
+        self.assertEqual((summary["first_t"], summary["last_t"]), (lines[0]["t"], lines[-1]["t"]))
+        self.assertGreaterEqual(summary["largest_gap_s"], 0)
         for proc in Path("/proc").iterdir():
             try:
                 cmdline = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode()
             except (OSError, ValueError):
                 continue
-            self.assertNotIn(sampler, cmdline, "the sampler outlived its run")
-        print("PASS: capacity samples keep a transient peak, carry over a resume and end with the run")
+            roots = {str(self.root), os.path.realpath(self.root)}
+            self.assertFalse("capacity_sampler.py" in cmdline and any(root in cmdline for root in roots),
+                             f"the sampler outlived its run: {cmdline}")
+        print("PASS: capacity samples keep a transient peak, survive a torn line, append on resume, end with the run")
+
+    def test_capacity_sampler_ends_at_once_when_its_parent_is_gone(self):
+        out = self.root / "orphan.jsonl"
+        ended = subprocess.run(
+            ["python3", str(self.root / "scripts" / "capacity_sampler.py"), "sample", "--parent", str(2**22 + 1),
+             "--cache-dir", str(self.root / "data"), "--out", str(out), "--interval", "1"],
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(ended.returncode, 0, ended.stderr)
+        self.assertFalse(out.exists() and out.read_text(), "an orphaned sampler recorded samples")
+        print("PASS: a sampler whose named parent is not its parent ends before sampling")
 
     def test_backfill_partial_exit2_does_not_abort(self):
         r = self._run(exit_env={"STUB_EXIT_backfill": "2"})

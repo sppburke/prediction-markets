@@ -391,7 +391,8 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 - 2026-10-28 (15/5-minute loop): `/series?exclude_events=true` (paged, 2,525 rows at 17:10 CT) listed
   recurrence `15m` on 10 series (the eight crypto windows plus `gold` and `silver`) and `5m` on 8
   (`eth, btc, xrp, sol, doge, bnb, hype, zec`). Participant discovery and the ranking scope now
-  filter the same listing by a recurrence set (`bootstrap_market_recurrences`). A market of each
+  filter the same listing, each by its own recurrence set (`bootstrap_market_recurrences` and the
+  wrapper's `PE_RANK_MARKET_RECURRENCES`, both in `_GLOSSARY.md`). A market of each
   of the 18 series (16 at 21:40 CT; the two `zec` series, which that paged listing did not
   return, fetched by id at 23:47 CT) carried `feeType` `crypto_fees_v2` with `feeSchedule`
   `{"exponent":1,"rate":0.07,"takerOnly":true,"rebateRate":0.2}`, equal to pass 2's taker rate.

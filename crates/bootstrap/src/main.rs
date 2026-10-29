@@ -2,11 +2,10 @@ use pe_bootstrap::{
     BootstrapConfig, backfill,
     cache::WalletCache,
     cache_migration::{
-        CacheActivationRequest, PriorCacheBinding, SupabasePublicationProbe,
-        activate_cache_v2_with_handoff, finalize_cache_v2_with_export_manifest, init_seeded_cache,
-        migrate_cache_v2, populate_activity_bulk_root_v2_with_clock,
-        populate_activity_fresh_v2_with_clock, populate_activity_v2,
-        restore_prior_cache_with_final_stage_record, stage_cache_cycle_v2,
+        CacheActivationRequest, PriorCacheBinding, SeedPlan, SupabasePublicationProbe,
+        activate_cache_v2_with_handoff, finalize_cache_v2_with_export_manifest, migrate_cache_v2,
+        populate_activity_bulk_root_v2_with_clock, populate_activity_fresh_v2_with_clock,
+        populate_activity_v2, restore_prior_cache_with_final_stage_record, stage_cache_cycle_v2,
         verify_frozen_payload_v1,
     },
     config, coverage,
@@ -458,13 +457,14 @@ async fn main() {
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
             let result = match sub {
                 "cache-init" => match (wallets_file_arg.as_deref(), drops_from_arg.as_deref()) {
-                    (Some(wallets), Some(drops_from)) => {
-                        pe_bootstrap::lock::CacheMutationLock::acquire(&bootstrap_config.cache_path)
-                            .and_then(|_lock| {
-                                init_seeded_cache(&bootstrap_config, wallets, drops_from)
-                                    .and_then(json_report)
-                            })
-                    }
+                    // The inputs are verified before the lock file is created: bad input touches nothing.
+                    (Some(wallets), Some(drops_from)) => SeedPlan::read(wallets, drops_from)
+                        .and_then(|plan| {
+                            pe_bootstrap::lock::CacheMutationLock::acquire(
+                                &bootstrap_config.cache_path,
+                            )
+                            .and_then(|_lock| plan.init(&bootstrap_config).and_then(json_report))
+                        }),
                     _ => Err(BootstrapError::Invalid {
                         message: "cache-init requires --wallets and --drops-from".to_owned(),
                     }),

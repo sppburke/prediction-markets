@@ -57,7 +57,7 @@ mod projection_digest;
 mod projection_v3;
 mod seed;
 pub use projection_v3::{ClassificationReport, ExportProjectionSummary};
-pub use seed::{SeededCacheReport, init_seeded_cache};
+pub use seed::{SeedPlan, SeededCacheReport, init_seeded_cache};
 #[cfg(target_os = "linux")]
 mod walk_prefetch;
 use digests::{JsonArrayDigest, ReceiptSetDigest};

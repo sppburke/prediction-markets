@@ -262,12 +262,13 @@ fi
 # would leave the push stage without credentials.
 set -a; source ./.env; set +a
 MIN_TTR_SECS=60
-# Drive-room settings (docs/26), checked before anything runs so a bad value is never silently ignored.
-[[ -z "${PE_RANK_MIN_FREE_GB:-}" || "$PE_RANK_MIN_FREE_GB" =~ ^[0-9]+$ ]] || {
-  echo "FATAL: PE_RANK_MIN_FREE_GB must be a whole number of GB" >&2; exit 2;
+# Drive-room settings (docs/26), checked before anything runs so a bad value is never silently ignored. Decimal digits
+# without a leading zero (Bash arithmetic reads one as octal), at most six, so the byte sums cannot overflow.
+[[ -z "${PE_RANK_MIN_FREE_GB:-}" || "$PE_RANK_MIN_FREE_GB" =~ ^(0|[1-9][0-9]{0,5})$ ]] || {
+  echo "FATAL: PE_RANK_MIN_FREE_GB must be a whole number of GB (0 to 999999)" >&2; exit 2;
 }
-[[ -z "${PE_RANK_CAPACITY_SAMPLE_SECS:-}" || "$PE_RANK_CAPACITY_SAMPLE_SECS" =~ ^[1-9][0-9]*$ ]] || {
-  echo "FATAL: PE_RANK_CAPACITY_SAMPLE_SECS must be a whole number of seconds" >&2; exit 2;
+[[ -z "${PE_RANK_CAPACITY_SAMPLE_SECS:-}" || "$PE_RANK_CAPACITY_SAMPLE_SECS" =~ ^[1-9][0-9]{0,5}$ ]] || {
+  echo "FATAL: PE_RANK_CAPACITY_SAMPLE_SECS must be a whole number of seconds (1 to 999999)" >&2; exit 2;
 }
 
 # Neutralize PE_BOOTSTRAP_FETCH_RESOLUTIONS for the `backfill` stage (issue #383). `.env` sets
@@ -509,10 +510,30 @@ fi
 # The schema-two candidate lane (#588) is a cycle property: chosen when the cycle
 # is created and read back from its frozen configuration on every resume.
 FRESH_LANE="0"
+# Capacity gate (docs/26): a candidate copy is made only while the installed cache's filesystem holds the cache's size
+# plus PE_RANK_MIN_FREE_GB (10^9 bytes); otherwise stop here, before anything is staged (a new cycle also before its
+# pointer is written). A resume whose candidate exists, or a publication resume, makes no copy and is never gated.
+capacity_gate() {
+  [[ -n "${PE_RANK_MIN_FREE_GB:-}" ]] || return 0
+  local installed_real installed_bytes free_bytes need_bytes
+  installed_real="$(readlink -f -- "$DB")"
+  installed_bytes="$(stat -c %s -- "$installed_real")"
+  free_bytes="$(df -B1 --output=avail -- "$installed_real" | tail -n 1 | tr -d ' ')"
+  [[ "$installed_bytes" =~ ^[0-9]+$ && "$free_bytes" =~ ^[0-9]+$ ]] || {
+    echo "FATAL: capacity gate cannot read the installed cache's size or free space" >&2; exit 2;
+  }
+  need_bytes=$((installed_bytes + PE_RANK_MIN_FREE_GB * 1000000000))
+  if (( free_bytes < need_bytes )); then
+    echo "FATAL: capacity: free_bytes=$free_bytes need_bytes=$need_bytes (installed $installed_bytes + PE_RANK_MIN_FREE_GB=$PE_RANK_MIN_FREE_GB); no candidate copy made" >&2
+    exit 2
+  fi
+}
 if [[ "$PRODUCTION_CYCLE" == "1" ]]; then
   if [[ -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
     OUT_DIR="$(validate_cycle_pointer)" || exit $?
     CYCLE_RESUMED="1"
+    # A cycle retained before its candidate copy completed makes that copy again.
+    [[ -e "$(dirname -- "$(readlink -f -- "$DB")")/wallet_cache.$(basename -- "$OUT_DIR").side.db" ]] || capacity_gate
     [[ -f "$OUT_DIR/cycle_manifest.json" && ! -L "$OUT_DIR/cycle_manifest.json" ]] || {
       echo "FATAL: resumed production cycle omitted its frozen cycle manifest" >&2
       exit 2
@@ -522,22 +543,7 @@ configuration = json.load(open(sys.argv[1], encoding="utf-8"))
 print(1 if configuration.get("cache_lane") == "fresh_v2" else 0)' "$OUT_DIR/cycle_configuration.json")"
     echo "RANK_AND_PUSH_CYCLE_RESUME=$OUT_DIR"
   else
-    # Capacity gate: a new cycle starts only while the installed cache's filesystem holds the cache's size plus
-    # PE_RANK_MIN_FREE_GB (10^9 bytes); otherwise stop here, between cycles, before anything is staged. A resumed
-    # cycle was budgeted when it began and is never gated.
-    if [[ -n "${PE_RANK_MIN_FREE_GB:-}" ]]; then
-      INSTALLED_REAL="$(readlink -f -- "$DB")"
-      INSTALLED_BYTES="$(stat -c %s -- "$INSTALLED_REAL")"
-      FREE_BYTES="$(df -B1 --output=avail -- "$INSTALLED_REAL" | tail -n 1 | tr -d ' ')"
-      [[ "$INSTALLED_BYTES" =~ ^[0-9]+$ && "$FREE_BYTES" =~ ^[0-9]+$ ]] || {
-        echo "FATAL: capacity gate cannot read the installed cache's size or free space" >&2; exit 2;
-      }
-      NEED_BYTES=$((INSTALLED_BYTES + PE_RANK_MIN_FREE_GB * 1000000000))
-      if (( FREE_BYTES < NEED_BYTES )); then
-        echo "FATAL: capacity: free_bytes=$FREE_BYTES need_bytes=$NEED_BYTES (installed $INSTALLED_BYTES + PE_RANK_MIN_FREE_GB=$PE_RANK_MIN_FREE_GB); no new cycle started" >&2
-        exit 2
-      fi
-    fi
+    capacity_gate
     INSTALLED_SCHEMA="$("$PYTHON_BIN" -c 'import sqlite3, sys
 with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
     schema = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -621,13 +627,13 @@ mkdir -p "$OUT_DIR"
 echo "RANK_AND_PUSH_RUN_DIR=$OUT_DIR"
 
 # Capacity samples for the drive-room margin (docs/26): free bytes and file sizes only, every
-# PE_RANK_CAPACITY_SAMPLE_SECS while this run lives; a resumed run of the cycle appends. Unset = none.
+# PE_RANK_CAPACITY_SAMPLE_SECS while this run lives; a resumed run of the cycle appends. Unset = none. The sampler holds
+# none of the run's locks (descriptors 8 and 9), so it can never block a recovery.
 if [[ -n "${PE_RANK_CAPACITY_SAMPLE_SECS:-}" ]]; then
-  SAMPLER_ARGS=(--cache-dir "$(dirname -- "$(readlink -f -- "$DB")")" --out "$OUT_DIR/capacity_samples.jsonl"
-    --summary "$OUT_DIR/capacity_summary.json" --interval "$PE_RANK_CAPACITY_SAMPLE_SECS"
-    --dir "parquet=$PARQUET_DIR")
+  SAMPLER_ARGS=(sample --parent "$$" --cache-dir "$(dirname -- "$(readlink -f -- "$DB")")"
+    --out "$OUT_DIR/capacity_samples.jsonl" --interval "$PE_RANK_CAPACITY_SAMPLE_SECS" --dir "parquet=$PARQUET_DIR")
   [[ -z "${SQLITE_TMPDIR:-}" ]] || SAMPLER_ARGS+=(--dir "sqlite_tmp=$SQLITE_TMPDIR")
-  "$PYTHON_BIN" scripts/capacity_sampler.py "${SAMPLER_ARGS[@]}" &
+  "$PYTHON_BIN" scripts/capacity_sampler.py "${SAMPLER_ARGS[@]}" 8>&- 9>&- &
   SAMPLER_PID=$!
 fi
 

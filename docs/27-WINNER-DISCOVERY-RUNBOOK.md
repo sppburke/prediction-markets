@@ -27,7 +27,7 @@ defaults"):
 ```
 PE_BOOTSTRAP_LEADERBOARD_BASE_URL        # override leaderboard host (testing)
 PE_BOOTSTRAP_LEADERBOARD_TOP_N           # list depth; paged (canonical default in _GLOSSARY.md); 0 disables the source
-PE_BOOTSTRAP_MARKET_RECURRENCES          # participant markets' Gamma recurrences, TOML array (default ["15m"])
+PE_BOOTSTRAP_MARKET_RECURRENCES          # participant markets' Gamma recurrences, TOML array (canonical default in _GLOSSARY.md)
 PE_BOOTSTRAP_DATADASH_API_URL            # default https://api.datadash.xyz (on by default; "" disables)
 PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS    # recent market lookback; 0 disables with no HTTP
 PE_BOOTSTRAP_CACHE_PATH                  # default wallet_cache.db

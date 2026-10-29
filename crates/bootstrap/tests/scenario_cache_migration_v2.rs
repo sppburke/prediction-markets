@@ -14128,16 +14128,12 @@ async fn staging_interruption_refuses_source_drift_and_checks_before_copying() {
 const PUBLICATION_PRINT_WALLET: &str = "0x5555555555555555555555555555555555555555";
 
 fn publication_dataset(now: i64, quiet: &str) -> (Vec<Value>, Vec<Value>) {
-    publication_dataset_sized(now, quiet, 20)
-}
-
-fn publication_dataset_sized(now: i64, quiet: &str, size: i64) -> (Vec<Value>, Vec<Value>) {
     let mut rows = Vec::new();
     let mut markets = Vec::new();
     // Whole hours keep each entry clear of the same-day horizon's floor before UTC midnight; ten
     // days give the survivor the distinct entry days its day-clustered t needs.
     let old = (now - 40 * 86_400).div_euclid(3_600) * 3_600;
-    for index in 0..size {
+    for index in 0..20 {
         let market = format!("0x{:064x}", index + 100);
         let token = (1000 + 2 * index).to_string();
         let entry = old + (index % 10) * 86_400 + (index / 10) * 3_600;
@@ -20957,6 +20953,37 @@ async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
             .contains("not this initialized, uncollected"),
         "{error}"
     );
+    // A collection that stored no trades still stamps its wallets, and a data table it wrote is
+    // no longer empty: either one is a collected cache, refused and left as it is.
+    for (name, edit) in [
+        (
+            "stamped.db",
+            "UPDATE wallets SET last_polymarket_fetch_at = 1, forward_frontier_unix = 2",
+        ),
+        (
+            "cursor.db",
+            "INSERT INTO source_cursor VALUES ('clob_closed', '', 1)",
+        ),
+    ] {
+        let config = BootstrapConfig {
+            cache_path: dir.path().join(name),
+            ..Default::default()
+        };
+        init(&format!("{WALLET}\n"), &old, &config).unwrap();
+        Connection::open(&config.cache_path)
+            .unwrap()
+            .execute_batch(edit)
+            .unwrap();
+        let before = std::fs::read(&config.cache_path).unwrap();
+        let error = init(&format!("{WALLET}\n"), &old, &config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not this initialized, uncollected"),
+            "{name}: {error}"
+        );
+        assert_eq!(std::fs::read(&config.cache_path).unwrap(), before, "{name}");
+    }
 
     // The new cache's history lacks the conversion that triggered each drop; WALLET_B arrives
     // through discovery after initialization (and, in `delayed`, only a generation later).
@@ -21023,6 +21050,22 @@ async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
         count(&delayed, "SELECT COUNT(*) FROM activity_seed_drops_v3"),
         1
     );
+    // A seeded cache used as the old cache hands on a carried row that still waits.
+    let reseeded = BootstrapConfig {
+        cache_path: dir.path().join("reseeded.db"),
+        ..Default::default()
+    };
+    let report = init(&format!("{WALLET}\n"), &delayed, &reseeded).unwrap();
+    assert_eq!(report.wallets_with_drops, 2);
+    let waiting: String = Connection::open(&reseeded.cache_path)
+        .unwrap()
+        .query_row(
+            "SELECT scope_drops_json FROM activity_seed_drops_v3 WHERE wallet_hex = ?1",
+            [WALLET_B],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rusqlite::types::Value::Text(waiting), later_drops);
     for (name, edit) in [
         (
             "changed.db",
@@ -21367,4 +21410,73 @@ async fn real_wrapper_seeded_loop_prepares_and_publishes() {
             .any(|request| request.contains("/events/keyset") && request.contains("series_id=8"))
     );
     venue.stop();
+}
+
+/// AC4: a cache without the carried-drop table keeps main's projection and digests; this fixture's
+/// values were computed by this same test at 82a2080, before the carried-drop change.
+#[tokio::test]
+async fn whole_market_cache_keeps_main_projection_and_digests() {
+    let dir = TempDir::new().unwrap();
+    let cache = dataset_candidate(&dir, "whole.db", &[WALLET_B]);
+    let history = |wallet: &str| {
+        let row = |market: &str, id: &str, epoch: i64| {
+            let mut row = dataset_row(wallet, market, &format!("{wallet}-{id}"), "BUY", epoch);
+            row["asset"] = Value::from(if market == "0xb" { "200" } else { "100" });
+            row
+        };
+        let mut conversion = row("\\xe", "conversion", FRESH_END - 2);
+        conversion["type"] = Value::from("CONVERSION");
+        vec![
+            row("0xa", "before-drop", FRESH_END - 3),
+            row("0xb", "beside-drop", FRESH_END - 2),
+            conversion,
+        ]
+    };
+    let fetcher = DatasetFetcher {
+        rows: [history(WALLET), history(WALLET_B)].concat(),
+        ..Default::default()
+    };
+    history_v3_collect(&cache, &fetcher, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&cache);
+    finalize_cache_v2_unbound(&cache, None, FRESH_END + 1).unwrap();
+    let connection = Connection::open(&cache).unwrap();
+    let (count, digest, inputs): (u64, String, String) = connection
+        .query_row(
+            "SELECT ranker_projection_count, ranker_projection_digest, ranker_projection_inputs_json
+             FROM cache_v2_migration_state",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let inputs: Value = serde_json::from_str(&inputs).unwrap();
+    let drops: Vec<String> = connection
+        .prepare("SELECT scope_drops_json FROM activity_wallet_history_v3 ORDER BY wallet_hex")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let actual = serde_json::json!({
+        "count": count,
+        "digest": digest,
+        "spool_sha256": inputs["projection_spool"]["sha256"],
+        "certificate_digest": inputs["certificate_digest"],
+        "drops": drops,
+    });
+    assert_eq!(
+        actual,
+        serde_json::json!({
+            "count": 2,
+            "digest": "9353b04f620324c1123df57f5b2b30da1cf761cd01a6a037258351a869782beb",
+            "spool_sha256": "53a354116c7b399e8af52089718840dc5becced1e6df48347655e47a4bf09ff6",
+            "certificate_digest": "035c5f3320d41f58cf46a9088ed94440b1d67f66e451f22c6069ca86c1c3b035",
+            "drops": [
+                "[{\"cause\":\"conversion\",\"dropped_at_unix\":1799999998,\"scope_id\":\"0xe\",\"scope_kind\":\"event\"}]",
+                "[{\"cause\":\"conversion\",\"dropped_at_unix\":1799999998,\"scope_id\":\"0xe\",\"scope_kind\":\"event\"}]",
+            ],
+        }),
+        "{actual}"
+    );
 }

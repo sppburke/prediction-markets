@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """Sample the ranking cache's drive while one rank-and-push run is alive (metadata only).
 
-Every --interval seconds, until its parent (the wrapper) ends, append one JSON line to --out: the time, the free bytes of
-the cache folder's filesystem (statvfs; the quantity `df --output=avail` shows), the size of every regular file directly
-in that folder (the installed cache, candidates, their -wal/-shm files, spools) and the byte total of each extra folder
-(--dir NAME=PATH, for example SQLite's temporary folder and the export folder). --summary holds the smallest free bytes
-seen (with its time) and each name's largest size, replaced atomically after every sample and carried over by a resumed
-run of the same cycle, so a peak that is gone before the cycle ends stays recorded. A peak is caught when it lasts at least
-one interval. It never opens a database or reads any file's contents (docs/26, capacity).
+`sample`: every --interval seconds, while --parent (the wrapper's PID) is this process's parent, append one JSON line to
+--out: the time, the free bytes of the cache folder's filesystem (statvfs; the quantity `df --output=avail` shows), the
+size of every regular file directly in that folder (the installed cache, candidates, their -wal/-shm files, spools) and
+the byte total of each extra folder (--dir NAME=PATH, for example SQLite's temporary folder and the export folder). A
+resumed run of the same cycle appends to the same file, after dropping a last line a crash left unfinished. It never
+opens a database or reads any file's contents.
+
+`summarize SAMPLES`: the samples file folded into one JSON object: the smallest free bytes and when, each name's largest
+size, the sample count, the first and last sample times and the largest gap between consecutive samples (a gap much
+longer than the interval means nothing was sampled then). A peak is caught when it lasts at least one interval. The
+samples file is the record; the summary is computed from it whenever it is needed (docs/26, capacity).
 """
 
 import argparse
 import json
 import os
-import tempfile
 import time
 
 
@@ -46,48 +49,60 @@ def sample(cache_dir, folders):
     }
 
 
-def merge(summary, record):
-    if summary["min_free_bytes"] is None or record["free_bytes"] < summary["min_free_bytes"]:
-        summary["min_free_bytes"] = record["free_bytes"]
-        summary["min_free_at"] = record["t"]
-    peaks = summary["peak_bytes"]
-    for name, size in [*record["files"].items(), *record["dirs"].items()]:
-        peaks[name] = max(size, peaks.get(name, 0))
-    summary["samples"] += 1
-
-
-def write_atomically(path, value):
-    fd, tmp = tempfile.mkstemp(prefix=".capacity_summary.", dir=os.path.dirname(path) or ".")
+def drop_unfinished_line(path):
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, sort_keys=True)
-            handle.write("\n")
-        os.replace(tmp, path)
-    except BaseException:
-        os.unlink(tmp)
-        raise
+        with open(path, "rb+") as handle:
+            data = handle.read()
+            if data and not data.endswith(b"\n"):
+                handle.truncate(data.rfind(b"\n") + 1)
+    except FileNotFoundError:
+        pass
+
+
+def summarize(path):
+    with open(path, "rb") as handle:
+        complete = handle.read().split(b"\n")[:-1]  # a last line without its newline was never finished
+    records = [json.loads(line) for line in complete]
+    if not records:
+        raise SystemExit(f"{path}: no samples")
+    lowest = min(records, key=lambda record: record["free_bytes"])
+    peaks = {}
+    for record in records:
+        for name, size in [*record["files"].items(), *record["dirs"].items()]:
+            peaks[name] = max(size, peaks.get(name, 0))
+    times = [record["t"] for record in records]
+    return {
+        "min_free_bytes": lowest["free_bytes"],
+        "min_free_at": lowest["t"],
+        "peak_bytes": peaks,
+        "samples": len(records),
+        "first_t": times[0],
+        "last_t": times[-1],
+        "largest_gap_s": round(max((b - a for a, b in zip(times, times[1:])), default=0.0), 1),
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cache-dir", required=True)
-    parser.add_argument("--out", required=True)
-    parser.add_argument("--summary", required=True)
-    parser.add_argument("--interval", type=float, required=True)
-    parser.add_argument("--dir", action="append", default=[], metavar="NAME=PATH")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command", required=True)
+    run = commands.add_parser("sample")
+    run.add_argument("--parent", type=int, required=True)
+    run.add_argument("--cache-dir", required=True)
+    run.add_argument("--out", required=True)
+    run.add_argument("--interval", type=float, required=True)
+    run.add_argument("--dir", action="append", default=[], metavar="NAME=PATH")
+    fold = commands.add_parser("summarize")
+    fold.add_argument("samples")
     args = parser.parse_args()
+    if args.command == "summarize":
+        print(json.dumps(summarize(args.samples), sort_keys=True))
+        return 0
     folders = dict(item.split("=", 1) for item in args.dir)
-    summary = {"min_free_bytes": None, "min_free_at": None, "peak_bytes": {}, "samples": 0}
-    if os.path.exists(args.summary):
-        with open(args.summary, encoding="utf-8") as handle:
-            summary = json.load(handle)
-    parent = os.getppid()
-    while os.getppid() == parent:
+    drop_unfinished_line(args.out)
+    while os.getppid() == args.parent:
         record = sample(args.cache_dir, folders)
         with open(args.out, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
-        merge(summary, record)
-        write_atomically(args.summary, summary)
         time.sleep(args.interval)
     return 0
 

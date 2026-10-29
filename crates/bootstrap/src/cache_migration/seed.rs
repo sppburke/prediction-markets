@@ -21,8 +21,10 @@ pub struct SeededCacheReport {
     pub already_initialized: bool,
 }
 
-/// What the old cache hands on: every certified non-empty cumulative drop (discovery may
-/// admit any of its wallets later), its tombstones and its infrastructure flags.
+/// What the old cache hands on: every non-empty cumulative drop its commitment certifies (its
+/// certificates' and, for a seeded cache, the carried rows still awaiting a wallet's first
+/// finalize; discovery may admit any of these wallets later), its tombstones and its
+/// infrastructure flags.
 struct Carried {
     drops: BTreeMap<String, String>,
     tombstones: BTreeMap<String, (i64, String)>,
@@ -38,17 +40,46 @@ struct SeededState {
     drops: BTreeMap<String, String>,
 }
 
-/// Create a schema-one cache at `config.cache_path` whose active wallets are exactly
-/// `wallets_path`'s, as market participants, carrying what the finalized format-three cache
-/// `drops_from` holds (see [`Carried`]). The cache appears at its path only once complete; an
-/// existing cache succeeds only while it is still exactly that initialized, uncollected cache.
+/// A seeded cache's verified inputs, read without touching the target, so bad input leaves
+/// nothing behind (not even the target's lock file).
+pub struct SeedPlan {
+    wallets: BTreeSet<String>,
+    carried: Carried,
+}
+
+/// [`SeedPlan::read`] then [`SeedPlan::init`]; the caller holds the target's mutation lock.
 pub fn init_seeded_cache(
     config: &BootstrapConfig,
     wallets_path: &Path,
     drops_from: &Path,
 ) -> Result<SeededCacheReport, BootstrapError> {
-    let wallets = read_seed_wallets(wallets_path)?;
-    let carried = Carried::read(drops_from, &wallets)?;
+    SeedPlan::read(wallets_path, drops_from)?.init(config)
+}
+
+impl SeedPlan {
+    /// The seed list (`wallets_path`) and what the finalized format-three cache `drops_from`
+    /// hands on (see [`Carried`]), both validated.
+    pub fn read(wallets_path: &Path, drops_from: &Path) -> Result<Self, BootstrapError> {
+        let wallets = read_seed_wallets(wallets_path)?;
+        let carried = Carried::read(drops_from, &wallets)?;
+        Ok(Self { wallets, carried })
+    }
+
+    /// Create a schema-one cache at `config.cache_path` whose active wallets are exactly the
+    /// seeds, as market participants, carrying the plan's drops, tombstones and flags. The cache
+    /// appears at its path only once complete; an existing cache succeeds only while it is still
+    /// exactly that initialized, uncollected cache.
+    pub fn init(&self, config: &BootstrapConfig) -> Result<SeededCacheReport, BootstrapError> {
+        let Self { wallets, carried } = self;
+        init_from(config, wallets, carried)
+    }
+}
+
+fn init_from(
+    config: &BootstrapConfig,
+    wallets: &BTreeSet<String>,
+    carried: &Carried,
+) -> Result<SeededCacheReport, BootstrapError> {
     let target = &config.cache_path;
     let report = |already_initialized| SeededCacheReport {
         cache_path: target.clone(),
@@ -66,7 +97,7 @@ pub fn init_seeded_cache(
         already_initialized,
     };
     if target.exists() {
-        return if seeded_state(target)?.is_some_and(|stored| stored == carried.state(&wallets)) {
+        return if seeded_state(target)?.is_some_and(|stored| stored == carried.state(wallets)) {
             Ok(report(true))
         } else {
             invalid(format!(
@@ -220,18 +251,30 @@ impl Carried {
         }
         verify_history_certificates(&connection)?;
         let mut drops = BTreeMap::new();
-        let mut statement = connection.prepare(
+        let mut queries = vec![
             "SELECT wallet_hex, scope_drops_json FROM activity_wallet_history_v3
              WHERE scope_drops_json != '[]'",
-        )?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            let (wallet, json): (String, String) = (row.get(0)?, row.get(1)?);
-            let parsed: Vec<projection_v3::ScopeDrop> = serde_json::from_str(&json)?;
-            if canonical_json(&parsed)? != json {
-                return invalid(format!("non-canonical certified drops for {wallet}"));
+        ];
+        if has_seed_drops(&connection)? {
+            queries.push(
+                "SELECT wallet_hex, scope_drops_json FROM activity_seed_drops_v3
+                 WHERE scope_drops_json != '[]'",
+            );
+        }
+        for query in queries {
+            let mut statement = connection.prepare(query)?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let (wallet, json): (String, String) = (row.get(0)?, row.get(1)?);
+                let parsed: Vec<projection_v3::ScopeDrop> = serde_json::from_str(&json)?;
+                if canonical_json(&parsed)? != json {
+                    return invalid(format!("non-canonical certified drops for {wallet}"));
+                }
+                // A carried row goes when its wallet's first certificate is written.
+                if drops.insert(wallet.clone(), json).is_some() {
+                    return invalid(format!("{wallet} has both a certificate and carried drops"));
+                }
             }
-            drops.insert(wallet, json);
         }
         let tombstones = connection
             .prepare("SELECT wallet_hex, purged_at_unix, reason FROM purged_wallets")?
@@ -277,21 +320,54 @@ impl Carried {
     }
 }
 
-/// `None` unless PATH is still schema one with no collection, legacy trades or migration
-/// state: a collected cache is never accepted as initialized.
+/// The only tables initialization writes; in an uncollected cache every other table is empty.
+const INIT_TABLES: [&str; 5] = [
+    "wallets",
+    "purged_wallets",
+    SEED_DROPS_TABLE,
+    "wallet_activation_batches",
+    "wallet_activation_batch_wallets",
+];
+
+/// `None` unless PATH is still schema one with no migration state, every table that
+/// initialization does not write empty, and every wallet's collection fields at their
+/// defaults (a collection that stored no trades still stamps them): a collected cache is never
+/// accepted as initialized.
 fn seeded_state(path: &Path) -> Result<Option<SeededState>, BootstrapError> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let schema: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if schema != crate::cache::CACHE_SCHEMA_VERSION_V1 {
+    if schema != crate::cache::CACHE_SCHEMA_VERSION_V1 || !has_seed_drops(&connection)? {
         return Ok(None);
     }
-    let uncollected: bool = connection.query_row(
-        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'cache_v2_migration_state')
-         AND NOT EXISTS(SELECT 1 FROM trades)",
+    let tables = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for table in tables
+        .iter()
+        .filter(|table| !INIT_TABLES.contains(&table.as_str()))
+    {
+        let quoted = table.replace('"', "\"\"");
+        let empty: bool = connection.query_row(
+            &format!("SELECT NOT EXISTS(SELECT 1 FROM \"{quoted}\")"),
+            [],
+            |row| row.get(0),
+        )?;
+        if !empty {
+            return Ok(None);
+        }
+    }
+    let collected: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM wallets WHERE trade_count != 0
+            OR last_polymarket_fetch_at IS NOT NULL OR backfill_partial != 0
+            OR forward_frontier_unix IS NOT NULL OR backward_floor_unix IS NOT NULL
+            OR polymarket_contracts_seen != 0)",
         [],
         |row| row.get(0),
     )?;
-    if !uncollected || !has_seed_drops(&connection)? {
+    if collected {
         return Ok(None);
     }
     let wallets = connection

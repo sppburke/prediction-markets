@@ -1797,19 +1797,49 @@ series); remove it, with `PE_RANK_MARKET_RECURRENCES=15m,5m`, at a boundary afte
 participants is a capacity decision: tens of thousands of wallets trade those markets each month,
 many with long histories. Measure their certified sizes in the old cache first.
 
+**Checkout** (no downtime; the old loop keeps running), with this release:
+
+```bash
+git clone /mnt/storage/prediction-markets /mnt/storage/prediction-markets-15m5m
+git -C /mnt/storage/prediction-markets-15m5m checkout --detach <release commit>
+ln -s /mnt/storage/prediction-markets-15m5m ~/prediction-markets-15m5m && cd ~/prediction-markets-15m5m
+python3 -m venv .venv && .venv/bin/pip install -r scripts/requirements.txt
+install -m 0755 <the release's pe-bootstrap> target/release/pe-bootstrap   # the old checkout's binary
+cp ~/prediction-markets/.env .env                                          # then append the settings above
+mkdir -p data/eval-results /mnt/t7/cache-15m5m && : > data/wallet_cache.db.lock
+ln -s /mnt/t7/cache-15m5m/wallet_cache.db data/wallet_cache.db
+ln -s "$PWD/data/eval-results" /mnt/t7/cache-15m5m/eval-results              # the two lock aliases
+ln -s "$PWD/data/wallet_cache.db.lock" /mnt/t7/cache-15m5m/wallet_cache.db.lock
+install -m 0644 deploy/systemd/pe-rank-loop-15m5m.service ~/.config/systemd/user/
+systemctl --user daemon-reload                                             # installed, not enabled; no flag yet
+```
+
+The export folder (`data/parquet`) belongs to each checkout; the copied `SQLITE_TMPDIR` is shared,
+which is safe because only one loop runs at a time.
+
 **Provisioning.** With both loops stopped, write the seed list (one wallet per line): every wallet in
 pass 2's universe (`latency_shift_ranked.csv`) of each published cycle since gen 26, plus the wallets
 with an admitted, payout-eligible 15-minute entry in the old loop's last `projection.parquet`, minus
 the wallets the old cache tombstones or flags (record them). The research window's batches chose only
 from those universes, and the frozen tools read each wallet from a later cycle's universe. Size it from the old cache's
-certificates (the seeds' source rows × the old cache's bytes per source row), and run, under the
-cache lock, `pe-bootstrap cache-init --db /mnt/t7/cache-15m5m/wallet_cache.db --wallets SEEDS
---drops-from /mnt/t7/cache/wallet_cache.db`. It verifies the old cache's certificates, carries every
-certified non-empty cumulative drop (for any wallet discovery may admit later), every tombstone and
-every infrastructure flag, activates exactly the seeds, and appears at its path only when complete.
-A seed the old cache tombstones or flags is refused. A rerun reports `already_initialized` only while
-the file is still that initialized, never-collected cache (schema one, the same wallet rows,
-tombstones and carried drops); anything else is refused and left as it is. Carried drops are
+certificates (the seeds' source rows × the old cache's bytes per source row), and run, from the new
+checkout with its settings loaded:
+
+```bash
+cd ~/prediction-markets-15m5m && set -a && . ./.env && set +a
+target/release/pe-bootstrap cache-init --db /mnt/t7/cache-15m5m/wallet_cache.db --wallets SEEDS \
+  --drops-from /mnt/t7/cache/wallet_cache.db
+```
+
+It verifies the seed list and the old cache's certificates before taking the new cache's lock (bad
+input leaves nothing behind), carries every non-empty cumulative drop the old cache's commitment
+certifies (its certificates' and, if it was itself seeded, its carried rows still waiting; for any
+wallet discovery may admit later), every tombstone and every infrastructure flag, activates exactly
+the seeds, and appears at its path only when complete. A seed the old cache tombstones or flags is
+refused. A rerun reports `already_initialized` only while the file is still that initialized,
+never-collected cache (schema one, the same wallet rows, tombstones and carried drops, every table
+that initialization does not write empty, and no wallet's collection fields set, since a collection
+that stores no trades still stamps them); anything else is refused and left as it is. Carried drops are
 history-guarded and committed inside the certificate digest after the certificates, so every stable
 proof authenticates them; a wallet's first certificate takes its drops over and removes the carried
 row. The first wrapper cycle then stages, migrates and collects a bulk root as in "Fresh bulk root"
@@ -1828,8 +1858,11 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    both loops are inactive (the pause helper sees every ranker process). Keep its flag `stop`.
 4. Capacity: proceed only if free bytes ≥ 3 × S + the old loop's last payout tables, spool and
    exports + 50 GB, S being the seeds' certified complete-history size. These are estimates; the
-   first cycle's `capacity_summary.json` records the actual minimum free bytes and peaks (installed,
-   candidate, WAL, spool, exports, SQLite temporary files).
+   first cycle's samples record the actual minimum free bytes and peaks (installed, candidate, WAL,
+   spool, exports, SQLite temporary files): `python3 scripts/capacity_sampler.py summarize
+   <cycle>/capacity_samples.jsonl` folds them, and its `largest_gap_s` (at most about three sample
+   intervals) and `first_t`/`last_t` (around the cycle's start and publication) show that the samples
+   cover the whole cycle.
 5. `cache-init` as above (rerun it right before the first cycle: it must report
    `already_initialized`).
 6. First cycle, supervisor off: set `PE_RANK_SCHEMA_TWO_CUTOVER=prepare` and
@@ -1840,7 +1873,8 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    exit 0); run `scripts/rank_cycle_manifest.py research-coverage --root
    /mnt/storage/prediction-markets/data/eval-results --since <gen 26's cycle> --candidate <the prepared
    cycle>` and hold the switch for the owner if it reports any wallet (an exclusion record is not
-   coverage); record pe-service's mode. Then set the selector to `1` and run `--resume-pending`.
+   coverage); record pe-service's mode. Then set `PE_RANK_SCHEMA_TWO_CUTOVER=1` in the new `.env` and
+   run `--resume-pending` (a prepared request resumes only under `1`).
 7. After pe-service applies the batch and the research fetch accepts the linked cycle, set
    `PE_RANK_MIN_FREE_GB` to the first cycle's peak use above the installed size (its samples) plus
    20 GB (`_GLOSSARY.md` `rank_min_free_gb`; the gate is a forecast from measured cycles), write `run`
@@ -1850,10 +1884,12 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    tombstoned, in its preference order; read-only), size their complete histories from the old
    cache's certificates (a wallet it lacks at the venue sample's upper estimate), and only if that
    plus the measured transient peak fits above installed + margin, run one cycle with that batch as
-   a supervised one-shot under `prepare`, publish it, set the margin from its samples plus its
-   admission growth plus 20 GB, then restore supervision with that batch. Repeat for any change of
-   admission scope or count. Resumed cycles are not gated; before restarting after an operator stop,
-   compare free bytes with the retained cycle's remaining envelope from its samples.
+   a supervised one-shot under `prepare` (set `1` and `--resume-pending` after its checks), publish
+   it, set the margin from its samples plus its admission growth plus 20 GB, then restore
+   supervision with that batch. Repeat for any change of admission scope or count. The gate runs
+   wherever a candidate copy is about to be made, new or retained cycle; a resume whose candidate
+   exists is not gated, so before restarting such a cycle after an operator stop, compare free bytes
+   with its remaining envelope from its samples.
 
 **Recovery** follows the sections above: a failed `cache-init` reruns; a slow or failed root
 resumes; a full drive mid-cycle rolls the transaction back and fails the stage (free space, then
@@ -1861,11 +1897,15 @@ resume); a top-up exhausted before preparation takes the guarded abandonment in 
 damage boundaries", then a fresh cycle (never a second top-up); a prepared request resumes exactly.
 
 **Revert** (owner's choice): flag-stop and disable the new loop at a boundary; prove the old loop's
-headroom (installed size + catch-up growth + spool + WAL + 50 GB). Deleting the new loop's retained
-copies to make room needs the owner's yes (it forecloses switching back). Run the old loop's first
-cycle under `prepare`, pass the frozen merger check and `research-coverage` against it (the root
-holds the new loop's linked cycles; any reported wallet holds the publication and any deletion for
-the owner), publish it, then write `run` and `enable --now` the old loop.
+headroom (installed size + catch-up growth + spool + WAL + 50 GB) with the new loop's cache and
+research artifacts (cycle folders, links, requests, manifests, ranking CSVs) all kept. If it does not
+fit, move the closed new cache to `/mnt/storage` with the verified mover (`move.sh`) or hold the revert
+and report the shortfall; deleting any of it needs the owner's yes. Run the old loop's first cycle
+under `prepare`, pass the frozen merger check and `research-coverage` against it (the root holds the
+new loop's linked cycles; any reported wallet holds the publication for the owner), set
+`PE_RANK_SCHEMA_TWO_CUTOVER=1` and run `--resume-pending`, verify the publication, set the old
+loop's `PE_RANK_MIN_FREE_GB` from that cycle's samples as in step 7 (its `.env` gets
+`PE_RANK_CAPACITY_SAMPLE_SECS=10` before that cycle), then write `run` and `enable --now` the old loop.
 
 ---
 
