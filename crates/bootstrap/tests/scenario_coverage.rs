@@ -202,7 +202,10 @@ fn scenario_coverage_partial_prior_stamp_is_incomplete_and_unmigrated_reader_wor
 static INTERLEAVE_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 static INTERLEAVE_STATE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn interleave_after_first_read(sql: &str) {
+fn interleave_after_first_read(event: rusqlite::trace::TraceEvent<'_>) {
+    let rusqlite::trace::TraceEvent::Stmt(_, sql) = event else {
+        return;
+    };
     use std::sync::atomic::Ordering::SeqCst;
     match INTERLEAVE_STATE.load(SeqCst) {
         // Arm once the wallet count is about to run...
@@ -256,9 +259,10 @@ fn coverage_counts_ignore_a_commit_landing_mid_probe() {
     INTERLEAVE_STATE.store(0, SeqCst);
     let during = {
         let mut cache = WalletCache::open_read_only(&path).unwrap();
-        cache
-            .raw_conn_mut_for_test()
-            .trace(Some(interleave_after_first_read));
+        cache.raw_conn_mut_for_test().trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(interleave_after_first_read),
+        );
         cache.coverage_counts().unwrap()
     };
     assert_eq!(

@@ -145,7 +145,8 @@ struct ProgressOnDrop<'a>(&'a Connection);
 
 impl Drop for ProgressOnDrop<'_> {
     fn drop(&mut self) {
-        self.0.progress_handler(0, None::<fn() -> bool>);
+        // The setter fails only for a borrowed handle; rusqlite opened this connection.
+        let _ = self.0.progress_handler(0, None::<fn() -> bool>);
     }
 }
 
@@ -187,7 +188,8 @@ fn quick_check_inner(
     let stop = AtomicBool::new(false);
     thread::scope(|scope| {
         let progress = Arc::clone(&counter);
-        connection.progress_handler(
+        // The setter fails only for a borrowed handle; rusqlite opened this connection.
+        let _ = connection.progress_handler(
             i32::from(PROGRESS_STEP_PAGES),
             Some(move || {
                 progress.fetch_add(u64::from(PROGRESS_STEP_PAGES), Ordering::Relaxed);
@@ -670,15 +672,19 @@ mod tests {
         let counter = Arc::new(AtomicU64::new(0));
         let progress = Arc::clone(&counter);
         let mut statement = connection.prepare("PRAGMA quick_check").unwrap();
-        connection.progress_handler(
-            256,
-            Some(move || {
-                progress.fetch_add(u64::from(PROGRESS_STEP_PAGES), Ordering::Relaxed);
-                false
-            }),
-        );
+        connection
+            .progress_handler(
+                256,
+                Some(move || {
+                    progress.fetch_add(u64::from(PROGRESS_STEP_PAGES), Ordering::Relaxed);
+                    false
+                }),
+            )
+            .unwrap();
         let verdict = statement.query_row([], |row| row.get(0)).unwrap();
-        connection.progress_handler(0, None::<fn() -> bool>);
+        connection
+            .progress_handler(0, None::<fn() -> bool>)
+            .unwrap();
         (verdict, counter)
     }
 

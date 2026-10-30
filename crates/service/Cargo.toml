@@ -75,7 +75,7 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 pe-event-log = { path = "../event-log", version = "0.1.0", features = ["scan-metrics"] }
 base64.workspace = true
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled", "fallible_uint"] }
 # Paused-clock scenario tests drive the reader timers with the production constants (#546).
 tokio = { workspace = true, features = ["test-util"] }
 rust_decimal_macros = { workspace = true }
