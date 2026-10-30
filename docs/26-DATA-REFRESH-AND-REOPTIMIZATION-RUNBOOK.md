@@ -1953,10 +1953,10 @@ research artifacts (cycle folders, links, requests, manifests, ranking CSVs) all
 fit, hold the revert and report the shortfall: every retained cache role stays at its recorded path
 (activation and recovery need its regular files on one filesystem at the recorded paths); deleting any
 of it needs the owner's yes. Record the old loop's admission setting and run its first cycle
-under `prepare` with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0`, pass the frozen merger check and
-`research-coverage` against it (the root holds the
-new loop's linked cycles; a wallet missing because of the switch back holds the publication for the
-owner), and run `scripts/rank_cycle_manifest.py drops-cover --source
+under `prepare` with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0`; until 11/30 01:00 UTC pass the frozen
+merger check and `research-coverage` against it (the root holds the new loop's linked cycles; a wallet
+missing because of the switch back holds the publication for the owner); always run
+`scripts/rank_cycle_manifest.py drops-cover --source
 /mnt/t7/cache-15m5m/wallet_cache.db --target <the old loop's prepared candidate>`: any drop the
 candidate does not keep as early holds the publication for the owner with both loops stopped (drops
 are cumulative and never removed; catching up from the venue cannot restore a deleted trigger). Then set
