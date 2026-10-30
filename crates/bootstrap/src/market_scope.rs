@@ -734,7 +734,8 @@ mod tests {
         (scope, fetcher.1.load(Ordering::SeqCst))
     }
 
-    /// The pinned series by id, as Gamma answers `/series/{id}`; anything else is `serve_ok`'s.
+    /// The pinned series by id, as Gamma answers `/series/{id}`; a catalog listing request fails the test; anything
+    /// else is `serve_ok`'s.
     fn serve_pinned(url: &str, call: usize) -> Result<Vec<u8>, SourceError> {
         let row = match url.strip_prefix(&format!("{BASE}/series/")) {
             Some("2") => json!({"id": 2, "slug": "btc-up-or-down-15m", "recurrence": "15m"}),
@@ -744,6 +745,9 @@ mod tests {
                 return Err(SourceError::Fatal {
                     message: "HTTP 404".to_owned(),
                 });
+            }
+            None if url.starts_with(&format!("{BASE}/series?")) => {
+                panic!("a pinned scope requested the catalog listing: {url}")
             }
             None if url == events_url(BASE, "12", FLOOR_ISO, None).unwrap() => {
                 json!({"events": [event("12", "5m", &[condition(4)])]})
