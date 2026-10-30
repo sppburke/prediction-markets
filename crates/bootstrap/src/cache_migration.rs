@@ -55,7 +55,9 @@ mod incremental;
 mod measurement;
 mod projection_digest;
 mod projection_v3;
+mod seed;
 pub use projection_v3::{ClassificationReport, ExportProjectionSummary};
+pub use seed::{SeedPlan, SeededCacheReport, require_init_roles};
 #[cfg(target_os = "linux")]
 mod walk_prefetch;
 use digests::{JsonArrayDigest, ReceiptSetDigest};
@@ -214,7 +216,8 @@ fn create_history_v3(connection: &Connection) -> Result<(), BootstrapError> {
 }
 
 fn verify_history_write_guards(connection: &Connection) -> Result<(), BootstrapError> {
-    for table in HISTORY_GUARDED_TABLES {
+    let carried = seed::has_seed_drops(connection)?.then_some(&seed::SEED_DROPS_TABLE);
+    for table in HISTORY_GUARDED_TABLES.iter().chain(carried) {
         for operation in ["INSERT", "UPDATE", "DELETE"] {
             let stored: Option<String> = connection.query_row(
                 "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1 AND tbl_name = ?2",

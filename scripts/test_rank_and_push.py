@@ -45,6 +45,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 WRAPPER = Path(__file__).resolve().parent / "rank_and_push.sh"
 
@@ -52,6 +53,12 @@ WRAPPER = Path(__file__).resolve().parent / "rank_and_push.sh"
 # co-updates the wrapper literal AND this constant in the same commit (issue #370 PR2 lands
 # the 0→30 flip as its own commit).
 EXPECTED_DEFAULT_HALF_LIFE = "30"
+CYCLE_SETTINGS = {
+    "market_recurrences": "PE_BOOTSTRAP_MARKET_RECURRENCES",
+    "rank_market_recurrences": "PE_RANK_MARKET_RECURRENCES",
+    "rank_market_series": "PE_RANK_MARKET_SERIES",
+    "research_link_dir": "PE_RANK_RESEARCH_LINK_DIR",
+}
 
 
 def _write_exec(path: Path, body: str) -> None:
@@ -104,6 +111,7 @@ class RankAndPushScenario(unittest.TestCase):
         shutil.copy(WRAPPER.parent / "rank_cycle_manifest.py", self.root / "scripts")
         shutil.copy(WRAPPER.parent / "partial_backfill_wallets.py", self.root / "scripts")
         shutil.copy(WRAPPER.parent / "ranker_decay.py", self.root / "scripts")
+        shutil.copy(WRAPPER.parent / "capacity_sampler.py", self.root / "scripts")
 
         # The fake publisher below does not contact this syntactically valid endpoint.
         (self.root / ".env").write_text(
@@ -124,6 +132,10 @@ class RankAndPushScenario(unittest.TestCase):
             '  exit 0\n'
             'fi\n'
             'echo "$*" >> pe_bootstrap.log\n'
+            'if [[ -n "${STUB_RECORD_SAMPLED:-}" && ! -e sampled.log ]]; then\n'
+            '  found=no; for f in data/eval-results/cron-*/capacity_samples.jsonl; do [[ -s "$f" ]] && found=yes; done\n'
+            '  echo "$found" > sampled.log\n'
+            'fi\n'
             'echo "${PE_BOOTSTRAP_FETCH_RESOLUTIONS:-}" >> pe_bootstrap_env.log\n'
             'echo "${PE_BOOTSTRAP_PURGE_DECISION_CSV:-}" >> pe_bootstrap_purge_csv.log\n'
             'if [[ -f data/eval-results/rank_and_push.cycle ]]; then\n'
@@ -132,6 +144,12 @@ class RankAndPushScenario(unittest.TestCase):
             '  printf missing >> pe_bootstrap_cycle.log\n'
             'fi\n'
             'printf "\\n" >> pe_bootstrap_cycle.log\n'
+            'if [[ -n "${STUB_WAIT_SAMPLE:-}" && "$1" == "$STUB_WAIT_SAMPLE" ]]; then\n'
+            '  for _ in $(seq 300); do\n'
+            '    for f in data/eval-results/cron-*/capacity_samples.jsonl; do [[ -s "$f" ]] && break 2; done\n'
+            '    sleep 0.1\n'
+            '  done\n'
+            'fi\n'
             'sub="$1"\n'
             'key="STUB_EXIT_${sub//-/_}"\n'
             'code="${!key:-0}"\n'
@@ -148,6 +166,14 @@ class RankAndPushScenario(unittest.TestCase):
             'a = sys.argv[1:]; out = a[a.index("--out-dir") + 1]\n'
             'os.makedirs(out, exist_ok=True)\n'
             'json.dump({"version": int(os.environ.get("STUB_EXPORT_VERSION", "2"))}, open(os.path.join(out, "schema_v2_export_manifest.json"), "w"))\n'
+            'transient = os.environ.get("STUB_TRANSIENT")\n'
+            'if transient:\n'
+            '    import glob, time\n'
+            '    open(transient, "wb").write(b"x" * 1_000_000)\n'
+            '    name = os.path.basename(transient); deadline = time.time() + 30\n'
+            '    while time.time() < deadline and not any(name in line for path in glob.glob("data/eval-results/cron-*/capacity_samples.jsonl") for line in open(path)):\n'
+            '        time.sleep(0.05)\n'
+            '    os.unlink(transient)\n'
             'raise SystemExit(int(os.environ.get("STUB_EXIT_export", "0")))\n',
         )
         _write_exec(
@@ -276,6 +302,8 @@ class RankAndPushScenario(unittest.TestCase):
     def _run(self, *args, exit_env=None):
         env = dict(os.environ)
         env.pop("PE_PYTHON", None)
+        for variable in CYCLE_SETTINGS.values():
+            env.pop(variable, None)
         env.update(exit_env or {})
         return subprocess.run(
             ["bash", str(self.wrapper), *args],
@@ -418,6 +446,31 @@ class RankAndPushScenario(unittest.TestCase):
                 for log in ("export.log", "rank.log", "rerank.log", "push.log"):
                     self.assertIsNone(self._log(log), log)
 
+    def test_ranking_recurrences_are_independent_of_discovery(self):
+        for ranking in (None, "15m,5m"):
+            with self.subTest(ranking=ranking):
+                self.tearDown(); self.setUp()
+                env = {"PE_BOOTSTRAP_MARKET_RECURRENCES": '["5m"]',
+                       "PE_RANK_MARKET_RECURRENCES": ranking or ""}
+                result = self._run(exit_env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
+                self.assertEqual(scope[scope.index("--recurrences") + 1], ranking or "15m")
+
+    def test_pinned_ranking_series_reach_market_scope_only_when_set(self):
+        pin = "10192:btc-up-or-down-15m,12518:zec-up-or-down-15m"
+        for series in (None, pin):
+            with self.subTest(series=series):
+                self.tearDown(); self.setUp()
+                result = self._run(exit_env={"PE_RANK_MARKET_SERIES": series} if series else {})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
+                if series:
+                    self.assertEqual(scope[scope.index("--series") + 1], pin)
+                else:
+                    self.assertNotIn("--series", scope)
+        print("PASS: PE_RANK_MARKET_SERIES pins market-scope's series only when set")
+
     def test_refresh_crossing_utc_midnight_moves_window_end_scope_and_anchor_together(self):
         sys.path.insert(0, str(WRAPPER.parent))
         from ranker_decay import window_bounds
@@ -485,7 +538,8 @@ class RankAndPushScenario(unittest.TestCase):
         out_dir = (self.root / "data" / "eval-results").glob("cron-*")
         scope_file = str(next(out_dir).relative_to(self.root) / "market_scope.json")
         self.assertEqual(scope, ["market-scope", "--out", scope_file,
-                                 "--end-date-min", str(window_bounds(None, win_end)[0] - 86_400)])
+                                 "--end-date-min", str(window_bounds(None, win_end)[0] - 86_400),
+                                 "--recurrences", "15m"])
         for args in (rank_args, rerank_args):
             self.assertEqual(args[args.index("--market-scope") + 1], scope_file)
 
@@ -573,6 +627,152 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual([e for s, e in pairs if s == "winner-discovery"], [""], "discovery saw a leaked var")
         self.assertEqual([e for s, e in pairs if s == "events"], [""], "events saw a leaked var")
         print("PASS: FETCH_RESOLUTIONS unset for discovery/backfill/events, =1 only for resolutions")
+
+    def _df_stub(self, avail):
+        """A `df` first on PATH that reports AVAIL free bytes for any path (the gate's only free-space source)."""
+        stub = self.root / "stub-bin"
+        stub.mkdir(exist_ok=True)
+        _write_exec(stub / "df", f'#!/usr/bin/env bash\nprintf "Avail\\n%s\\n" "{avail}"\n')
+        return {"PATH": f"{stub}:{os.environ['PATH']}"}
+
+    def test_capacity_gate_refuses_a_copy_without_room_and_never_gates_a_staged_resume(self):
+        cycle = self.root / "data/eval-results/rank_and_push.cycle"
+        installed = os.stat(os.path.realpath(self.root / "data" / "wallet_cache.db")).st_size
+        need = installed + 1_000_000_000  # PE_RANK_MIN_FREE_GB=1
+        # One byte short, though far more than the margin alone: the installed cache's size counts.
+        short = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(need - 1)})
+        self.assertEqual(short.returncode, 2, short.stdout + short.stderr)
+        self.assertIn(f"FATAL: capacity: free_bytes={need - 1} need_bytes={need} ", short.stderr)
+        self.assertFalse(cycle.exists())
+        self.assertIsNone(self._log("rank.log"))
+        self.assertIsNone(self._log("pe_bootstrap.log"))  # nothing staged: no bootstrap stage ran
+        for bad in ("ten", "020", "1000000"):  # not a number, octal to Bash, past the overflow-safe six digits
+            r = self._run(exit_env={"PE_RANK_MIN_FREE_GB": bad})
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("PE_RANK_MIN_FREE_GB must be a whole number of GB", r.stderr)
+        self.assertFalse(cycle.exists())
+        retained = self._run(exit_env={"STUB_EXIT_events": "75"})
+        self.assertEqual(retained.returncode, 75, retained.stdout + retained.stderr)
+        self.assertTrue(cycle.exists())
+        (run_dir,) = self.root.glob("data/eval-results/cron-*")
+        # Retained before its candidate copy existed: the resume makes the copy, so it is gated.
+        stages_before = self._log("pe_bootstrap.log")
+        unstaged = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(need - 1)})
+        self.assertEqual(unstaged.returncode, 2, unstaged.stdout + unstaged.stderr)
+        self.assertIn("FATAL: capacity", unstaged.stderr)
+        self.assertTrue(cycle.exists())
+        self.assertEqual(self._log("pe_bootstrap.log"), stages_before)  # refused before any stage
+        side = Path(os.path.realpath(self.root / "data" / "wallet_cache.db")).parent / f"wallet_cache.{run_dir.name}.side.db"
+        side.write_bytes(b"")
+        staged = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(0)})
+        self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+        self.assertNotIn("FATAL: capacity", staged.stderr)
+        exact = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(need)})
+        self.assertEqual(exact.returncode, 0, exact.stdout + exact.stderr)
+        print("PASS: capacity gate refuses a copy one byte short; staged resumes and exact room proceed")
+
+    def test_capacity_gate_counts_a_retained_cycles_interrupted_copy_as_free(self):
+        installed = os.stat(os.path.realpath(self.root / "data" / "wallet_cache.db")).st_size
+        need = installed + 1_000_000_000  # PE_RANK_MIN_FREE_GB=1
+        retained = self._run(exit_env={"STUB_EXIT_events": "75"})
+        self.assertEqual(retained.returncode, 75, retained.stdout + retained.stderr)
+        (run_dir,) = self.root.glob("data/eval-results/cron-*")
+        side = Path(os.path.realpath(self.root / "data" / "wallet_cache.db")).parent / f"wallet_cache.{run_dir.name}.side.db"
+        Path(f"{side}.pending").write_bytes(b"xx")  # an interrupted copy, which staging removes before copying again
+        short = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(need - 3)})
+        self.assertEqual(short.returncode, 2, short.stdout + short.stderr)
+        self.assertIn(f"FATAL: capacity: free_bytes={need - 3} need_bytes={need} ", short.stderr)
+        self.assertIn("interrupted copy 2 reclaimable", short.stderr)
+        fits = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(need - 2)})
+        self.assertEqual(fits.returncode, 0, fits.stdout + fits.stderr)
+        print("PASS: capacity gate counts a retained cycle's interrupted copy as free space")
+
+    def test_capacity_sampler_is_off_unless_configured(self):
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(list(self.root.glob("data/eval-results/cron-*/capacity_*")), [])
+        self.assertNotIn("capacity_sampler.py", self.python_log.read_text())
+        for bad in ("0", "010", "1000000"):
+            r = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": bad})
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("PE_RANK_CAPACITY_SAMPLE_SECS must be a whole number", r.stderr)
+        print("PASS: no capacity samples unless PE_RANK_CAPACITY_SAMPLE_SECS is set")
+
+    def test_capacity_sampler_keeps_a_transient_peak_and_ends_with_the_run(self):
+        transient = self.root / "data" / "wallet_cache.transient.db"
+        sampler = self.root / "scripts" / "capacity_sampler.py"
+        # The failing stage waits for the sampler's first line, so the run never ends before a sample exists.
+        retained = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "1", "STUB_EXIT_events": "75",
+                                       "STUB_WAIT_SAMPLE": "events"})
+        self.assertEqual(retained.returncode, 75, retained.stdout + retained.stderr)
+        (run_dir,) = self.root.glob("data/eval-results/cron-*")
+        samples = run_dir / "capacity_samples.jsonl"
+        first = len(samples.read_text().splitlines())
+        self.assertGreaterEqual(first, 1)
+        with open(samples, "a", encoding="utf-8") as handle:
+            handle.write('{"t": 1')  # a line a crash left unfinished
+        resumed = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "1", "STUB_TRANSIENT": str(transient)})
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertFalse(transient.exists())
+        lines = [json.loads(line) for line in samples.read_text().splitlines()]  # every line complete again
+        self.assertGreater(len(lines), first)  # the resumed run appended
+        for line in lines:
+            self.assertEqual(sorted(set(line) - {"mark"}), ["dirs", "files", "free_bytes", "interval", "t"])
+            self.assertGreater(line["free_bytes"], 0)
+        folded = subprocess.run(["python3", str(sampler), "summarize", str(samples)],
+                                capture_output=True, text=True, check=True)
+        summary = json.loads(folded.stdout)
+        self.assertEqual(summary["peak_bytes"]["wallet_cache.transient.db"], 1_000_000)
+        self.assertEqual(summary["min_free_bytes"], min(line["free_bytes"] for line in lines))
+        self.assertEqual((summary["first_free_bytes"], summary["first_files"]), (lines[0]["free_bytes"], lines[0]["files"]))
+        self.assertEqual((summary["attempts"], summary["unterminated_attempts"]), (2, 0))
+        self.assertEqual([line.get("mark") for line in lines if "mark" in line], ["start", "end", "start", "end"])
+        self.assertEqual(summary["samples"], len(lines))
+        self.assertEqual((summary["first_t"], summary["last_t"]), (lines[0]["t"], lines[-1]["t"]))
+        self.assertGreaterEqual(summary["largest_gap_s"], 0)
+        for proc in Path("/proc").iterdir():
+            try:
+                cmdline = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+            except (OSError, ValueError):
+                continue
+            roots = {str(self.root), os.path.realpath(self.root)}
+            self.assertFalse("capacity_sampler.py" in cmdline and any(root in cmdline for root in roots),
+                             f"the sampler outlived its run: {cmdline}")
+        print("PASS: capacity samples keep a transient peak, survive a torn line, append on resume, end with the run")
+
+    def test_capacity_sampler_ends_at_once_when_its_parent_is_gone(self):
+        out = self.root / "orphan.jsonl"
+        ended = subprocess.run(
+            ["python3", str(self.root / "scripts" / "capacity_sampler.py"), "sample", "--parent", str(2**22 + 1),
+             "--cache-dir", str(self.root / "data"), "--out", str(out), "--interval", "1"],
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(ended.returncode, 0, ended.stderr)
+        self.assertFalse(out.exists() and out.read_text(), "an orphaned sampler recorded samples")
+        print("PASS: a sampler whose named parent is not its parent ends before sampling")
+
+    def test_capacity_sampler_first_sample_precedes_every_stage(self):
+        # The background sampler starts only once the first stage has recorded what it saw, so the margin's F0 and S0
+        # exist at that stage only if the wrapper sampled before running it.
+        scripts = self.root / "scripts"
+        shutil.move(scripts / "capacity_sampler.py", scripts / "capacity_sampler_real.py")
+        _write_exec(
+            scripts / "capacity_sampler.py",
+            "#!/usr/bin/env python3\n"
+            "import os, sys, time\n"
+            'deadline = time.time() + 30\n'
+            'while "--once" not in sys.argv and not os.path.exists("sampled.log") and time.time() < deadline:\n'
+            "    time.sleep(0.05)\n"
+            'if "--once" not in sys.argv and not os.path.exists("sampled.log"):\n'
+            "    raise SystemExit(0)  # never sample before the first stage recorded what it saw\n"
+            'real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "capacity_sampler_real.py")\n'
+            "os.execv(sys.executable, [sys.executable, real, *sys.argv[1:]])\n",
+        )
+        r = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "1", "STUB_RECORD_SAMPLED": "1"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((self.root / "sampled.log").read_text().strip(), "yes")
+        (run_dir,) = self.root.glob("data/eval-results/cron-*")
+        self.assertGreaterEqual(len((run_dir / "capacity_samples.jsonl").read_text().splitlines()), 1)
+        print("PASS: the first capacity sample is written before any stage runs, even with a late sampler")
 
     def test_backfill_partial_exit2_does_not_abort(self):
         r = self._run(exit_env={"STUB_EXIT_backfill": "2"})
@@ -856,6 +1056,225 @@ class RankAndPushScenario(unittest.TestCase):
             "cycle retry created another production run directory",
         )
         self.assertFalse(cycle.exists(), "completed retried cycle did not clear its pointer")
+
+    def _install_cycle_probe(self):
+        probe = self.root / "scripts" / "_cycle_probe.py"
+        probe.write_text(
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            'if "--validate-request" in sys.argv: raise SystemExit(0)\n'
+            f"variables = {[*CYCLE_SETTINGS.values(), 'PE_MARKET_RECURRENCES']!r}\n"
+            'settings = {key: os.environ[key] for key in variables if key in os.environ}\n'
+            'with open("cycle_probe.log", "a") as handle:\n'
+            '    handle.write(json.dumps({"stage": sys.argv[1], "settings": settings}) + "\\n")\n'
+            'if "STUB_REQUIRE_RESEARCH_LINK" in os.environ:\n'
+            '    cycle = Path(Path("data/eval-results/rank_and_push.cycle").read_text().strip())\n'
+            '    link = Path(os.environ["STUB_REQUIRE_RESEARCH_LINK"]) / cycle.name\n'
+            '    assert link.is_symlink(), f"missing research link before {sys.argv[1]}"\n'
+            '    assert os.readlink(link) == str(cycle.resolve())\n'
+        )
+        bootstrap = self.root / "target" / "release" / "pe-bootstrap"
+        body = bootstrap.read_text()
+        bootstrap.write_text(body.replace(
+            'echo "$*" >> pe_bootstrap.log\n',
+            f'{shlex.quote(sys.executable)} scripts/_cycle_probe.py "$@" || exit $?\n'
+            'echo "$*" >> pe_bootstrap.log\n',
+        ))
+        publisher = self.root / "scripts" / "push_ranking_to_supabase.py"
+        body = publisher.read_text()
+        publisher.write_text(body.replace(
+            '    a = sys.argv[1:]\n',
+            '    a = sys.argv[1:]\n'
+            '    import subprocess\n'
+            '    subprocess.run([sys.executable, "scripts/_cycle_probe.py", "publish", *a], check=True)\n',
+        ))
+
+    def test_research_link_precedes_staging_and_publication_on_every_entry(self):
+        for entry in ("new", "cycle", "pending", "recovered", "recovered-explicit"):
+            with self.subTest(entry=entry):
+                self.tearDown(); self.setUp()
+                self._install_candidate_layout(schema=2)
+                self._install_candidate_stub()
+                self._install_cycle_probe()
+                research = self.root / "research links"
+                with (self.root / ".env").open("a") as handle:
+                    handle.write(f"PE_RANK_RESEARCH_LINK_DIR={shlex.quote(str(research))}\n")
+                probe_env = {"STUB_REQUIRE_RESEARCH_LINK": str(research)}
+                failure = {} if entry == "new" else (
+                    {"STUB_EXIT_cache_populate_activity_v2": "75"} if entry == "cycle"
+                    else {"STUB_PUSH_EXIT": "75"}
+                )
+                first = self._run(exit_env={**probe_env, **failure})
+                self.assertEqual(first.returncode, 0 if entry == "new" else 75,
+                                 first.stderr + first.stdout)
+                cycle_dir = next((self.root / "data/eval-results").glob("cron-*"))
+                link = research / cycle_dir.name
+                self.assertEqual(os.readlink(link), str(cycle_dir.resolve()))
+                if entry != "new":
+                    link.unlink()
+                    if entry.startswith("recovered"):
+                        (self.root / "data/eval-results/rank_and_push.pending").unlink()
+                    args = ("--resume-pending",) if entry in ("pending", "recovered-explicit") else ()
+                    resumed = self._run(*args, exit_env=probe_env)
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+                    self.assertEqual(os.readlink(link), str(cycle_dir.resolve()))
+                self.assertEqual(list(research.glob("*.tmp.*")), [])
+                probes = [json.loads(line) for line in self._log("cycle_probe.log").splitlines()]
+                self.assertIn("cache-stage-v2", [probe["stage"] for probe in probes])
+                self.assertIn("publish", [probe["stage"] for probe in probes])
+
+    def test_research_link_collisions_stop_before_pipeline_stages(self):
+        research = self.root / "research"
+        research.mkdir()
+        out = self.root / "data/eval-results/research-cycle"
+        link = research / out.name
+        for collision in ("file", "directory", "wrong-link", "dangling-link"):
+            with self.subTest(collision=collision):
+                if collision == "file":
+                    link.write_text("keep me\n")
+                elif collision == "directory":
+                    link.mkdir()
+                else:
+                    link.symlink_to(self.root if collision == "wrong-link" else self.root / "missing")
+                inode = link.lstat().st_ino
+                result = self._run("--out-dir", str(out), exit_env={
+                    "PE_RANK_RESEARCH_LINK_DIR": str(research),
+                })
+                self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+                self.assertIn("FATAL: research link collision", result.stderr)
+                self.assertEqual(link.lstat().st_ino, inode, "collision was replaced")
+                if collision == "file":
+                    self.assertEqual(link.read_text(), "keep me\n")
+                elif collision.endswith("link"):
+                    self.assertEqual(os.readlink(link), str(
+                        self.root if collision == "wrong-link" else self.root / "missing"
+                    ))
+                for log in ("pipeline_versions.log", "pe_bootstrap.log", "export.log",
+                            "rank.log", "rerank.log", "push.log"):
+                    self.assertIsNone(self._log(log), f"{log} ran despite the collision")
+                if collision == "directory":
+                    link.rmdir()
+                else:
+                    link.unlink()
+
+    def test_existing_correct_research_link_is_accepted(self):
+        out = self.root / "data/eval-results/research-cycle"
+        out.mkdir()
+        research = self.root / "research"
+        research.mkdir()
+        link = research / out.name
+        link.symlink_to(out)
+        inode = link.lstat().st_ino
+        result = self._run("--out-dir", str(out), exit_env={
+            "PE_RANK_RESEARCH_LINK_DIR": str(research),
+        })
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(link.lstat().st_ino, inode)
+        self.assertIsNotNone(self._log("push.log"))
+
+    def test_research_link_collision_stops_resumed_candidate_before_staging(self):
+        self._install_candidate_layout(schema=2)
+        self._install_candidate_stub()
+        research = self.root / "research"
+        with (self.root / ".env").open("a") as handle:
+            handle.write(f"PE_RANK_RESEARCH_LINK_DIR={shlex.quote(str(research))}\n")
+        first = self._run(exit_env={"STUB_EXIT_cache_populate_activity_v2": "75"})
+        self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+        cycle = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
+        link = research / cycle.name
+        link.unlink()
+        link.write_text("keep me\n")
+        before = self._log("pe_bootstrap.log")
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 2, resumed.stderr + resumed.stdout)
+        self.assertIn("FATAL: research link collision", resumed.stderr)
+        self.assertEqual(self._log("pe_bootstrap.log"), before)
+        self.assertIsNone(self._log("push.log"))
+        self.assertEqual(link.read_text(), "keep me\n")
+
+    def test_cycle_settings_override_changed_env_and_unset_absent_keys_on_every_resume(self):
+        for entry in ("cycle", "pending", "recovered", "recovered-explicit"):
+            for recorded in (True, False):
+                with self.subTest(entry=entry, recorded=recorded):
+                    self.tearDown(); self.setUp()
+                    self._install_cycle_probe()
+                    settings = dict(zip(CYCLE_SETTINGS.values(), (
+                        "15m,5m", "", "10192:btc-up-or-down-15m",
+                        str(self.root / "research 'links $(literal)"),
+                    ), strict=True)) if recorded else {}
+                    with (self.root / ".env").open("a") as handle:
+                        for variable, value in settings.items():
+                            handle.write(f"{variable}={shlex.quote(value)}\n")
+                    first = self._run(exit_env={
+                        "STUB_EXIT_events" if entry == "cycle" else "STUB_PUSH_EXIT": "75",
+                    })
+                    self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+                    cycle = self.root / "data/eval-results/rank_and_push.cycle"
+                    out = self.root / cycle.read_text().strip()
+                    configuration = out / "cycle_configuration.json"
+                    before = configuration.read_bytes()
+                    value = json.loads(before)
+                    self.assertEqual({variable: value[key] for key, variable in CYCLE_SETTINGS.items()
+                                      if key in value}, settings)
+                    changed = {variable: str(self.root / "changed research") if key == "research_link_dir"
+                               else "changed" for key, variable in CYCLE_SETTINGS.items()}
+                    with (self.root / ".env").open("a") as handle:
+                        for variable, value in changed.items():
+                            handle.write(f"{variable}={shlex.quote(value)}\n")
+                    if entry.startswith("recovered"):
+                        (self.root / "data/eval-results/rank_and_push.pending").unlink()
+                    (self.root / "cycle_probe.log").unlink()
+                    args = ("--resume-pending",) if entry in ("pending", "recovered-explicit") else ()
+                    resumed = self._run(*args, exit_env=changed)
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+                    probes = [json.loads(line) for line in self._log("cycle_probe.log").splitlines()]
+                    self.assertTrue(probes)
+                    self.assertTrue(all(probe["settings"] == settings for probe in probes), probes)
+                    self.assertEqual(configuration.read_bytes(), before)
+                    self.assertFalse((self.root / "changed research").exists())
+
+    def test_cycle_settings_record_the_discovery_alias_and_clear_it_when_absent(self):
+        # The bootstrap configuration also reads PE_MARKET_RECURRENCES (config.rs `load`): a cycle records the value
+        # discovery used, and a resume restores it through the canonical variable or clears both spellings.
+        for recorded in ('["15m","5m"]', None):
+            with self.subTest(recorded=recorded):
+                self.tearDown(); self.setUp()
+                self._install_cycle_probe()
+                if recorded:
+                    with (self.root / ".env").open("a") as handle:
+                        handle.write(f"PE_MARKET_RECURRENCES={shlex.quote(recorded)}\n")
+                first = self._run(exit_env={"STUB_EXIT_events": "75"})
+                self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+                out = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
+                self.assertEqual(json.loads((out / "cycle_configuration.json").read_text()).get("market_recurrences"),
+                                 recorded)
+                with (self.root / ".env").open("a") as handle:
+                    handle.write("PE_MARKET_RECURRENCES='[\"5m\"]'\n")
+                (self.root / "cycle_probe.log").unlink()
+                resumed = self._run(exit_env={"PE_MARKET_RECURRENCES": '["5m"]'})
+                self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+                probes = [json.loads(line)["settings"] for line in self._log("cycle_probe.log").splitlines()]
+                want = {"PE_BOOTSTRAP_MARKET_RECURRENCES": recorded} if recorded else {}
+                self.assertTrue(probes and all(probe == want for probe in probes), probes)
+
+    def test_unset_cycle_settings_preserve_configuration_bytes(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        configuration = next((self.root / "data/eval-results").glob("cron-*/cycle_configuration.json"))
+        self.assertEqual(configuration.read_bytes(), (
+            b'{"fill_window_secs": "120", "floor_tstat": "3.0", "half_life_days": "30", '
+            b'"latency_shift_secs": "2", "min_active_months": "0", "min_avg_per_month": "0", '
+            b'"min_trl": "20", "price_max": "0.65", "price_min": "0.15", "top_n": "200", '
+            b'"ttr_hours": "24"}\n'
+        ))
+
+    def test_research_service_matches_default_unit(self):
+        # Only the checkout differs: each loop's own stop flag keeps the stopped one stopped.
+        units = WRAPPER.parent.parent / "deploy/systemd"
+        expected = (units / "pe-rank-loop.service").read_text().replace(
+            "%h/prediction-markets/", "%h/prediction-markets-15m5m/",
+        )
+        self.assertEqual((units / "pe-rank-loop-15m5m.service").read_text(), expected)
 
     def test_direct_zero_arg_prefers_pending_publication_over_cycle_replay(self):
         first = self._run(exit_env={"STUB_PUSH_EXIT": "75"})
@@ -3320,6 +3739,77 @@ raise SystemExit(real_ranker.main())
         self.assertEqual(result.returncode,1,result.stdout+result.stderr)
         self.assertNotIn("LOOP_TEMPFAIL",result.stdout)
         self.assertEqual(len((self.root/"due.log").read_text().splitlines()),1)
+
+
+class CapacitySamplerUnitTest(unittest.TestCase):
+    """capacity_sampler.py's summary arithmetic and sampling cadence, with no real sleeps."""
+
+    def setUp(self):
+        sys.path.insert(0, str(WRAPPER.parent))
+        self.addCleanup(sys.path.remove, str(WRAPPER.parent))
+        import capacity_sampler
+        self.sampler = capacity_sampler
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def test_summary_folds_first_lowest_peaks_and_largest_gap(self):
+        samples = self.tmp / "s.jsonl"
+        records = [
+            {"t": 100.0, "free_bytes": 900, "files": {"wallet_cache.db": 50}, "dirs": {"parquet": 1}},
+            {"t": 110.0, "free_bytes": 700, "files": {"wallet_cache.db": 50, "c.db": 200}, "dirs": {"parquet": 5}},
+            {"t": 135.5, "free_bytes": 800, "files": {"wallet_cache.db": 60}, "dirs": {"parquet": 2}},
+        ]
+        samples.write_text("".join(json.dumps(record) + "\n" for record in records) + '{"t": 1')  # torn last line
+        self.assertEqual(self.sampler.summarize(samples), {
+            "attempts": 1, "unterminated_attempts": 1,
+            "first_free_bytes": 900, "first_files": {"wallet_cache.db": 50},
+            "min_free_bytes": 700, "min_free_at": 110.0,
+            "peak_bytes": {"wallet_cache.db": 60, "c.db": 200, "parquet": 5},
+            "samples": 3, "first_t": 100.0, "last_t": 135.5, "largest_gap_s": 25.5, "qualified": False,
+        })
+
+    def test_summary_counts_gaps_within_attempts_and_flags_an_unended_one(self):
+        samples = self.tmp / "attempts.jsonl"
+        def record(t, mark=None):
+            return {"t": t, "free_bytes": 500, "files": {}, "dirs": {}, **({"mark": mark} if mark else {})}
+        first = [record(0.0, "start"), record(10.0), record(12.0, "end")]
+        second = [record(200.0, "start"), record(209.0), record(215.0)]  # no end: the run did not end through its trap
+        samples.write_text("".join(json.dumps(line) + "\n" for line in first + second))
+        summary = self.sampler.summarize(samples)
+        self.assertEqual((summary["attempts"], summary["unterminated_attempts"], summary["largest_gap_s"]), (2, 1, 10.0))
+
+    def test_summary_qualifies_only_ended_attempts_sampled_within_three_intervals(self):
+        def summary(*attempts):
+            samples = self.tmp / "q.jsonl"
+            lines = []
+            for attempt in attempts:
+                for i, (t, interval) in enumerate(attempt):
+                    mark = {0: "start", len(attempt) - 1: "end"}.get(i)
+                    record = {"t": t, "free_bytes": 500, "files": {}, "dirs": {}, "interval": interval}
+                    lines.append({**record, **({"mark": mark} if mark else {})})
+            samples.write_text("".join(json.dumps(line) + "\n" for line in lines))
+            return self.sampler.summarize(samples)["qualified"]
+        ended = [(0.0, 10.0), (10.0, 10.0), (40.0, 10.0)]  # a 30-s gap: exactly three intervals
+        self.assertTrue(summary(ended, [(500.0, 5.0), (515.0, 5.0)]))  # the gap between attempts does not count
+        self.assertFalse(summary(ended, [(500.0, 5.0), (515.1, 5.0)]))  # one gap over three of its intervals
+        self.assertFalse(summary([(0.0, 10.0), (10.0, None), (20.0, 10.0)]))  # a sample without its interval
+        unended = self.tmp / "unended.jsonl"
+        unended.write_text(json.dumps({"t": 0.0, "free_bytes": 1, "files": {}, "dirs": {}, "interval": 10.0, "mark": "start"}) + "\n")
+        self.assertFalse(self.sampler.summarize(unended)["qualified"])  # an attempt without its end sample
+
+    def _main(self, out, parents, *extra):
+        sleeps = []
+        argv = ["capacity_sampler.py", "sample", "--parent", "4242", "--cache-dir", str(self.tmp),
+                "--out", str(out), "--interval", "7", *extra]
+        with mock.patch.object(self.sampler.os, "getppid", lambda: next(parents)), \
+                mock.patch.object(self.sampler.time, "sleep", sleeps.append), \
+                mock.patch.object(sys, "argv", argv):
+            self.assertEqual(self.sampler.main(), 0)
+        return len(out.read_text().splitlines()), sleeps
+
+    def test_sampler_writes_once_per_interval_until_its_parent_changes(self):
+        self.assertEqual(self._main(self.tmp / "loop.jsonl", iter([4242, 4242, 4242, 1])), (3, [7.0, 7.0, 7.0]))
+        self.assertEqual(self._main(self.tmp / "once.jsonl", iter([4242]), "--once"), (1, []))
 
 
 if __name__ == "__main__":

@@ -1921,6 +1921,7 @@ SH
 cat > "$forge_bin/pgrep" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+[[ ! -e "${FORGE_TEST_STATE:?}/probe-error" ]] || exit 2
 [[ -e "${FORGE_TEST_STATE:?}/descendant-running" ]]
 SH
 chmod +x "$forge_bin/systemctl" "$forge_bin/pgrep"
@@ -1941,6 +1942,13 @@ forge_run status > "$forge_state/status-descendant.out"
 grep -q '"paused_complete": false' "$forge_state/status-descendant.out" ||
   fail "Forge status ignored a live cycle descendant"
 rm "$forge_state/descendant-running"
+: > "$forge_state/probe-error"
+if forge_run status > "$forge_state/status-probe-error.out" 2>&1; then
+  fail "Forge status read a failed descendant probe as no descendant"
+fi
+grep -q 'descendant probe failed (pgrep exit 2)' "$forge_state/status-probe-error.out" ||
+  fail "Forge status did not report the failed descendant probe"
+rm "$forge_state/probe-error"
 
 rank_lock="$forge_repo/data/eval-results/.rank_and_push.lock"
 : > "$forge_state/hold-rank-lock"
@@ -2060,6 +2068,74 @@ forge_run restore > "$forge_state/restore-after-activating.out"
   fail "Forge activating refusal did not restore its recorded unit bits"
 [[ "$(<"$forge_repo/data/eval-results/rank_and_push.loop")" == run ]] ||
   fail "Forge activating refusal did not restore its recorded run flag"
+
+# Checkout overrides select their own unit, flags, records, and locks.
+mv "$forge_bin/systemctl" "$forge_bin/systemctl-fixture"
+cat > "$forge_bin/systemctl" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$#" == 3 && "$3" == "${FORGE_TEST_UNIT:?}" ]] || exit 2
+printf '%s\n' "$*" >> "${FORGE_TEST_STATE:?}/unit.calls"
+exec "$(dirname "$0")/systemctl-fixture" "$@"
+SH
+chmod +x "$forge_bin/systemctl"
+forge_override_run() {
+  env HOME="$forge_home" PE_FORGE_CHECKOUT="$forge_override_repo" \
+    FORGE_TEST_STATE="$forge_state" FORGE_TEST_UNIT="$forge_override_unit" PATH="$forge_bin:$PATH" \
+    bash "$SCRIPT_DIR/forge_pause.sh" "$@"
+}
+for forge_checkout_name in prediction-markets prediction-markets-15m5m; do
+  forge_override_repo="$TEST_TMP/forge-override/$forge_checkout_name"
+  forge_override_unit="pe-rank-loop${forge_checkout_name#prediction-markets}"
+  mkdir -p "$forge_override_repo/data/eval-results"
+  for forge_prior_state in active inactive; do
+    if [[ "$forge_prior_state" == active ]]; then
+      forge_prior_enabled=enabled
+    else
+      forge_prior_enabled=disabled
+    fi
+    printf '%s\n' run > "$forge_override_repo/data/eval-results/rank_and_push.loop"
+    printf '%s\n' "$forge_prior_enabled" > "$forge_state/unit.enabled"
+    printf '%s\n' "$forge_prior_state" > "$forge_state/unit.active"
+    forge_override_run pause > "$forge_state/override-pause.out"
+    forge_override_run status > "$forge_state/override-status.out"
+    grep -q '"paused_complete": true' "$forge_state/override-status.out" ||
+      fail "$forge_checkout_name override did not prove a complete pause"
+    [[ "$(<"$forge_override_repo/data/eval-results/rank_and_push.loop")" == stop ]] ||
+      fail "$forge_checkout_name override did not stop its own flag"
+    [[ -f "$forge_override_repo/data/eval-results/.forge_pause.json" &&
+       -f "$forge_override_repo/data/eval-results/.forge_pause.lock" &&
+       -f "$forge_override_repo/data/eval-results/.rank_and_push.lock" ]] ||
+      fail "$forge_checkout_name override did not use its own record and locks"
+    [[ "$(<"$forge_repo/data/eval-results/rank_and_push.loop")" == run &&
+       ! -e "$forge_repo/data/eval-results/.forge_pause.json" ]] ||
+      fail "$forge_checkout_name override touched the default checkout"
+    forge_override_run restore > "$forge_state/override-restore.out"
+    [[ "$(<"$forge_state/unit.enabled")" == "$forge_prior_enabled" &&
+       "$(<"$forge_state/unit.active")" == "$forge_prior_state" ]] ||
+      fail "$forge_checkout_name override did not restore its prior unit bits"
+    [[ "$(<"$forge_override_repo/data/eval-results/rank_and_push.loop")" == run &&
+       ! -e "$forge_override_repo/data/eval-results/.forge_pause.json" ]] ||
+      fail "$forge_checkout_name override did not restore its flag and consume its record"
+  done
+done
+for forge_checkout_name in unrelated-checkout prediction-markets-; do
+  forge_override_repo="$TEST_TMP/forge-override/$forge_checkout_name"
+  mkdir -p "$forge_override_repo/data/eval-results"
+  forge_calls_before=$(wc -l < "$forge_state/unit.calls")
+  set +e
+  forge_override_run pause > "$forge_state/override-invalid.out" 2> "$forge_state/override-invalid.err"
+  rc=$?
+  set -e
+  [[ "$rc" == 1 ]] || fail "unsupported Forge checkout $forge_checkout_name returned $rc"
+  grep -q 'FATAL: unsupported Forge checkout name' "$forge_state/override-invalid.err" ||
+    fail "unsupported Forge checkout refusal was not explicit"
+  [[ ! -e "$forge_override_repo/data/eval-results/.forge_pause.lock" &&
+     ! -e "$forge_override_repo/data/eval-results/.forge_pause.json" &&
+     ! -e "$forge_override_repo/data/eval-results/rank_and_push.loop" &&
+     "$(wc -l < "$forge_state/unit.calls")" == "$forge_calls_before" ]] ||
+    fail "unsupported Forge checkout mutated pause or unit state"
+done
 
 # A database that has never run the archive SQL has no activation_id column on the archive tables (the
 # deployed database before the first activation): the stamp predicate must read "no stamped rows", never

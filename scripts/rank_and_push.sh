@@ -130,6 +130,13 @@ MIN_ACTIVE_MONTHS="0"
 LATENCY_SHIFT_SECS="2"
 FILL_WINDOW_SECS="120"
 TOP_N="200"
+# Settings recorded in each cycle's cycle_configuration.json when set and restored on its resumes, one per line: the key,
+# the variable the wrapper exports, then any alias the bootstrap configuration also reads (config.rs `load` reads
+# PE_<name> under PE_BOOTSTRAP_<name>), recorded by its effective value and cleared on restore.
+RANK_CYCLE_SETTINGS="market_recurrences PE_BOOTSTRAP_MARKET_RECURRENCES PE_MARKET_RECURRENCES
+rank_market_recurrences PE_RANK_MARKET_RECURRENCES
+rank_market_series PE_RANK_MARKET_SERIES
+research_link_dir PE_RANK_RESEARCH_LINK_DIR"
 # DuckDB read-layer (issue #375). Empty => resolved after .env (flag > .env > default).
 # ENGINE: auto (DuckDB over a fresh Parquet snapshot, else SQLite) | duck (require it) |
 # sqlite (force SQLite, skip the export). SKIP_EXPORT bypasses the Step-0a rewrite.
@@ -153,6 +160,7 @@ RESUME_PENDING="0"                # internal supervisor recovery path; never sta
 PENDING_FILE="data/eval-results/rank_and_push.pending"
 CYCLE_FILE="data/eval-results/rank_and_push.cycle"
 PRODUCTION_CYCLE="0"
+CYCLE_RESUMED="0"
 CACHE_STAGE_RECORD=""
 FIXED_DB=""
 PRIOR_CACHE_BACKUP=""
@@ -261,6 +269,14 @@ fi
 # would leave the push stage without credentials.
 set -a; source ./.env; set +a
 MIN_TTR_SECS=60
+# Drive-room settings (docs/26), checked before anything runs so a bad value is never silently ignored. Decimal digits
+# without a leading zero (Bash arithmetic reads one as octal), at most six, so the byte sums cannot overflow.
+[[ -z "${PE_RANK_MIN_FREE_GB:-}" || "$PE_RANK_MIN_FREE_GB" =~ ^(0|[1-9][0-9]{0,5})$ ]] || {
+  echo "FATAL: PE_RANK_MIN_FREE_GB must be a whole number of GB (0 to 999999)" >&2; exit 2;
+}
+[[ -z "${PE_RANK_CAPACITY_SAMPLE_SECS:-}" || "$PE_RANK_CAPACITY_SAMPLE_SECS" =~ ^[1-9][0-9]{0,5}$ ]] || {
+  echo "FATAL: PE_RANK_CAPACITY_SAMPLE_SECS must be a whole number of seconds (1 to 999999)" >&2; exit 2;
+}
 
 # Neutralize PE_BOOTSTRAP_FETCH_RESOLUTIONS for the `backfill` stage (issue #383). `.env` sets
 # it =1 (.env:30) and the `set -a; source ./.env` above exports it GLOBALLY, so without this unset
@@ -385,12 +401,17 @@ PIPELINE_VERSIONS_TMP=""
 CYCLE_CONFIG_TMP=""
 CURRENT_CYCLE_TMP=""
 CAPTURE_PID=""
+SAMPLER_PID=""
 cleanup_rank_and_push() {
   local status=$?
-  if [[ -n "$CAPTURE_PID" ]]; then
-    kill "$CAPTURE_PID" 2>/dev/null || true
-    wait "$CAPTURE_PID" 2>/dev/null || true
-  fi
+  local pid
+  for pid in "$CAPTURE_PID" "$SAMPLER_PID"; do
+    [[ -n "$pid" ]] || continue
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  # The run's last capacity sample, once its children ended, closes its attempt (capacity_sampler.py summarize).
+  [[ -z "$SAMPLER_PID" ]] || "$PYTHON_BIN" "${SAMPLER[@]}" --once --mark end 8>&- 9>&- || true
   [[ -z "$CYCLE_TMP" ]] || rm -f "$CYCLE_TMP"
   [[ -z "$PIPELINE_VERSIONS_TMP" ]] || rm -f "$PIPELINE_VERSIONS_TMP"
   [[ -z "$CYCLE_CONFIG_TMP" ]] || rm -f "$CYCLE_CONFIG_TMP"
@@ -498,9 +519,36 @@ fi
 # The schema-two candidate lane (#588) is a cycle property: chosen when the cycle
 # is created and read back from its frozen configuration on every resume.
 FRESH_LANE="0"
+# Capacity gate (docs/26): a candidate copy is made only while the installed cache's filesystem holds the cache's size
+# plus PE_RANK_MIN_FREE_GB (10^9 bytes); otherwise stop here, before anything is staged (a new cycle also before its
+# pointer is written). A resume whose candidate exists, or a publication resume, makes no copy and is never gated. For a
+# retained cycle ($1, its candidate's path), an interrupted copy's `<candidate>.pending` counts as free: staging removes
+# it before it copies again.
+capacity_gate() {
+  [[ -n "${PE_RANK_MIN_FREE_GB:-}" ]] || return 0
+  local installed_real installed_bytes free_bytes need_bytes pending_bytes=0
+  installed_real="$(readlink -f -- "$DB")"
+  installed_bytes="$(stat -c %s -- "$installed_real")"
+  free_bytes="$(df -B1 --output=avail -- "$installed_real" | tail -n 1 | tr -d ' ')"
+  if [[ -n "${1:-}" && -f "$1.pending" && ! -L "$1.pending" ]]; then
+    pending_bytes="$(stat -c %s -- "$1.pending")"
+  fi
+  [[ "$installed_bytes" =~ ^[0-9]+$ && "$free_bytes" =~ ^[0-9]+$ && "$pending_bytes" =~ ^[0-9]+$ ]] || {
+    echo "FATAL: capacity gate cannot read the installed cache's size or free space" >&2; exit 2;
+  }
+  need_bytes=$((installed_bytes + PE_RANK_MIN_FREE_GB * 1000000000))
+  if (( free_bytes + pending_bytes < need_bytes )); then
+    echo "FATAL: capacity: free_bytes=$free_bytes need_bytes=$need_bytes (installed $installed_bytes + PE_RANK_MIN_FREE_GB=$PE_RANK_MIN_FREE_GB; interrupted copy $pending_bytes reclaimable); no candidate copy made" >&2
+    exit 2
+  fi
+}
 if [[ "$PRODUCTION_CYCLE" == "1" ]]; then
   if [[ -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
     OUT_DIR="$(validate_cycle_pointer)" || exit $?
+    CYCLE_RESUMED="1"
+    # A cycle retained before its candidate copy completed makes that copy again.
+    RETAINED_SIDE="$(dirname -- "$(readlink -f -- "$DB")")/wallet_cache.$(basename -- "$OUT_DIR").side.db"
+    [[ -e "$RETAINED_SIDE" ]] || capacity_gate "$RETAINED_SIDE"
     [[ -f "$OUT_DIR/cycle_manifest.json" && ! -L "$OUT_DIR/cycle_manifest.json" ]] || {
       echo "FATAL: resumed production cycle omitted its frozen cycle manifest" >&2
       exit 2
@@ -510,6 +558,7 @@ configuration = json.load(open(sys.argv[1], encoding="utf-8"))
 print(1 if configuration.get("cache_lane") == "fresh_v2" else 0)' "$OUT_DIR/cycle_configuration.json")"
     echo "RANK_AND_PUSH_CYCLE_RESUME=$OUT_DIR"
   else
+    capacity_gate
     INSTALLED_SCHEMA="$("$PYTHON_BIN" -c 'import sqlite3, sys
 with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
     schema = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -527,11 +576,12 @@ with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
     CYCLE_CONFIG_TMP="data/eval-results/.cycle_configuration.$$.json"
     CURRENT_CYCLE_TMP="data/eval-results/.cycle_manifest.$$.json"
     "$PE_BOOTSTRAP_BIN" pipeline-versions > "$PIPELINE_VERSIONS_TMP"
-    "$PYTHON_BIN" - "$CYCLE_CONFIG_TMP" \
+    RANK_CYCLE_SETTINGS="$RANK_CYCLE_SETTINGS" "$PYTHON_BIN" - "$CYCLE_CONFIG_TMP" \
       "$HALF_LIFE_DAYS" "$TTR_HOURS" "$PRICE_MIN" "$PRICE_MAX" "$FLOOR_TSTAT" \
       "$MIN_TRL" "$MIN_AVG_PER_MONTH" "$MIN_ACTIVE_MONTHS" "$LATENCY_SHIFT_SECS" \
       "$FILL_WINDOW_SECS" "$TOP_N" "$FRESH_LANE" <<'PY'
 import json
+import os
 import sys
 
 keys = [
@@ -545,6 +595,10 @@ configuration = dict(zip(keys, sys.argv[2:-1], strict=True))
 # unchanged-day gate; the one-time cutover keeps it.
 if sys.argv[-1] == "1":
     configuration["cache_lane"] = "fresh_v2"
+for key, *variables in (line.split() for line in os.environ["RANK_CYCLE_SETTINGS"].splitlines()):
+    value = next((os.environ[variable] for variable in variables if variable in os.environ), None)
+    if value is not None:
+        configuration[key] = value
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(configuration, handle, sort_keys=True)
     handle.write("\n")
@@ -582,6 +636,57 @@ fi
 
 mkdir -p "$OUT_DIR"
 echo "RANK_AND_PUSH_RUN_DIR=$OUT_DIR"
+
+# Capacity samples for the drive-room margin (docs/26): free bytes and file sizes only, the first (`start`) written before
+# anything is staged (the margin's F0 and S0), then every PE_RANK_CAPACITY_SAMPLE_SECS while this run lives, and the last
+# (`end`) from the exit trap; a resumed run of the cycle appends. Unset = none. The sampler holds none of the run's locks
+# (descriptors 8 and 9), so it can never block a recovery.
+if [[ -n "${PE_RANK_CAPACITY_SAMPLE_SECS:-}" ]]; then
+  SAMPLER=(scripts/capacity_sampler.py sample --parent "$$" --cache-dir "$(dirname -- "$(readlink -f -- "$DB")")"
+    --out "$OUT_DIR/capacity_samples.jsonl" --interval "$PE_RANK_CAPACITY_SAMPLE_SECS" --dir "parquet=$PARQUET_DIR")
+  "$PYTHON_BIN" "${SAMPLER[@]}" --once --mark start 8>&- 9>&- ||
+    { echo "FATAL: the capacity sampler could not write its first sample" >&2; exit 2; }
+  "$PYTHON_BIN" "${SAMPLER[@]}" 8>&- 9>&- &
+  SAMPLER_PID=$!
+fi
+
+# Frozen cycle settings take precedence over the .env loaded on this invocation.
+# Pure re-push tails have no cycle manifest or frozen configuration to restore.
+if [[ "$CYCLE_RESUMED" == "1" || ( "$RESUME_PENDING" == "1" && -f "$OUT_DIR/cycle_manifest.json" ) ]]; then
+  FROZEN_CYCLE_ENV="$(RANK_CYCLE_SETTINGS="$RANK_CYCLE_SETTINGS" "$PYTHON_BIN" - "$OUT_DIR/cycle_configuration.json" <<'PY'
+import json
+import os
+import shlex
+import sys
+
+configuration = json.load(open(sys.argv[1], encoding="utf-8"))
+for key, *variables in (line.split() for line in os.environ["RANK_CYCLE_SETTINGS"].splitlines()):
+    if key in configuration:
+        print(f"export {variables[0]}={shlex.quote(configuration[key])}")
+        variables = variables[1:]
+    for variable in variables:
+        print(f"unset {variable}")
+PY
+)"
+  eval "$FROZEN_CYCLE_ENV"
+fi
+
+if [[ -v PE_RANK_RESEARCH_LINK_DIR ]]; then
+  mkdir -p -- "$PE_RANK_RESEARCH_LINK_DIR" || {
+    echo "FATAL: cannot create research link directory: $PE_RANK_RESEARCH_LINK_DIR" >&2
+    exit 2
+  }
+  RESEARCH_LINK="$PE_RANK_RESEARCH_LINK_DIR/$(basename -- "$OUT_DIR")"
+  RUN_DIR_REAL="$(readlink -f -- "$OUT_DIR")"
+  # symlink(2) never replaces an existing name, so a concurrent creator cannot be clobbered.
+  if [[ ! -e "$RESEARCH_LINK" && ! -L "$RESEARCH_LINK" ]]; then
+    ln -s -- "$RUN_DIR_REAL" "$RESEARCH_LINK" || true
+  fi
+  [[ -L "$RESEARCH_LINK" && "$(readlink -- "$RESEARCH_LINK")" == "$RUN_DIR_REAL" ]] || {
+    echo "FATAL: research link collision: $RESEARCH_LINK (expected target $RUN_DIR_REAL)" >&2
+    exit 2
+  }
+fi
 
 CUTOVER_MODE="0"
 BEFORE_RANKING_JSON=""
@@ -640,19 +745,25 @@ if [[ "$SKIP_RANK" == "0" && ! -f "$PIPELINE_VERSIONS_FILE" ]]; then
   "$PE_BOOTSTRAP_BIN" pipeline-versions > "$PIPELINE_VERSIONS_FILE"
 fi
 if [[ "$CUTOVER_MODE" == "1" && ! -f "$OUT_DIR/cycle_manifest.json" ]]; then
-  "$PYTHON_BIN" - "$OUT_DIR/cycle_configuration.json" \
+  RANK_CYCLE_SETTINGS="$RANK_CYCLE_SETTINGS" "$PYTHON_BIN" - "$OUT_DIR/cycle_configuration.json" \
     "$HALF_LIFE_DAYS" "$TTR_HOURS" "$PRICE_MIN" "$PRICE_MAX" \
     "$FLOOR_TSTAT" "$MIN_TRL" "$MIN_AVG_PER_MONTH" "$MIN_ACTIVE_MONTHS" \
     "$LATENCY_SHIFT_SECS" "$FILL_WINDOW_SECS" "$TOP_N" <<'PY'
 import json
+import os
 import sys
 keys = [
     "half_life_days", "ttr_hours", "price_min", "price_max", "floor_tstat",
     "min_trl", "min_avg_per_month", "min_active_months", "latency_shift_secs",
     "fill_window_secs", "top_n",
 ]
+configuration = dict(zip(keys, sys.argv[2:], strict=True))
+for key, *variables in (line.split() for line in os.environ["RANK_CYCLE_SETTINGS"].splitlines()):
+    value = next((os.environ[variable] for variable in variables if variable in os.environ), None)
+    if value is not None:
+        configuration[key] = value
 with open(sys.argv[1], "w", encoding="utf-8") as destination:
-    json.dump(dict(zip(keys, sys.argv[2:], strict=True)), destination, sort_keys=True)
+    json.dump(configuration, destination, sort_keys=True)
     destination.write("\n")
 PY
   "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture --db "$DB" \
@@ -972,9 +1083,9 @@ else
   refresh_data
 fi
 if [[ "$SKIP_RANK" == "0" ]]; then
-  # Rank only first entries in markets whose Gamma series recurs every 15 minutes, the markets
-  # gate F copies (#782, #784). Resolve the window end once, here, so the scope, pass one and the
-  # default decay anchor share it; an explicit --as-of still wins.
+  # Rank only first entries in the requested Gamma series (#784). Resolve the window end once,
+  # here, so the scope, pass one and the default decay anchor share it; an explicit --as-of
+  # still wins.
   RANK_WIN_END="${WIN_END:-$(date -u +%Y-%m-%d)}"
   AS_OF="${AS_OF:-$RANK_WIN_END}"
   RANK_WIN_ARGS=(--win-end "$RANK_WIN_END")
@@ -987,9 +1098,10 @@ from ranker_decay import window_bounds
 print(window_bounds(sys.argv[1] or None, sys.argv[2])[0] - 86_400)
 PY
 )" || exit $?
-  echo "── Market scope: 15-minute series markets from Gamma → $MARKET_SCOPE_FILE ──"
+  echo "── Market scope: ${PE_RANK_MARKET_RECURRENCES:-15m} series markets from Gamma → $MARKET_SCOPE_FILE ──"
   run_refresh_stage "market-scope" "$PE_BOOTSTRAP_BIN" market-scope --out "$MARKET_SCOPE_FILE" \
-    --end-date-min "$scope_floor" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    --end-date-min "$scope_floor" --recurrences "${PE_RANK_MARKET_RECURRENCES:-15m}" \
+    ${PE_RANK_MARKET_SERIES:+--series "$PE_RANK_MARKET_SERIES"} "${BOOTSTRAP_CONFIG_ARGS[@]}"
 fi
 if [[ "$CUTOVER_MODE" == "1" ]]; then
   require_cutover_inputs

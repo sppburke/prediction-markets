@@ -536,73 +536,110 @@ def assert_certified_full_incremental_equivalence(full: str, incremental: str) -
         print("PASS: real full/delta caches have identical exported positions, wallet universe, publisher times and content watermarks")
 
 
-def assert_certified_deferred_publication_equivalence(
-        deferred: str, control: str, deferred_record: str, control_record: str,
-        process_now: int) -> None:
-    """Prove exact publication entries with each cache's own certification and provenance."""
+PUBLICATION_VERSIONS = {"source": "polymarket-public-activity", "activity_schema": 2,
+                        "activity_parser": 2, "clob_resolution_schema": 2,
+                        "clob_resolution_parser": 2, "cache_schema": 2, "configuration": 1}
+
+
+def _certified_publication(db: str, record: str, root: Path, index: int, process_now: int,
+                           scope: str) -> tuple[dict, Path]:
+    """Rank, re-rank and prepare one certified cache's publish request offline; return it and the rank folder."""
     import latency_shift_rerank as latency
     import push_ranking_to_supabase as publisher
     import rank_cycle_manifest as cycle
 
     day = datetime.fromtimestamp(process_now, timezone.utc).strftime("%Y-%m-%d")
-    versions = {"source": "polymarket-public-activity", "activity_schema": 2,
-                "activity_parser": 2, "clob_resolution_schema": 2,
-                "clob_resolution_parser": 2, "cache_schema": 2, "configuration": 1}
+    (root / "before.json").write_text("[]")
+    (root / "versions.json").write_text(json.dumps(PUBLICATION_VERSIONS))
+    out, parquet = root / f"rank-{index}", root / f"parquet-{index}"
+    _export_certified_cache(db, str(parquet))
+    snapshot = root / f"cycle-{index}.json"
+    snapshot.write_text(json.dumps(cycle.snapshot(Path(db), day, PUBLICATION_VERSIONS, {})))
+    argv = ["rank", "--db", db, "--out-dir", str(out), "--universe-from-trades",
+            "--as-of", str(process_now), "--win-end", day, "--scheduled-only",
+            "--min-trl", "20", "--min-avg-per-month", "0", "--min-active-months", "0",
+            "--floor-tstat", "2.0", "--ttr-hours", "48", "--market-scope", scope]
+    with mock.patch.dict(os.environ, {"PE_RANKER_ENGINE": "duck",
+                                      "PE_RANKER_PARQUET_DIR": str(parquet),
+                                      "PE_RANKER_PARQUET_MAX_AGE_HOURS": "0"}), \
+            mock.patch.object(sys, "argv", argv):
+        assert rk.main() == 0
+    argv = ["latency", "--db", db, "--out-dir", str(out),
+            "--ranked-csv", str(out / "ranked_72hr_buyandhold.csv"),
+            "--positions-csv", str(out / "qualifying_positions_72hr.csv"),
+            "--as-of", str(process_now), "--min-trl", "20",
+            "--floor-tstat", "3.0",
+            "--ttr-max-secs", "86400", "--before-ranking-json", str(root / "before.json"),
+            "--cycle-manifest-file", str(snapshot), "--cache-stage-record", record,
+            "--pipeline-versions-file", str(root / "versions.json"), "--market-scope", scope]
+    with mock.patch.dict(os.environ, {"PE_RANKER_PARQUET_DIR": str(parquet)}), mock.patch.object(sys, "argv", argv):
+        assert latency.main() == 0
+    manifest_path = out / "oracle_manifest.json"
+    with mock.patch.object(sys, "argv", ["push", "--db", db,
+            "--ranked-csv", str(out / "latency_shift_ranked.csv"),
+            "--manifest-file", str(manifest_path), "--cache-stage-record", record,
+            "--cache-side-db", db, "--cache-fixed-db", str(root / f"fixed-{index}.db"),
+            "--prior-cache-backup", str(root / f"prior-{index}.db")]):
+        args = publisher.build_parser().parse_args()
+    with mock.patch.object(publisher, "_request_once") as network:
+        request = publisher.prepare_publish_request(args, process_now)
+    network.assert_not_called()
+    publisher.validate_publish_request(request)
+    stage = json.loads(Path(record).read_text())
+    assert request["cache_activation"]["expected_sha256"] == stage["cache_sha256"]
+    assert stage["cache_sha256"] == hashlib.sha256(Path(db).read_bytes()).hexdigest()
+    manifest = json.loads(manifest_path.read_text())
+    assert request["batch"]["config_hash"] == hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return request, out
+
+
+def assert_certified_deferred_publication_equivalence(
+        deferred: str, control: str, deferred_record: str, control_record: str,
+        process_now: int) -> None:
+    """Prove exact publication entries with each cache's own certification and provenance."""
     requests = []
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        (root / "before.json").write_text("[]")
-        (root / "versions.json").write_text(json.dumps(versions))
         for index, (db, record) in enumerate(((deferred, deferred_record),
                                              (control, control_record))):
-            out, parquet = root / f"rank-{index}", root / f"parquet-{index}"
-            _export_certified_cache(db, str(parquet))
-            snapshot = root / f"cycle-{index}.json"
-            snapshot.write_text(json.dumps(cycle.snapshot(Path(db), day, versions, {})))
             scope = all_markets_scope(db, root / f"scope-{index}.json")
-            argv = ["rank", "--db", db, "--out-dir", str(out), "--universe-from-trades",
-                    "--as-of", str(process_now), "--win-end", day, "--scheduled-only",
-                    "--min-trl", "20", "--min-avg-per-month", "0", "--min-active-months", "0",
-                    "--floor-tstat", "2.0", "--ttr-hours", "48", "--market-scope", scope]
-            with mock.patch.dict(os.environ, {"PE_RANKER_ENGINE": "duck",
-                                              "PE_RANKER_PARQUET_DIR": str(parquet),
-                                              "PE_RANKER_PARQUET_MAX_AGE_HOURS": "0"}), \
-                    mock.patch.object(sys, "argv", argv):
-                assert rk.main() == 0
-            argv = ["latency", "--db", db, "--out-dir", str(out),
-                    "--ranked-csv", str(out / "ranked_72hr_buyandhold.csv"),
-                    "--positions-csv", str(out / "qualifying_positions_72hr.csv"),
-                    "--as-of", str(process_now), "--min-trl", "20",
-                    "--floor-tstat", "3.0",
-                    "--ttr-max-secs", "86400", "--before-ranking-json", str(root / "before.json"),
-                    "--cycle-manifest-file", str(snapshot), "--cache-stage-record", record,
-                    "--pipeline-versions-file", str(root / "versions.json"), "--market-scope", scope]
-            with mock.patch.dict(os.environ, {"PE_RANKER_PARQUET_DIR": str(parquet)}), mock.patch.object(sys, "argv", argv):
-                assert latency.main() == 0
-            manifest_path = out / "oracle_manifest.json"
-            with mock.patch.object(sys, "argv", ["push", "--db", db,
-                    "--ranked-csv", str(out / "latency_shift_ranked.csv"),
-                    "--manifest-file", str(manifest_path), "--cache-stage-record", record,
-                    "--cache-side-db", db, "--cache-fixed-db", str(root / f"fixed-{index}.db"),
-                    "--prior-cache-backup", str(root / f"prior-{index}.db")]):
-                args = publisher.build_parser().parse_args()
-            with mock.patch.object(publisher, "_request_once") as network:
-                request = publisher.prepare_publish_request(args, process_now)
-            network.assert_not_called()
-            publisher.validate_publish_request(request)
-            stage = json.loads(Path(record).read_text())
-            assert request["cache_activation"]["expected_sha256"] == stage["cache_sha256"]
-            assert stage["cache_sha256"] == hashlib.sha256(Path(db).read_bytes()).hexdigest()
-            manifest = json.loads(manifest_path.read_text())
-            assert request["batch"]["config_hash"] == hashlib.sha256(
-                json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-            requests.append(request)
+            requests.append(_certified_publication(db, record, root, index, process_now, scope)[0])
         assert requests[0]["entries"] == requests[1]["entries"], "deferral changed published entries"
         assert requests[0]["entries"] and all(row["survives"] for row in requests[0]["entries"])
         assert requests[0]["batch"]["universe_size"] < requests[1]["batch"]["universe_size"]
         assert requests[0]["batch"]["config_hash"] != requests[1]["batch"]["config_hash"]
         assert requests[0]["cache_activation"] != requests[1]["cache_activation"]
         print("PASS: deferral preserves exact published entries with independently bound provenance")
+
+
+def assert_certified_seeded_publication_equivalence(
+        complete: str, seeded: str, complete_record: str, seeded_record: str,
+        process_now: int) -> None:
+    """A seeds-only cache ranks and publishes exactly what a cache that also holds wallets trading no
+    ranked market does."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        # Production takes the scope from Gamma: the ranked markets, none of the extra wallets' markets.
+        scope = all_markets_scope(seeded, root / "scope.json")
+        (a, a_out), (b, b_out) = (
+            _certified_publication(db, record, root, index, process_now, scope)
+            for index, (db, record) in enumerate(((complete, complete_record), (seeded, seeded_record))))
+        for name in ("ranked_72hr_buyandhold.csv", "latency_shift_ranked.csv", "oracle_outcomes.csv"):
+            assert (a_out / name).read_bytes() == (b_out / name).read_bytes(), name
+        assert a["entries"] == b["entries"], "the extra wallet changed published entries"
+        survivors = {row["wallet_hex"] for row in a["entries"] if row["survives"]}
+        assert survivors, "no survivor to compare"
+        # The survivor's entries are priced from the shared tape: each sample is the retained print
+        # wallet's reference (0.25 + i in market i), not the survivor's own entry print (0.20 + i).
+        with open(b_out / "oracle_outcomes.csv", newline="", encoding="utf-8") as handle:
+            priced = [row for row in csv.DictReader(handle)
+                      if row["wallet"] in survivors and row["outcome"] == "repriced"]
+        assert priced, "no survivor entry priced from the shared tape"
+        for row in priced:
+            index = int(row["market_id"], 16) - 100
+            assert abs(float(row["sample_price"]) - (25 + index) / 100) < 1e-9, row
+        print("PASS: a seeds-only cache publishes exact entries, priced from another seed's prints")
 
 
 def assert_certified_excluded_newest_is_stale(db: str, excluded: str, process_now: int) -> None:
@@ -1642,7 +1679,7 @@ class MarketScopeLoad(unittest.TestCase):
             "listing too long": lambda v: v["pages"][0].update(rows=51),
             "negative rows": lambda v: v["pages"][0].update(rows=-1),
             "missing cursor field": lambda v: v["pages"][3].pop("returned_next_cursor"),
-            "recurrence": lambda v: v.update(recurrence="5m"),
+            "recurrence": lambda v: v.update(recurrence="hourly"),
             "times": lambda v: v.update(started_at_unix=2**63),
             "count": lambda v: v.update(count=3),
             "digest": lambda v: v.update(digest="0" * 64),
@@ -1665,6 +1702,50 @@ class MarketScopeLoad(unittest.TestCase):
             with self.subTest(name):
                 value = self.two_series()
                 mutate(value)
+                with self.assertRaises(ranker_duck.MarketScopeError):
+                    self.load(value)
+
+    def pinned(self) -> dict:
+        """The same two series read by id (`market-scope --series`) instead of the catalog listing."""
+        value = self.two_series()
+        listing, chains = value["pages"][0], value["pages"][1:]
+        reads = [{**listing, "ordinal": i, "series_id": s["id"], "url": f"https://gamma/series/{s['id']}", "rows": 1}
+                 for i, s in enumerate(value["series"])]
+        value["pages"] = reads + [{**page, "ordinal": len(reads) + i} for i, page in enumerate(chains)]
+        return value
+
+    def test_pinned_series_reads_replace_the_listing(self):
+        ids, _ = self.load(self.pinned())
+        self.assertEqual(ids, frozenset({"0xa", "0xb"}))
+        cases = {
+            "read names another series": lambda v: v["pages"][0].update(series_id="11"),
+            "read url": lambda v: v["pages"][1].update(url="https://gamma/series/2"),
+            "read rows": lambda v: v["pages"][0].update(rows=2),
+            "a read missing": lambda v: v["pages"].pop(1) and [p.update(ordinal=i) for i, p in enumerate(v["pages"])],
+            "read with a cursor": lambda v: v["pages"][0].update(returned_next_cursor="c"),
+            "listing mixed with reads": lambda v: v["pages"][1].update(series_id=None),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name):
+                value = self.pinned()
+                mutate(value)
+                with self.assertRaises(ranker_duck.MarketScopeError):
+                    self.load(value)
+
+    def test_known_recurrence_lists_are_accepted(self):
+        for recurrence in ("15m", "5m", "15m,5m"):
+            with self.subTest(recurrence=recurrence):
+                value = self.two_series()
+                value["recurrence"] = recurrence
+                ids, summary = self.load(value)
+                self.assertEqual(ids, frozenset({"0xa", "0xb"}))
+                self.assertEqual(summary["recurrence"], recurrence)
+
+    def test_invalid_recurrence_lists_are_refused(self):
+        for recurrence in ("", ",", "15m,", ",5m", "15m,hourly", "15m,15m", None, []):
+            with self.subTest(recurrence=recurrence):
+                value = self.two_series()
+                value["recurrence"] = recurrence
                 with self.assertRaises(ranker_duck.MarketScopeError):
                     self.load(value)
 

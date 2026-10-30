@@ -1,8 +1,7 @@
-//! Gamma 15-minute market scope for the ranker (#784).
+//! Gamma market scope for the ranker and participant discovery (#784, #800).
 //!
-//! Gate F copies only markets whose Gamma event's first series recurs every 15 minutes (#782).
-//! The ranker scores the same markets: this command lists every Gamma series, keeps those with
-//! that recurrence, walks each one's events through the documented `/events/keyset` endpoint back
+//! This command lists every Gamma series, keeps those with a requested recurrence,
+//! walks each one's events through the documented `/events/keyset` endpoint back
 //! to an end-date floor, and writes the markets' condition ids with every page's hash, cursor
 //! chain and times. Any surprise in a reply fails the command (exit 1); exhausted transient
 //! fetches exit 75 so the loop supervisor retries the retained cycle. Nothing touches the cache.
@@ -96,7 +95,7 @@ impl ScopeFetcher for ReqwestFetcher {
     }
 }
 
-/// A listed 15-minute series.
+/// A listed series with a requested recurrence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScopeSeries {
     pub id: String,
@@ -126,7 +125,7 @@ pub struct MarketScope {
     pub source_id: &'static str,
     pub schema_version: u32,
     pub parser_version: u32,
-    pub recurrence: &'static str,
+    pub recurrence: String,
     pub end_date_min_unix: i64,
     pub started_at_unix: i64,
     pub completed_at_unix: i64,
@@ -137,21 +136,45 @@ pub struct MarketScope {
     pub digest: String,
 }
 
+pub(crate) fn canonical_recurrences(recurrences: &[String]) -> Result<Vec<String>, BootstrapError> {
+    if recurrences.is_empty()
+        || recurrences
+            .iter()
+            .any(|value| !matches!(value.as_str(), FIFTEEN_MINUTE_RECURRENCE | "5m"))
+    {
+        return Err(BootstrapError::Invalid {
+            message: "market recurrences must be a non-empty list of 15m or 5m".to_owned(),
+        });
+    }
+    let mut sorted = recurrences.to_vec();
+    sorted.sort();
+    if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(BootstrapError::Invalid {
+            message: "market recurrences must not contain duplicates".to_owned(),
+        });
+    }
+    Ok(sorted)
+}
+
 /// Build the production fetcher, sweep, and write the scope file atomically.
 pub async fn run_market_scope(
     config: &BootstrapConfig,
     out: &Path,
     end_date_min_unix: i64,
+    recurrences: &[String],
+    pinned: Option<&[ScopeSeries]>,
 ) -> Result<MarketScope, BootstrapError> {
-    let scope = recent_market_scope(config, end_date_min_unix).await?;
+    let scope = recent_market_scope(config, end_date_min_unix, recurrences, pinned).await?;
     crate::cache_migration::atomic_write_json(out, &scope)?;
     Ok(scope)
 }
 
-/// Sweep recent 15-minute markets with page provenance, without writing a file.
+/// Sweep recent markets with page provenance, without writing a file.
 pub(crate) async fn recent_market_scope(
     config: &BootstrapConfig,
     end_date_min_unix: i64,
+    recurrences: &[String],
+    pinned: Option<&[ScopeSeries]>,
 ) -> Result<MarketScope, BootstrapError> {
     let client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(15))
@@ -162,18 +185,49 @@ pub(crate) async fn recent_market_scope(
         &fetcher,
         &config.gamma_base_url,
         end_date_min_unix,
+        recurrences,
+        pinned,
         PAGE_RETRY_BASE,
     )
     .await
 }
 
-/// List the 15-minute series, then walk each one's events ending at or after the floor.
+/// Parse `id:slug,...`, the series a scope must list exactly (the research period pins gen 26's).
+pub fn parse_pinned_series(text: &str) -> Result<Vec<ScopeSeries>, BootstrapError> {
+    let mut pinned: Vec<ScopeSeries> = Vec::new();
+    for item in text.split(',') {
+        let invalid = || BootstrapError::Invalid {
+            message: format!("market series must be id:slug pairs; got {item:?}"),
+        };
+        let (id, slug) = item.split_once(':').ok_or_else(invalid)?;
+        let number: u64 = id.parse().map_err(|_| invalid())?;
+        if slug.is_empty() || number.to_string() != id {
+            return Err(invalid());
+        }
+        if pinned.iter().any(|series| series.id == id) {
+            return Err(BootstrapError::Invalid {
+                message: format!("market series {id} is pinned twice"),
+            });
+        }
+        pinned.push(ScopeSeries {
+            id: id.to_owned(),
+            slug: Some(slug.to_owned()),
+        });
+    }
+    Ok(pinned)
+}
+
+/// List the requested series (or read exactly the pinned ones by id), then walk each one's events
+/// ending at or after the floor.
 async fn sweep_market_scope<F: ScopeFetcher + Sync>(
     fetcher: &F,
     base_url: &str,
     end_date_min_unix: i64,
+    recurrences: &[String],
+    pinned: Option<&[ScopeSeries]>,
     retry_base: Duration,
 ) -> Result<MarketScope, BootstrapError> {
+    let recurrences = canonical_recurrences(recurrences)?;
     let started_at_unix = OffsetDateTime::now_utc().unix_timestamp();
     let floor = OffsetDateTime::from_unix_timestamp(end_date_min_unix)
         .ok()
@@ -182,45 +236,23 @@ async fn sweep_market_scope<F: ScopeFetcher + Sync>(
             message: format!("market-scope: unusable --end-date-min {end_date_min_unix}"),
         })?;
     let mut pages = Vec::new();
-
-    let mut series = BTreeMap::new();
-    let mut listed = false;
-    for page_index in 0..SERIES_MAX_PAGES {
-        let offset = page_index * SERIES_PAGE_LIMIT;
-        let url = format!(
-            "{base_url}/series?exclude_events=true&limit={SERIES_PAGE_LIMIT}&offset={offset}"
-        );
-        let page = fetch_with_retry(fetcher, &url, "series", retry_base).await?;
-        let rows: Vec<Value> = parse_page(&url, &page.body)?;
-        for row in &rows {
-            if !row.is_object() {
-                return anomaly(&url, "series row is not an object");
-            }
-            if row.get("recurrence").and_then(Value::as_str) != Some(FIFTEEN_MINUTE_RECURRENCE) {
-                continue;
-            }
-            let (number, id) = decimal_id(row.get("id"))
-                .ok_or_else(|| anomaly_error(&url, "15-minute series id is not decimal"))?;
-            let slug = row.get("slug").and_then(Value::as_str).map(str::to_owned);
-            series.entry(number).or_insert(ScopeSeries { id, slug });
+    let series = match pinned {
+        Some(pinned) => {
+            pinned_series(
+                fetcher,
+                base_url,
+                pinned,
+                &recurrences,
+                retry_base,
+                &mut pages,
+            )
+            .await?
         }
-        let rows_len = rows.len();
-        pages.push(page_record(
-            &pages, "series", None, url, None, None, &page, rows_len,
-        )?);
-        if rows_len < SERIES_PAGE_LIMIT {
-            listed = true;
-            break;
-        }
-    }
-    if !listed {
-        return Err(BootstrapError::Gamma {
-            message: format!("market-scope: series listing exceeded {SERIES_MAX_PAGES} pages"),
-        });
-    }
+        None => list_series(fetcher, base_url, &recurrences, retry_base, &mut pages).await?,
+    };
     if series.is_empty() {
         return Err(BootstrapError::Gamma {
-            message: "market-scope: Gamma lists no 15-minute series".to_owned(),
+            message: "market-scope: Gamma lists no requested series".to_owned(),
         });
     }
 
@@ -251,7 +283,13 @@ async fn sweep_market_scope<F: ScopeFetcher + Sync>(
                 Some(_) => return anomaly(&url, "next_cursor is not a non-empty string"),
             };
             for event in events {
-                collect_event(&url, &listed_series.id, event, &mut condition_ids)?;
+                collect_event(
+                    &url,
+                    &listed_series.id,
+                    event,
+                    &recurrences,
+                    &mut condition_ids,
+                )?;
             }
             pages.push(page_record(
                 &pages,
@@ -282,7 +320,7 @@ async fn sweep_market_scope<F: ScopeFetcher + Sync>(
     }
     if condition_ids.is_empty() {
         return Err(BootstrapError::Gamma {
-            message: "market-scope: the 15-minute series list no markets".to_owned(),
+            message: "market-scope: the requested series list no markets".to_owned(),
         });
     }
 
@@ -293,7 +331,7 @@ async fn sweep_market_scope<F: ScopeFetcher + Sync>(
         source_id: SOURCE_ID,
         schema_version: 1,
         parser_version: 1,
-        recurrence: FIFTEEN_MINUTE_RECURRENCE,
+        recurrence: recurrences.join(","),
         end_date_min_unix,
         started_at_unix,
         completed_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
@@ -305,11 +343,115 @@ async fn sweep_market_scope<F: ScopeFetcher + Sync>(
     })
 }
 
-/// Label one event's markets after proving it belongs to the walked 15-minute series.
+/// Each pinned series read by id, in id order; its page joins the scope's provenance. A series that
+/// is missing, renamed or no longer of a requested recurrence fails the stage temporarily (the loop
+/// retries; a lasting change is the owner's research decision).
+async fn pinned_series<F: ScopeFetcher + Sync>(
+    fetcher: &F,
+    base_url: &str,
+    pinned: &[ScopeSeries],
+    recurrences: &[String],
+    retry_base: Duration,
+    pages: &mut Vec<ScopePage>,
+) -> Result<BTreeMap<u64, ScopeSeries>, BootstrapError> {
+    let mut wanted = BTreeMap::new();
+    for series in pinned {
+        let number = series
+            .id
+            .parse::<u64>()
+            .map_err(|_| BootstrapError::Internal)?;
+        wanted.insert(number, series.clone());
+    }
+    for (number, want) in &wanted {
+        let url = format!("{base_url}/series/{}", want.id);
+        let changed = |reason: &str| BootstrapError::TransientSource {
+            source_name: "gamma-series",
+            message: format!("market-scope: pinned series {} {reason}", want.id),
+        };
+        let page = match fetch_with_retry(fetcher, &url, "series", retry_base).await {
+            Err(BootstrapError::Gamma { message }) => return Err(changed(&message)),
+            fetched => fetched?,
+        };
+        let row: Value = parse_page(&url, &page.body)?;
+        if decimal_id(row.get("id")).map(|(value, _)| value) != Some(*number) {
+            return Err(changed("is answered under another id"));
+        }
+        if row.get("slug").and_then(Value::as_str) != want.slug.as_deref() {
+            return Err(changed("has another slug"));
+        }
+        if !row
+            .get("recurrence")
+            .and_then(Value::as_str)
+            .is_some_and(|value| recurrences.iter().any(|requested| requested == value))
+        {
+            return Err(changed("has no requested recurrence"));
+        }
+        pages.push(page_record(
+            pages,
+            "series",
+            Some(want.id.clone()),
+            url,
+            None,
+            None,
+            &page,
+            1,
+        )?);
+    }
+    Ok(wanted)
+}
+
+/// One complete `/series` listing, keeping the requested recurrences' series; its pages join the
+/// scope's provenance.
+async fn list_series<F: ScopeFetcher + Sync>(
+    fetcher: &F,
+    base_url: &str,
+    recurrences: &[String],
+    retry_base: Duration,
+    pages: &mut Vec<ScopePage>,
+) -> Result<BTreeMap<u64, ScopeSeries>, BootstrapError> {
+    let mut series = BTreeMap::new();
+    for page_index in 0..SERIES_MAX_PAGES {
+        let offset = page_index * SERIES_PAGE_LIMIT;
+        let url = format!(
+            "{base_url}/series?exclude_events=true&limit={SERIES_PAGE_LIMIT}&offset={offset}"
+        );
+        let page = fetch_with_retry(fetcher, &url, "series", retry_base).await?;
+        let rows: Vec<Value> = parse_page(&url, &page.body)?;
+        for row in &rows {
+            if !row.is_object() {
+                return anomaly(&url, "series row is not an object");
+            }
+            if !row
+                .get("recurrence")
+                .and_then(Value::as_str)
+                .is_some_and(|value| recurrences.iter().any(|requested| requested == value))
+            {
+                continue;
+            }
+            let (number, id) = decimal_id(row.get("id"))
+                .ok_or_else(|| anomaly_error(&url, "requested series id is not decimal"))?;
+            let slug = row.get("slug").and_then(Value::as_str).map(str::to_owned);
+            series.entry(number).or_insert(ScopeSeries { id, slug });
+        }
+        let rows_len = rows.len();
+        pages.push(page_record(
+            pages, "series", None, url, None, None, &page, rows_len,
+        )?);
+        if rows_len < SERIES_PAGE_LIMIT {
+            return Ok(series);
+        }
+    }
+    Err(BootstrapError::Gamma {
+        message: format!("market-scope: series listing exceeded {SERIES_MAX_PAGES} pages"),
+    })
+}
+
+/// Label one event's markets after proving it belongs to a requested, walked series.
 fn collect_event(
     url: &str,
     series_id: &str,
     event: &Value,
+    recurrences: &[String],
     condition_ids: &mut BTreeSet<String>,
 ) -> Result<(), BootstrapError> {
     let first_series = event
@@ -323,8 +465,13 @@ fn collect_event(
     {
         return anomaly(url, "event's first series is not the requested series");
     }
-    if event_series_recurrence(event) != Some(FIFTEEN_MINUTE_RECURRENCE) {
-        return anomaly(url, "event's first series does not recur every 15 minutes");
+    if !event_series_recurrence(event)
+        .is_some_and(|value| recurrences.iter().any(|requested| requested == value))
+    {
+        return anomaly(
+            url,
+            "event's first series does not have a requested recurrence",
+        );
     }
     let markets = event
         .get("markets")
@@ -550,7 +697,166 @@ mod tests {
     async fn sweep<G: Fn(&str, usize) -> Result<Vec<u8>, SourceError> + Sync>(
         serve: G,
     ) -> Result<MarketScope, BootstrapError> {
-        sweep_market_scope(&fetcher(serve), BASE, FLOOR, Duration::ZERO).await
+        sweep_market_scope(
+            &fetcher(serve),
+            BASE,
+            FLOOR,
+            &BootstrapConfig::default().market_recurrences,
+            None,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    async fn sweep_pinned<G: Fn(&str, usize) -> Result<Vec<u8>, SourceError> + Sync>(
+        serve: G,
+        pin: &str,
+    ) -> (Result<MarketScope, BootstrapError>, usize) {
+        sweep_pinned_with(serve, pin, &BootstrapConfig::default().market_recurrences).await
+    }
+
+    async fn sweep_pinned_with<G: Fn(&str, usize) -> Result<Vec<u8>, SourceError> + Sync>(
+        serve: G,
+        pin: &str,
+        recurrences: &[String],
+    ) -> (Result<MarketScope, BootstrapError>, usize) {
+        let fetcher = fetcher(serve);
+        let pinned = parse_pinned_series(pin).unwrap();
+        let scope = sweep_market_scope(
+            &fetcher,
+            BASE,
+            FLOOR,
+            recurrences,
+            Some(&pinned),
+            Duration::ZERO,
+        )
+        .await;
+        (scope, fetcher.1.load(Ordering::SeqCst))
+    }
+
+    /// The pinned series by id, as Gamma answers `/series/{id}`; a catalog listing request fails the test; anything
+    /// else is `serve_ok`'s.
+    fn serve_pinned(url: &str, call: usize) -> Result<Vec<u8>, SourceError> {
+        let row = match url.strip_prefix(&format!("{BASE}/series/")) {
+            Some("2") => json!({"id": 2, "slug": "btc-up-or-down-15m", "recurrence": "15m"}),
+            Some("11") => json!({"id": "11", "slug": "eth-up-or-down-15m", "recurrence": "15m"}),
+            Some("12") => json!({"id": "12", "slug": "sol-up-or-down-5m", "recurrence": "5m"}),
+            Some(_) => {
+                return Err(SourceError::Fatal {
+                    message: "HTTP 404".to_owned(),
+                });
+            }
+            None if url.starts_with(&format!("{BASE}/series?")) => {
+                panic!("a pinned scope requested the catalog listing: {url}")
+            }
+            None if url == events_url(BASE, "12", FLOOR_ISO, None).unwrap() => {
+                json!({"events": [event("12", "5m", &[condition(4)])]})
+            }
+            None => return serve_ok(url, call),
+        };
+        Ok(serde_json::to_vec(&row).unwrap())
+    }
+
+    /// FAIL: a pin of both recurrences (the configuration after 11/30) loses a pinned series that the catalog listing
+    /// omits, or consults the listing at all.
+    #[tokio::test]
+    async fn a_pin_of_both_recurrences_keeps_a_series_the_catalog_omits() {
+        let both = ["15m".to_owned(), "5m".to_owned()];
+        // Series 12 (5m) is absent from serve_ok's catalog pages; the pin reads it by id.
+        let (scope, _) = sweep_pinned_with(
+            serve_pinned,
+            "12:sol-up-or-down-5m,2:btc-up-or-down-15m",
+            &both,
+        )
+        .await;
+        let scope = scope.unwrap();
+        let ids: Vec<&str> = scope
+            .series
+            .iter()
+            .map(|series| series.id.as_str())
+            .collect();
+        assert_eq!(ids, ["2", "12"]);
+        assert_eq!(scope.recurrence, "15m,5m");
+        assert!(
+            scope
+                .pages
+                .iter()
+                .all(|page| page.kind != "series" || page.series_id.is_some()),
+            "a pinned scope never lists the catalog"
+        );
+        assert_eq!(
+            scope.condition_ids,
+            vec![condition(1), condition(3), condition(4)]
+        );
+    }
+
+    /// FAIL: a pinned scope lists the catalog, keeps a series outside the pin, or accepts a
+    /// pinned series that is missing, renamed or of another recurrence.
+    #[tokio::test]
+    async fn pinned_series_are_read_by_id_exactly() {
+        let (scope, _) =
+            sweep_pinned(serve_pinned, "11:eth-up-or-down-15m,2:btc-up-or-down-15m").await;
+        let scope = scope.unwrap();
+        let ids = |scope: &MarketScope| -> Vec<String> {
+            scope
+                .series
+                .iter()
+                .map(|series| series.id.clone())
+                .collect()
+        };
+        assert_eq!(ids(&scope), vec!["2".to_owned(), "11".to_owned()]);
+        let reads: Vec<(Option<&str>, &str)> = scope
+            .pages
+            .iter()
+            .filter(|page| page.kind == "series")
+            .map(|page| (page.series_id.as_deref(), page.url.as_str()))
+            .collect();
+        assert_eq!(
+            reads,
+            vec![
+                (Some("2"), "http://gamma.test/series/2"),
+                (Some("11"), "http://gamma.test/series/11")
+            ]
+        );
+        assert_eq!(
+            scope.condition_ids,
+            vec![condition(1), condition(2), condition(3)]
+        );
+        // The pin keeps series 2 only; series 11's markets stay out.
+        let (scope, _) = sweep_pinned(serve_pinned, "2:btc-up-or-down-15m").await;
+        assert_eq!(
+            scope.unwrap().condition_ids,
+            vec![condition(1), condition(3)]
+        );
+        // Renamed, missing or of another recurrence: a temporary failure after one read.
+        for pin in [
+            "11:eth-15m",
+            "13:doge-up-or-down-15m",
+            "12:sol-up-or-down-5m",
+        ] {
+            let (error, calls) = sweep_pinned(serve_pinned, pin).await;
+            let error = error.unwrap_err();
+            assert_eq!(
+                error.exit_code(),
+                BootstrapError::TEMPFAIL_EXIT_CODE,
+                "{pin}: {error}"
+            );
+            assert_eq!(calls, 1, "{pin}");
+        }
+    }
+
+    /// FAIL: a malformed or duplicated pin is accepted.
+    #[test]
+    fn pinned_series_parse_only_decimal_ids_with_slugs_once() {
+        assert_eq!(
+            parse_pinned_series("10192:btc-up-or-down-15m,12518:zec-up-or-down-15m")
+                .unwrap()
+                .len(),
+            2
+        );
+        for bad in ["", "10192", "10192:", "x:btc", "010192:btc", "1:a,1:b"] {
+            assert!(parse_pinned_series(bad).is_err(), "{bad}");
+        }
     }
 
     #[tokio::test]
@@ -615,7 +921,7 @@ mod tests {
         assert_eq!(scope.pages[4].source_at_unix, Some(900));
         assert_eq!(scope.end_date_min_unix, FLOOR);
         assert_eq!(
-            (scope.version, scope.source_id, scope.recurrence),
+            (scope.version, scope.source_id, scope.recurrence.as_str()),
             (1, "polymarket-gamma", "15m")
         );
         assert!(scope.started_at_unix <= scope.completed_at_unix);
@@ -624,6 +930,109 @@ mod tests {
                 .unwrap()
                 .ends_with("after_cursor=a%3Db%26c")
         );
+    }
+
+    #[tokio::test]
+    async fn default_scope_file_keeps_the_15m_bytes() {
+        let mut scope = sweep(|url: &str, _| {
+            let body = if url.contains("/series?") {
+                r#"[{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"}]"#.to_owned()
+            } else {
+                format!(
+                    r#"{{"events":[{{"series":[{{"id":"7","recurrence":"15m"}}],"markets":[{{"conditionId":"{}"}}]}}]}}"#,
+                    condition(0xab)
+                )
+            };
+            Ok(body.into_bytes())
+        })
+        .await
+        .unwrap();
+        scope.started_at_unix = 1_000;
+        scope.completed_at_unix = 1_001;
+        let dir = tempfile::TempDir::new().unwrap();
+        let out = dir.path().join("scope.json");
+        crate::cache_migration::atomic_write_json(&out, &scope).unwrap();
+        assert_eq!(
+            std::fs::read(out).unwrap(),
+            include_bytes!("../tests/fixtures/market_scope_15m.json")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn requested_recurrences_select_series_and_events_in_canonical_order() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for requested in [vec!["5m"], vec!["15m", "5m"], vec!["5m", "15m"]] {
+            figment::Jail::expect_with(|jail| {
+                let calls = fetcher(|url: &str, _| {
+                    let value = if url.contains("/series?") {
+                        json!([
+                            {"id": "2", "recurrence": "15m"},
+                            {"id": "3", "recurrence": "5m"},
+                            {"id": "4", "recurrence": "daily"}
+                        ])
+                    } else if url.contains("series_id=2&") {
+                        json!({"events": [event("2", "15m", &[condition(2)])]})
+                    } else if url.contains("series_id=3&") {
+                        json!({"events": [event("3", "5m", &[condition(3)])]})
+                    } else {
+                        panic!("unexpected URL {url}");
+                    };
+                    Ok(serde_json::to_vec(&value).unwrap())
+                });
+                jail.set_env("PE_BOOTSTRAP_OUTPUT", "/tmp/watchlist.json");
+                jail.set_env(
+                    "PE_BOOTSTRAP_MARKET_RECURRENCES",
+                    serde_json::to_string(&requested).unwrap(),
+                );
+                let config = crate::config::load(None).unwrap();
+                let scope = runtime
+                    .block_on(sweep_market_scope(
+                        &calls,
+                        BASE,
+                        FLOOR,
+                        &config.market_recurrences,
+                        None,
+                        Duration::ZERO,
+                    ))
+                    .unwrap();
+                let both = requested.len() == 2;
+                assert_eq!(scope.recurrence, if both { "15m,5m" } else { "5m" });
+                assert_eq!(
+                    scope
+                        .series
+                        .iter()
+                        .map(|series| series.id.as_str())
+                        .collect::<Vec<_>>(),
+                    if both { vec!["2", "3"] } else { vec!["3"] }
+                );
+                assert_eq!(
+                    scope.condition_ids,
+                    if both {
+                        vec![condition(2), condition(3)]
+                    } else {
+                        vec![condition(3)]
+                    }
+                );
+                assert_eq!(calls.1.load(Ordering::SeqCst), if both { 3 } else { 2 });
+                Ok(())
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_recurrences_fail_before_fetching() {
+        let calls = fetcher(|_: &str, _| panic!("invalid recurrences must not fetch"));
+        for requested in [vec![], vec!["hourly"], vec!["15m", "15m"], vec![""]] {
+            let recurrences: Vec<String> = requested.into_iter().map(str::to_owned).collect();
+            let error = sweep_market_scope(&calls, BASE, FLOOR, &recurrences, None, Duration::ZERO)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, BootstrapError::Invalid { .. }));
+        }
+        assert_eq!(calls.1.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -723,9 +1132,16 @@ mod tests {
             )
         };
         let calls = fetcher(endless);
-        let error = sweep_market_scope(&calls, BASE, FLOOR, Duration::ZERO)
-            .await
-            .unwrap_err();
+        let error = sweep_market_scope(
+            &calls,
+            BASE,
+            FLOOR,
+            &BootstrapConfig::default().market_recurrences,
+            None,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.exit_code(), 1);
         assert_eq!(
             calls.1.load(Ordering::SeqCst),

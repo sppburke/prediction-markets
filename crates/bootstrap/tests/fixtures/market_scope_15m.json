@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "source_id": "polymarket-gamma",
+  "schema_version": 1,
+  "parser_version": 1,
+  "recurrence": "15m",
+  "end_date_min_unix": 1776384000,
+  "started_at_unix": 1000,
+  "completed_at_unix": 1001,
+  "series": [
+    {
+      "id": "7",
+      "slug": "btc-up-or-down-15m"
+    }
+  ],
+  "pages": [
+    {
+      "ordinal": 0,
+      "kind": "series",
+      "series_id": null,
+      "url": "http://gamma.test/series?exclude_events=true&limit=50&offset=0",
+      "request_cursor": null,
+      "returned_next_cursor": null,
+      "raw_sha256": "7a4b6d16f83265c7f1e920da424cf8f049949c04b90e39e6e2c0ad1759325875",
+      "rows": 1,
+      "observed_at_unix": 990,
+      "received_at_unix": 1000,
+      "source_at_unix": 900
+    },
+    {
+      "ordinal": 1,
+      "kind": "events",
+      "series_id": "7",
+      "url": "http://gamma.test/events/keyset?series_id=7&end_date_min=2026-04-17T00%3A00%3A00Z&limit=100",
+      "request_cursor": null,
+      "returned_next_cursor": null,
+      "raw_sha256": "18f56e24fcd1e4988b1e7738c074da11e8cd97e598ad9e3589457290f5d2a3e4",
+      "rows": 1,
+      "observed_at_unix": 991,
+      "received_at_unix": 1001,
+      "source_at_unix": 900
+    }
+  ],
+  "condition_ids": [
+    "0xabababababababababababababababababababababababababababababababab"
+  ],
+  "count": 1,
+  "digest": "6836abfe460e9eeb5bf774d98fcddb837cbcb0a7da20cdeb5e7388a1fb0b0606"
+}

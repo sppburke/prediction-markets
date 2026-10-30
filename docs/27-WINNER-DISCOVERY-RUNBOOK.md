@@ -26,7 +26,8 @@ defaults"):
 
 ```
 PE_BOOTSTRAP_LEADERBOARD_BASE_URL        # override leaderboard host (testing)
-PE_BOOTSTRAP_LEADERBOARD_TOP_N           # list depth; paged (canonical default in _GLOSSARY.md)
+PE_BOOTSTRAP_LEADERBOARD_TOP_N           # list depth; paged (canonical default in _GLOSSARY.md); 0 disables the source
+PE_BOOTSTRAP_MARKET_RECURRENCES          # participant markets' Gamma recurrences, TOML array (canonical default in _GLOSSARY.md)
 PE_BOOTSTRAP_DATADASH_API_URL            # default https://api.datadash.xyz (on by default; "" disables)
 PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS    # recent market lookback; 0 disables with no HTTP
 PE_BOOTSTRAP_CACHE_PATH                  # default wallet_cache.db
@@ -108,8 +109,8 @@ behaviour of the `SRC_GAP502` (64), `SRC_DATADASH` (128) and
 
 ## Recent market participants (#800)
 
-The third source sweeps the existing Gamma 15-minute series scope with a recent end-date
-floor, then reads public Data API `/trades` for those condition ids over one frozen lookback
+The third source sweeps the Gamma series of `bootstrap_market_recurrences` (15-minute by default;
+`_GLOSSARY.md`) with a recent end-date floor, then reads public Data API `/trades` for those condition ids over one frozen lookback
 window. It uses the endpoint's default `takerOnly=true`, so only taker wallets are discovered.
 Future markets can be in the Gamma scope; an empty trades reply adds no wallet. The lookback
 default and request bounds are canonical in

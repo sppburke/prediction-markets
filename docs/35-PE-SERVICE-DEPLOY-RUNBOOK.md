@@ -121,13 +121,17 @@ SUPABASE_DB_URL=<session-pooler-url> scripts/deploy/activate_generation.sh --dry
   --bankroll <fresh-bankroll>
 ```
 
-Before starting the driver, pause the ranking loop from an operator host that can reach Forge and
-verify the recorded and live state:
+Before starting the driver, pause the ranking loop that publishes from an operator host that can reach
+Forge and verify the recorded and live state. Name its checkout explicitly (`prediction-markets`, or
+`prediction-markets-15m5m` once the 15/5-minute loop publishes, `docs/26` "Second loop") and use the
+same checkout for the pause, status, checkout update and restore below; the helper derives the unit from
+it:
 
 ```bash
+CHECKOUT=prediction-markets   # the publishing checkout
 scp scripts/deploy/forge_pause.sh forge:/tmp/forge_pause.sh
-ssh forge 'bash /tmp/forge_pause.sh pause'
-ssh forge 'bash /tmp/forge_pause.sh status'
+ssh forge "PE_FORGE_CHECKOUT=\$HOME/$CHECKOUT bash /tmp/forge_pause.sh pause"
+ssh forge "PE_FORGE_CHECKOUT=\$HOME/$CHECKOUT bash /tmp/forge_pause.sh status"
 ```
 
 The activation driver runs on the VPS, which cannot resolve or reach Forge. The Forge pause is
@@ -217,12 +221,12 @@ check was performed, not an automated site probe. This interactive attestation i
 exception that leaves the service running at `started`; supply the attestation on the next identical run
 or choose rollback.
 
-After the driver reaches `verified`, update the Forge checkout to the exact merge commit and restore its
+After the driver reaches `verified`, update that Forge checkout to the exact merge commit and restore its
 recorded flag, enablement, and activity independently on Forge itself:
 
 ```bash
-ssh forge 'cd ~/prediction-markets && scripts/deploy/forge_pause.sh restore'
-ssh forge 'cd ~/prediction-markets && scripts/deploy/forge_pause.sh status'
+ssh forge "cd ~/$CHECKOUT && PE_FORGE_CHECKOUT=\$HOME/$CHECKOUT scripts/deploy/forge_pause.sh restore"
+ssh forge "cd ~/$CHECKOUT && PE_FORGE_CHECKOUT=\$HOME/$CHECKOUT scripts/deploy/forge_pause.sh status"
 ```
 
 Do not restore Forge before `verified`: the driver checks the frozen batch again during verification.

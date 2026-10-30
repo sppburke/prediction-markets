@@ -84,6 +84,67 @@ fn run_all_until_legacy_fixture_error(root: &Path, cache_path: &Path, args: &[&s
 }
 
 #[test]
+fn cache_init_cli_refuses_bad_input_before_touching_the_target() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let cache_path = root.join("fresh.db");
+    std::fs::write(root.join("seeds.txt"), "not-a-wallet\n").unwrap();
+    let output = run_cli(
+        root,
+        &cache_path,
+        &[
+            "cache-init",
+            "--wallets",
+            "seeds.txt",
+            "--drops-from",
+            "old.db",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("seed list line 1"), "{stderr}");
+    // Neither the cache nor its lock file exists: the inputs were refused before the lock.
+    assert!(!cache_path.exists());
+    assert!(!pe_bootstrap::lock::lock_path_for(&cache_path).exists());
+
+    // An input that is a file initialization removes (the unfinished copy, a rollback journal SQLite deletes beside
+    // an empty database) or truncates (the lock) is refused before anything changes, so a source cache placed there
+    // survives, and (except where the input is the lock itself) no lock file is created.
+    std::fs::write(root.join("seeds.txt"), format!("{}\n", wallet_hex(0x61))).unwrap();
+    for collision in [
+        "fresh.db.init",
+        "fresh.db.init-journal",
+        "fresh.db-journal",
+        "fresh.db.lock",
+    ] {
+        std::fs::write(root.join(collision), b"old cache bytes").unwrap();
+        let output = run_cli(
+            root,
+            &cache_path,
+            &[
+                "cache-init",
+                "--wallets",
+                "seeds.txt",
+                "--drops-from",
+                collision,
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert!(stderr.contains("is not an independent file"), "{stderr}");
+        assert_eq!(
+            std::fs::read(root.join(collision)).unwrap(),
+            b"old cache bytes"
+        );
+        assert!(!cache_path.exists());
+        if collision != "fresh.db.lock" {
+            assert!(!pe_bootstrap::lock::lock_path_for(&cache_path).exists());
+        }
+        std::fs::remove_file(root.join(collision)).unwrap();
+    }
+}
+
+#[test]
 fn create_cache_flag_provisions_and_initializes_a_fresh_install_through_cli() {
     for args in CREATE_CACHE_INVOCATIONS {
         let dir = TempDir::new().unwrap();

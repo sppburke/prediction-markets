@@ -161,7 +161,7 @@ The bonus/penalty weights in `03-PHASE-MODEL-ENGINE.md` are illustrative startin
 
 Why log growth: it directly optimizes compounding and penalizes overbetting. A trader who doubles once and then sits illiquid may have high PnL but poor daily compounding for a follower.
 
-**Scope.** The production ranker scores only first entries in markets the service copies: gate F's 15-minute series, at their taker rate (`ranker_market_scope`, `ranker_fee_rate` in [_GLOSSARY.md](_GLOSSARY.md); [#784](https://github.com/sppburke/prediction-markets/issues/784)).
+**Scope.** The production ranker scores only first entries in markets the service copies: gate F's 15-minute series, at their taker rate (`ranker_market_scope`, `ranker_fee_rate` in [_GLOSSARY.md](_GLOSSARY.md); [#784](https://github.com/sppburke/prediction-markets/issues/784)). The ranked recurrences are a cycle setting (`PE_RANK_MARKET_RECURRENCES`; meaning and default under `bootstrap_market_recurrences` in [_GLOSSARY.md](_GLOSSARY.md)); widening it to `15m,5m` waits for gate F to copy the same markets.
 
 ## Copy survivability
 

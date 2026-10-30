@@ -90,3 +90,33 @@ fn a_reply_anomaly_exits_one_and_writes_nothing() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(entries(dir.path()).is_empty());
 }
+
+#[test]
+fn market_scope_invalid_recurrences_exit_one_before_fetching() {
+    for args in [
+        vec!["--recurrences", ""],
+        vec!["--recurrences", "15m,"],
+        vec!["--recurrences", "hourly"],
+        vec!["--recurrences", "15m,15m"],
+        vec!["--recurrences"],
+        vec!["--recurrences="],
+    ] {
+        let dir = TempDir::new().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"))
+            .args(["market-scope", "--out"])
+            .arg(dir.path().join("scope.json"))
+            .args(["--end-date-min", "1776384000"])
+            .args(args)
+            .env("PE_BOOTSTRAP_OUTPUT", dir.path().join("out.json"))
+            .env("PE_BOOTSTRAP_MARKET_RECURRENCES", r#"["15m","5m"]"#)
+            .env(
+                "PE_BOOTSTRAP_GAMMA_BASE_URL",
+                "invalid URL must never be fetched",
+            )
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("market recurrences"));
+        assert!(entries(dir.path()).is_empty());
+    }
+}

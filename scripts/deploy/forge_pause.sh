@@ -3,7 +3,8 @@
 
 set -euo pipefail
 
-REPO_ROOT="$HOME/prediction-markets"
+REPO_ROOT="${PE_FORGE_CHECKOUT:-$HOME/prediction-markets}"
+[[ "$REPO_ROOT" == /* ]] || REPO_ROOT="$PWD/$REPO_ROOT"
 RUN_FLAG="$REPO_ROOT/data/eval-results/rank_and_push.loop"
 PAUSE_RECORD="$REPO_ROOT/data/eval-results/.forge_pause.json"
 PAUSE_LOCK="$REPO_ROOT/data/eval-results/.forge_pause.lock"
@@ -24,23 +25,30 @@ usage() {
   exit 2
 }
 
+CHECKOUT_NAME=$(basename -- "$REPO_ROOT")
+case "$CHECKOUT_NAME" in
+  prediction-markets) RANK_UNIT=pe-rank-loop ;;
+  prediction-markets-?*) RANK_UNIT="pe-rank-loop-${CHECKOUT_NAME#prediction-markets-}" ;;
+  *) die "unsupported Forge checkout name: $CHECKOUT_NAME" ;;
+esac
+
 unit_enabled() {
   local output rc
-  if output=$(systemctl --user is-enabled pe-rank-loop 2>/dev/null); then rc=0; else rc=$?; fi
+  if output=$(systemctl --user is-enabled "$RANK_UNIT" 2>/dev/null); then rc=0; else rc=$?; fi
   case "$output:$rc" in
     enabled:0) echo true ;;
     disabled:1) echo false ;;
-    *) die "could not prove pe-rank-loop enablement (rc=$rc, output=$output)" ;;
+    *) die "could not prove $RANK_UNIT enablement (rc=$rc, output=$output)" ;;
   esac
 }
 
 unit_active() {
   local output rc
-  if output=$(systemctl --user is-active pe-rank-loop 2>/dev/null); then rc=0; else rc=$?; fi
+  if output=$(systemctl --user is-active "$RANK_UNIT" 2>/dev/null); then rc=0; else rc=$?; fi
   case "$output:$rc" in
     active:0) echo true ;;
     inactive:3|failed:3) echo false ;;
-    *) die "could not prove pe-rank-loop activity (rc=$rc, output=$output)" ;;
+    *) die "could not prove $RANK_UNIT activity (rc=$rc, output=$output)" ;;
   esac
 }
 
@@ -148,8 +156,12 @@ delete_pause_record() {
   fsync_directory "$parent"
 }
 
+# 0 = a descendant runs, 1 = none; a failed probe (pgrep status above 1) stops the caller.
 cycle_descendant_running() {
-  pgrep -f 'rank_and_push_loop[.]sh|rank_and_push[.]sh|[p]e-bootstrap|[l]atency_shift_rerank[.]py|[r]ank_72hr_buyandhold[.]py' >/dev/null
+  local rc=0
+  pgrep -f 'rank_and_push_loop[.]sh|rank_and_push[.]sh|[p]e-bootstrap|[l]atency_shift_rerank[.]py|[r]ank_72hr_buyandhold[.]py' >/dev/null || rc=$?
+  [[ "$rc" -le 1 ]] || die "the cycle descendant probe failed (pgrep exit $rc)"
+  return "$rc"
 }
 
 rank_locks_unheld() {
@@ -172,10 +184,10 @@ pause() {
   load_pause_record
   write_flag_atomically stop
   deadline=$((SECONDS + STOP_WAIT_SECS))
-  systemctl --user stop pe-rank-loop
+  systemctl --user stop "$RANK_UNIT"
   active=$(unit_active) || exit $?
   while [[ "$active" == true ]]; do
-    ((SECONDS < deadline)) || die "pe-rank-loop did not become inactive within $STOP_WAIT_SECS seconds"
+    ((SECONDS < deadline)) || die "$RANK_UNIT did not become inactive within $STOP_WAIT_SECS seconds"
     sleep 1
     active=$(unit_active) || exit $?
   done
@@ -201,20 +213,20 @@ restore() {
   local enabled active
   write_flag_atomically "$prior_flag"
   if [[ "$prior_enabled" == true ]]; then
-    systemctl --user enable pe-rank-loop
+    systemctl --user enable "$RANK_UNIT"
     enabled=$(unit_enabled) || exit $?
     [[ "$enabled" == true ]] || die "failed to restore Forge enablement"
   else
-    systemctl --user disable pe-rank-loop
+    systemctl --user disable "$RANK_UNIT"
     enabled=$(unit_enabled) || exit $?
     [[ "$enabled" == false ]] || die "failed to restore Forge disablement"
   fi
   if [[ "$prior_active" == true ]]; then
-    systemctl --user start pe-rank-loop
+    systemctl --user start "$RANK_UNIT"
     active=$(unit_active) || exit $?
     [[ "$active" == true ]] || die "failed to restore Forge activity"
   else
-    systemctl --user stop pe-rank-loop
+    systemctl --user stop "$RANK_UNIT"
     active=$(unit_active) || exit $?
     [[ "$active" == false ]] || die "failed to restore Forge inactivity"
   fi

@@ -381,12 +381,26 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-10-13 | 2026-12-12 |
 | https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-10-15 | 2026-12-14 |
 | https://docs.polymarket.com/api-spec/gamma-openapi.yaml (`Market.events`, `Event.series`, `Series.recurrence`) | 2026-10-15 | 2026-12-14 |
-| https://gamma-api.polymarket.com/series?exclude_events=true&limit=50&offset={k} | 2026-10-15 | 2026-12-14 |
+| https://gamma-api.polymarket.com/series?exclude_events=true&limit=50&offset={k} | 2026-10-28 | 2026-12-27 |
+| https://gamma-api.polymarket.com/series/{id} (the pinned ranking scope, `PE_RANK_MARKET_SERIES`) | 2026-10-28 | 2026-12-27 |
 | https://gamma-api.polymarket.com/events/keyset?series_id={id}&end_date_min={iso}&limit=100&after_cursor={cursor} (documented in gamma-openapi.yaml) | 2026-10-15 | 2026-12-14 |
 | https://gamma-api.polymarket.com/markets?clob_token_ids={token}&closed=true | 2026-09-02 | 2026-11-01 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 
 ## Public sources
+
+- 2026-10-28 (15/5-minute loop): `/series?exclude_events=true` (paged, 2,525 rows at 17:10 CT) listed
+  recurrence `15m` on 10 series (the eight crypto windows plus `gold` and `silver`) and `5m` on 8
+  (`eth, btc, xrp, sol, doge, bnb, hype, zec`). Participant discovery and the ranking scope
+  filter that listing, each by its own recurrence set (`bootstrap_market_recurrences` and the
+  wrapper's `PE_RANK_MARKET_RECURRENCES`, both in `_GLOSSARY.md`), except while
+  `PE_RANK_MARKET_SERIES` pins the ranking scope: then each pinned series is read by id
+  (`/series/{id}`, one request per series) and the listing is not used for ranking. The 15/5-minute
+  loop always pins it: gen 26's ten until 11/30 01:00 UTC, then the freshly verified 15m/5m set. A market of each
+  of the 18 series (16 at 21:40 CT; the two `zec` series, which that paged listing did not
+  return, fetched by id at 23:47 CT) carried `feeType` `crypto_fees_v2` with `feeSchedule`
+  `{"exponent":1,"rate":0.07,"takerOnly":true,"rebateRate":0.2}`, equal to pass 2's taker rate.
+  Re-capture every 15m/5m series and its fees before ranking `15m,5m`.
 
 | Link | Last checked | Re-verify by |
 |---|---|---|
@@ -496,7 +510,9 @@ Treat as research inspiration; not a production decision input unless an authori
   `next_cursor` reply field; `offset` is rejected. `/events` itself does not document `series_id`,
   and the `/series` and `/events` `recurrence` filters reject `15m` (422). Live probes (about 50
   GETs, plus a full sweep): `/series?exclude_events=true` caps pages at 50 rows (47 at offset 2,450,
-  0 at 2,497); `closed=true` lists none, so the default listing is complete. Keyset pages hold at
+  0 at 2,497); `closed=true` lists none, so the default listing hides no closed series. A paged walk
+  is still not a complete snapshot: on 2026-10-28 one returned 12 of the 18 15m/5m series while direct
+  reads (by slug, and `/series/{id}` for the two `zec` series) returned the other six. Keyset pages hold at
   most 100 events (`limit=101` capped), honor an ISO `end_date_min` exactly, return open and closed
   events (175 = 79 closed + 96 open, matching separate queries), keep their head and cursor across
   new events, end with a page without `next_cursor`, return zero events for an unknown series and
