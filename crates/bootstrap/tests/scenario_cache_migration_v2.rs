@@ -40,6 +40,7 @@ use pe_source_polymarket_public::{
     CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageManifest, ClobCoveragePage, FixtureFetcher,
     PageFetcher, parse_activity_response,
 };
+use rusqlite::trace::{TraceEvent, TraceEventCodes};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -11108,7 +11109,7 @@ fn trace_collection_interleaving(
     skip: usize,
     mutation: &'static str,
 ) -> Connection {
-    let mut connection = Connection::open(path).unwrap();
+    let connection = Connection::open(path).unwrap();
     connection
         .pragma_update(None, "journal_mode", "WAL")
         .unwrap();
@@ -11122,23 +11123,33 @@ fn trace_collection_interleaving(
             committed: false,
         });
     });
-    connection.trace(Some(|sql| {
-        COLLECTION_INTERLEAVING.with(|state| {
-            let mut state = state.borrow_mut();
-            let Some(state) = state.as_mut() else { return };
-            if state.committed || !sql.contains(state.sql_fragment) {
+    connection.trace_v2(
+        TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(|event| {
+            // Selectors name bound values, so match the expanded statement; SQLite's "--" trigger lines never match.
+            let TraceEvent::Stmt(statement, sql) = event else {
                 return;
-            }
-            if state.skip > 0 {
-                state.skip -= 1;
+            };
+            let Some(sql) = statement.expanded_sql().filter(|_| !sql.starts_with("--")) else {
                 return;
-            }
-            let external = scenario_sql_connection(&state.path).unwrap();
-            external.busy_timeout(std::time::Duration::ZERO).unwrap();
-            assert_eq!(external.execute(state.mutation, []).unwrap(), 1);
-            state.committed = true;
-        });
-    }));
+            };
+            COLLECTION_INTERLEAVING.with(|state| {
+                let mut state = state.borrow_mut();
+                let Some(state) = state.as_mut() else { return };
+                if state.committed || !sql.contains(state.sql_fragment) {
+                    return;
+                }
+                if state.skip > 0 {
+                    state.skip -= 1;
+                    return;
+                }
+                let external = scenario_sql_connection(&state.path).unwrap();
+                external.busy_timeout(std::time::Duration::ZERO).unwrap();
+                assert_eq!(external.execute(state.mutation, []).unwrap(), 1);
+                state.committed = true;
+            });
+        }),
+    );
     connection
 }
 
@@ -12117,17 +12128,19 @@ async fn bulk_root_rejects_duplicate_wallet_batch_before_any_insert() {
     let inserts = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&inserts);
     let mut connection = Connection::open(&fixture.side).unwrap();
-    connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
-        if matches!(
-            context.action,
-            rusqlite::hooks::AuthAction::Insert {
-                table_name: "activity_groups_v2"
+    connection
+        .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(
+                context.action,
+                rusqlite::hooks::AuthAction::Insert {
+                    table_name: "activity_groups_v2"
+                }
+            ) {
+                observed.fetch_add(1, Ordering::SeqCst);
             }
-        ) {
-            observed.fetch_add(1, Ordering::SeqCst);
-        }
-        rusqlite::hooks::Authorization::Allow
-    }));
+            rusqlite::hooks::Authorization::Allow
+        }))
+        .unwrap();
     let error = pe_bootstrap::cache_migration::commit_activity_batch_for_test(
         &mut connection,
         WALLET.to_owned(),
@@ -12226,31 +12239,36 @@ async fn interrupted_bulk_build(during: bool) {
     let building = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed = Arc::clone(&building);
     let connection = Connection::open(&fixture.side).unwrap();
-    connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
-        if matches!(
-            context.action,
-            rusqlite::hooks::AuthAction::CreateIndex {
-                index_name: "idx_activity_groups_v2_source_trade_id",
-                ..
+    connection
+        .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            if matches!(
+                context.action,
+                rusqlite::hooks::AuthAction::CreateIndex {
+                    index_name: "idx_activity_groups_v2_source_trade_id",
+                    ..
+                }
+            ) {
+                observed.store(true, Ordering::SeqCst);
+                if !during {
+                    return rusqlite::hooks::Authorization::Deny;
+                }
             }
-        ) {
-            observed.store(true, Ordering::SeqCst);
-            if !during {
-                return rusqlite::hooks::Authorization::Deny;
-            }
-        }
-        rusqlite::hooks::Authorization::Allow
-    }));
+            rusqlite::hooks::Authorization::Allow
+        }))
+        .unwrap();
     let interrupted = Arc::new(AtomicUsize::new(0));
     if during {
         let building = Arc::clone(&building);
         let interrupted = Arc::clone(&interrupted);
-        connection.progress_handler(
-            1,
-            Some(move || {
-                building.load(Ordering::SeqCst) && interrupted.fetch_add(1, Ordering::SeqCst) == 40
-            }),
-        );
+        connection
+            .progress_handler(
+                1,
+                Some(move || {
+                    building.load(Ordering::SeqCst)
+                        && interrupted.fetch_add(1, Ordering::SeqCst) == 40
+                }),
+            )
+            .unwrap();
     }
     let error = pe_bootstrap::cache_migration::collect_activity_v2_for_test(
         connection,
@@ -12633,8 +12651,10 @@ async fn bulk_root_index_name_is_not_accepted_as_definition_or_as_build_proof() 
 }
 
 static BULK_PROBE_SQL: Mutex<Vec<String>> = Mutex::new(Vec::new());
-fn trace_bulk_probes(sql: &str) {
-    if sql.starts_with("SELECT wallet_hex FROM activity_groups_v2 WHERE source_trade_id") {
+fn trace_bulk_probes(event: TraceEvent<'_>) {
+    if let TraceEvent::Stmt(_, sql) = event
+        && sql.starts_with("SELECT wallet_hex FROM activity_groups_v2 WHERE source_trade_id")
+    {
         BULK_PROBE_SQL.lock().unwrap().push(sql.to_owned());
     }
 }
@@ -12646,8 +12666,8 @@ async fn bulk_root_skips_only_identity_probes_and_sealed_successor_keeps_both_an
     // wallet, keeps predecessor rows, and forces a full read in its successor.
     let fixture = BulkRootFixture::new();
     fixture.admit().await;
-    let mut connection = Connection::open(&fixture.side).unwrap();
-    connection.trace(Some(trace_bulk_probes));
+    let connection = Connection::open(&fixture.side).unwrap();
+    connection.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(trace_bulk_probes));
     pe_bootstrap::cache_migration::collect_activity_v2_for_test(
         connection,
         &bulk_source(),
@@ -12675,8 +12695,8 @@ async fn bulk_root_skips_only_identity_probes_and_sealed_successor_keeps_both_an
         ],
         ..Default::default()
     };
-    let mut connection = Connection::open(&fixture.side).unwrap();
-    connection.trace(Some(trace_bulk_probes));
+    let connection = Connection::open(&fixture.side).unwrap();
+    connection.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(trace_bulk_probes));
     pe_bootstrap::cache_migration::collect_activity_v2_for_test(
         connection,
         &source,
@@ -15757,30 +15777,32 @@ async fn history_v3_empty_continuation_neither_loads_nor_writes_retained_history
     .unwrap_err();
     assert_eq!(error.exit_code(), 75);
     let connection = Connection::open(&side).unwrap();
-    connection.authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
-        use rusqlite::hooks::{AuthAction, Authorization};
-        match context.action {
-            AuthAction::Read {
-                table_name: "activity_groups_v2",
-                column_name: "wallet_hex" | "source_trade_id",
-            } => Authorization::Allow,
-            AuthAction::Read {
-                table_name: "activity_groups_v2",
-                ..
+    connection
+        .authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
+            use rusqlite::hooks::{AuthAction, Authorization};
+            match context.action {
+                AuthAction::Read {
+                    table_name: "activity_groups_v2",
+                    column_name: "wallet_hex" | "source_trade_id",
+                } => Authorization::Allow,
+                AuthAction::Read {
+                    table_name: "activity_groups_v2",
+                    ..
+                }
+                | AuthAction::Insert {
+                    table_name: "activity_groups_v2",
+                }
+                | AuthAction::Update {
+                    table_name: "activity_groups_v2",
+                    ..
+                }
+                | AuthAction::Delete {
+                    table_name: "activity_groups_v2",
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
             }
-            | AuthAction::Insert {
-                table_name: "activity_groups_v2",
-            }
-            | AuthAction::Update {
-                table_name: "activity_groups_v2",
-                ..
-            }
-            | AuthAction::Delete {
-                table_name: "activity_groups_v2",
-            } => Authorization::Deny,
-            _ => Authorization::Allow,
-        }
-    }));
+        }))
+        .unwrap();
     pe_bootstrap::cache_migration::collect_activity_v2_for_test(
         connection,
         &source,
@@ -17797,18 +17819,20 @@ async fn history_v3_collection_reports_run_timing_and_writer_counts() {
     let observed = Arc::clone(&measured_drain);
     let mut commits = 0;
     let mut commit_started = None;
-    connection.commit_hook(Some(move || {
-        if commits == 0 {
-            barrier.wait();
-            commit_started = Some(std::time::Instant::now());
-        }
-        std::thread::sleep(commit_delay);
-        commits += 1;
-        if commits == 35 {
-            *observed.lock().unwrap() = commit_started.unwrap().elapsed();
-        }
-        false
-    }));
+    connection
+        .commit_hook(Some(move || {
+            if commits == 0 {
+                barrier.wait();
+                commit_started = Some(std::time::Instant::now());
+            }
+            std::thread::sleep(commit_delay);
+            commits += 1;
+            if commits == 35 {
+                *observed.lock().unwrap() = commit_started.unwrap().elapsed();
+            }
+            false
+        }))
+        .unwrap();
     pe_bootstrap::cache_migration::collect_activity_v2_for_test(
         connection,
         &fetcher,
@@ -17964,21 +17988,24 @@ fn collection_766_writes(
 ) -> Arc<Mutex<Vec<(rusqlite::hooks::Action, i64)>>> {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&writes);
-    connection.update_hook(Some(move |action, _: &str, table: &str, rowid| {
-        if table == "activity_groups_v2" {
-            observed.lock().unwrap().push((action, rowid));
-        }
-    }));
+    connection
+        .update_hook(Some(move |action, _: &str, table: &str, rowid| {
+            if table == "activity_groups_v2" {
+                observed.lock().unwrap().push((action, rowid));
+            }
+        }))
+        .unwrap();
     writes
 }
 
 static COLLECTION_766_DELETE_SQL: Mutex<Vec<String>> = Mutex::new(Vec::new());
-fn collection_766_trace_deletes(sql: &str) {
-    if sql.starts_with("DELETE FROM activity_groups_v2") {
-        COLLECTION_766_DELETE_SQL
-            .lock()
-            .unwrap()
-            .push(sql.to_owned());
+fn collection_766_trace_deletes(event: TraceEvent<'_>) {
+    // The assertion names the bound wallet, so record the expanded statement.
+    if let TraceEvent::Stmt(statement, sql) = event
+        && sql.starts_with("DELETE FROM activity_groups_v2")
+        && let Some(sql) = statement.expanded_sql()
+    {
+        COLLECTION_766_DELETE_SQL.lock().unwrap().push(sql);
     }
 }
 
@@ -18548,20 +18575,22 @@ async fn collection_766_late_history_failure_attempts_no_activity_writes() {
         let writes = collection_766_writes(&connection);
         let attempted = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&attempted);
-        connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
-            use rusqlite::hooks::{AuthAction, Authorization};
-            if matches!(
-                context.action,
-                AuthAction::Insert {
-                    table_name: "activity_groups_v2"
-                } | AuthAction::Delete {
-                    table_name: "activity_groups_v2"
+        connection
+            .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                use rusqlite::hooks::{AuthAction, Authorization};
+                if matches!(
+                    context.action,
+                    AuthAction::Insert {
+                        table_name: "activity_groups_v2"
+                    } | AuthAction::Delete {
+                        table_name: "activity_groups_v2"
+                    }
+                ) {
+                    observed.fetch_add(1, Ordering::SeqCst);
                 }
-            ) {
-                observed.fetch_add(1, Ordering::SeqCst);
-            }
-            Authorization::Allow
-        }));
+                Authorization::Allow
+            }))
+            .unwrap();
         log.0.lock().unwrap().clear();
         let error = pe_bootstrap::cache_migration::collect_activity_v2_for_test(
             connection,
@@ -18617,7 +18646,9 @@ async fn collection_766_insert_or_commit_failure_restores_history_releases_rows_
         if commit_fails {
             // Refuse the COMMIT of the wallet transaction after all its deletes and inserts.
             let observed = Arc::clone(&writes);
-            connection.commit_hook(Some(move || !observed.lock().unwrap().is_empty()));
+            connection
+                .commit_hook(Some(move || !observed.lock().unwrap().is_empty()))
+                .unwrap();
         }
         let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
         log.0.lock().unwrap().clear();
@@ -18699,7 +18730,7 @@ async fn collection_766_insert_or_commit_failure_restores_history_releases_rows_
 #[tokio::test]
 async fn collection_766_unchanged_repair_and_incremental_keep_their_commit_paths() {
     let log = collection_766_log();
-    for path in ["unchanged", "repair", "incremental"] {
+    for path in ["unchanged", "repair", "unreadable", "incremental"] {
         let dir = TempDir::new().unwrap();
         let side = dataset_candidate(&dir, "preserved.db", &[]);
         let mut source = DatasetFetcher {
@@ -18724,7 +18755,7 @@ async fn collection_766_unchanged_repair_and_incremental_keep_their_commit_paths
             &side,
             "SELECT rowid, * FROM activity_groups_v2 ORDER BY source_trade_id",
         );
-        let repairs = if path == "repair" {
+        let repairs = if matches!(path, "repair" | "unreadable") {
             vec![WALLET.to_owned()]
         } else {
             Vec::new()
@@ -18737,29 +18768,40 @@ async fn collection_766_unchanged_repair_and_incremental_keep_their_commit_paths
                 .as_array()
                 .unwrap()
                 .contains(&Value::from(WALLET)),
-            path == "repair"
+            matches!(path, "repair" | "unreadable")
         );
         if path == "unchanged" {
             collection_766_assert_automatic_proved_full(&side);
+        }
+        if path == "unreadable" {
+            history_v3_damage_connection(&side)
+                .execute(
+                    "UPDATE activity_groups_v2 SET semantic_revision = CAST(x'80' AS TEXT)
+                     WHERE rowid = (SELECT MIN(rowid) FROM activity_groups_v2 WHERE wallet_hex = ?1)",
+                    [WALLET],
+                )
+                .unwrap();
         }
         let connection = Connection::open(&side).unwrap();
         let writes = collection_766_writes(&connection);
         let history_reads = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&history_reads);
-        connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
-            use rusqlite::hooks::{AuthAction, Authorization};
-            if matches!(
-                context.action,
-                AuthAction::Read {
-                    table_name: "activity_groups_v2",
-                    column_name: "components_json",
-                    ..
+        connection
+            .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                use rusqlite::hooks::{AuthAction, Authorization};
+                if matches!(
+                    context.action,
+                    AuthAction::Read {
+                        table_name: "activity_groups_v2",
+                        column_name: "components_json",
+                        ..
+                    }
+                ) {
+                    observed.fetch_add(1, Ordering::SeqCst);
                 }
-            ) {
-                observed.fetch_add(1, Ordering::SeqCst);
-            }
-            Authorization::Allow
-        }));
+                Authorization::Allow
+            }))
+            .unwrap();
         log.0.lock().unwrap().clear();
         pe_bootstrap::cache_migration::collect_activity_v2_for_test(
             connection,
@@ -18832,6 +18874,19 @@ async fn collection_766_unchanged_repair_and_incremental_keep_their_commit_paths
                 assert_eq!(generation_rows(&side, 2), 1);
                 assert_eq!(writes.len(), 1);
                 assert_eq!(writes[0].0, rusqlite::hooks::Action::SQLITE_INSERT);
+            }
+            "unreadable" => {
+                assert_eq!(fields["rows_deleted"], 3);
+                assert_eq!(fields["rows_inserted"], 3);
+                assert_eq!(generation_rows(&side, 3), 3);
+                assert_eq!(
+                    collection_766_events(
+                        &log,
+                        "replacing unreadable explicitly repaired wallet history"
+                    )
+                    .len(),
+                    1
+                );
             }
             _ => unreachable!(),
         }
@@ -18906,9 +18961,12 @@ async fn collection_766_no_proof_full_and_bulk_root_still_insert_every_fetched_r
             ),
             0
         );
-        let mut connection = Connection::open(&fixture.side).unwrap();
+        let connection = Connection::open(&fixture.side).unwrap();
         let writes = collection_766_writes(&connection);
-        connection.trace(Some(collection_766_trace_deletes));
+        connection.trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(collection_766_trace_deletes),
+        );
         COLLECTION_766_DELETE_SQL.lock().unwrap().clear();
         log.0.lock().unwrap().clear();
         pe_bootstrap::cache_migration::collect_activity_v2_for_test(
@@ -19514,15 +19572,17 @@ async fn collection_747_shared_count_bounds_and_releases_more_than_64_wallets_be
     let connection = Connection::open(&side).unwrap();
     let (release, wait) = std::sync::mpsc::sync_channel(1);
     let mut first = true;
-    connection.commit_hook(Some(move || {
-        if first {
-            first = false;
-            wait.recv().unwrap();
-            true
-        } else {
-            false
-        }
-    }));
+    connection
+        .commit_hook(Some(move || {
+            if first {
+                first = false;
+                wait.recv().unwrap();
+                true
+            } else {
+                false
+            }
+        }))
+        .unwrap();
     let run = pe_bootstrap::cache_migration::collect_activity_v2_with_limits_for_test(
         connection,
         &fetcher,

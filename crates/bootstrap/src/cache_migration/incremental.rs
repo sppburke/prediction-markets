@@ -1981,7 +1981,8 @@ fn commit_history_wallet(
                     | BootstrapError::Parse { .. }
                     | BootstrapError::Sqlite(
                         rusqlite::Error::InvalidColumnType(..)
-                        | rusqlite::Error::FromSqlConversionFailure(..),
+                        | rusqlite::Error::FromSqlConversionFailure(..)
+                        | rusqlite::Error::Utf8Error(..),
                     )),
                 ) => {
                     tracing::warn!(wallet, stored_digest_error = %error, certified_digest = ?certificate.as_ref().map(|certificate| &certificate.ordered_digest), "replacing unreadable explicitly repaired wallet history");

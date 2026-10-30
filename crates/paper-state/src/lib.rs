@@ -806,9 +806,7 @@ const ASSET_IDENTITY_CONDITION_LOOKUP: &str = "SELECT token, condition_id, outco
 pub struct PaperStateDb {
     conn: Mutex<Connection>,
     /// A second connection to the same file, used only for the retention job's warm reads, so they
-    /// never hold the shared connection (#813). It never writes or checkpoints: with the bundled
-    /// SQLite (3.46), a checkpoint on one connection racing another connection's WAL reset can
-    /// corrupt the database (sqlite.org/wal.html, "WAL-Reset Bug").
+    /// never hold the shared connection (#813). It never writes or checkpoints.
     maintenance: Mutex<Connection>,
 }
 
@@ -7163,19 +7161,24 @@ fn parse_pending_state(s: &str) -> Result<DecisionPendingState, PaperStateError>
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
     use rust_decimal_macros::dec;
 
     static TRACED_STATEMENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-    fn record_traced_statement(statement: &str) {
-        TRACED_STATEMENTS.lock().unwrap().push(statement.to_owned());
+    fn record_traced_statement(event: TraceEvent<'_>) {
+        if let TraceEvent::Stmt(_, sql) = event {
+            TRACED_STATEMENTS.lock().unwrap().push(sql.to_owned());
+        }
     }
 
     /// The warm-order test's own trace sink, so it never shares statements with another test.
     static WARM_STATEMENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-    fn record_warm_statement(statement: &str) {
-        WARM_STATEMENTS.lock().unwrap().push(statement.to_owned());
+    fn record_warm_statement(event: TraceEvent<'_>) {
+        if let TraceEvent::Stmt(_, sql) = event {
+            WARM_STATEMENTS.lock().unwrap().push(sql.to_owned());
+        }
     }
 
     fn db() -> (tempfile::TempDir, PaperStateDb) {
@@ -7731,7 +7734,7 @@ mod tests {
         db.sync_checkpoint_dispositions().unwrap();
     }
 
-    /// The WAL-index header's `mxFrame` (offset 16) and `nBackfill` (offset 96), as SQLite 3.46 lays them out.
+    /// The WAL-index header's `mxFrame` (offset 16) and `nBackfill` (offset 96), as SQLite lays them out.
     /// Reading the file through another descriptor drops this process's POSIX locks on it, which only
     /// matters to other processes: tests only.
     fn wal_frames(dir: &tempfile::TempDir) -> (u32, u32) {
@@ -7880,7 +7883,7 @@ mod tests {
         warm: &str,
         call: impl Fn(&PaperStateDb) + Sync,
     ) {
-        // The trace expands bound parameters, so the statement is matched up to its first one.
+        // Statements are matched up to their first bound parameter.
         let prefix = warm.split('?').next().unwrap();
         WARM_STATEMENTS.lock().unwrap().clear();
         std::thread::scope(|scope| {
@@ -7913,7 +7916,10 @@ mod tests {
         let conn = Connection::open(dir.path().join("paper_state.db")).unwrap();
         insert_anchor(&conn, 1, 1, "{\"proof\": 1}");
         insert_anchor(&conn, 1, 2, "{\"proof\": 2}");
-        db.maintenance().trace(Some(record_warm_statement));
+        db.maintenance().trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_warm_statement),
+        );
         assert_warms_before_lock(&db, WARM_SUPERSEDED_ANCHOR_PROOFS_SQL, |db| {
             db.blank_superseded_anchor_proofs(&AnchorProofCursor::start(), 1)
                 .unwrap();
@@ -7925,7 +7931,7 @@ mod tests {
             db.wallet_retention_wait(WalletAddress([1; 20]), 0, None)
                 .unwrap();
         });
-        db.maintenance().trace(None);
+        db.maintenance().trace_v2(TraceEventCodes::empty(), None);
     }
 
     fn wallet() -> WalletAddress {
@@ -8842,7 +8848,10 @@ mod tests {
     fn activity_bucket_batch_uses_one_outer_transaction_and_one_savepoint_per_bucket() {
         let (_dir, db) = db();
         TRACED_STATEMENTS.lock().unwrap().clear();
-        db.lock().trace(Some(record_traced_statement));
+        db.lock().trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_traced_statement),
+        );
 
         db.begin_batch().unwrap();
         for (source_epoch, suffix) in [(100, 'a'), (101, 'b'), (102, 'c')] {
@@ -8850,7 +8859,7 @@ mod tests {
                 .unwrap();
         }
         db.commit_batch().unwrap();
-        db.lock().trace(None);
+        db.lock().trace_v2(TraceEventCodes::empty(), None);
 
         let statements = std::mem::take(&mut *TRACED_STATEMENTS.lock().unwrap());
         assert_eq!(

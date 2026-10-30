@@ -59,7 +59,7 @@ pub(crate) fn reject_bulk_root(connection: &Connection) -> Result<(), BootstrapE
 
 fn reject_bulk_root_database(
     connection: &Connection,
-    database: Option<rusqlite::DatabaseName<'_>>,
+    database: Option<&str>,
 ) -> Result<(), BootstrapError> {
     let version: i64 = connection.pragma_query_value(database, "user_version", |row| row.get(0))?;
     if version == CACHE_SCHEMA_VERSION_BULK_ROOT {
@@ -3609,10 +3609,7 @@ impl WalletCache {
         // Everything between ATTACH and DETACH is bound (never `?`) so the DETACH
         // always runs on this connection; the original error is surfaced after.
         let work = (|| -> Result<(), BootstrapError> {
-            reject_bulk_root_database(
-                &self.conn,
-                Some(rusqlite::DatabaseName::Attached("purge_archive")),
-            )?;
+            reject_bulk_root_database(&self.conn, Some("purge_archive"))?;
             // Mirrors on first use + the manifest. CTAS is the bootstrap only;
             // steady-state schema safety is the name reconciliation below.
             self.conn.execute_batch(
@@ -3840,8 +3837,9 @@ impl WalletCache {
     /// which maintenance statement ran (`incremental_vacuum` vs bare `VACUUM`,
     /// and the absence of `DROP INDEX` on the recovery path).
     #[cfg(test)]
-    pub(crate) fn install_sql_trace(&mut self, f: Option<fn(&str)>) {
-        self.conn.trace(f);
+    pub(crate) fn install_sql_trace(&mut self, f: Option<fn(rusqlite::trace::TraceEvent<'_>)>) {
+        self.conn
+            .trace_v2(rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT, f);
     }
 
     /// Drop the two non-lookup `trades` secondary indexes (`idx_trades_market_id`
@@ -7408,8 +7406,10 @@ mod tests {
     // ── #538: reclamation path selection (trace-proven) ───────────────────────
 
     static RECLAIM_TRACE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    fn reclaim_trace_collect(sql: &str) {
-        RECLAIM_TRACE.lock().unwrap().push(sql.to_owned());
+    fn reclaim_trace_collect(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+            RECLAIM_TRACE.lock().unwrap().push(sql.to_owned());
+        }
     }
 
     #[test]

@@ -455,14 +455,17 @@ mod tests {
     use super::*;
 
     static RECOVERY_TRACE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    fn recovery_trace_collect(sql: &str) {
-        RECOVERY_TRACE.lock().unwrap().push(sql.to_owned());
+    fn recovery_trace_collect(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+            RECOVERY_TRACE.lock().unwrap().push(sql.to_owned());
+        }
     }
 
     static INTERRUPT_ON_RECLAIM: std::sync::Mutex<Option<rusqlite::InterruptHandle>> =
         std::sync::Mutex::new(None);
-    fn interrupt_on_reclaim(sql: &str) {
-        if sql.contains("incremental_vacuum")
+    fn interrupt_on_reclaim(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+            && sql.contains("incremental_vacuum")
             && let Some(h) = INTERRUPT_ON_RECLAIM.lock().unwrap().as_ref()
         {
             h.interrupt();
