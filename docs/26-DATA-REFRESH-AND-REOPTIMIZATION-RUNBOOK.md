@@ -1786,7 +1786,7 @@ A second checkout runs the same code with its own cache, flag, locks and cycle f
 ```
 PE_BOOTSTRAP_MARKET_RECURRENCES='["15m"]'      # participant discovery; ["15m","5m"] once the owner admits 5-minute traders
 PE_RANK_MARKET_RECURRENCES=15m                 # ranking scope; 15m,5m only after gate F copies 5-minute markets
-PE_RANK_MARKET_SERIES=10191:eth-up-or-down-15m,10192:btc-up-or-down-15m,10422:xrp-up-or-down-15m,10423:sol-up-or-down-15m,11328:doge-up-or-down-15m,11329:hype-up-or-down-15m,11330:bnb-up-or-down-15m,12518:zec-up-or-down-15m,12967:gold-up-or-down-15m,12968:silver-up-or-down-15m  # gen 26's series, until 11/30 01:00 UTC
+PE_RANK_MARKET_SERIES=10191:eth-up-or-down-15m,10192:btc-up-or-down-15m,10422:xrp-up-or-down-15m,10423:sol-up-or-down-15m,11328:doge-up-or-down-15m,11329:hype-up-or-down-15m,11330:bnb-up-or-down-15m,12518:zec-up-or-down-15m,12967:gold-up-or-down-15m,12968:silver-up-or-down-15m  # gen 26's series; from 11/30 01:00 UTC the verified 15m/5m set
 PE_BOOTSTRAP_LEADERBOARD_TOP_N=0               # leaderboard off
 PE_BOOTSTRAP_DATADASH_API_URL=                 # datadash off
 PE_RANK_RESEARCH_LINK_DIR=/mnt/storage/prediction-markets/data/eval-results
@@ -1798,7 +1798,11 @@ Each cycle records the four new settings in `cycle_configuration.json` and resto
 `rank_research_link_dir`). The cache keeps complete histories, read and certified as in the old
 loop; it differs only in which wallets it holds. The series pin keeps every
 linked cycle's market list on the November research's contract (recurrence `15m`, exactly gen 26's
-series); remove it, with `PE_RANK_MARKET_RECURRENCES=15m,5m`, at a boundary after 11/30 01:00 UTC. Admitting 5-minute
+series). Keep the pin after 11/30 01:00 UTC: at a boundary with no retained cycle, set it to the freshly
+verified 15m/5m series (each `id:slug`) with `PE_RANK_MARKET_RECURRENCES=15m,5m`, and give the stopped
+old checkout the same two values. The catalog listing can omit series (one paged listing on 10/28
+returned 12 of 18), while the pin reads each series by id; a new series joins only through a
+re-verified pin. Admitting 5-minute
 participants is a capacity decision: tens of thousands of wallets trade those markets each month,
 many with long histories. Measure their certified sizes in the old cache first.
 
@@ -1811,6 +1815,7 @@ ln -s /mnt/storage/prediction-markets-15m5m ~/prediction-markets-15m5m && cd ~/p
 python3 -m venv .venv && .venv/bin/pip install -r scripts/requirements.txt
 install -D -m 0755 <the release's pe-bootstrap> target/release/pe-bootstrap   # the old checkout's binary
 cp ~/prediction-markets/.env .env                                          # then append the settings above
+echo 'PE_RANKER_PARQUET_DIR=/mnt/t7/parquet-15m5m' >> .env                 # its own export folder (see below)
 mkdir -p data/eval-results /mnt/t7/cache-15m5m && : > data/wallet_cache.db.lock
 ln -s /mnt/t7/cache-15m5m/wallet_cache.db data/wallet_cache.db
 ln -s "$PWD/data/eval-results" /mnt/t7/cache-15m5m/eval-results              # the two lock aliases
@@ -1819,8 +1824,10 @@ install -m 0644 deploy/systemd/pe-rank-loop-15m5m.service ~/.config/systemd/user
 systemctl --user daemon-reload                                             # installed, not enabled; no flag yet
 ```
 
-The export folder (`data/parquet`) belongs to each checkout; the copied `SQLITE_TMPDIR` is shared,
-which is safe because only one loop runs at a time.
+Each loop exports to its own folder: the copied `.env` names the old loop's export folder on
+`/mnt/t7`, so the new checkout's `PE_RANKER_PARQUET_DIR` (the last assignment wins) points at
+`/mnt/t7/parquet-15m5m`. The copied `SQLITE_TMPDIR` (`/mnt/t7/sqlite-tmp`) is shared, which is safe: it
+holds only SQLite's temporary files, and only one loop runs at a time.
 
 **Provisioning.** With both loops stopped, write the seed list (one wallet per line): every wallet in
 pass 2's universe (`latency_shift_ranked.csv`) of each published cycle since gen 26, plus the wallets
@@ -1867,8 +1874,8 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    copy and spool; record `df -B1`.
 3. Install and verify this release in the old checkout by "Forge release deployment" above while
    both loops are inactive (the pause helper sees every ranker process), and add the research pin to
-   its `.env` until 11/30 01:00 UTC (`PE_RANK_MARKET_SERIES` as above, `PE_RANK_MARKET_RECURRENCES=15m`),
-   so a revert's cycles meet the frozen merger's list contract. Keep its flag `stop`.
+   its `.env` (`PE_RANK_MARKET_SERIES` as above, `PE_RANK_MARKET_RECURRENCES=15m`; after 11/30 the new
+   loop's values), so a revert's cycles meet the frozen merger's list contract. Keep its flag `stop`.
 4. Capacity: proceed only if free bytes ≥ 3 × S + the old loop's last payout tables, spool and
    exports + the operator reserve (`_GLOSSARY.md` `rank_capacity_operator_reserve_gb`), S being the seeds'
    certified complete-history size. These are estimates; the first cycle's samples record the actual first
@@ -1909,7 +1916,9 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    `forge_pause.sh status` shows the unit inactive with no descendants or held locks, and that no
    cycle or pending pointer exists. Then list the wallets the next batch would admit (`activate-next`'s selection: inactive, not infrastructure, not
    tombstoned, in its preference order; read-only), size their complete histories from the old
-   cache's certificates (a wallet it lacks at the venue sample's upper estimate), and only if that
+   cache's certificates (source rows × its measured bytes per source row; a wallet it lacks at the
+   planning sample's largest complete history, 27,080 rows read with `start=1`, at the same bytes per
+   row, recorded separately), and only if that
    plus the measured transient peak fits above installed + margin, run one cycle with that batch as
    an operator-run one-shot under `prepare` with participant discovery off for that cycle
    (`PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS=0`; the leaderboard and datadash are already off), so nothing
@@ -1943,8 +1952,9 @@ headroom (installed size + catch-up growth + spool + WAL + the operator reserve)
 research artifacts (cycle folders, links, requests, manifests, ranking CSVs) all kept. If it does not
 fit, hold the revert and report the shortfall: every retained cache role stays at its recorded path
 (activation and recovery need its regular files on one filesystem at the recorded paths); deleting any
-of it needs the owner's yes. Run the old loop's first cycle
-under `prepare`, pass the frozen merger check and `research-coverage` against it (the root holds the
+of it needs the owner's yes. Record the old loop's admission setting and run its first cycle
+under `prepare` with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0`, pass the frozen merger check and
+`research-coverage` against it (the root holds the
 new loop's linked cycles; a wallet missing because of the switch back holds the publication for the
 owner), and run `scripts/rank_cycle_manifest.py drops-cover --source
 /mnt/t7/cache-15m5m/wallet_cache.db --target <the old loop's prepared candidate>`: any drop the
@@ -1953,7 +1963,8 @@ are cumulative and never removed; catching up from the venue cannot restore a de
 `PE_RANK_SCHEMA_TWO_CUTOVER=1` and run `--resume-pending`, verify the publication, and once a summary
 qualified (that cycle's, or the next one-shot's, as in step 7) set the old loop's `PE_RANK_MIN_FREE_GB`
 from the latest qualified summary (its `.env` gets `PE_RANK_CAPACITY_SAMPLE_SECS=10` before that cycle),
-then write `run` and `enable --now` the old loop.
+then write `run` and `enable --now` the old loop with admission still 0. A nonzero batch, the recorded
+one included, returns only through step 7's qualification procedure for that checkout and unit.
 
 ---
 

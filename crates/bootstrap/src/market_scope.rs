@@ -712,13 +712,21 @@ mod tests {
         serve: G,
         pin: &str,
     ) -> (Result<MarketScope, BootstrapError>, usize) {
+        sweep_pinned_with(serve, pin, &BootstrapConfig::default().market_recurrences).await
+    }
+
+    async fn sweep_pinned_with<G: Fn(&str, usize) -> Result<Vec<u8>, SourceError> + Sync>(
+        serve: G,
+        pin: &str,
+        recurrences: &[String],
+    ) -> (Result<MarketScope, BootstrapError>, usize) {
         let fetcher = fetcher(serve);
         let pinned = parse_pinned_series(pin).unwrap();
         let scope = sweep_market_scope(
             &fetcher,
             BASE,
             FLOOR,
-            &BootstrapConfig::default().market_recurrences,
+            recurrences,
             Some(&pinned),
             Duration::ZERO,
         )
@@ -737,9 +745,45 @@ mod tests {
                     message: "HTTP 404".to_owned(),
                 });
             }
+            None if url == events_url(BASE, "12", FLOOR_ISO, None).unwrap() => {
+                json!({"events": [event("12", "5m", &[condition(4)])]})
+            }
             None => return serve_ok(url, call),
         };
         Ok(serde_json::to_vec(&row).unwrap())
+    }
+
+    /// FAIL: a pin of both recurrences (the configuration after 11/30) loses a pinned series that the catalog listing
+    /// omits, or consults the listing at all.
+    #[tokio::test]
+    async fn a_pin_of_both_recurrences_keeps_a_series_the_catalog_omits() {
+        let both = ["15m".to_owned(), "5m".to_owned()];
+        // Series 12 (5m) is absent from serve_ok's catalog pages; the pin reads it by id.
+        let (scope, _) = sweep_pinned_with(
+            serve_pinned,
+            "12:sol-up-or-down-5m,2:btc-up-or-down-15m",
+            &both,
+        )
+        .await;
+        let scope = scope.unwrap();
+        let ids: Vec<&str> = scope
+            .series
+            .iter()
+            .map(|series| series.id.as_str())
+            .collect();
+        assert_eq!(ids, ["2", "12"]);
+        assert_eq!(scope.recurrence, "15m,5m");
+        assert!(
+            scope
+                .pages
+                .iter()
+                .all(|page| page.kind != "series" || page.series_id.is_some()),
+            "a pinned scope never lists the catalog"
+        );
+        assert_eq!(
+            scope.condition_ids,
+            vec![condition(1), condition(3), condition(4)]
+        );
     }
 
     /// FAIL: a pinned scope lists the catalog, keeps a series outside the pin, or accepts a
