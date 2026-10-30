@@ -1873,7 +1873,7 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
 2. One `bash scripts/rank_and_push.sh --resume-pending` in the old checkout retires its displaced
    copy and spool; record `df -B1`.
 3. Install and verify this release in the old checkout by "Forge release deployment" above while
-   both loops are inactive (the pause helper sees every ranker process), and add the research pin to
+   both loops are inactive (the pause helper sees every ranker process), and add the series pin to
    its `.env` (`PE_RANK_MARKET_SERIES` as above, `PE_RANK_MARKET_RECURRENCES=15m`; after 11/30 the new
    loop's values), so a revert's cycles meet the frozen merger's list contract. Keep its flag `stop`.
 4. Capacity: proceed only if free bytes ≥ 3 × S + the old loop's last payout tables, spool and
@@ -1926,9 +1926,9 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    the preview (set `1` and `--resume-pending` after its checks), publish it, and only if its summary,
    recorded right after the prepare run, qualified as in step 4 (the batch's growth is inside its
    measured drop), set the margin by the glossary's formula from it, then restore discovery and
-   supervision with that batch (flag `run`, start the unit); if it did not qualify, run the next cycle
-   with that batch the same way; if the batch does not fit, keep 0, restore supervision and ask the
-   owner. Repeat for any change of admission scope or count. The gate runs
+   supervision with that batch (write `run` atomically, `systemctl --user enable --now` the unit and
+   verify it active and enabled); if it did not qualify, run the next cycle with that batch the same
+   way; if the batch does not fit, keep 0, restore supervision the same way and ask the owner. Repeat for any change of admission scope or count. The gate runs
    wherever a candidate copy is about to be made, new or retained cycle; a resume whose candidate
    exists is not gated, so before restarting such a cycle after an operator stop, compare free bytes
    with its remaining envelope from its samples.
