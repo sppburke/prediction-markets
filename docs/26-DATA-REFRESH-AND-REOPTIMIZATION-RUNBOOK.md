@@ -15,7 +15,7 @@ and publishes to Supabase `latest_ranking`, which `pe-service` reads.
 > to `scp`, and `pe-service` has **no** seed/leaderboard fallback (Supabase is the sole
 > wallet source, #370/#379). Do not run these procedures on the VPS.
 
-On Forge, `~/prediction-markets` links to `/mnt/t7/prediction-markets`.
+On Forge, `~/prediction-markets` links to `/mnt/storage/prediction-markets`.
 
 ## Prerequisites
 
@@ -61,8 +61,12 @@ cargo build --release -p pe-bootstrap
   (the push reads them). `rank_and_push.sh` selects its own interpreter so the documented
   one-line command is independent of an interactive shell's `PATH`: `PE_PYTHON` (an
   executable-path override) → `.venv-analysis/bin/python3` → `.venv/bin/python3`. It does
-  not silently use the system `python3`. Install `scripts/requirements.txt` into one of those
-  repository environments. Before taking the PID lock, creating a run directory, or refreshing
+  not silently use the system `python3`. For the Python 3.11 analysis environment and CI,
+  install `scripts/requirements.txt` into one of those repository environments. Forge runs
+  Python 3.14, for which that file's `duckdb==1.3.2` has no wheel: keep its checkout's working
+  `.venv` (numpy, pandas, duckdb 1.4.5 and their dependencies) and give a second checkout that
+  exact set ("15/5-minute loop" below), also when the wrapper's remediation message names
+  `scripts/requirements.txt`. Before taking the PID lock, creating a run directory, or refreshing
   the cache, the wrapper imports its required modules and exits with remediation instructions if
   the environment is incomplete. Schema one retains `engine=auto` with its SQLite fallback;
   schema two requires the verified Parquet/DuckDB path and rejects SQLite.
@@ -1812,7 +1816,8 @@ many with long histories. Measure their certified sizes in the old cache first.
 git clone /mnt/storage/prediction-markets /mnt/storage/prediction-markets-15m5m
 git -C /mnt/storage/prediction-markets-15m5m checkout --detach <release commit>
 ln -s /mnt/storage/prediction-markets-15m5m ~/prediction-markets-15m5m && cd ~/prediction-markets-15m5m
-python3 -m venv .venv && .venv/bin/pip install -r scripts/requirements.txt
+python3 -m venv .venv && /mnt/storage/prediction-markets/.venv/bin/pip freeze > .venv/old-loop-freeze.txt
+.venv/bin/pip install --only-binary=:all: -r .venv/old-loop-freeze.txt     # the old loop's exact set (Python 3.14)
 install -D -m 0755 <the release's pe-bootstrap> target/release/pe-bootstrap   # the old checkout's binary
 cp ~/prediction-markets/.env .env                                          # then append the settings above
 echo 'PE_RANKER_PARQUET_DIR=/mnt/t7/parquet-15m5m' >> .env                 # its own export folder (see below)
