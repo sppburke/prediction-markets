@@ -466,14 +466,56 @@ async fn retention_publication_after_a_generation_change_ends_the_owner() {
 }
 
 #[tokio::test]
+async fn retention_commit_syncs_the_authority_directory_after_releasing_the_receipt_index() {
+    let mut fixture = Fixture::new(Some(true));
+    install_retention_fence(&fixture.path).unwrap();
+    let index = fixture.index.clone();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let at_commit = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (record, committed, snapshot) = (seen.clone(), seen.clone(), at_commit.clone());
+    fixture.context.hooks = Arc::new(RetentionHooks {
+        directory_sync: Some(Arc::new(move |path| {
+            // Another thread reads the index during each sync: a held write guard would block it.
+            let index = index.clone();
+            let (sent, received) = std::sync::mpsc::channel();
+            std::thread::spawn(move || sent.send(index.retention_epoch()));
+            let epoch = received
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .ok();
+            record.lock().unwrap().push(epoch);
+            RetentionAuthority::sync_directory(path)
+        })),
+        after_commit: Some(Arc::new(move || {
+            *snapshot.lock().unwrap() = committed.lock().unwrap().clone();
+            Ok(())
+        })),
+        ..Default::default()
+    });
+    let mut owner = fixture.owner(CheckpointOwnerHooks::default());
+    owner.initialize_for_scenario().await.unwrap();
+    owner.retention_for_scenario().await.unwrap();
+    // The commit synced the directory once itself, after the index switch.
+    assert_eq!(*at_commit.lock().unwrap(), [Some(1)]);
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().all(|epoch| *epoch == Some(1)), "{seen:?}");
+    assert_eq!(
+        RetentionAuthority::load(&fixture.path)
+            .unwrap()
+            .unwrap()
+            .epoch,
+        1
+    );
+}
+
+#[tokio::test]
 async fn retention_visible_authority_switches_index_while_sync_retries_fail() {
     let mut fixture = Fixture::new(Some(true));
     install_retention_fence(&fixture.path).unwrap();
     let fail_sync = Arc::new(AtomicBool::new(true));
     let sync_flag = fail_sync.clone();
     fixture.context.hooks = Arc::new(RetentionHooks {
-        authority_write: Some(Arc::new(|authority, path| {
-            authority.write(path)?;
+        authority_write: Some(Arc::new(|staged| {
+            staged.publish()?;
             Err(pe_event_log::RetentionWriteError {
                 visible: true,
                 source: std::io::Error::other("after authority rename").into(),
@@ -635,7 +677,7 @@ async fn retention_authority_before_rename_leaves_epoch_and_index_unchanged() {
     let mut fixture = Fixture::new(Some(true));
     install_retention_fence(&fixture.path).unwrap();
     fixture.context.hooks = Arc::new(RetentionHooks {
-        authority_write: Some(Arc::new(|_, _| {
+        authority_write: Some(Arc::new(|_| {
             Err(pe_event_log::RetentionWriteError {
                 visible: false,
                 source: std::io::Error::other("before authority rename").into(),

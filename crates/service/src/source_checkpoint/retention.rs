@@ -77,7 +77,7 @@ pub struct RetentionContext {
 
 #[cfg(feature = "scenario")]
 type AuthorityWriter = Arc<
-    dyn Fn(&RetentionAuthority, &Path) -> Result<(), pe_event_log::RetentionWriteError>
+    dyn Fn(pe_event_log::StagedRetention) -> Result<(), pe_event_log::RetentionWriteError>
         + Send
         + Sync,
 >;
@@ -1397,6 +1397,9 @@ pub(crate) fn commit(
         request.authority.boundary,
     )?;
     request.authority.pins = pins.into_values().collect();
+    // The authority is written and synced before the receipt-index lock is taken, and its
+    // directory is synced after the lock is released, so other index users never wait on them (#754).
+    let staged = request.authority.stage(&path)?;
     // The sidecar handle that serves retired receipts is opened under this lock, before the
     // authority can become visible; the prefix it reads is never rewritten afterwards (#745).
     let reader = request.receipts.retired_reader()?;
@@ -1405,15 +1408,15 @@ pub(crate) fn commit(
         .prepare_retention_install(request.authority.clone(), Some(reader))?;
     let result = {
         #[cfg(feature = "scenario")]
-        if let Some(write) = &request.context.hooks.authority_write {
-            write(&request.authority, &path)
+        if let Some(publish) = &request.context.hooks.authority_write {
+            publish(staged)
         } else {
-            request.authority.write(&path)
+            staged.publish()
         }
         #[cfg(not(feature = "scenario"))]
-        request.authority.write(&path)
+        staged.publish()
     };
-    let directory_synced = match result {
+    let published = match result {
         Ok(()) => true,
         Err(error) if error.visible => false,
         Err(error) => return Err(error.into()),
@@ -1427,6 +1430,7 @@ pub(crate) fn commit(
         .as_ref()
         .map(|hook| hook());
     installer.install_retention();
+    let directory_synced = published && sync_authority(&request.context, &path).is_ok();
     info!(
         epoch = request.authority.epoch,
         boundary_sequence = request.authority.boundary.sequence.0,

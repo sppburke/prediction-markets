@@ -692,9 +692,12 @@ receipt index, without re-authenticating the complete read, and advances to redu
 still requires a full walk. Runtime publication prunes current work through the shared paper-state
 handle, then requires a complete `wal_checkpoint(PASSIVE)` durability barrier before installing
 the pruned manifest: busy is zero and every WAL frame is checkpointed. The barrier never waits on
-readers under the connection mutex and retains `synchronous=NORMAL`. An incomplete or failed
-barrier skips publication until the next hourly attempt. Read-only preparation and compatibility
-conversion keep unpruned candidates. Manifest bytes and retained collection counts are logged.
+readers: it refuses while a batch is open on the shared connection, then runs up to three passive
+checkpoints on the handle's checkpoint connection, so the shared connection (which keeps
+`synchronous=NORMAL`) is never held through their syncs. A concurrent commit can leave one attempt
+partial. An incomplete or failed barrier skips publication until the next hourly attempt. Read-only
+preparation and compatibility conversion keep unpruned candidates. Manifest bytes and retained
+collection counts are logged.
 New commitments produce no frame bindings or counterpart-basis receipts. Historical commitment
 fields and basis-bearing proofs remain decodable and verifiable when selected by an open
 continuation or qualification. Qualification retains feed-audit verification and the frozen
@@ -927,7 +930,7 @@ call count.
 | `DISK_FREE_WARN_BYTES` | 15,000,000,000 bytes (15 GB) | Compiled `disk_monitor` constant, no TOML/env key. Below this on any durable filesystem, `status.json` reports `disk_low: true` and one ERROR logs the transition; readiness is unaffected (an alarm only; the floor stops the service). Recovery to at least this clears the flag and logs INFO. |
 | `DISK_FREE_FLOOR_BYTES` | 5,000,000,000 bytes (5 GB) | Compiled `disk_monitor` constant, no TOML/env key. Startup refuses before writable initialization below this; a runtime sample below it fails the critical owner and requests coordinated shutdown. |
 | `DISK_SAMPLE_SECS` | 60 s | Compiled `disk_monitor` constant, no TOML/env key. The named critical owner samples immediately, then at this cadence regardless of `status_interval_secs`; sampling errors WARN and retry at the next tick without initiating shutdown. |
-| `PAPER_CHECKPOINT_SECS` | 1 s | Compiled `disk_monitor` constant, no TOML/env key. Paper-state WAL checkpoints: when the owner starts, the service's shared paper-state connection stops checkpointing inside its commits (`wal_autocheckpoint = 0`); the owner then runs `wal_checkpoint(PASSIVE)` on that connection as a short hold of its own, never inside a transaction (skipped while a caller-owned batch is open), immediately and at this cadence, one at a time, in a blocking task that main joins at shutdown within `POST_ABORT_JOIN_BOUND`, while free-space sampling continues. Checkpoints stay on the one connection that writes. If the setting cannot be stopped (read back as 0), the critical owner fails. A partial checkpoint (behind another process's reader) or a busy one (another process checkpointing) is not a failure: the next tick continues. An SQL error logs one ERROR, retries every tick and never stops the owner, while the WAL grows; the next error-free call logs INFO. Checkpoint progress itself is not alarmed. CLI, migration and test handles keep SQLite's automatic checkpoints. |
+| `PAPER_CHECKPOINT_SECS` | 1 s | Compiled `disk_monitor` constant, no TOML/env key. Paper-state WAL checkpoints: when the owner starts, the service's shared paper-state connection stops checkpointing inside its commits (`wal_autocheckpoint = 0`); the owner then runs `wal_checkpoint(PASSIVE)` on the handle's checkpoint connection, which writes no rows, so its syncs never hold the shared connection, immediately and at this cadence, one at a time, in a blocking task that main joins at shutdown within `POST_ABORT_JOIN_BOUND`, while free-space sampling continues. It copies only committed frames, including while a caller-owned batch is open. If the setting cannot be stopped (read back as 0), the critical owner fails. A partial checkpoint (behind a reader or a concurrent commit) or a busy one (another process checkpointing) is not a failure: the next tick continues. An SQL error logs one ERROR, retries every tick and never stops the owner, while the WAL grows; the next error-free call logs INFO. Checkpoint progress itself is not alarmed. CLI, migration and test handles keep SQLite's automatic checkpoints. |
 
 Disk checks cover the parent directories of `source_event_log_path`, `paper_state_db_path`,
 `event_log_path`, `status_path`, and `jsonl_log_path`, once per device. Before a parent exists,
@@ -1068,7 +1071,9 @@ which detects external length drift but not equal-length rewrites of verified by
 | Runtime exit cap | `POST_ABORT_JOIN_BOUND` = 10 s. After the async entry point returns, explicit runtime `shutdown_timeout` bounds synchronous tasks that outlive async supervision; exit codes are unchanged. |
 
 The authority commits before the new window is verified and its format-3 checkpoint published;
-only durable publication permits punching. A post-rename authority sync failure switches the index
+only durable publication permits punching. The commit writes and syncs the authority file before
+taking the receipt-index lock, renames it and switches the index under the lock, and syncs its
+directory after releasing it. A post-rename authority sync failure switches the index
 immediately but must complete its directory sync before publication/punching. The same process or
 next boot finishes that epoch first, without rewriting its committed feed file. Rebuilds need the
 coherent authority, receipts prefix, verified pins and suffix through `retained_tail`; checkpoint
