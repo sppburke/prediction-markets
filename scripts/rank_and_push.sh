@@ -915,7 +915,7 @@ refresh_data() {
 # Schema-two private-candidate lane (#588). Every path is a Rust owner that
 # resumes from its own durable state; the wrapper only derives the cycle's
 # physical names, the recorded initial activity/payout targets, and the
-# one linked activity top-up recorded on the candidate.
+# linked successors recorded on the candidate.
 installed_request_args() {
   local request
   request="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py installed-request --root data/eval-results)" || return $?

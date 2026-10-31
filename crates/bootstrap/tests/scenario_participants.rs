@@ -152,9 +152,17 @@ fn serve(venue: Arc<Mutex<Venue>>) -> String {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let mut stream = stream.unwrap();
-            let mut bytes = [0u8; 8_192];
-            let read = stream.read(&mut bytes).unwrap();
-            let request = String::from_utf8_lossy(&bytes[..read]).into_owned();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0u8; 4_096];
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0, "incomplete fixture request");
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            let request = String::from_utf8_lossy(&bytes).into_owned();
             let mut venue = venue.lock().unwrap();
             venue.requests.push(request.clone());
             let (status, body) = if request.starts_with("GET /series/7 ") {

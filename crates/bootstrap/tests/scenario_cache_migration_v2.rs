@@ -13434,11 +13434,6 @@ async fn legacy_prior_cycle_stages_activates_and_restores_with_original_request_
     assert!(!prior.exists());
     assert_eq!(std::fs::read(publication).unwrap(), request_bytes);
 }
-fn weekly_instant_after(wallet: &str, epoch: i64) -> i64 {
-    let phase = i64::from_str_radix(&wallet[wallet.len() - 12..], 16).unwrap() % 604_800;
-    epoch + (-phase - epoch).rem_euclid(604_800)
-}
-
 // PASS: quiet wallets read every successor, remain projected, and interrupted
 // collection and explicit repairs preserve frozen membership; FAIL: otherwise.
 #[tokio::test]
@@ -13628,7 +13623,7 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
 async fn quiet_wallet_deferral_rejects_forged_evidence() {
     let dir = TempDir::new().unwrap();
     let side = dataset_candidate(&dir, "forged-deferral.db", &[WALLET_B]);
-    let end = weekly_instant_after(WALLET, FRESH_END) - 100;
+    let end = FRESH_END;
     let source = DatasetFetcher {
         rows: vec![
             dataset_row(WALLET, "0xold", "old", "BUY", end - 2_592_001),
@@ -15294,12 +15289,13 @@ impl PageFetcher for WrapperActivityFixture {
 }
 
 // PASS: real parser failures match the wrapper's named E11 constants exactly as
-// recorded in collector receipts; a non-array response matches none. FAIL: drift.
+// recorded in collector receipts; a non-array response matches none; the wrapper's
+// page-parse prefix and exchange-contract set equal the Rust owners'. FAIL: drift.
 #[tokio::test]
 async fn unrepresentable_parser_text_matches_receipt_reasons_and_wrapper_constants() {
     let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let constants = Command::new("python3").current_dir(repository).args(["-c",
-        "import json,sys; sys.path.insert(0, 'scripts'); import rank_cycle_manifest as m; print(json.dumps([m.UNREPRESENTABLE_PRICE,m.UNREPRESENTABLE_MAPPING,m.UNREPRESENTABLE_DECIMAL,m.ACTIVITY_RESPONSE_JSON]))"])
+        "import json,sys; sys.path.insert(0, 'scripts'); import rank_cycle_manifest as m; print(json.dumps([m.UNREPRESENTABLE_PRICE,m.UNREPRESENTABLE_MAPPING,m.UNREPRESENTABLE_DECIMAL,m.ACTIVITY_RESPONSE_JSON,m.ACTIVITY_PAGE_PARSE_FAILURE]+sorted(m.EXCHANGE_CONTRACTS)))"])
         .output().unwrap();
     assert!(
         constants.status.success(),
@@ -15307,6 +15303,12 @@ async fn unrepresentable_parser_text_matches_receipt_reasons_and_wrapper_constan
         String::from_utf8_lossy(&constants.stderr)
     );
     let constants: Vec<String> = serde_json::from_slice(&constants.stdout).unwrap();
+    let mut contracts: Vec<String> = pe_bootstrap::chain::ALL_EXCHANGE_CONTRACTS
+        .iter()
+        .map(|address| format!("{address:#x}"))
+        .collect();
+    contracts.sort();
+    assert_eq!(constants[5..], contracts[..]);
     let mut price = dataset_row(WALLET, "0xa", "price", "BUY", FRESH_END);
     price["price"] = Value::from("3.1968021978");
     let mut mapping = price.clone();
@@ -15352,6 +15354,7 @@ async fn unrepresentable_parser_text_matches_receipt_reasons_and_wrapper_constan
         let proof = collection_proof(&side, 1, WALLET);
         let reason = proof["exclusion_reason"].as_str().unwrap();
         assert_eq!(reason, format!("activity page parse failed: {error}"));
+        assert!(reason.starts_with(&constants[4]), "{reason}");
         let matches = [
             reason.contains(&constants[0]),
             reason.contains(&constants[1]),
