@@ -37,7 +37,7 @@ const DEFAULT_LEADERBOARD_TOP_N: u32 = 1_050;
 const DEFAULT_DATADASH_API_URL: &str = "https://api.datadash.xyz";
 const DEFAULT_DATADASH_REQUEST_INTERVAL_MS: u64 = 500;
 const DEFAULT_DATADASH_MAX_COHORT_WALLETS: u64 = 10_000;
-// Issue #800: recent 15-minute market participant discovery.
+// Issues #800/#821: participant discovery coverage overlap.
 const DEFAULT_PARTICIPANT_LOOKBACK_SECS: u64 = 86_400;
 // Issue #385: `pe-bootstrap purge` defaults.
 const DEFAULT_PURGE_INACTIVITY_SECS: i64 = 1_209_600; // 14 days
@@ -410,8 +410,9 @@ pub struct BootstrapConfig {
     )]
     pub datadash_max_cohort_wallets: u64,
 
-    /// Recent 15-minute market participant lookback in seconds (#800). Zero disables
-    /// the source without HTTP. Canonical default in `docs/_GLOSSARY.md`.
+    /// Participant discovery overlap in seconds, subtracted from matching persisted
+    /// coverage's end, otherwise from now (#800/#821). Zero disables the source without
+    /// HTTP or coverage change. Canonical default in `docs/_GLOSSARY.md`.
     /// `PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS` overrides.
     #[serde(
         default = "default_participant_lookback_secs",

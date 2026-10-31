@@ -8,7 +8,9 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
+use pe_core_types::WalletAddress;
 use pe_source_polymarket_public::{RECONCILIATION_RATE_LIMIT_RETRY_SECS, ReqwestFetcher};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -22,13 +24,160 @@ use crate::error::BootstrapError;
 use crate::leaderboard_discovery::{
     LeaderboardDiscoveryReport, LeaderboardFetcher, run_leaderboard_discovery_with_policy,
 };
-use crate::market_scope::{MarketScope, ScopeFetcher, ScopePage, recent_market_scope};
+use crate::market_scope::{
+    MarketScope, ScopeFetcher, ScopePage, ScopeSeries, canonical_recurrences, recent_market_scope,
+};
 use crate::pile::{self, ActivationPolicy, SRC_MARKET_PARTICIPANT};
 
 const PARTICIPANT_SOURCE_ID: &str = "polymarket-data-api-trades";
 const PARTICIPANT_MIN_INTERVAL_MS: u64 = 500;
 const PARTICIPANT_MARKET_CHUNK: usize = 40;
 const PARTICIPANT_PAGE_LIMIT: usize = 10_000;
+
+/// Normalized ranking scope shared by participant discovery and accepted sweep imports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipantScope {
+    pub recurrences: Vec<String>,
+    pub series: Option<Vec<ScopeSeries>>,
+}
+
+impl ParticipantScope {
+    pub fn new(
+        recurrences: &[String],
+        pinned: Option<&[ScopeSeries]>,
+    ) -> Result<Self, BootstrapError> {
+        let mut series = pinned.map(<[ScopeSeries]>::to_vec);
+        if let Some(series) = &mut series {
+            series.sort_by(|a, b| a.id.cmp(&b.id));
+            let text = series
+                .iter()
+                .map(|s| format!("{}:{}", s.id, s.slug.as_deref().unwrap_or_default()))
+                .collect::<Vec<_>>()
+                .join(",");
+            crate::market_scope::parse_pinned_series(&text)?;
+        }
+        Ok(Self {
+            recurrences: canonical_recurrences(recurrences)?,
+            series,
+        })
+    }
+}
+
+/// Completed participant reads over every scope market ending at or after the floor,
+/// for the half-open interval [covered_from_unix, covered_through_unix). Stored as
+/// one JSON object in `meta.participant_discovery_coverage`, including on schema two.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipantDiscoveryCoverage {
+    pub version: u32,
+    pub scope: ParticipantScope,
+    pub market_floor_unix: i64,
+    pub covered_from_unix: i64,
+    pub covered_through_unix: i64,
+}
+
+impl ParticipantDiscoveryCoverage {
+    pub(crate) fn validate(&self) -> Result<(), BootstrapError> {
+        if self.version != 1
+            || self.scope
+                != ParticipantScope::new(&self.scope.recurrences, self.scope.series.as_deref())?
+            || self.covered_from_unix < 0
+            || self.covered_from_unix >= self.covered_through_unix
+        {
+            return Err(BootstrapError::Invalid {
+                message: "invalid participant discovery coverage".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn merge_import(&self, prior: Option<&Self>) -> Result<Self, BootstrapError> {
+        self.validate()?;
+        let Some(prior) = prior.filter(|prior| prior.scope == self.scope) else {
+            return Ok(self.clone());
+        };
+        if self.market_floor_unix < prior.market_floor_unix {
+            if self.covered_from_unix <= prior.covered_from_unix
+                && self.covered_through_unix >= prior.covered_through_unix
+            {
+                return Ok(self.clone());
+            }
+            return Err(BootstrapError::Invalid {
+                message: format!(
+                    "earlier market floor requires coverage of [{}, {}); supplied [{}, {})",
+                    prior.covered_from_unix,
+                    prior.covered_through_unix,
+                    self.covered_from_unix,
+                    self.covered_through_unix
+                ),
+            });
+        }
+        if self.covered_from_unix > prior.covered_through_unix
+            || self.covered_through_unix < prior.covered_from_unix
+        {
+            return Err(BootstrapError::Invalid {
+                message: format!(
+                    "participant coverage missing bridge [{}, {})",
+                    self.covered_through_unix.min(prior.covered_through_unix),
+                    self.covered_from_unix.max(prior.covered_from_unix)
+                ),
+            });
+        }
+        Ok(Self {
+            covered_from_unix: self.covered_from_unix.min(prior.covered_from_unix),
+            covered_through_unix: self.covered_through_unix.max(prior.covered_through_unix),
+            market_floor_unix: self.market_floor_unix.max(prior.market_floor_unix),
+            ..self.clone()
+        })
+    }
+}
+
+/// Validate a sweep file and all coverage inputs before changing either wallets or
+/// coverage. The caller holds the cache mutation lock through both commits.
+pub fn import_participants(
+    cache: &mut WalletCache,
+    file: &std::path::Path,
+    coverage: ParticipantDiscoveryCoverage,
+    now: i64,
+) -> Result<usize, BootstrapError> {
+    coverage.validate()?;
+    if coverage.covered_through_unix > now {
+        return Err(BootstrapError::Invalid {
+            message: "participant coverage must not end in the future".to_owned(),
+        });
+    }
+    let bytes = std::fs::read(file)?;
+    let text = std::str::from_utf8(&bytes).map_err(|error| BootstrapError::Invalid {
+        message: format!("participants-import: {error}"),
+    })?;
+    let wallets = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            WalletAddress::from_hex(line.trim())
+                .map(|wallet| wallet.to_string())
+                .map_err(|error| BootstrapError::Invalid {
+                    message: format!("participants-import: invalid wallet {line:?}: {error}"),
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let merged = coverage.merge_import(cache.participant_discovery_coverage()?.as_ref())?;
+    merged.validate()?;
+    upsert_participants(cache, wallets.iter().cloned())?;
+    cache.set_participant_discovery_coverage(&merged)?;
+    tracing::info!(file_sha256 = %format!("{:x}", Sha256::digest(&bytes)), wallet_count = wallets.len(), "participants-import: complete");
+    Ok(wallets.len())
+}
+
+fn upsert_participants(
+    cache: &mut WalletCache,
+    wallets: impl IntoIterator<Item = String>,
+) -> Result<(), BootstrapError> {
+    let rows: Vec<_> = wallets
+        .into_iter()
+        .map(|hex| (hex, SRC_MARKET_PARTICIPANT, false, None, None, None, 0))
+        .collect();
+    cache.upsert_wallets_bulk(&rows)
+}
 
 /// The supported wallet-discovery sources for `winner-discovery`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +202,15 @@ pub async fn run_source_discovery(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
 ) -> Result<SourceDiscoveryResult, BootstrapError> {
-    run_source_discovery_with_policy(source, config, cache, ActivationPolicy::Immediate).await
+    run_source_discovery_with_policy(
+        source,
+        config,
+        cache,
+        ActivationPolicy::Immediate,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Source discovery with an explicit activation policy. The rank-and-push
@@ -63,6 +220,8 @@ pub async fn run_source_discovery_with_policy(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
     activation_policy: ActivationPolicy,
+    pinned: Option<&[ScopeSeries]>,
+    market_floor: Option<i64>,
 ) -> Result<SourceDiscoveryResult, BootstrapError> {
     match source {
         WalletDiscoverySource::Leaderboard => {
@@ -143,8 +302,16 @@ pub async fn run_source_discovery_with_policy(
                 cache,
                 activation_policy,
                 now,
+                pinned,
                 participant_fetcher,
-                |lo| recent_market_scope(config, lo, &config.market_recurrences, None),
+                |lo| {
+                    recent_market_scope(
+                        config,
+                        market_floor.unwrap_or(lo),
+                        &config.market_recurrences,
+                        pinned,
+                    )
+                },
             )
             .await
         }
@@ -168,6 +335,7 @@ async fn run_participant_discovery<F, S, Fut>(
     cache: &mut WalletCache,
     policy: ActivationPolicy,
     now: i64,
+    pinned: Option<&[ScopeSeries]>,
     make_fetcher: impl FnOnce() -> Result<F, BootstrapError>,
     scope: S,
 ) -> Result<SourceDiscoveryResult, BootstrapError>
@@ -176,9 +344,22 @@ where
     S: FnOnce(i64) -> Fut,
     Fut: Future<Output = Result<MarketScope, BootstrapError>>,
 {
+    let normalized_scope = ParticipantScope::new(&config.market_recurrences, pinned)?;
+    let prior = if config.participant_lookback_secs == 0 {
+        None
+    } else {
+        cache.participant_discovery_coverage()?
+    };
+    let matching = prior
+        .as_ref()
+        .filter(|prior| prior.scope == normalized_scope);
     let lo = i64::try_from(config.participant_lookback_secs)
         .ok()
-        .and_then(|lookback| now.checked_sub(lookback));
+        .and_then(|lookback| {
+            matching
+                .map_or(now, |prior| prior.covered_through_unix)
+                .checked_sub(lookback)
+        });
     let mut record = ParticipantRecord {
         source_id: PARTICIPANT_SOURCE_ID,
         schema_version: 1,
@@ -194,7 +375,9 @@ where
         if config.participant_lookback_secs == 0 {
             return Ok(Vec::new());
         }
-        let lo = lo.ok_or("failed:window")?;
+        let lo = lo
+            .filter(|lo| *lo >= 0 && *lo < now)
+            .ok_or("failed:window")?;
         let market_scope = scope(lo)
             .await
             .map_err(|error| participant_failure("failed:gamma", &error))?;
@@ -258,17 +441,39 @@ where
     {
         tracing::info!(page = %serde_json::to_string(page)?, "winner_discovery: participant page");
     }
-    if record.status != "ok" {
+    if record.status == "disabled" {
         return Ok(SourceDiscoveryResult {
             status: record.status,
             ..SourceDiscoveryResult::default()
         });
     }
-    let rows: Vec<_> = wallets
-        .into_iter()
-        .map(|hex| (hex, SRC_MARKET_PARTICIPANT, false, None, None, None, 0))
-        .collect();
-    cache.upsert_wallets_bulk(&rows)?;
+    if record.status != "ok" {
+        return Err(BootstrapError::TransientSource {
+            source_name: PARTICIPANT_SOURCE_ID,
+            message: record.status.to_owned(),
+        });
+    }
+    let mut coverage = ParticipantDiscoveryCoverage {
+        version: 1,
+        scope: normalized_scope,
+        market_floor_unix: record
+            .market_scope
+            .as_ref()
+            .ok_or(BootstrapError::Internal)?
+            .end_date_min_unix,
+        covered_from_unix: lo.ok_or(BootstrapError::Internal)?,
+        covered_through_unix: now,
+    };
+    if let Some(prior) = matching {
+        coverage.covered_from_unix = coverage.covered_from_unix.min(prior.covered_from_unix);
+        coverage.covered_through_unix = coverage
+            .covered_through_unix
+            .max(prior.covered_through_unix);
+        coverage.market_floor_unix = coverage.market_floor_unix.max(prior.market_floor_unix);
+    }
+    coverage.validate()?;
+    upsert_participants(cache, wallets)?;
+    cache.set_participant_discovery_coverage(&coverage)?;
     let activated = pile::apply_activation_policy(cache, policy)?;
     Ok(SourceDiscoveryResult {
         unique_wallets: record.wallet_count,
@@ -311,7 +516,7 @@ async fn collect_participant_trades<F: ScopeFetcher>(
             let mut complete = false;
             for offset in [0, PARTICIPANT_PAGE_LIMIT] {
                 let url = format!(
-                    "{base_url}/trades?market={markets}&limit={PARTICIPANT_PAGE_LIMIT}&offset={offset}&start={lo}&end={}",
+                    "{base_url}/trades?market={markets}&limit={PARTICIPANT_PAGE_LIMIT}&offset={offset}&takerOnly=false&start={lo}&end={}",
                     hi - 1
                 );
                 let page = fetcher
@@ -340,7 +545,7 @@ async fn collect_participant_trades<F: ScopeFetcher>(
                 }
                 for row in trades {
                     let Some(wallet) = row.get("proxyWallet").and_then(Value::as_str) else {
-                        continue;
+                        return Err("incomplete:proxy-wallet");
                     };
                     let wallet = wallet.to_ascii_lowercase();
                     if wallet.len() == 42
@@ -348,6 +553,8 @@ async fn collect_participant_trades<F: ScopeFetcher>(
                         && wallet[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
                     {
                         window_wallets.insert(wallet);
+                    } else {
+                        return Err("incomplete:proxy-wallet");
                     }
                 }
                 if rows < PARTICIPANT_PAGE_LIMIT {
@@ -403,6 +610,7 @@ mod tests {
             &mut cache,
             ActivationPolicy::Immediate,
             NOW,
+            None,
             || Ok(fetcher),
             |_| async { Ok(scope(1)) },
         )
@@ -530,12 +738,6 @@ mod tests {
             {"proxyWallet": wallet(0xbb).to_uppercase()},
             {"proxyWallet": wallet(0xaa)},
             {"proxyWallet": wallet(0xbb)},
-            {"proxyWallet": "0x123"},
-            {"proxyWallet": format!("0x{}", "g".repeat(40))},
-            {"proxyWallet": format!("1x{}", "a".repeat(40))},
-            {"proxyWallet": "é".repeat(21)},
-            {"proxyWallet": null},
-            {}
         ]);
         let fetcher = fetcher(|_: &str| Ok(body.clone()));
         let mut pages = Vec::new();
@@ -550,13 +752,14 @@ mod tests {
             assert_eq!(q["market"].split(',').count(), if i == 2 { 1 } else { 40 });
             assert_eq!(q["limit"], "10000");
             assert_eq!(q["offset"], "0");
+            assert_eq!(q["takerOnly"], "false");
             assert_eq!(q["start"], "100");
             assert_eq!(q["end"], "104");
             let page = &pages[i];
             assert_eq!(page.ordinal, u64::try_from(i).unwrap());
             assert_eq!(page.url, *url);
             assert_eq!(page.kind, "trades");
-            assert_eq!(page.rows, 9);
+            assert_eq!(page.rows, 3);
             assert_eq!(
                 page.raw_sha256,
                 format!("{:x}", Sha256::digest(serde_json::to_vec(&body).unwrap()))
@@ -651,19 +854,20 @@ mod tests {
             &mut cache,
             ActivationPolicy::Immediate,
             101,
+            None,
             || Ok(fetcher),
             |_| async { Ok(scope(1)) },
         )
         .await
-        .unwrap();
-        assert_eq!(r.status, "incomplete");
-        assert_eq!((r.unique_wallets, r.activated), (0, 0));
+        .unwrap_err();
+        assert_eq!(r.exit_code(), 75);
+        assert!(r.to_string().contains("incomplete"));
         assert_eq!(cache.wallet_pile_size().unwrap(), 0);
         assert_eq!(urls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn participants_gamma_failure_is_soft_and_does_not_fetch_or_upsert() {
+    async fn participants_gamma_failure_is_tempfail_and_does_not_fetch_or_upsert() {
         let (_dir, mut cache) = tmp_cache();
         let fetcher = fetcher(|_: &str| Ok(json!([])));
         let urls = Arc::clone(&fetcher.urls);
@@ -672,6 +876,7 @@ mod tests {
             &mut cache,
             ActivationPolicy::Immediate,
             NOW,
+            None,
             || Ok(fetcher),
             |lo| async move {
                 assert_eq!(lo, 100);
@@ -681,9 +886,9 @@ mod tests {
             },
         )
         .await
-        .unwrap();
-        assert_eq!(r.status, "failed:gamma");
-        assert_eq!((r.unique_wallets, r.activated), (0, 0));
+        .unwrap_err();
+        assert_eq!(r.exit_code(), 75);
+        assert!(r.to_string().contains("failed:gamma"));
         assert_eq!(cache.wallet_pile_size().unwrap(), 0);
         assert!(urls.lock().unwrap().is_empty());
     }
@@ -698,6 +903,7 @@ mod tests {
             &mut cache,
             ActivationPolicy::Immediate,
             NOW,
+            None,
             || {
                 built.set(true);
                 Ok(fetcher)
@@ -722,6 +928,7 @@ mod tests {
             &mut cache,
             ActivationPolicy::Immediate,
             NOW,
+            None,
             || Ok(fetcher),
             |_| async { Ok(scope(1)) },
         )
@@ -753,13 +960,14 @@ mod tests {
                 &mut cache,
                 ActivationPolicy::Immediate,
                 NOW,
+                None,
                 || Ok(fetcher),
                 |_| async { Ok(scope(41)) },
             )
             .await
-            .unwrap();
-            assert!(r.status.starts_with("failed:trades"));
-            assert_eq!((r.unique_wallets, r.activated), (0, 0));
+            .unwrap_err();
+            assert_eq!(r.exit_code(), 75);
+            assert!(r.to_string().contains("failed:trades"));
             assert_eq!(cache.wallet_pile_size().unwrap(), 0);
         }
     }
@@ -844,6 +1052,7 @@ mod tests {
                 &mut cache,
                 policy,
                 NOW,
+                None,
                 || Ok(fetcher),
                 |_| async { Ok(scope(1)) },
             )
@@ -874,6 +1083,7 @@ mod tests {
             &mut cache,
             ActivationPolicy::Immediate,
             NOW,
+            None,
             || Ok(fetcher),
             |_| async { Ok(scope(1)) },
         )
@@ -934,6 +1144,7 @@ mod tests {
             &mut cache,
             ActivationPolicy::Deferred,
             NOW,
+            None,
             || Ok(fetcher),
             |_| async { Ok(gamma) },
         )
@@ -1019,6 +1230,7 @@ mod tests {
             &mut cache,
             ActivationPolicy::Immediate,
             NOW,
+            None,
             || Ok(fetcher),
             |_| async { Ok(scope(1)) },
         )
@@ -1030,5 +1242,519 @@ mod tests {
             SRC_MARKET_PARTICIPANT
         );
         assert_eq!(cache.active_wallet_count().unwrap(), 0);
+    }
+    fn coverage(from: i64, through: i64, floor: i64) -> ParticipantDiscoveryCoverage {
+        ParticipantDiscoveryCoverage {
+            version: 1,
+            scope: ParticipantScope::new(&["15m".into()], None).unwrap(),
+            market_floor_unix: floor,
+            covered_from_unix: from,
+            covered_through_unix: through,
+        }
+    }
+
+    #[tokio::test]
+    async fn participants_invalid_wallet_refuses_the_chunk_and_logs_its_hash() {
+        for invalid in [
+            json!({}),
+            json!({"proxyWallet": null}),
+            json!({"proxyWallet": "0x123"}),
+            json!({"proxyWallet": format!("0x{}", "g".repeat(40))}),
+            json!({"proxyWallet": "é".repeat(21)}),
+            json!({"proxyWallet": format!("1x{}", "a".repeat(40))}),
+        ] {
+            let (_dir, mut cache) = tmp_cache();
+            let prior = coverage(50, 90, 20);
+            cache.set_participant_discovery_coverage(&prior).unwrap();
+            let log = AuditLog::default();
+            let writer = log.clone();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone())
+                    .finish(),
+            );
+            let body = json!([{"proxyWallet": wallet(1)}, invalid]);
+            let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&body).unwrap()));
+            let error = run_participant_discovery(
+                &config(5),
+                &mut cache,
+                ActivationPolicy::Deferred,
+                NOW,
+                None,
+                || Ok(fetcher(|_: &str| Ok(body.clone()))),
+                |_| async { Ok(scope(1)) },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.exit_code(), 75);
+            assert_eq!(cache.wallet_pile_size().unwrap(), 0);
+            assert_eq!(cache.participant_discovery_coverage().unwrap(), Some(prior));
+            assert!(
+                String::from_utf8(log.0.lock().unwrap().clone())
+                    .unwrap()
+                    .contains(&hash)
+            );
+        }
+    }
+
+    #[test]
+    fn participants_coverage_accessor_fails_closed() {
+        let (_dir, mut cache) = tmp_cache();
+        assert_eq!(cache.participant_discovery_coverage().unwrap(), None);
+        let valid = coverage(10, 20, 0);
+        cache.set_participant_discovery_coverage(&valid).unwrap();
+        assert_eq!(cache.participant_discovery_coverage().unwrap(), Some(valid));
+        for malformed in [
+            "not json",
+            "{}",
+            r#"{"version":2,"scope":{"recurrences":["15m"],"series":null},"market_floor_unix":0,"covered_from_unix":10,"covered_through_unix":20}"#,
+        ] {
+            cache
+                .raw_conn_for_test()
+                .execute(
+                    "UPDATE meta SET value=?1 WHERE key='participant_discovery_coverage'",
+                    [malformed],
+                )
+                .unwrap();
+            assert!(cache.participant_discovery_coverage().is_err());
+        }
+        cache
+            .raw_conn_for_test()
+            .execute_batch("DROP TABLE meta")
+            .unwrap();
+        assert!(matches!(
+            cache.participant_discovery_coverage(),
+            Err(BootstrapError::Sqlite(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn participants_long_gap_failure_and_interrupted_record_repeat_the_tail() {
+        let (_dir, mut cache) = tmp_cache();
+        let prior = coverage(10, 105, 20);
+        cache.set_participant_discovery_coverage(&prior).unwrap();
+        let broken = fetcher(|url: &str| {
+            assert_eq!(query(url)["start"], "100");
+            Err(SourceError::Fatal {
+                message: "fixture page failure".into(),
+            })
+        });
+        let error = run_participant_discovery(
+            &config(5),
+            &mut cache,
+            ActivationPolicy::Deferred,
+            1_000,
+            None,
+            || Ok(broken),
+            |lo| async move {
+                assert_eq!(lo, 100);
+                Ok(scope(1))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 75);
+        assert_eq!(
+            cache.participant_discovery_coverage().unwrap(),
+            Some(prior.clone())
+        );
+        cache.raw_conn_for_test().execute_batch("CREATE TRIGGER stop_coverage BEFORE INSERT ON meta WHEN NEW.key='participant_discovery_coverage' BEGIN SELECT RAISE(ABORT, 'interrupted coverage commit'); END;").unwrap();
+        let good = || {
+            Ok(fetcher(|url: &str| {
+                assert_eq!(query(url)["start"], "100");
+                Ok(json!([{"proxyWallet": wallet(1)}]))
+            }))
+        };
+        let error = run_participant_discovery(
+            &config(5),
+            &mut cache,
+            ActivationPolicy::Deferred,
+            1_000,
+            None,
+            good,
+            |_| async { Ok(scope(1)) },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("interrupted coverage commit"));
+        assert_eq!(cache.wallet_pile_size().unwrap(), 1);
+        assert_eq!(cache.participant_discovery_coverage().unwrap(), Some(prior));
+        cache
+            .raw_conn_for_test()
+            .execute_batch("DROP TRIGGER stop_coverage")
+            .unwrap();
+        run_participant_discovery(
+            &config(5),
+            &mut cache,
+            ActivationPolicy::Deferred,
+            1_000,
+            None,
+            good,
+            |_| async { Ok(scope(1)) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(cache.wallet_pile_size().unwrap(), 1);
+        assert_eq!(
+            cache.participant_discovery_coverage().unwrap(),
+            Some(coverage(10, 1_000, 100))
+        );
+        run_participant_discovery(
+            &config(5),
+            &mut cache,
+            ActivationPolicy::Deferred,
+            1_005,
+            None,
+            || {
+                Ok(fetcher(|url: &str| {
+                    assert_eq!(query(url)["start"], "995");
+                    Ok(json!([]))
+                }))
+            },
+            |_| async {
+                let mut scope = scope(1);
+                scope.end_date_min_unix = 20;
+                Ok(scope)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cache.participant_discovery_coverage().unwrap(),
+            Some(coverage(10, 1_005, 100))
+        );
+    }
+
+    #[tokio::test]
+    async fn participants_disabled_preserves_coverage_and_bad_records_stop_before_reads() {
+        let (_dir, mut cache) = tmp_cache();
+        let prior = coverage(10, 20, 0);
+        cache.set_participant_discovery_coverage(&prior).unwrap();
+        run_participant_discovery(
+            &config(0),
+            &mut cache,
+            ActivationPolicy::Deferred,
+            NOW,
+            None,
+            || Ok(fetcher(|_: &str| panic!("disabled fetch"))),
+            |_| async { panic!("disabled scope") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(cache.participant_discovery_coverage().unwrap(), Some(prior));
+        cache
+            .raw_conn_for_test()
+            .execute(
+                "UPDATE meta SET value='malformed' WHERE key='participant_discovery_coverage'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            run_participant_discovery(
+                &config(5),
+                &mut cache,
+                ActivationPolicy::Deferred,
+                NOW,
+                None,
+                || Ok(fetcher(|_: &str| panic!("bad coverage trades"))),
+                |_| async { panic!("bad coverage scope") }
+            )
+            .await
+            .is_err()
+        );
+        cache
+            .raw_conn_for_test()
+            .execute_batch("DROP TABLE meta")
+            .unwrap();
+        assert!(
+            run_participant_discovery(
+                &config(5),
+                &mut cache,
+                ActivationPolicy::Deferred,
+                NOW,
+                None,
+                || Ok(fetcher(|_: &str| panic!("bad query trades"))),
+                |_| async { panic!("bad query scope") }
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn participants_scope_change_replaces_coverage_on_schema_two_without_source_cursor() {
+        let (_dir, mut cache) = tmp_cache();
+        cache.raw_conn_for_test().execute_batch("ALTER TABLE source_cursor RENAME TO source_cursor_v1_sealed; PRAGMA user_version=2;").unwrap();
+        cache
+            .set_participant_discovery_coverage(&coverage(10, 20, 0))
+            .unwrap();
+        let pin = crate::market_scope::parse_pinned_series("8:eight,7:seven").unwrap();
+        run_participant_discovery(
+            &config(5),
+            &mut cache,
+            ActivationPolicy::Deferred,
+            NOW,
+            Some(&pin),
+            || {
+                Ok(fetcher(|url: &str| {
+                    assert_eq!(query(url)["start"], "100");
+                    Ok(json!([]))
+                }))
+            },
+            |lo| async move {
+                assert_eq!(lo, 100);
+                Ok(scope(1))
+            },
+        )
+        .await
+        .unwrap();
+        let mut expected = coverage(100, NOW, 100);
+        expected.scope = ParticipantScope::new(&["15m".into()], Some(&pin)).unwrap();
+        assert_eq!(expected.scope.series.as_ref().unwrap()[0].id, "7");
+        assert_eq!(
+            cache.participant_discovery_coverage().unwrap(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn participants_import_merges_intervals_and_validates_before_writes() {
+        let (dir, mut cache) = tmp_cache();
+        let file = dir.path().join("participants.txt");
+        std::fs::write(
+            &file,
+            format!(
+                "0x{}\n\n{}\n",
+                wallet(0xab)[2..].to_uppercase(),
+                wallet(0xab)
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            import_participants(&mut cache, &file, coverage(10, 20, 5), NOW).unwrap(),
+            1
+        );
+        assert_eq!(cache.wallet_pile_size().unwrap(), 1);
+        for (input, expected) in [
+            (coverage(20, 30, 6), coverage(10, 30, 6)),
+            (coverage(15, 25, 7), coverage(10, 30, 7)),
+            (coverage(0, 10, 7), coverage(0, 30, 7)),
+            (coverage(0, 30, 6), coverage(0, 30, 6)),
+        ] {
+            import_participants(&mut cache, &file, input, NOW).unwrap();
+            assert_eq!(
+                cache.participant_discovery_coverage().unwrap(),
+                Some(expected.clone())
+            );
+            import_participants(&mut cache, &file, expected.clone(), NOW).unwrap();
+            assert_eq!(
+                cache.participant_discovery_coverage().unwrap(),
+                Some(expected)
+            );
+            assert_eq!(cache.wallet_pile_size().unwrap(), 1);
+        }
+        let prior = cache.participant_discovery_coverage().unwrap();
+        std::fs::write(&file, wallet(2)).unwrap();
+        for (bad, reason) in [
+            (coverage(31, 40, 6), "missing bridge [30, 31)"),
+            (coverage(10, 20, 5), "requires coverage of [0, 30)"),
+            (coverage(-1, 10, 6), "invalid"),
+            (coverage(10, 10, 6), "invalid"),
+            (coverage(20, 10, 6), "invalid"),
+            (coverage(10, NOW + 1, 6), "future"),
+        ] {
+            let error = import_participants(&mut cache, &file, bad, NOW).unwrap_err();
+            assert!(error.to_string().contains(reason), "{error}");
+            assert_eq!(cache.participant_discovery_coverage().unwrap(), prior);
+            assert_eq!(cache.wallet_pile_size().unwrap(), 1);
+        }
+        std::fs::write(&file, format!("{}\ninvalid\n{}", wallet(2), wallet(3))).unwrap();
+        assert!(import_participants(&mut cache, &file, coverage(30, 40, 6), NOW).is_err());
+        assert_eq!(cache.wallet_pile_size().unwrap(), 1);
+        assert_eq!(cache.participant_discovery_coverage().unwrap(), prior);
+        std::fs::write(&file, wallet(2)).unwrap();
+        let mut replacement = coverage(50, 60, 1);
+        replacement.scope.recurrences = vec!["5m".into()];
+        import_participants(&mut cache, &file, replacement.clone(), NOW).unwrap();
+        assert_eq!(
+            cache.participant_discovery_coverage().unwrap(),
+            Some(replacement)
+        );
+    }
+
+    #[tokio::test]
+    async fn participants_import_repairs_old_coverage_then_discovery_reads_only_recent_tail() {
+        let (dir, mut cache) = tmp_cache();
+        cache
+            .set_participant_discovery_coverage(&coverage(10, 20, 100))
+            .unwrap();
+        let file = dir.path().join("participants.txt");
+        std::fs::write(&file, wallet(1)).unwrap();
+        import_participants(&mut cache, &file, coverage(0, 100, 20), NOW).unwrap();
+        run_participant_discovery(
+            &config(5),
+            &mut cache,
+            ActivationPolicy::Deferred,
+            NOW,
+            None,
+            || {
+                Ok(fetcher(|url: &str| {
+                    assert_eq!(query(url)["start"], "95");
+                    Ok(json!([]))
+                }))
+            },
+            |_| async {
+                let mut scope = scope(1);
+                scope.end_date_min_unix = 20;
+                Ok(scope)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cache.participant_discovery_coverage().unwrap(),
+            Some(coverage(0, NOW, 20))
+        );
+    }
+
+    #[test]
+    fn participants_import_commits_wallets_before_coverage_and_reports_exclusions() {
+        let (dir, mut cache) = tmp_cache();
+        let file = dir.path().join("participants.txt");
+        let exchange = format!("{:#x}", crate::chain::ALL_EXCHANGE_CONTRACTS[0]);
+        std::fs::write(
+            &file,
+            format!("{}\n{}\n{}\n{exchange}", wallet(1), wallet(2), wallet(3)),
+        )
+        .unwrap();
+        cache
+            .upsert_wallet(&wallet(2), pile::SRC_TRADES, true, None, None, None)
+            .unwrap();
+        cache
+            .raw_conn_for_test()
+            .execute(
+                "INSERT INTO purged_wallets VALUES (?1, 1, 'proven_loser')",
+                [wallet(1)],
+            )
+            .unwrap();
+        cache
+            .raw_conn_for_test()
+            .execute(
+                "INSERT INTO purged_wallets VALUES (?1, 1, 'infra')",
+                [wallet(3)],
+            )
+            .unwrap();
+        let log = AuditLog::default();
+        let writer = log.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        cache.raw_conn_for_test().execute_batch("CREATE TRIGGER stop_coverage BEFORE INSERT ON meta WHEN NEW.key='participant_discovery_coverage' BEGIN SELECT RAISE(ABORT, 'interrupted import'); END;").unwrap();
+        assert!(
+            import_participants(&mut cache, &file, coverage(10, 20, 0), NOW)
+                .unwrap_err()
+                .to_string()
+                .contains("interrupted import")
+        );
+        assert_eq!(cache.participant_discovery_coverage().unwrap(), None);
+        assert!(!cache.is_purged(&wallet(1)).unwrap());
+        assert!(cache.is_purged(&wallet(3)).unwrap());
+        assert_eq!(cache.wallet_pile_size().unwrap(), 2);
+        assert_eq!(
+            cache
+                .raw_conn_for_test()
+                .query_row::<i64, _, _>(
+                    "SELECT is_infra FROM wallets WHERE wallet_hex=?1",
+                    [wallet(2)],
+                    |row| row.get(0)
+                )
+                .unwrap(),
+            0
+        );
+        cache
+            .raw_conn_for_test()
+            .execute_batch("DROP TRIGGER stop_coverage")
+            .unwrap();
+        import_participants(&mut cache, &file, coverage(10, 20, 0), NOW).unwrap();
+        let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains(&wallet(3)) && log.contains("skipped_infra=1"),
+            "{log}"
+        );
+        assert!(log.contains(&format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(&file).unwrap())
+        )));
+        assert!(log.contains("wallet_count=4"));
+        assert_eq!(
+            cache.participant_discovery_coverage().unwrap(),
+            Some(coverage(10, 20, 0))
+        );
+    }
+    #[tokio::test]
+    async fn participants_discovery_names_infra_skips_on_every_run() {
+        let (_dir, mut cache) = tmp_cache();
+        cache
+            .raw_conn_for_test()
+            .execute(
+                "INSERT INTO purged_wallets VALUES (?1, 1, 'infra')",
+                [wallet(3)],
+            )
+            .unwrap();
+        let log = AuditLog::default();
+        let writer = log.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        for _ in 0..2 {
+            run_participant_discovery(
+                &config(5),
+                &mut cache,
+                ActivationPolicy::Deferred,
+                NOW,
+                None,
+                || Ok(fetcher(|_: &str| Ok(json!([{"proxyWallet": wallet(3)}])))),
+                |_| async { Ok(scope(1)) },
+            )
+            .await
+            .unwrap();
+        }
+        let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("market participant skipped: infra tombstone")
+                .count(),
+            2
+        );
+        assert_eq!(log.matches(&wallet(3)).count(), 2);
+        assert_eq!(log.matches("skipped_infra=1").count(), 2);
+        assert_eq!(cache.wallet_pile_size().unwrap(), 0);
+    }
+
+    #[test]
+    fn participants_normalize_scope_and_block_all_exchange_contracts() {
+        let (_dir, mut cache) = tmp_cache();
+        let scope = ParticipantScope::new(&["5m".into(), "15m".into()], None).unwrap();
+        assert_eq!(scope.recurrences, ["15m", "5m"]);
+        assert_eq!(scope.series, None);
+        let contracts: Vec<_> = crate::chain::ALL_EXCHANGE_CONTRACTS
+            .iter()
+            .map(|address| format!("{address:#x}"))
+            .collect();
+        cache
+            .raw_conn_for_test()
+            .execute(
+                "INSERT INTO purged_wallets VALUES (?1, 1, 'proven_loser')",
+                [&contracts[0]],
+            )
+            .unwrap();
+        upsert_participants(&mut cache, contracts).unwrap();
+        assert_eq!(cache.wallet_pile_size().unwrap(), 0);
     }
 }

@@ -99,8 +99,8 @@ command -v flock >/dev/null 2>&1 || {
 DB="data/wallet_cache.db"
 UNIVERSE=""                       # empty => --universe-from-trades (the #370 production default)
 OUT_DIR=""                        # empty => auto-timestamped data/eval-results/cron-<UTC>
-# Empty window => the Python ranker's RELATIVE defaults apply (win_end = today UTC-midnight,
-# win_start = win_end - ranker_window_days(180)); override with --win-start/--win-end (issue #366).
+# Empty window ends at the production cycle's UTC creation day (today for parameterized runs);
+# win_start = win_end - ranker_window_days(180). Override with --win-start/--win-end (issue #366).
 WIN_START=""
 WIN_END=""
 # Recency decay (issue #366). Production default is 30-day half-life (issue #370, the sweep
@@ -108,8 +108,8 @@ WIN_END=""
 # Staging note (#370): for the first full-universe run, override with --half-life-days 0 so a
 # surprising cohort shift is attributable to the wider universe vs decay; drop the override after.
 HALF_LIFE_DAYS="30"
-# Shared decay age anchor for BOTH passes; empty => resolved below to UTC-midnight today (= the
-# relative win_end) so the two passes weight every trade against the identical anchor.
+# Shared decay age anchor for BOTH passes; empty => the resolved window end,
+# so the two passes weight every trade against the identical anchor.
 AS_OF=""
 TTR_HOURS="24"
 TARGET_N="25"
@@ -671,6 +671,30 @@ PY
   eval "$FROZEN_CYCLE_ENV"
 fi
 
+if [[ "$SKIP_RANK" == "0" || "$SKIP_DISCOVERY" == "0" ]]; then
+  # Resolve the cycle's clocks before discovery or collection. Production retries
+  # keep the directory's UTC creation day; parameterized runs use today's default.
+  RANK_CLOCK_DAY="$(date -u +%Y-%m-%d)"
+  if [[ "$PRODUCTION_CYCLE" == "1" && "$(basename -- "$OUT_DIR")" =~ ^cron-([0-9]{4})([0-9]{2})([0-9]{2})T[0-9]{6}Z$ ]]; then
+    RANK_CLOCK_DAY="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}"
+  fi
+  RANK_WIN_END="${WIN_END:-$RANK_CLOCK_DAY}"
+  AS_OF="${AS_OF:-$RANK_WIN_END}"
+  RANK_WIN_ARGS=(--win-end "$RANK_WIN_END")
+  [[ -z "$WIN_START" ]] || RANK_WIN_ARGS+=(--win-start "$WIN_START")
+  RANK_BOUNDS="$("$PYTHON_BIN" - "$WIN_START" "$RANK_WIN_END" <<'PY'
+import sys
+sys.path.insert(0, "scripts")
+from ranker_decay import window_bounds
+start, end = window_bounds(sys.argv[1] or None, sys.argv[2])
+print(start, end, start - 86_400)
+PY
+  )" || exit $?
+  read -r RANK_WINDOW_START_UNIX RANK_WINDOW_END_UNIX scope_floor <<< "$RANK_BOUNDS"
+  DISCOVERY_SCOPE_ARGS=(--recurrences "${PE_RANK_MARKET_RECURRENCES:-15m}" --end-date-min "$scope_floor")
+  [[ -z "${PE_RANK_MARKET_SERIES:-}" ]] || DISCOVERY_SCOPE_ARGS+=(--series "$PE_RANK_MARKET_SERIES")
+fi
+
 if [[ -v PE_RANK_RESEARCH_LINK_DIR ]]; then
   mkdir -p -- "$PE_RANK_RESEARCH_LINK_DIR" || {
     echo "FATAL: cannot create research link directory: $PE_RANK_RESEARCH_LINK_DIR" >&2
@@ -862,7 +886,8 @@ refresh_data() {
   else
     # winner-discovery hits both sources: leaderboard (errors propagate → fatal),
     # datadash (soft-fails internally → still exit 0). #324/#365.
-    run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation \
+      "${DISCOVERY_SCOPE_ARGS[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
     run_refresh_stage "activate-next" "$PE_BOOTSTRAP_BIN" activate-next \
       --batch-id "$ACTIVATION_BATCH_ID" --audit-csv "$ACTIVATION_AUDIT_CSV" \
       "${BOOTSTRAP_CONFIG_ARGS[@]}"
@@ -890,7 +915,7 @@ refresh_data() {
 # Schema-two private-candidate lane (#588). Every path is a Rust owner that
 # resumes from its own durable state; the wrapper only derives the cycle's
 # physical names, the recorded initial activity/payout targets, and the
-# one linked activity top-up recorded on the candidate.
+# linked successors recorded on the candidate.
 installed_request_args() {
   local request
   request="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py installed-request --root data/eval-results)" || return $?
@@ -1002,7 +1027,8 @@ print(json.load(open(sys.argv[1], encoding="utf-8"))["resumed"])' "$stage_json")
     if [[ "$batch_recorded" == "1" ]]; then
       echo "   [winner-discovery] skipped: activation batch $ACTIVATION_BATCH_ID already recorded"
     elif [[ "$batch_recorded" == "0" ]]; then
-      run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation "${BOOTSTRAP_CONFIG_ARGS[@]}"
+      run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation \
+        "${DISCOVERY_SCOPE_ARGS[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
     else
       echo "FATAL: unexpected activation batch probe output: $batch_recorded" >&2; exit 2
     fi
@@ -1012,11 +1038,15 @@ print(json.load(open(sys.argv[1], encoding="utf-8"))["resumed"])' "$stage_json")
   fi
   export PE_BOOTSTRAP_CACHE_PATH="$side"
 
-  # Read the recorded candidate head, including an interrupted or manually
-  # started top-up. Its persisted base link consumes this cycle's one allowance.
+  # Read the recorded head, including interrupted or manually started successors.
   local -a targets=()
+  local -a candidate_args=(--prior "$prior" --side "$side" --include-bulk-root
+    --window-start-unix "$RANK_WINDOW_START_UNIX" --window-end-unix "$RANK_WINDOW_END_UNIX"
+    --market-floor-unix "$scope_floor" --fill-window-secs "$FILL_WINDOW_SECS"
+    --recurrences "${PE_RANK_MARKET_RECURRENCES:-15m}")
+  [[ -z "${PE_RANK_MARKET_SERIES:-}" ]] || candidate_args+=(--series "$PE_RANK_MARKET_SERIES")
   local target_output
-  target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side" --include-bulk-root)" || exit $?
+  target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets "${candidate_args[@]}")" || exit $?
   mapfile -t targets <<< "$target_output"
   [[ "${#targets[@]}" -eq 5 && "${targets[3]}" =~ ^[01]$ && "${targets[4]}" =~ ^[01]$ ]] || { echo "FATAL: could not derive candidate targets" >&2; exit 2; }
   local activity_target="${targets[0]}"
@@ -1032,17 +1062,14 @@ print(json.load(open(sys.argv[1], encoding="utf-8"))["resumed"])' "$stage_json")
   fi
   local -a freshness_args=()
   [[ -z "$MAX_CACHE_STALENESS_HOURS" ]] || freshness_args+=(--max-staleness-hours "$MAX_CACHE_STALENESS_HOURS")
-  target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side" --include-bulk-root --after-collection "${freshness_args[@]}")" || exit $?
-  mapfile -t targets <<< "$target_output"
-  if [[ "${targets[0]}" != "$activity_target" ]]; then
+  while true; do
+    target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets "${candidate_args[@]}" --after-collection "${freshness_args[@]}")" || exit $?
+    mapfile -t targets <<< "$target_output"
+    [[ "${targets[0]}" != "$activity_target" ]] || break
     activity_target="${targets[0]}"
     run_refresh_stage "activity-top-up" "$PE_BOOTSTRAP_BIN" cache-populate-activity-v2 --db "$side" \
       --fresh-generation "$activity_target" "${BOOTSTRAP_CONFIG_ARGS[@]}"
-    # Recheck after the only allowed top-up; a stale successor fails before ranking.
-    target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side" --include-bulk-root --after-collection "${freshness_args[@]}")" || exit $?
-    mapfile -t targets <<< "$target_output"
-    [[ "${targets[0]}" == "$activity_target" ]] || { echo "FATAL: unexpected second activity top-up" >&2; exit 2; }
-  fi
+  done
   if [[ "${targets[2]}" == "1" ]]; then
     echo "   [payout] completed walk at or after the activity head; reused"
   else
@@ -1083,21 +1110,8 @@ else
   refresh_data
 fi
 if [[ "$SKIP_RANK" == "0" ]]; then
-  # Rank only first entries in the requested Gamma series (#784). Resolve the window end once,
-  # here, so the scope, pass one and the default decay anchor share it; an explicit --as-of
-  # still wins.
-  RANK_WIN_END="${WIN_END:-$(date -u +%Y-%m-%d)}"
-  AS_OF="${AS_OF:-$RANK_WIN_END}"
-  RANK_WIN_ARGS=(--win-end "$RANK_WIN_END")
-  [[ -z "$WIN_START" ]] || RANK_WIN_ARGS+=(--win-start "$WIN_START")
+  # Read the ranking scope after refresh, using the cycle's resolved bounds.
   MARKET_SCOPE_FILE="$OUT_DIR/market_scope.json"
-  scope_floor="$("$PYTHON_BIN" - "$WIN_START" "$RANK_WIN_END" <<'PY'
-import sys
-sys.path.insert(0, "scripts")
-from ranker_decay import window_bounds
-print(window_bounds(sys.argv[1] or None, sys.argv[2])[0] - 86_400)
-PY
-)" || exit $?
   echo "── Market scope: ${PE_RANK_MARKET_RECURRENCES:-15m} series markets from Gamma → $MARKET_SCOPE_FILE ──"
   run_refresh_stage "market-scope" "$PE_BOOTSTRAP_BIN" market-scope --out "$MARKET_SCOPE_FILE" \
     --end-date-min "$scope_floor" --recurrences "${PE_RANK_MARKET_RECURRENCES:-15m}" \

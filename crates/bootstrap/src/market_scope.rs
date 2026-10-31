@@ -15,7 +15,7 @@ use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
     FIFTEEN_MINUTE_RECURRENCE, HttpRequestContext, ReqwestFetcher, event_series_recurrence,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -96,7 +96,7 @@ impl ScopeFetcher for ReqwestFetcher {
 }
 
 /// A listed series with a requested recurrence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeSeries {
     pub id: String,
     pub slug: Option<String>,

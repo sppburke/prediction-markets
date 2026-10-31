@@ -176,13 +176,12 @@ class CandidateTargetsTest(unittest.TestCase):
         self.assertEqual(self.targets(), (3, 1, 0, 0, 1))
         self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24),
                          (3, 1, 0, 0, 1))
-        # The used top-up is the last head: it proceeds while it can still pass the
-        # publisher, reserve or not, and is refused only once it cannot.
+        # A later head proceeds while it can pass the publisher, reserve or not.
         self.assertEqual(self.targets(after_collection=True, now=100 + 86400, max_staleness_hours=24),
                          (3, 1, 0, 0, 1))
         with self.assertRaisesRegex(ValueError, "activity top-up is stale"):
             self.targets(after_collection=True, now=101 + 86400, max_staleness_hours=24)
-        for head, message in ((identity(3, 1, version=3), "single top-up"),
+        for head, message in ((identity(3, 1, version=3), "predecessor chain"),
                               (identity(2, None, version=3), "initial activity head")):
             with self.subTest(head=head):
                 with sqlite3.connect(self.side) as c:
@@ -193,6 +192,13 @@ class CandidateTargetsTest(unittest.TestCase):
             c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (top_up,))
             c.execute("UPDATE activity_coverage_manifests_v2 SET collection_identity_json=? WHERE generation=2",
                       (identity(2, None, version=3),))
+        with self.assertRaisesRegex(ValueError, "matching completed manifest"):
+            self.targets()
+        # Even a self-consistent archive must bind the staged predecessor.
+        invalid_initial = identity(2, None, version=3)
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE activity_coverage_manifests_v2 SET reference_sha256=? WHERE generation=2",
+                      (json.loads(invalid_initial)["digest"],))
         with self.assertRaisesRegex(ValueError, "initial activity head"):
             self.targets()
 
@@ -341,10 +347,10 @@ class CandidateTargetsTest(unittest.TestCase):
             c.execute("INSERT INTO activity_coverage_manifests_v2(generation) VALUES (1)")
             c.execute("INSERT INTO clob_payout_coverage_manifests_v2(generation, completed_at_unix) VALUES (4, 100)")
         self.assertEqual(candidate_targets(None, self.side, include_bulk_root=True), (2, 4, 1, 0, 0))
-        # A mutated candidate cannot change the baseline or grant a second top-up.
+        # A mutated candidate cannot change the baseline or omit its archived chain.
         with sqlite3.connect(self.side) as c:
             c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (identity(4, 3),))
-        with self.assertRaisesRegex(ValueError, "single top-up"):
+        with self.assertRaisesRegex(ValueError, "predecessor chain"):
             candidate_targets(None, self.side)
         self.assertFalse(self.prior.exists())
 
@@ -399,6 +405,241 @@ class CandidateTargetsTest(unittest.TestCase):
             payout_generation=2, fresh_identity=None)))
         self.assertEqual(candidate_targets(None, self.side, after_collection=True,
                                            now=100, max_staleness_hours=24), (1, 2, 0))
+
+class CandidateObligationsTest(unittest.TestCase):
+    wallet = "0x" + "1" * 40
+
+    def setUp(self):
+        CandidateTargetsTest.setUp(self)
+        self.coverage = dict(version=1, scope=dict(recurrences=["15m"], series=None),
+                             market_floor_unix=0, covered_from_unix=10, covered_through_unix=200)
+        self.record_coverage(self.coverage)
+
+    def record_coverage(self, value):
+        with sqlite3.connect(self.side) as c:
+            c.execute("INSERT OR REPLACE INTO meta VALUES ('participant_discovery_coverage', ?)",
+                      (json.dumps(value),))
+
+    def head(self, generation=1, base=None, *, complete=True, end=220, **changes):
+        value = json.loads(identity(generation, base))
+        value.update(fixed_end_unix=end, **changes)
+        content = {key: item for key, item in value.items() if key != "digest"}
+        value["digest"] = hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        raw = json.dumps(value)
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (raw,))
+            if complete:
+                c.execute("INSERT OR REPLACE INTO activity_coverage_manifests_v2 "
+                          "(generation, reference_sha256, collection_identity_json) VALUES (?, ?, ?)",
+                          (generation, value["digest"], raw))
+        return value
+
+    def receipt(self, reason, *, generation=1, wallet=None, **changes):
+        proof = dict(version=3, disposition="excluded", exclusion_reason="acquisition_failure",
+                     aggregation_status="not_attempted", start_exclusive=0, fixed_end_unix=220)
+        proof.update(changes)
+        with sqlite3.connect(self.side) as c:
+            c.execute("INSERT INTO activity_wallet_coverage_staging_v2 "
+                      "(generation, wallet_hex, aggregate_count, acquisition_json, exclusion_reason) "
+                      "VALUES (?, ?, 0, ?, ?)", (generation, wallet or self.wallet, json.dumps(proof), reason))
+
+    def targets(self, **changes):
+        args = dict(after_collection=True, now=220, max_staleness_hours=24,
+                    window_start_unix=10, window_end_unix=80, market_floor_unix=0)
+        args.update(changes)
+        return candidate_targets(self.prior, self.side, **args)
+
+    def test_three_successors_resume_before_and_after_creation_and_reject_broken_chains(self):
+        for generation in range(1, 5):
+            if generation > 1:
+                self.head(generation, generation - 1, complete=False)
+                self.assertEqual(self.targets(after_collection=False)[0], generation)
+                with self.assertRaisesRegex(ValueError, "matching completed manifest"):
+                    self.targets()
+            self.head(generation, generation - 1 if generation > 1 else None)
+            if generation < 4:
+                self.receipt("held-row limit reached", generation=generation,
+                             aggregation_status="complete", fixed_end_unix=100)
+            self.assertEqual(self.targets()[0], generation + (generation < 4))
+        before = self.side.read_bytes()
+        self.assertEqual(self.targets()[0], 4)
+        self.assertEqual(self.side.read_bytes(), before)
+        for sql in ("DELETE FROM activity_coverage_manifests_v2 WHERE generation=2",
+                    "UPDATE activity_coverage_manifests_v2 SET collection_identity_json=NULL WHERE generation=3"):
+            with self.subTest(sql=sql):
+                with sqlite3.connect(self.side) as c:
+                    c.execute(sql)
+                with self.assertRaisesRegex(ValueError, "predecessor chain"):
+                    self.targets(after_collection=False)
+                self.side.write_bytes(before)
+        self.head(4, 1)
+        with self.assertRaisesRegex(ValueError, "predecessor chain"):
+            self.targets()
+
+    def test_unrepresentable_rows_with_and_without_proved_windows_are_listed_once(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from rank_cycle_manifest import (UNREPRESENTABLE_PRICE, UNREPRESENTABLE_MAPPING,
+                                         UNREPRESENTABLE_DECIMAL, ACTIVITY_RESPONSE_JSON)
+        wallets = ["0x" + digit * 40 for digit in "123"]
+        self.head(wallets=wallets, full_read_wallets=wallets)
+        reasons = (UNREPRESENTABLE_PRICE + " 3.2: out of range", UNREPRESENTABLE_MAPPING,
+                   ACTIVITY_RESPONSE_JSON + " row 1: numeric token 4.212e-7 " + UNREPRESENTABLE_DECIMAL)
+        for proved in (False, True):
+            with self.subTest(proved=proved):
+                with sqlite3.connect(self.side) as c:
+                    c.execute("DELETE FROM activity_wallet_coverage_staging_v2")
+                for digit, reason in zip("123", reasons):
+                    self.receipt(reason, wallet="0x" + digit * 40,
+                                 aggregation_status="complete" if proved else "not_attempted",
+                                 fixed_end_unix=100 if proved else 220)
+                output = StringIO()
+                with redirect_stderr(output):
+                    self.assertEqual(self.targets()[0], 1)
+                self.assertEqual(output.getvalue().count("[unrepresentable-row]"), 3)
+                for digit, reason in zip("123", reasons):
+                    self.assertIn("0x" + digit * 40 + ": " + reason, output.getvalue())
+
+    def test_no_progress_parse_aggregation_and_collision_holds_persist_before_any_successor(self):
+        self.head()
+        reasons = (("acquisition budget exhausted", "acquisition_failure"),
+                   ("activity response json: expected an array", "acquisition_failure"),
+                   ("numeric token is not an exactly representable decimal", "acquisition_failure"),
+                   ("aggregation failed", "aggregation_failure"),
+                   ("cross-boundary collision", "cross_boundary_collision"))
+        self.record_coverage(dict(self.coverage, covered_through_unix=199))
+        for reason, kind in reasons:
+            with self.subTest(reason=reason):
+                with sqlite3.connect(self.side) as c:
+                    c.execute("DELETE FROM activity_wallet_coverage_staging_v2")
+                self.receipt(reason, exclusion_reason=kind)
+                for after in (True, False, True):
+                    with self.assertRaisesRegex(ValueError, self.wallet + ": " + reason):
+                        self.targets(after_collection=after, now=100000)
+        # Operator-created recovery is adopted; the held predecessor is audit history.
+        self.head(2, 1)
+        self.record_coverage(self.coverage)
+        self.assertEqual(self.targets()[0], 2)
+
+    def test_other_parse_failures_hold_even_after_proved_windows(self):
+        self.head()
+        self.receipt("activity page parse failed: activity response json: expected an array",
+                     aggregation_status="complete", fixed_end_unix=100)
+        with self.assertRaisesRegex(ValueError, self.wallet + ": activity page parse failed"):
+            self.targets()
+
+    def test_partial_and_historical_deferred_exclusions_take_successors(self):
+        self.head()
+        self.receipt("held-row limit reached", aggregation_status="complete", fixed_end_unix=100)
+        self.assertEqual(self.targets()[0], 2)
+        self.head(2, 1)
+        self.receipt("dormant wallet deferred", generation=2, version=2, exclusion_reason="dormant_deferred")
+        self.assertEqual(self.targets()[0], 3)
+        self.head(3, 2, deferred_wallets=[], full_read_wallets=[self.wallet])
+        self.assertEqual(self.targets()[0], 3)
+
+    def test_participants_hold_before_collection_but_exchange_contracts_are_exempt(self):
+        from rank_cycle_manifest import EXCHANGE_CONTRACTS
+        participants = [("0x" + digit * 40, active, infra, 256)
+                        for digit, active, infra in (("1", 0, 0), ("2", 1, 1), ("3", 1, 0))]
+        with sqlite3.connect(self.side) as c:
+            c.executemany("INSERT INTO wallets VALUES (?, ?, ?, ?)", participants)
+            c.execute("INSERT INTO purged_wallets VALUES (?, 'proven_loser')", (participants[2][0],))
+        with self.assertRaises(ValueError) as held:
+            self.targets(after_collection=False)
+        for row, reason in zip(participants, ("inactive", "flagged", "tombstoned")):
+            self.assertIn(row[0] + ": " + reason, str(held.exception))
+        with sqlite3.connect(self.side) as c:
+            c.execute("DELETE FROM wallets")
+            c.execute("DELETE FROM purged_wallets")
+            c.executemany("INSERT INTO wallets VALUES (?, 0, 1, 256)", ((wallet,) for wallet in EXCHANGE_CONTRACTS))
+        self.assertEqual(self.targets(after_collection=False)[0], 1)
+
+    def test_newly_admitted_wallet_requires_a_head_that_includes_it(self):
+        self.head()
+        participant = "0x" + "2" * 40
+        with sqlite3.connect(self.side) as c:
+            c.execute("INSERT INTO wallets VALUES (?, 1, 0, 256)", (participant,))
+        self.assertEqual(self.targets()[0], 2)
+        self.head(2, 1, wallets=[self.wallet, participant])
+        self.assertEqual(self.targets()[0], 2)
+
+    def test_coverage_is_fail_closed_and_never_exempted_by_an_activation_batch(self):
+        self.head()
+        cases = ((None, "absent"), (None, "malformed"),
+                 (dict(self.coverage, version=2), "malformed"),
+                 (dict(self.coverage, covered_from_unix=True), "malformed"),
+                 (dict(self.coverage, covered_through_unix=10), "malformed"),
+                 (dict(self.coverage, scope=dict(recurrences=["15m", "15m"], series=None)), "malformed"),
+                 (dict(self.coverage, scope=dict(recurrences=["5m"], series=None)), "scope differs"),
+                 (dict(self.coverage, market_floor_unix=1), "market floor"),
+                 (dict(self.coverage, covered_from_unix=11), "window start"),
+                 (dict(self.coverage, covered_through_unix=199), "print tail"))
+        with sqlite3.connect(self.side) as c:
+            c.execute("CREATE TABLE wallet_activation_batches (batch_id TEXT)")
+            c.execute("INSERT INTO wallet_activation_batches VALUES ('recorded-completion')")
+        for value, reason in cases:
+            with self.subTest(reason=reason, value=value):
+                with sqlite3.connect(self.side) as c:
+                    c.execute("DELETE FROM meta")
+                    if value is not None or reason == "malformed":
+                        c.execute("INSERT INTO meta VALUES ('participant_discovery_coverage', ?)",
+                                  (json.dumps(value) if value is not None else "not-json",))
+                for after in (False, True):
+                    with self.assertRaisesRegex(ValueError, reason):
+                        self.targets(after_collection=after)
+        self.record_coverage(self.coverage)
+        self.assertEqual(self.targets()[0], 1)
+        with sqlite3.connect(self.side) as c:
+            c.execute("DROP TABLE meta")
+        with self.assertRaises(sqlite3.OperationalError):
+            self.targets()
+
+    def test_coverage_rejects_duplicate_fields_but_allows_serde_unknown_fields(self):
+        self.head()
+        raw = json.dumps(self.coverage).replace('"version": 1', '"version": 2, "version": 1')
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE meta SET value=?", (raw,))
+        with self.assertRaisesRegex(ValueError, "malformed: duplicate coverage field version"):
+            self.targets()
+        self.record_coverage(dict(self.coverage, extra=True, scope=dict(self.coverage["scope"], extra=True)))
+        self.assertEqual(self.targets()[0], 1)
+
+    def test_coverage_scope_uses_sorted_recurrences_and_string_series_ids(self):
+        self.head()
+        scope = dict(recurrences=["15m", "5m"],
+                     series=[dict(id="10", slug="ten"), dict(id="7", slug="seven")])
+        self.record_coverage(dict(self.coverage, scope=scope))
+        self.assertEqual(self.targets(recurrences="5m,15m", series="7:seven,10:ten")[0], 1)
+        for change in (dict(recurrences=["5m", "15m"]), dict(series=list(reversed(scope["series"]))),
+                       dict(series=[dict(id="7", slug="seven"), dict(id="7", slug="seven")]),
+                       dict(series=[dict(id="7", slug=None)])):
+            with self.subTest(change=change):
+                self.record_coverage(dict(self.coverage, scope=dict(scope, **change)))
+                with self.assertRaisesRegex(ValueError, "malformed"):
+                    self.targets(recurrences="15m,5m", series="10:ten,7:seven")
+        self.record_coverage(dict(self.coverage, scope=scope))
+        for changed in (dict(series=None), dict(series="10:ten,7:other"), dict(recurrences="15m")):
+            args = dict(recurrences="15m,5m", series="10:ten,7:seven")
+            args.update(changed)
+            with self.assertRaisesRegex(ValueError, "scope differs"):
+                self.targets(**args)
+
+    def test_inclusive_head_end_must_cover_the_last_print_second(self):
+        self.head(end=198)
+        self.assertEqual(self.targets()[0], 2)
+        self.head(end=199)
+        self.assertEqual(self.targets()[0], 1)
+
+    def test_complete_later_head_inside_max_age_proceeds_even_within_the_reserve_on_rerun(self):
+        self.head()
+        self.head(2, 1)
+        self.head(3, 2)
+        for _ in range(2):
+            self.assertEqual(self.targets(now=220 + 86400)[0], 3)
+            with self.assertRaisesRegex(ValueError, "top-up is stale"):
+                self.targets(now=221 + 86400)
+
 
 class ActivationBatchTest(unittest.TestCase):
     """The probe that lets a retried cycle skip finished discovery (#788)."""

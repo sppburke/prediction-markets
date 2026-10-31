@@ -10,6 +10,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 import tempfile
 from pathlib import Path
 
@@ -17,9 +18,22 @@ from partial_backfill_wallets import partial_backfill_wallets
 
 MANIFEST_VERSION = 1
 # Payout, finalize, export, both ranking passes and re-finalize after a completed
-# collection; a head that cannot also cover them takes the cycle's one top-up
+# collection; an initial head that cannot also cover them takes a reserve top-up
 # (`candidate_top_up_reserve_hours` in docs/_GLOSSARY.md).
 TOP_UP_RESERVE_HOURS = 7
+
+# Fixed parser texts for the owner-approved unrepresentable-row exceptions (#821).
+UNREPRESENTABLE_PRICE = "activity row has invalid price"
+UNREPRESENTABLE_MAPPING = "activity row has invalid condition/outcome mapping"
+UNREPRESENTABLE_DECIMAL = "is not an exactly representable decimal"
+ACTIVITY_RESPONSE_JSON = "activity response json:"
+ACTIVITY_PAGE_PARSE_FAILURE = "activity page parse failed:"
+EXCHANGE_CONTRACTS = frozenset((
+    "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e",
+    "0xc5d563a36ae78145c45a50134d48a1215220f80a",
+    "0xe111180000d2663c0091e4f400237545b87b996b",
+    "0xe2222d279d744050d28e00520010520000310f59",
+))
 
 
 def _one(connection: sqlite3.Connection, query: str, args=()):
@@ -630,16 +644,146 @@ def read_staging_baseline(side_path: Path, expected_sha256: str | None = None) -
     return evidence
 
 
+def _participant_scope(recurrences: list, series: list | None) -> dict:
+    """Normalize the scope exactly as ParticipantScope::new does."""
+    if (not isinstance(recurrences, list) or not recurrences
+            or any(value not in ("15m", "5m") for value in recurrences)
+            or len(set(recurrences)) != len(recurrences)):
+        raise ValueError("invalid participant discovery recurrences")
+    if series is not None:
+        if not isinstance(series, list) or not series:
+            raise ValueError("invalid participant discovery series")
+        ids = set()
+        for item in series:
+            if not isinstance(item, dict):
+                raise ValueError("invalid participant discovery series")
+            identifier, slug = item.get("id"), item.get("slug")
+            if (not isinstance(identifier, str) or re.fullmatch(r"0|[1-9][0-9]*", identifier) is None
+                    or int(identifier) > 2**64 - 1 or identifier in ids
+                    or not isinstance(slug, str) or not slug):
+                raise ValueError("invalid participant discovery series")
+            ids.add(identifier)
+        series = sorted(({"id": item["id"], "slug": item["slug"]} for item in series),
+                        key=lambda item: item["id"])
+    return {"recurrences": sorted(recurrences), "series": series}
+
+
+def _participant_coverage_hold(side: sqlite3.Connection, scope: dict, window_start: int,
+                               window_end: int, market_floor: int, fill_window: int) -> str | None:
+    def fields(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError(f"duplicate coverage field {key}")
+            result[key] = value
+        return result
+
+    row = side.execute("SELECT value FROM meta WHERE key = 'participant_discovery_coverage'").fetchone()
+    if row is None:
+        return "participant discovery coverage is absent"
+    try:
+        coverage = json.loads(row[0], object_pairs_hook=fields)
+        recorded_scope = {"recurrences": coverage["scope"]["recurrences"],
+                          "series": coverage["scope"].get("series")}
+        normalized = _participant_scope(recorded_scope["recurrences"], recorded_scope["series"])
+        if (type(coverage["version"]) is not int or coverage["version"] != 1
+                or normalized != recorded_scope
+                or any(type(coverage[key]) is not int or not -2**63 <= coverage[key] < 2**63
+                       for key in ("market_floor_unix", "covered_from_unix", "covered_through_unix"))
+                or not 0 <= coverage["covered_from_unix"] < coverage["covered_through_unix"]):
+            raise ValueError("invalid coverage fields")
+    except (ValueError, TypeError, KeyError) as error:
+        return f"participant discovery coverage is malformed: {error}"
+    if normalized != scope:
+        return "participant discovery coverage scope differs from the ranking scope"
+    if coverage["market_floor_unix"] > market_floor:
+        return f"participant discovery market floor {coverage['market_floor_unix']} is later than {market_floor}"
+    if coverage["covered_from_unix"] > window_start:
+        return f"participant discovery coverage starts after window start {window_start}"
+    if coverage["covered_through_unix"] < window_end + fill_window:
+        return f"participant discovery coverage ends before print tail {window_end + fill_window}"
+    return None
+
+
+def _candidate_obligations(side: sqlite3.Connection, head: dict | None, *, completed: bool,
+                           window_start: int | None, window_end: int | None,
+                           market_floor: int | None, fill_window: int, scope: dict) -> bool:
+    holds = []
+    # Rules 1 and 2 also apply before the initial collection and on frozen resumes.
+    for wallet, active, infra, tombstoned, tradeable in side.execute("""SELECT w.wallet_hex, w.is_active, w.is_infra,
+            EXISTS(SELECT 1 FROM purged_wallets p WHERE p.wallet_hex = w.wallet_hex),
+            EXISTS(SELECT 1 FROM active_tradeable_wallets a WHERE a.wallet_hex = w.wallet_hex)
+            FROM wallets w WHERE (w.source_bits & 256) != 0 ORDER BY w.wallet_hex"""):
+        if wallet in EXCHANGE_CONTRACTS:
+            continue
+        reasons = []
+        if not active:
+            reasons.append("inactive participant")
+        if infra:
+            reasons.append("flagged participant")
+        if tombstoned:
+            reasons.append("tombstoned participant")
+        if not tradeable:
+            reasons.append("participant absent from active_tradeable_wallets")
+        if reasons:
+            holds.append(f"{wallet}: {', '.join(reasons)}")
+    if window_start is not None:
+        reason = _participant_coverage_hold(side, scope, window_start, window_end, market_floor, fill_window)
+        if reason:
+            holds.append(reason)
+    successor = False
+    if head is not None:
+        # Rule 3: mirror ActivityWalletReceiptProof::partial(), after the E11 exceptions.
+        for wallet, raw, reason, count, pages in side.execute("""SELECT wallet_hex, acquisition_json,
+                exclusion_reason, aggregate_count, page_evidence_json
+                FROM activity_wallet_coverage_staging_v2 WHERE generation = ? ORDER BY wallet_hex""",
+                (head["generation"],)):
+            acquisition = json.loads(raw) if raw is not None else None
+            excluded = (acquisition["disposition"] == "excluded" if acquisition is not None else
+                        reason is not None or (count == 0 and any(page["row_count"] > 0 for page in json.loads(pages))))
+            if not excluded:
+                continue
+            kind = acquisition.get("exclusion_reason") if acquisition is not None else None
+            text = reason or kind or "excluded activity receipt without a reason"
+            if (UNREPRESENTABLE_PRICE in text or UNREPRESENTABLE_MAPPING in text
+                    or (ACTIVITY_RESPONSE_JSON in text and UNREPRESENTABLE_DECIMAL in text)):
+                print(f"   [unrepresentable-row] {wallet}: {text}", file=sys.stderr)
+            elif ACTIVITY_PAGE_PARSE_FAILURE in text or ACTIVITY_RESPONSE_JSON in text:
+                holds.append(f"{wallet}: {text}")
+            elif (acquisition is not None and acquisition["version"] == 3
+                  and kind == "acquisition_failure" and acquisition["aggregation_status"] == "complete"):
+                successor = True
+            elif kind == "dormant_deferred":
+                successor = True
+            else:
+                holds.append(f"{wallet}: {text}")
+    if holds:
+        raise ValueError("candidate HOLD:\n" + "\n".join(holds))
+    if completed:
+        # Rule 4: finalize uses the head's frozen wallet list and inclusive end.
+        active = {row[0] for row in side.execute("SELECT wallet_hex FROM active_tradeable_wallets")}
+        successor |= bool(active - set(head["wallets"]))
+        successor |= window_end is not None and head["fixed_end_unix"] < window_end - 1 + fill_window
+    return successor
+
+
 def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collection=False,
                       now: int | None = None, max_staleness_hours: int | None = None,
-                      include_bulk_root=False) -> tuple[int, int, int] | tuple[int, int, int, int]:
-    """Select this cycle's initial head or its one linked successor, read-only.
+                      include_bulk_root=False, window_start_unix: int | None = None,
+                      window_end_unix: int | None = None, market_floor_unix: int | None = None,
+                      fill_window_secs=120, recurrences="15m", series: str | None = None) -> tuple[int, ...]:
+    """Select this cycle's initial head or a linked successor, read-only.
 
     Rust certifies content and linkage on every collection call. This owner only
-    establishes cycle membership and the restart-safe one-top-up allowance.
+    establishes cycle membership and orders the recorded completion obligations.
     The optional fourth and fifth integers report bulk routing and completed
     activity; the default three values remain unchanged for existing callers.
     """
+    pinned = None if not series else [dict(zip(("id", "slug"), item.split(":", 1))) for item in series.split(",")]
+    scope = _participant_scope(recurrences.split(","), pinned)
+    if any(value is not None for value in (window_start_unix, window_end_unix, market_floor_unix)):
+        if any(value is None for value in (window_start_unix, window_end_unix, market_floor_unix)):
+            raise ValueError("candidate checks require window start, end and market floor together")
     if side_path.with_suffix(".stage.json").exists():
         baseline = read_staging_baseline(side_path)
         previous = int(baseline["activity_generation"])
@@ -685,24 +829,38 @@ def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collect
             return (*values, int(bulk), int(activity_complete))
 
         if head is None or (head == prior_identity and head["generation"] == previous):
+            _candidate_obligations(side, None, completed=False, window_start=window_start_unix,
+                                   window_end=window_end_unix, market_floor=market_floor_unix,
+                                   fill_window=fill_window_secs, scope=scope)
             if after_collection:
                 raise ValueError("activity collection did not complete this cycle's head")
             return targets(initial)
         generation = head["generation"]
-        top_up_used = generation != initial
         initial_identity = head
-        if top_up_used:
-            if generation < initial or head["version"] < 2 or head.get("base_generation") != initial:
-                raise ValueError("candidate head is outside this cycle's single top-up allowance")
-            initial_identity = _fresh_identity(_one(side, "SELECT collection_identity_json FROM activity_coverage_manifests_v2 WHERE generation = ?", (initial,)))
-            if initial_identity is None or initial_identity["generation"] != initial:
-                raise ValueError("top-up omitted this cycle's initial identity")
+        if generation < initial:
+            raise ValueError("candidate head is outside this staged cycle")
+        while initial_identity["generation"] > initial:
+            predecessor = initial_identity["generation"] - 1
+            if initial_identity["version"] < 2 or initial_identity.get("base_generation") != predecessor:
+                raise ValueError("candidate head is outside this staged cycle's predecessor chain")
+            archived = side.execute("SELECT collection_identity_json, reference_sha256 FROM activity_coverage_manifests_v2 WHERE generation = ?", (predecessor,)).fetchone()
+            initial_identity = _fresh_identity(archived[0]) if archived else None
+            if initial_identity is None or initial_identity["generation"] != predecessor:
+                raise ValueError("candidate predecessor chain omitted an archived identity")
+            if archived[1] != initial_identity["digest"]:
+                raise ValueError("candidate predecessor identity has no matching completed manifest")
         if initial_identity["version"] >= 2 and initial_identity["base_generation"] != (previous if prior_identity else None):
             raise ValueError("initial activity head does not belong to this staged cycle")
+        reference = _one(side, "SELECT reference_sha256 FROM activity_coverage_manifests_v2 WHERE generation = ?", (generation,))
+        completed = reference == head["digest"]
+        if after_collection and not completed:
+            raise ValueError("activity head has no matching completed manifest")
+        successor = _candidate_obligations(side, head, completed=completed, window_start=window_start_unix,
+                                           window_end=window_end_unix, market_floor=market_floor_unix,
+                                           fill_window=fill_window_secs, scope=scope)
         if after_collection:
-            reference = _one(side, "SELECT reference_sha256 FROM activity_coverage_manifests_v2 WHERE generation = ?", (generation,))
-            if reference != head["digest"]:
-                raise ValueError("activity head has no matching completed manifest")
+            if successor:
+                return targets(generation + 1)
             if now is None:
                 import time
                 now = int(time.time())
@@ -712,10 +870,10 @@ def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collect
             age = now - head["fixed_end_unix"]
             if age < 0:
                 raise ValueError("activity head fixed end is in the future")
-            if top_up_used:
-                # The last allowed head proceeds while it can still pass the publisher.
+            if generation != initial:
+                # Only the initial head may take a reserve-only successor (rule 5).
                 if age > max_staleness_hours * 3600:
-                    raise ValueError("activity top-up is stale; preserve the cycle, no second top-up is permitted")
+                    raise ValueError("activity top-up is stale; preserve the cycle and repair the held head")
             elif head["version"] < 4 or age + TOP_UP_RESERVE_HOURS * 3600 > max_staleness_hours * 3600:
                 generation = initial + 1
         return targets(generation)
@@ -803,6 +961,12 @@ def parse_args():
     targets.add_argument("--side", type=Path, required=True)
     targets.add_argument("--after-collection", action="store_true")
     targets.add_argument("--max-staleness-hours", type=int)
+    targets.add_argument("--window-start-unix", type=int)
+    targets.add_argument("--window-end-unix", type=int)
+    targets.add_argument("--market-floor-unix", type=int)
+    targets.add_argument("--fill-window-secs", type=int, default=120)
+    targets.add_argument("--recurrences", default="15m")
+    targets.add_argument("--series")
     targets.add_argument("--include-bulk-root", action="store_true",
                          help="append bulk eligibility and activity completion (0/1); default output stays three lines")
     batch = subparsers.add_parser("activation-batch",
@@ -835,7 +999,12 @@ def main() -> int:
     if args.command == "candidate-targets":
         for value in candidate_targets(args.prior, args.side, after_collection=args.after_collection,
                                        max_staleness_hours=args.max_staleness_hours,
-                                       include_bulk_root=args.include_bulk_root):
+                                       include_bulk_root=args.include_bulk_root,
+                                       window_start_unix=args.window_start_unix,
+                                       window_end_unix=args.window_end_unix,
+                                       market_floor_unix=args.market_floor_unix,
+                                       fill_window_secs=args.fill_window_secs,
+                                       recurrences=args.recurrences, series=args.series):
             print(value)
         return 0
     if args.command == "activation-batch":

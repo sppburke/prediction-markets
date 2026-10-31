@@ -49,13 +49,32 @@
 > Re-verify by **2026-12-09**. These dates retain the issue's source-pass provenance;
 > the documentation implementation made no network requests.
 
-> **Data API `/trades` for market participants (#800).** Last checked: **2026-10-23**;
-> re-verify by **2026-12-22**. The [official user-or-markets trades reference](https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets)
+> **Data API `/trades` for market participants (#800/#821).** Last checked: **2026-10-31**
+> for the recorded 10/30–10/31 participant and history probes; re-verify by **2026-12-30**.
+> The [official user-or-markets trades reference](https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets)
 > documents comma-separated condition ids in `market`, `limit` at most 10,000, offsets
 > 0–10,000 (HTTP 400 past the cap), and deeper reads via `start`/`end` time windows.
-> `takerOnly` defaults to true; rows carry `proxyWallet` and `timestamp`. This is the
-> public Data API, separate from authenticated CLOB trades. Participant discovery uses
-> inclusive wire `start=lo&end=hi−1` for each half-open `[lo, hi)` window.
+> `takerOnly` defaults to true; participant discovery now sends `takerOnly=false` to read
+> **both maker and taker wallets**. Rows carry `proxyWallet` and `timestamp`; the recorded
+> seven-day probe found 102 of 476 heavy non-seed wallets only as makers. This is the public
+> Data API, separate from authenticated CLOB trades. Inclusive wire `start=lo&end=hi−1`
+> represents each half-open `[lo, hi)` discovery window.
+>
+> The 10/31 complementary sweep found 67 trades outside the markets' trading-life windows:
+> 42 up to 3.7 h after June markets' recorded end/close, and 25 in four markets ending
+> 2026-08-05 that were still open and accepting orders at the check, trading through 9/21.
+> A market can therefore trade after its end or remain open months later; its end/close
+> cannot certify participant coverage. Discovery reads every ranking-scope market over the
+> whole interval (`docs/27`). Recorded old-data queries matching more than about 6,000 trades
+> from four to six months earlier returned HTTP 500/408 after about 5.5 s; recent windows
+> returned 10,000 rows in under 2 s. These are observations, not endpoint latency bounds;
+> production-reader completion time for a full-window sweep was not established.
+>
+> The related 10/31 `/activity` probe still found a 2026-03-26 SELL priced 3.1968021978 in
+> `0x1b5f1fc3…`'s public history. The recorded journal also contains invalid outcome mappings
+> and exact-decimal parser rejections. Those unrepresentable-row wallet exclusions are an
+> owner-approved, per-cycle reported exception pending the separate parser fix (`docs/26`).
+> These dates retain #821's probe provenance; this documentation update made no venue requests.
 
 > **CLOB neg-risk groups (#739/#588), Last checked: 2026-10-05; re-verify by
 > 2026-12-04.** The official [long-market schema](https://docs.polymarket.com/api-spec/clob-openapi.yaml)

@@ -157,10 +157,10 @@ fn datadash_rediscovery_does_not_lift() {
 }
 
 #[test]
-fn participant_rediscovery_does_not_lift_tombstone() {
+fn participant_rediscovery_lifts_proven_loser_tombstone() {
     let (still_purged, exists) = lift_outcome(SRC_MARKET_PARTICIPANT);
-    assert!(still_purged && !exists);
-    println!("PASS: participant rediscovery leaves the tombstone intact without re-insertion");
+    assert!(!still_purged && exists);
+    println!("PASS: participant rediscovery lifts the proven-loser tombstone");
 }
 
 #[test]
@@ -555,6 +555,31 @@ fn infra_purge_honors_shared_enable_flag_and_invalidates_wallet_derived_data() {
             "source {source} cannot lift an infra exclusion"
         );
     }
+    cache.mark_infra(&normal).unwrap();
+    upsert(&mut cache, &normal, SRC_DATADASH);
+    assert_eq!(
+        cache
+            .raw_conn_for_test()
+            .query_row::<i64, _, _>(
+                "SELECT is_infra FROM wallets WHERE wallet_hex=?1",
+                [&normal],
+                |row| row.get(0)
+            )
+            .unwrap(),
+        1
+    );
+    upsert(&mut cache, &normal, SRC_MARKET_PARTICIPANT);
+    assert_eq!(
+        cache
+            .raw_conn_for_test()
+            .query_row::<i64, _, _>(
+                "SELECT is_infra FROM wallets WHERE wallet_hex=?1",
+                [&normal],
+                |row| row.get(0)
+            )
+            .unwrap(),
+        0
+    );
     assert!(cache.clear_infra_exclusion(&infra).unwrap());
     upsert(&mut cache, &infra, SRC_LEADERBOARD);
     assert!(cache.conn_for_test_wallet_exists(&infra));
