@@ -26,8 +26,9 @@
 //! `synchronous = NORMAL`). The orchestrator consumes trades sequentially, so a
 //! short blocking call on the async worker is acceptable for v1; revisit with
 //! `spawn_blocking` if RTDS volume (issue #282 Phase 2) makes it material.
-//! Retention transactions, their warm reads and WAL checkpoints take longer; the
-//! service runs checkpoints in a blocking task.
+//! Retention transactions and their warm reads take longer. WAL checkpoints run on
+//! their own connection, never holding the shared one; the service runs them in a
+//! blocking task.
 
 mod migration;
 mod schema;
@@ -808,6 +809,9 @@ pub struct PaperStateDb {
     /// A second connection to the same file, used only for the retention job's warm reads, so they
     /// never hold the shared connection (#813). It never writes or checkpoints.
     maintenance: Mutex<Connection>,
+    /// A third connection, used only for WAL checkpoints, so their disk syncs never hold the shared
+    /// connection or the maintenance one (#754). It writes no rows.
+    checkpoint: Mutex<Connection>,
 }
 
 /// Durable reasons a departed wallet must keep its working state.
@@ -1360,10 +1364,16 @@ impl PaperStateDb {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
         maintenance.busy_timeout(std::time::Duration::from_secs(5))?;
+        let checkpoint = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )?;
+        checkpoint.busy_timeout(std::time::Duration::from_secs(5))?;
 
         Ok(Self {
             conn: Mutex::new(conn),
             maintenance: Mutex::new(maintenance),
+            checkpoint: Mutex::new(checkpoint),
         })
     }
 
@@ -1375,40 +1385,45 @@ impl PaperStateDb {
             .pragma_update_and_check(None, "wal_autocheckpoint", 0, |row| row.get(0))?)
     }
 
-    /// One passive WAL checkpoint on the shared connection, as its own short hold; it skips while a
-    /// caller-owned batch is open (a checkpoint cannot run inside a transaction). It copies what it
-    /// can: a reader elsewhere limits it, and a checkpoint in another process can make it report busy
-    /// and copy nothing; the next one continues. Only an SQL error fails it. Returns how long it held
-    /// the shared connection.
-    pub fn checkpoint_wal(&self) -> Result<std::time::Duration, PaperStateError> {
-        let conn = self.lock();
-        let started = std::time::Instant::now();
-        if conn.is_autocommit() {
-            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
-        }
-        Ok(started.elapsed())
+    /// One passive WAL checkpoint on the checkpoint connection, so its disk syncs hold neither the
+    /// shared connection nor the maintenance one (#754). It copies what it can: a reader or a
+    /// concurrent commit can limit it, and a checkpoint in another process can make it report busy
+    /// and copy nothing; the next one continues. Only an SQL error fails it.
+    pub fn checkpoint_wal(&self) -> Result<(), PaperStateError> {
+        self.checkpointer()
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
+        Ok(())
     }
 
-    /// Checkpoint dispositions before source work is removed from a runtime checkpoint.
+    /// Checkpoint dispositions before source work is removed from a runtime checkpoint. With no
+    /// batch open, every write so far is committed; a later complete passive checkpoint (busy zero,
+    /// every frame it saw backfilled) has then synced the WAL holding them. The checkpoint runs on
+    /// the checkpoint connection, so the shared one is never held through its syncs; a concurrent
+    /// commit's read mark can leave it partial, so it is retried twice before the barrier fails.
     pub fn sync_checkpoint_dispositions(&self) -> Result<(), PaperStateError> {
-        let conn = self.lock();
-        if !conn.is_autocommit() {
+        if !self.lock().is_autocommit() {
             return Err(PaperStateError::Internal(
                 "checkpoint barrier during a paper-state batch".to_owned(),
             ));
         }
-        let (busy, log, checkpointed): (i64, i64, i64) =
-            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
-        if busy != 0 || log != checkpointed {
-            return Err(PaperStateError::MigrationCheckpointIncomplete {
-                busy,
-                log,
-                checkpointed,
-            });
+        let checkpoint = self.checkpointer();
+        let mut incomplete = (0, 0, 0);
+        for _ in 0..3 {
+            let (busy, log, checkpointed): (i64, i64, i64) =
+                checkpoint.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            if busy == 0 && log == checkpointed {
+                return Ok(());
+            }
+            incomplete = (busy, log, checkpointed);
         }
-        Ok(())
+        let (busy, log, checkpointed) = incomplete;
+        Err(PaperStateError::MigrationCheckpointIncomplete {
+            busy,
+            log,
+            checkpointed,
+        })
     }
 
     /// Open an existing database without DDL, migration, or write permission.
@@ -1443,9 +1458,12 @@ impl PaperStateDb {
         }
         let maintenance = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         maintenance.busy_timeout(std::time::Duration::from_secs(5))?;
+        let checkpoint = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        checkpoint.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             conn: Mutex::new(conn),
             maintenance: Mutex::new(maintenance),
+            checkpoint: Mutex::new(checkpoint),
         })
     }
 
@@ -1459,6 +1477,13 @@ impl PaperStateDb {
     /// Lock the maintenance connection, recovering the guard as [`Self::lock`] does.
     fn maintenance(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.maintenance
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Lock the checkpoint connection, recovering the guard as [`Self::lock`] does.
+    fn checkpointer(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.checkpoint
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -7181,6 +7206,15 @@ mod tests {
         }
     }
 
+    /// The barrier test's own trace sink on the shared connection.
+    static BARRIER_STATEMENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn record_barrier_statement(event: TraceEvent<'_>) {
+        if let TraceEvent::Stmt(_, sql) = event {
+            BARRIER_STATEMENTS.lock().unwrap().push(sql.to_owned());
+        }
+    }
+
     fn db() -> (tempfile::TempDir, PaperStateDb) {
         let dir = tempfile::tempdir().unwrap();
         let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
@@ -7813,22 +7847,66 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_wal_skips_an_open_batch() {
+    fn checkpoint_wal_backfills_committed_frames_during_an_open_batch() {
         let (dir, db) = db();
         db.stop_auto_checkpoint().unwrap();
         db.lock()
             .execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
             .unwrap();
+        let (committed, _) = wal_frames(&dir);
         db.begin_batch().unwrap();
         db.lock()
             .execute("INSERT INTO writes VALUES (1)", [])
             .unwrap();
         db.checkpoint_wal().unwrap();
+        assert_eq!(wal_frames(&dir), (committed, committed));
         db.commit_batch().unwrap();
         let (frames, backfilled) = wal_frames(&dir);
         assert!(backfilled < frames, "{backfilled} of {frames}");
         db.checkpoint_wal().unwrap();
         assert_eq!(wal_frames(&dir), (frames, frames));
+    }
+
+    #[test]
+    fn checkpoint_wal_never_waits_for_the_shared_connection() {
+        let (dir, db) = db();
+        db.stop_auto_checkpoint().unwrap();
+        db.lock()
+            .execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
+            .unwrap();
+        std::thread::scope(|scope| {
+            let shared = db.lock();
+            let (sent, received) = std::sync::mpsc::channel();
+            let db = &db;
+            scope.spawn(move || sent.send(db.checkpoint_wal()).unwrap());
+            let checkpointed = received.recv_timeout(std::time::Duration::from_secs(10));
+            drop(shared);
+            checkpointed.unwrap().unwrap();
+        });
+        let (frames, backfilled) = wal_frames(&dir);
+        assert_eq!(backfilled, frames);
+    }
+
+    #[test]
+    fn sync_checkpoint_dispositions_never_checkpoints_on_the_shared_connection() {
+        let (dir, db) = db();
+        db.stop_auto_checkpoint().unwrap();
+        db.lock()
+            .execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
+            .unwrap();
+        db.lock().trace_v2(
+            TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(record_barrier_statement),
+        );
+        db.sync_checkpoint_dispositions().unwrap();
+        db.lock().trace_v2(TraceEventCodes::empty(), None);
+        let statements = BARRIER_STATEMENTS.lock().unwrap();
+        assert!(
+            !statements.iter().any(|sql| sql.contains("wal_checkpoint")),
+            "{statements:?}"
+        );
+        let (frames, backfilled) = wal_frames(&dir);
+        assert_eq!(backfilled, frames);
     }
 
     #[test]

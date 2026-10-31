@@ -106,6 +106,26 @@ pub struct RetentionWriteError {
     pub source: RetentionError,
 }
 
+/// An authority written and synced to its temporary file, not yet visible.
+#[derive(Debug)]
+pub struct StagedRetention {
+    temporary: PathBuf,
+    destination: PathBuf,
+}
+
+impl StagedRetention {
+    /// Rename the staged authority into place; a failure leaves the previous one.
+    pub fn publish(self) -> Result<(), RetentionWriteError> {
+        std::fs::rename(&self.temporary, &self.destination).map_err(|error| {
+            let _ = std::fs::remove_file(&self.temporary);
+            RetentionWriteError {
+                visible: false,
+                source: error.into(),
+            }
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CheckedAuthority {
@@ -190,6 +210,16 @@ impl RetentionAuthority {
     }
 
     pub fn write(&self, log: &Path) -> Result<(), RetentionWriteError> {
+        self.stage(log)?.publish()?;
+        Self::sync_directory(log).map_err(|source| RetentionWriteError {
+            visible: true,
+            source,
+        })
+    }
+
+    /// Write and sync the authority's bytes to its temporary file; nothing becomes visible until
+    /// [`StagedRetention::publish`], and the directory sync follows that (#754).
+    pub fn stage(&self, log: &Path) -> Result<StagedRetention, RetentionWriteError> {
         let before = |source| RetentionWriteError {
             visible: false,
             source,
@@ -211,16 +241,15 @@ impl RetentionAuthority {
                 .write(true)
                 .open(&temporary)?;
             file.write_all(&bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, &destination)
+            file.sync_all()
         })();
         if let Err(error) = result {
             let _ = std::fs::remove_file(&temporary);
             return Err(before(error.into()));
         }
-        Self::sync_directory(log).map_err(|source| RetentionWriteError {
-            visible: true,
-            source,
+        Ok(StagedRetention {
+            temporary,
+            destination,
         })
     }
 

@@ -49,7 +49,7 @@ pub use reader::Reader;
 pub use receipt::{RECEIPT_RECORD_LEN, ReceiptRecord};
 pub use retention::{
     FeedEntry, RetentionAuthority, RetentionBoundary, RetentionError, RetentionPin,
-    RetentionWriteError, TailBinding, retention_path,
+    RetentionWriteError, StagedRetention, TailBinding, retention_path,
 };
 pub use scanner::{IncompleteTail, LogTailBinding, ScanOutcome, Scanner};
 pub use writer::{AppendReceipt, CheckpointPrefix, CheckpointVerification, Writer};

@@ -1,6 +1,7 @@
 //! Free-space guard for the filesystems holding ordinary-service durable state, and the paper-state
 //! WAL checkpointer: the service's shared paper-state connection never checkpoints inside its commits,
-//! so this owner checkpoints it every `PAPER_CHECKPOINT_SECS` as a short hold of its own (#813).
+//! so this owner checkpoints it every `PAPER_CHECKPOINT_SECS`, on the paper-state handle's own
+//! checkpoint connection (#813, #754).
 
 use std::collections::HashSet;
 use std::io;
@@ -180,7 +181,7 @@ impl DiskMonitor {
             |path| fs2::available_space(path),
             move || stopping_state.stop_auto_checkpoint(),
             checkpoints,
-            move || paper_state.checkpoint_wal().map(|_held| ()),
+            move || paper_state.checkpoint_wal(),
         )
         .await
     }
