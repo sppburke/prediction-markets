@@ -15354,7 +15354,7 @@ async fn unrepresentable_parser_text_matches_receipt_reasons_and_wrapper_constan
         let proof = collection_proof(&side, 1, WALLET);
         let reason = proof["exclusion_reason"].as_str().unwrap();
         assert_eq!(reason, format!("activity page parse failed: {error}"));
-        assert!(reason.starts_with(&constants[4]), "{reason}");
+        assert_eq!(reason, format!("{} {error}", constants[4]));
         let matches = [
             reason.contains(&constants[0]),
             reason.contains(&constants[1]),

@@ -370,7 +370,8 @@ CREATE TABLE IF NOT EXISTS meta (
 -- dune_csv/dune_incr, removed in #335; bit5 was radion, removed on Radion
 -- retirement; the gaps are intentional
 -- — `source_bits` is persisted, do not renumber or reuse.)
--- `is_active` is sticky 0→1; `is_infra` is also sticky once set.
+-- `is_active` is sticky 0→1; `is_infra` is sticky except that a participant
+-- upsert clears an inherited flag (`infra` tombstones still block it).
 CREATE TABLE IF NOT EXISTS wallets (
     wallet_hex               TEXT    PRIMARY KEY NOT NULL,
     is_active                INTEGER NOT NULL DEFAULT 0,

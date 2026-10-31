@@ -146,9 +146,9 @@ impl Drop for CompletionSendWait<'_> {
         }
     }
 }
-/// Quiet-history threshold (`activity_quiet_after_secs` in `docs/_GLOSSARY.md`).
+/// Retained identity field (`activity_quiet_after_secs` in `docs/_GLOSSARY.md`); schedules no reads.
 const QUIET_AFTER_SECS: i64 = 2_592_000;
-/// Quiet-wallet polling period (`activity_repoll_period_secs` in `docs/_GLOSSARY.md`).
+/// Retained identity field (`activity_repoll_period_secs` in `docs/_GLOSSARY.md`); schedules no reads.
 const REPOLL_PERIOD_SECS: i64 = 604_800;
 const ACTIVITY_ID_INDEX_SQL: &str = "CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id
     ON activity_groups_v2(source_trade_id COLLATE BINARY)";

@@ -305,6 +305,9 @@ class RankAndPushScenario(unittest.TestCase):
         for variable in CYCLE_SETTINGS.values():
             env.pop(variable, None)
         env.update(exit_env or {})
+        clock = self.root / "clock"
+        if clock.is_dir():
+            env["PATH"] = f"{clock}:{env['PATH']}"
         return subprocess.run(
             ["bash", str(self.wrapper), *args],
             cwd=self.root,
@@ -313,6 +316,12 @@ class RankAndPushScenario(unittest.TestCase):
             text=True,
             timeout=60,
         )
+
+    def _shift_clock(self, ago):
+        """Run the wrapper's `date` this far behind real time (first on PATH in `_run`)."""
+        (self.root / "clock").mkdir(exist_ok=True)
+        _write_exec(self.root / "clock" / "date",
+                    f'#!/usr/bin/env bash\nexec {shutil.which("date")} -d {shlex.quote(ago)} "$@"\n')
 
     def _log(self, name):
         p = self.root / name
@@ -2189,6 +2198,10 @@ class RankAndPushScenario(unittest.TestCase):
         body = stub.read_text()
         marker = 'sub="$1"\n'
         assert marker in body
+        # A head must reach two minutes past the cycle day's midnight, and a default
+        # stub head ends 120 s before now. A cycle clock ten minutes behind real time
+        # keeps every default head past that print tail at any time of day.
+        self._shift_clock("10 minutes ago")
         emulate = (
             'case "$1" in cache-stage-v2|cache-migrate-v2|cache-populate-activity-v2'
             '|cache-populate-payout-v2|cache-finalize-v2|cache-activate|activate-next|winner-discovery)\n'
@@ -2999,11 +3012,8 @@ finally:
         self._prepare_incremental_fixture()
         # Keep the print tail behind both old heads so this isolates the
         # unchanged maximum-age refusal, after completion obligations are clear.
-        real_date = shutil.which("date")
-        shim = self.root / "shim"
-        shim.mkdir()
-        _write_exec(shim / "date", f'#!/usr/bin/env bash\nexec {real_date} -d "3 days ago" "$@"\n')
-        env = {"PATH": f"{shim}:{os.environ['PATH']}", "STUB_ACTIVITY_AGE_1": "180000", "STUB_ACTIVITY_AGE_2": "90000"}
+        self._shift_clock("3 days ago")
+        env = {"STUB_ACTIVITY_AGE_1": "180000", "STUB_ACTIVITY_AGE_2": "90000"}
         for _ in range(2):
             result = self._run(exit_env=env)
             self.assertNotEqual(result.returncode, 0)
