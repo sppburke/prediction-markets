@@ -67,6 +67,7 @@ async fn main() {
                 | "classify-infra"
                 | "coverage"
                 | "winner-discovery"
+                | "participants-import"
                 | "prices-history"
                 | "purge"
                 | "activate-next"
@@ -149,6 +150,8 @@ async fn main() {
         let mut prior_arg: Option<std::path::PathBuf> = None;
         let mut side_arg: Option<std::path::PathBuf> = None;
         let mut out_arg: Option<std::path::PathBuf> = None;
+        let mut covered_from_arg: Option<i64> = None;
+        let mut covered_through_arg: Option<i64> = None;
         let mut end_date_min_arg: Option<i64> = None;
         let mut recurrences_arg = "15m";
         let mut series_arg: Option<&str> = None;
@@ -387,6 +390,18 @@ async fn main() {
                 series_arg = Some(value);
             } else if let Some(v) = a.strip_prefix("--series=") {
                 series_arg = Some(v);
+            } else if a == "--covered-from" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                covered_from_arg = rest[i].parse().ok();
+            } else if let Some(v) = a.strip_prefix("--covered-from=") {
+                covered_from_arg = v.parse().ok();
+            } else if a == "--covered-through" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                covered_through_arg = rest[i].parse().ok();
+            } else if let Some(v) = a.strip_prefix("--covered-through=") {
+                covered_through_arg = v.parse().ok();
             } else if a == "--end-date-min" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -878,6 +893,43 @@ async fn main() {
             std::process::exit(exit);
         }
 
+        let participant_scope = if matches!(sub, "winner-discovery" | "participants-import") {
+            let parsed = (|| {
+                if rest
+                    .iter()
+                    .any(|arg| *arg == "--end-date-min" || arg.starts_with("--end-date-min="))
+                    && end_date_min_arg.is_none()
+                {
+                    return Err(BootstrapError::Invalid {
+                        message: "--end-date-min requires an integer".to_owned(),
+                    });
+                }
+                if rest
+                    .iter()
+                    .any(|arg| *arg == "--recurrences" || arg.starts_with("--recurrences="))
+                {
+                    bootstrap_config.market_recurrences =
+                        recurrences_arg.split(',').map(str::to_owned).collect();
+                }
+                let pinned = series_arg
+                    .map(pe_bootstrap::market_scope::parse_pinned_series)
+                    .transpose()?;
+                pe_bootstrap::wallet_discovery::ParticipantScope::new(
+                    &bootstrap_config.market_recurrences,
+                    pinned.as_deref(),
+                )
+            })();
+            match parsed {
+                Ok(scope) => Some(scope),
+                Err(error) => {
+                    tracing::error!(error = %error, "participant scope: invalid");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            None
+        };
+
         // Every named command below opens WalletCache read-write (including
         // `all`), so the one central guard must precede that open (#544).
         // Genuine readers return above through `open_read_only`.
@@ -1134,6 +1186,10 @@ async fn main() {
                     } else {
                         pile::ActivationPolicy::Immediate
                     },
+                    participant_scope
+                        .as_ref()
+                        .and_then(|scope| scope.series.as_deref()),
+                    end_date_min_arg,
                 )
                 .await
                 {
@@ -1152,7 +1208,40 @@ async fn main() {
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "winner-discovery: fatal");
-                        1
+                        e.exit_code()
+                    }
+                }
+            }
+
+            "participants-import" => {
+                let result = (|| {
+                    let (Some(wallets), Some(floor), Some(from), Some(through), Some(scope)) = (
+                        wallets_file_arg.as_deref(),
+                        end_date_min_arg,
+                        covered_from_arg,
+                        covered_through_arg,
+                        participant_scope,
+                    ) else {
+                        return Err(BootstrapError::Invalid { message: "participants-import requires --wallets, --end-date-min, --covered-from and --covered-through".to_owned() });
+                    };
+                    pe_bootstrap::wallet_discovery::import_participants(
+                        &mut cache,
+                        wallets,
+                        pe_bootstrap::wallet_discovery::ParticipantDiscoveryCoverage {
+                            version: 1,
+                            scope,
+                            market_floor_unix: floor,
+                            covered_from_unix: from,
+                            covered_through_unix: through,
+                        },
+                        time::OffsetDateTime::now_utc().unix_timestamp(),
+                    )
+                })();
+                match result {
+                    Ok(_) => 0,
+                    Err(error) => {
+                        tracing::error!(error = %error, "participants-import: fatal");
+                        error.exit_code()
                     }
                 }
             }

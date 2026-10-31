@@ -594,25 +594,6 @@ def _certified_publication(db: str, record: str, root: Path, index: int, process
     return request, out
 
 
-def assert_certified_deferred_publication_equivalence(
-        deferred: str, control: str, deferred_record: str, control_record: str,
-        process_now: int) -> None:
-    """Prove exact publication entries with each cache's own certification and provenance."""
-    requests = []
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        for index, (db, record) in enumerate(((deferred, deferred_record),
-                                             (control, control_record))):
-            scope = all_markets_scope(db, root / f"scope-{index}.json")
-            requests.append(_certified_publication(db, record, root, index, process_now, scope)[0])
-        assert requests[0]["entries"] == requests[1]["entries"], "deferral changed published entries"
-        assert requests[0]["entries"] and all(row["survives"] for row in requests[0]["entries"])
-        assert requests[0]["batch"]["universe_size"] < requests[1]["batch"]["universe_size"]
-        assert requests[0]["batch"]["config_hash"] != requests[1]["batch"]["config_hash"]
-        assert requests[0]["cache_activation"] != requests[1]["cache_activation"]
-        print("PASS: deferral preserves exact published entries with independently bound provenance")
-
-
 def assert_certified_seeded_publication_equivalence(
         complete: str, seeded: str, complete_record: str, seeded_record: str,
         process_now: int) -> None:

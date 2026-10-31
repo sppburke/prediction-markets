@@ -3268,13 +3268,13 @@ impl WalletCache {
     /// pass `0` when V1/V2 attribution is unavailable; the enumeration path
     /// passes the bit from `topic_to_contract_version_bit`.
     pub fn upsert_wallets_bulk(&mut self, rows: &[WalletUpsertRow]) -> Result<(), BootstrapError> {
-        // Issue #385 tombstone gate. Leaderboard may lift a non-infra tombstone;
-        // all other sources skip it. Infrastructure tombstones are never lifted
-        // here, regardless of source.
+        // Participants lift proven-loser exclusions and inherited flags; infra
+        // tombstones remain subject to explicit operator clearance.
         let mut purged = self.load_purged_reasons()?;
         let tx = self.conn.transaction()?;
+        let mut skipped_infra = HashSet::new();
         {
-            let mut stmt = tx.prepare(
+            let mut stmt = tx.prepare(concatcp!(
                 "INSERT INTO wallets (\
                     wallet_hex, source_bits, is_infra, \
                     dune_first_seen_unix, dune_closed_markets, dune_win_rate_bps, \
@@ -3282,19 +3282,36 @@ impl WalletCache {
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(wallet_hex) DO UPDATE SET \
                     source_bits = source_bits | excluded.source_bits, \
-                    is_infra = MAX(is_infra, excluded.is_infra), \
+                    is_infra = CASE WHEN (excluded.source_bits & ", crate::pile::SRC_MARKET_PARTICIPANT, ") != 0 THEN excluded.is_infra ELSE MAX(is_infra, excluded.is_infra) END, \
                     dune_first_seen_unix = COALESCE(excluded.dune_first_seen_unix, dune_first_seen_unix), \
                     dune_closed_markets = COALESCE(excluded.dune_closed_markets, dune_closed_markets), \
                     dune_win_rate_bps = COALESCE(excluded.dune_win_rate_bps, dune_win_rate_bps), \
-                    polymarket_contracts_seen = polymarket_contracts_seen | excluded.polymarket_contracts_seen",
-            )?;
+                    polymarket_contracts_seen = polymarket_contracts_seen | excluded.polymarket_contracts_seen"
+            ))?;
             let mut lift = tx.prepare("DELETE FROM purged_wallets WHERE wallet_hex = ?1")?;
             for (wallet, bits, infra, first_seen, closed, win_rate, version_bits) in rows {
+                let participant = (bits & crate::pile::SRC_MARKET_PARTICIPANT) != 0;
+                if participant
+                    && purged.get(wallet).is_some_and(|reason| reason == "infra")
+                    && skipped_infra.insert(wallet.clone())
+                {
+                    tracing::warn!(wallet, "market participant skipped: infra tombstone");
+                }
+                if participant
+                    && crate::chain::ALL_EXCHANGE_CONTRACTS
+                        .iter()
+                        .any(|address| format!("{address:#x}") == *wallet)
+                {
+                    continue;
+                }
                 if let Some(reason) = purged.get(wallet) {
                     // Infrastructure exclusions are permanent under ordinary
                     // discovery. Only the explicit operator clearance command
                     // may remove them.
-                    if reason != "infra" && (bits & crate::pile::TOMBSTONE_OVERRIDE_SOURCES) != 0 {
+                    if reason != "infra"
+                        && ((bits & crate::pile::TOMBSTONE_OVERRIDE_SOURCES) != 0
+                            || (participant && reason == "proven_loser"))
+                    {
                         // Override source (leaderboard) → lift + re-admit.
                         lift.execute(params![wallet])?;
                         purged.remove(wallet);
@@ -3316,6 +3333,15 @@ impl WalletCache {
             }
         }
         tx.commit()?;
+        if rows
+            .iter()
+            .any(|row| (row.1 & crate::pile::SRC_MARKET_PARTICIPANT) != 0)
+        {
+            tracing::info!(
+                skipped_infra = skipped_infra.len(),
+                "market participant upsert complete"
+            );
+        }
         Ok(())
     }
 
@@ -3788,6 +3814,42 @@ impl WalletCache {
             )
             .optional()?;
         Ok(row.is_some())
+    }
+
+    /// Only an absent key means no coverage; SQL, decoding and validation errors
+    /// propagate so discovery cannot silently restart from a recent window.
+    pub fn participant_discovery_coverage(
+        &self,
+    ) -> Result<Option<crate::wallet_discovery::ParticipantDiscoveryCoverage>, BootstrapError> {
+        let row: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'participant_discovery_coverage'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        row.map(|json| {
+            let coverage: crate::wallet_discovery::ParticipantDiscoveryCoverage =
+                serde_json::from_str(&json)?;
+            coverage.validate()?;
+            Ok(coverage)
+        })
+        .transpose()
+    }
+
+    /// Commit coverage after its participant upsert, with the cache mutation lock held.
+    pub(crate) fn set_participant_discovery_coverage(
+        &mut self,
+        coverage: &crate::wallet_discovery::ParticipantDiscoveryCoverage,
+    ) -> Result<(), BootstrapError> {
+        coverage.validate()?;
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('participant_discovery_coverage', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value != excluded.value",
+            [serde_json::to_string(coverage)?],
+        )?;
+        Ok(())
     }
 
     /// Capture the marker, freelist, and complete trades-index inventory using

@@ -13439,94 +13439,40 @@ fn weekly_instant_after(wallet: &str, epoch: i64) -> i64 {
     epoch + (-phase - epoch).rem_euclid(604_800)
 }
 
-// PASS: weekly instants select one successor read, deferred history stays untouched and
-// unprojected, and full recovery/top-ups preserve frozen membership; FAIL: otherwise.
+// PASS: quiet wallets read every successor, remain projected, and interrupted
+// collection and explicit repairs preserve frozen membership; FAIL: otherwise.
 #[tokio::test]
 async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
     use pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock;
     let dir = TempDir::new().unwrap();
     let passive = format!("0x{}{}", "22".repeat(14), &WALLET[30..]);
     let empty = format!("0x{}{}", "55".repeat(14), &WALLET[30..]);
-    let side = dataset_candidate(
-        &dir,
-        "weekly.db",
-        &[WALLET_B, WALLET_C, WALLET_D, &passive, &empty],
-    );
-    history_v3_freeze_legacy_root_at(
-        &side,
-        &[WALLET, WALLET_B, WALLET_C, WALLET_D, &passive, &empty],
-        1,
-        weekly_instant_after(WALLET, FRESH_END) - 100,
-    );
-    let instant = weekly_instant_after(WALLET, FRESH_END);
-    let root_end = instant - 100;
-    let old = root_end - 2_592_001;
+    let side = dataset_candidate(&dir, "quiet.db", &[WALLET_B, WALLET_C, &passive, &empty]);
+    let wallets = [WALLET, WALLET_B, WALLET_C, passive.as_str(), empty.as_str()];
+    history_v3_freeze_legacy_root_at(&side, &wallets, 1, FRESH_END);
+    let old = FRESH_END - 2_592_001;
     let mut source = DatasetFetcher {
         rows: vec![
             dataset_row(WALLET, "0xold", "old", "BUY", old),
             dataset_row(&passive, "0xpassive", "passive", "BUY", old),
-            dataset_row(WALLET_B, "0xactive", "active", "BUY", root_end),
+            dataset_row(WALLET_B, "0xactive", "active", "BUY", FRESH_END),
             dataset_row(WALLET_C, "0xrepair", "repair", "BUY", old),
-            dataset_row(WALLET_D, "0xbad", "bad", "BUY", root_end - 2),
-            {
-                let mut later = dataset_row(WALLET_D, "0xbad", "bad", "BUY", root_end - 1);
-                later["size"] = Value::from("2.500002");
-                later
-            },
         ],
         ..Default::default()
     };
-    populate_activity_fresh_v2(
-        &side,
-        &source,
-        "https://data.example",
-        1,
-        root_end,
-        root_end + 1,
-    )
-    .await
-    .unwrap();
-    assert_eq!(fresh_record(&side)["version"], 2);
-    assert!(fresh_record(&side).get("deferred_wallets").is_none());
-    assert!(
-        source
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(_, start, _)| *start == 1)
-    );
-    source.calls.lock().unwrap().clear();
-    populate_activity_fresh_v2(
-        &side,
-        &source,
-        "https://data.example",
-        2,
-        instant - 90,
-        instant - 89,
-    )
-    .await
-    .unwrap();
-    // Decision 9: the successor transitions to history format three.
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    history_v3_collect(&side, &source, 2, FRESH_END + 10, &[])
+        .await
+        .unwrap();
     assert_eq!(fresh_record(&side)["version"], 4);
     assert_eq!(
         fresh_record(&side)["deferred_wallets"],
         serde_json::json!([])
     );
-    assert!(source.calls.lock().unwrap().contains(&(
-        WALLET.to_owned(),
-        root_end + 1,
-        instant - 90
-    )));
-    assert!(
-        source
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&(WALLET_D.to_owned(), 1, instant - 90))
-    );
     dataset_payouts(&side, &source.rows).await;
-    finalize_cache_v2(&side, None, instant - 89).unwrap();
+    finalize_cache_v2(&side, None, FRESH_END + 11).unwrap();
     let retained = query_values(
         &side,
         &format!("SELECT * FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}'"),
@@ -13536,7 +13482,7 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
         .rows
         .push(dataset_row(WALLET_E, "0xnew", "new", "BUY", old));
     source.calls.lock().unwrap().clear();
-    Connection::open(&side).unwrap().execute_batch("CREATE TRIGGER stop_weekly_manifest BEFORE INSERT ON activity_coverage_manifests_v2 WHEN NEW.generation = 3 BEGIN SELECT RAISE(ABORT, 'interrupted weekly completion'); END").unwrap();
+    Connection::open(&side).unwrap().execute_batch("CREATE TRIGGER stop_quiet_manifest BEFORE INSERT ON activity_coverage_manifests_v2 WHEN NEW.generation = 3 BEGIN SELECT RAISE(ABORT, 'interrupted quiet completion'); END").unwrap();
     let config = collection_config(&side);
     assert!(
         populate_activity_fresh_v2_with_clock(
@@ -13545,53 +13491,39 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
             "https://data.example",
             3,
             &[WALLET_C.to_owned()],
-            || Ok(instant - 80),
-            instant - 79,
+            || Ok(FRESH_END + 20),
+            FRESH_END + 21,
             None
         )
         .await
         .is_err()
     );
     let frozen = fresh_record(&side);
-    assert_eq!(
-        frozen["deferred_wallets"],
-        serde_json::json!([WALLET, passive, empty])
-    );
+    assert_eq!(frozen["deferred_wallets"], serde_json::json!([]));
+    for wallet in wallets {
+        assert!(source.calls.lock().unwrap().contains(&(
+            wallet.to_owned(),
+            if wallet == WALLET_C {
+                1
+            } else {
+                FRESH_END + 11
+            },
+            FRESH_END + 20
+        )));
+    }
     assert!(
         source
             .calls
             .lock()
             .unwrap()
+            .contains(&(WALLET_E.to_owned(), 1, FRESH_END + 20))
+    );
+    let proofs = stored_receipt_proofs(&Connection::open(&side).unwrap(), 3);
+    assert!(
+        proofs
             .iter()
-            .all(|(wallet, _, _)| wallet != WALLET && wallet != &passive && wallet != &empty)
+            .all(|proof| proof["acquisition"]["exclusion_reason"].is_null())
     );
-    for wallet in [WALLET_C, WALLET_D, WALLET_E] {
-        assert!(
-            source
-                .calls
-                .lock()
-                .unwrap()
-                .contains(&(wallet.to_owned(), 1, instant - 80))
-        );
-    }
-    let receipts = stored_receipt_proofs(&Connection::open(&side).unwrap(), 3);
-    let deferred = receipts
-        .iter()
-        .find(|proof| proof["wallet_hex"] == WALLET)
-        .unwrap();
-    assert_eq!(
-        deferred["acquisition"]["exclusion_reason"],
-        "dormant_deferred"
-    );
-    assert_eq!(
-        deferred["acquisition"]["aggregation_status"],
-        "not_attempted"
-    );
-    assert_eq!(deferred["acquisition"]["mode"], "full");
-    assert_eq!(deferred["acquisition"]["start_exclusive"], 0);
-    assert_eq!(deferred["acquisition"]["predecessor"]["carried"], false);
-    assert_eq!(deferred["pages"], serde_json::json!([]));
-    assert_eq!(deferred["aggregate_count"], 0);
     assert_eq!(
         query_values(
             &side,
@@ -13605,8 +13537,8 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
         "https://data.example",
         3,
         &[WALLET.to_owned()],
-        || Ok(instant + 99),
-        instant + 100,
+        || Ok(FRESH_END + 99),
+        FRESH_END + 100,
         None,
     )
     .await
@@ -13614,99 +13546,47 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
     assert!(refused.to_string().contains("frozen full-read selection"));
     Connection::open(&side)
         .unwrap()
-        .execute_batch("DROP TRIGGER stop_weekly_manifest")
+        .execute_batch("DROP TRIGGER stop_quiet_manifest")
         .unwrap();
     source.calls.lock().unwrap().clear();
-    populate_activity_fresh_v2(
-        &side,
-        &source,
-        "https://data.example",
-        3,
-        instant + 99,
-        instant + 100,
-    )
-    .await
-    .unwrap();
+    history_v3_collect(&side, &source, 3, FRESH_END + 99, &[])
+        .await
+        .unwrap();
     assert_eq!(fresh_record(&side), frozen);
     assert!(source.calls.lock().unwrap().is_empty());
-    WalletCache::open(&side)
-        .unwrap()
-        .conn_for_test_set_active(&empty, 0);
     dataset_payouts(&side, &source.rows).await;
+    finalize_cache_v2(&side, None, FRESH_END + 22).unwrap();
     assert!(
-        finalize_cache_v2(&side, None, instant - 78)
-            .unwrap()
-            .is_none()
+        projected_entries(&side)
+            .iter()
+            .any(|(wallet, _, _)| wallet == WALLET)
     );
     assert!(
-        !projected_entries(&side)
+        projected_entries(&side)
             .iter()
-            .any(|(wallet, _, _)| wallet == WALLET || wallet == &passive)
+            .any(|(wallet, _, _)| wallet == &passive)
     );
     source.rows.push(dataset_row(
         WALLET,
         "0xreturned",
         "returned",
         "BUY",
-        instant - 70,
+        FRESH_END + 30,
     ));
     source.calls.lock().unwrap().clear();
-    populate_activity_fresh_v2(
-        &side,
-        &source,
-        "https://data.example",
-        4,
-        instant,
-        instant + 1,
-    )
-    .await
-    .unwrap();
-    assert!(
-        fresh_record(&side)["deferred_wallets"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::from(WALLET))
+    history_v3_collect(&side, &source, 4, FRESH_END + 40, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh_record(&side)["deferred_wallets"],
+        serde_json::json!([])
     );
-    assert!(
-        source
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(wallet, _, _)| wallet != WALLET && wallet != &passive && wallet != &empty)
-    );
-    assert!(
-        fresh_record(&side)["deferred_wallets"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::from(empty.clone()))
-    );
-    let long = dir.path().join("long-interval.db");
-    std::fs::copy(&side, &long).unwrap();
-    source.calls.lock().unwrap().clear();
-    populate_activity_fresh_v2(
-        &side,
-        &source,
-        "https://data.example",
-        5,
-        instant + 10,
-        instant + 11,
-    )
-    .await
-    .unwrap();
-    collection_766_assert_automatic_proved_full(&side);
-    for wallet in [WALLET, passive.as_str(), empty.as_str()] {
-        assert_eq!(
-            source
-                .calls
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(w, _, _)| w == wallet)
-                .cloned()
-                .collect::<Vec<_>>(),
-            [(wallet.to_owned(), 1, instant + 10)]
-        );
+    for wallet in wallets {
+        assert!(source.calls.lock().unwrap().contains(&(
+            wallet.to_owned(),
+            FRESH_END + 21,
+            FRESH_END + 40
+        )));
     }
     assert_eq!(
         count(
@@ -13714,16 +13594,6 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
             &format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}'")
         ),
         2
-    );
-    // A differing automatic full read preserves the old row's insertion provenance.
-    assert_eq!(
-        count(
-            &side,
-            &format!(
-                "SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}' AND coverage_generation = 5"
-            )
-        ),
-        1
     );
     assert_eq!(
         query_values(
@@ -13735,75 +13605,21 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
         retained
     );
     source.calls.lock().unwrap().clear();
-    populate_activity_fresh_v2(
-        &side,
-        &source,
-        "https://data.example",
-        6,
-        instant + 20,
-        instant + 21,
-    )
-    .await
-    .unwrap();
-    assert!(source.calls.lock().unwrap().contains(&(
-        WALLET.to_owned(),
-        instant + 11,
-        instant + 20
-    )));
-    assert!(
-        source
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(wallet, _, _)| wallet != &passive)
-    );
-    source.calls.lock().unwrap().clear();
-    let long_end = instant + 2 * 604_800;
-    populate_activity_fresh_v2(
-        &long,
-        &source,
-        "https://data.example",
-        5,
-        long_end,
-        long_end + 1,
-    )
-    .await
-    .unwrap();
+    let long_end = FRESH_END + 2 * 604_800;
+    history_v3_collect(&side, &source, 5, long_end, &[])
+        .await
+        .unwrap();
     assert_eq!(
-        source
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(wallet, _, _)| wallet == &passive)
-            .count(),
-        1
+        fresh_record(&side)["deferred_wallets"],
+        serde_json::json!([])
     );
-    source.calls.lock().unwrap().clear();
-    populate_activity_fresh_v2(
-        &long,
-        &source,
-        "https://data.example",
-        6,
-        long_end + 10,
-        long_end + 11,
-    )
-    .await
-    .unwrap();
-    assert!(
-        source
-            .calls
-            .lock()
-            .unwrap()
-            .contains(&(passive.clone(), long_end + 1, long_end + 10))
-    );
-    assert!(
-        !fresh_record(&long)["full_read_wallets"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::from(passive))
-    );
+    for wallet in wallets {
+        assert!(source.calls.lock().unwrap().contains(&(
+            wallet.to_owned(),
+            FRESH_END + 41,
+            long_end
+        )));
+    }
 }
 
 // PASS: frozen deferred receipts reject claimed pages/current rows and the reason on
@@ -13820,20 +13636,47 @@ async fn quiet_wallet_deferral_rejects_forged_evidence() {
         ],
         ..Default::default()
     };
-    for (generation, end) in [(1, end), (2, end + 10), (3, end + 20)] {
-        populate_activity_fresh_v2(
-            &side,
-            &source,
-            "https://data.example",
-            generation,
-            end,
-            end + 1,
-        )
+    history_v3_freeze_legacy_root_at(&side, &[WALLET, WALLET_B], 1, end);
+    let root = history_v3_collect(&side, &source, 1, end, &[])
         .await
         .unwrap();
-        dataset_payouts(&side, &source.rows).await;
-        finalize_cache_v2(&side, None, end + 1).unwrap();
-    }
+    let prior_manifest =
+        history_v3_legacy_successor(&side, &source, &root, end + 10, &[WALLET, WALLET_B], &[])
+            .await;
+    let prior = fresh_record(&side);
+    let link = whole_json_digest(
+        &serde_json::json!({"version":1, "manifest":prior_manifest, "collection_identity":prior}),
+    );
+    // Historical identity three, frozen before collection: production admission
+    // no longer creates deferrals, but exact resume must still authenticate them.
+    let mut identity = serde_json::json!({
+        "version":3, "generation":3, "fixed_end_unix":end + 20,
+        "wallets":[WALLET,WALLET_B], "base_generation":2, "base_manifest_sha256":link,
+        "start_exclusive":end + 10, "full_read_wallets":[], "deferred_wallets":[WALLET],
+        "quiet_after_secs":2_592_000, "repoll_period_secs":604_800,
+    });
+    identity["digest"] = Value::from(whole_json_digest(&identity));
+    Connection::open(&side)
+        .unwrap()
+        .execute(
+            "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1",
+            [identity.to_string()],
+        )
+        .unwrap();
+    history_v3_collect(&side, &source, 3, end + 20, &[])
+        .await
+        .unwrap();
+    assert_eq!(fresh_record(&side), identity);
+    assert_eq!(
+        stored_receipt_proofs(&Connection::open(&side).unwrap(), 3)[0]["acquisition"]["exclusion_reason"],
+        "dormant_deferred"
+    );
+    let no_reads = DatasetFetcher::default();
+    history_v3_collect(&side, &no_reads, 3, end + 99, &[])
+        .await
+        .unwrap();
+    assert_eq!(fresh_record(&side), identity);
+    assert!(no_reads.calls.lock().unwrap().is_empty());
     let originals = query_values(
         &side,
         "SELECT wallet_hex, page_evidence_json, acquisition_json FROM activity_wallet_coverage_staging_v2 WHERE generation = 3 ORDER BY wallet_hex",
@@ -13871,13 +13714,7 @@ async fn quiet_wallet_deferral_rejects_forged_evidence() {
         )
         .await
         .unwrap_err();
-        // Decision 6: sealed receipts authenticate the record before detailed replay.
-        assert!(
-            error
-                .to_string()
-                .contains("historical receipt-set commitment mismatch"),
-            "{reason}: {error}"
-        );
+        assert!(error.to_string().contains(reason), "{reason}: {error}");
         assert!(no_reads.calls.lock().unwrap().is_empty());
         for row in &originals {
             conn.execute("UPDATE activity_wallet_coverage_staging_v2 SET page_evidence_json = ?2, acquisition_json = ?3 WHERE generation = 3 AND wallet_hex = ?1", rusqlite::params_from_iter(row)).unwrap();
@@ -13888,6 +13725,27 @@ async fn quiet_wallet_deferral_rejects_forged_evidence() {
         )
         .unwrap();
     }
+    source.calls.lock().unwrap().clear();
+    history_v3_collect(&side, &source, 4, end + 30, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh_record(&side)["deferred_wallets"],
+        serde_json::json!([])
+    );
+    assert!(
+        fresh_record(&side)["full_read_wallets"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from(WALLET))
+    );
+    assert!(
+        source
+            .calls
+            .lock()
+            .unwrap()
+            .contains(&(WALLET.to_owned(), 1, end + 30))
+    );
 }
 
 // PASS: interrupted version-two roots and successors retain their identity and
@@ -14251,96 +14109,6 @@ fn publication_payouts(path: &std::path::Path, markets: &[Value], now: i64) {
     cache.complete_clob_payout_walk_v2(&manifest, now).unwrap();
 }
 
-// PASS: quiet-wallet deferral leaves published entries exactly equal to a full-poll
-// control while both requests validate their own provenance; FAIL: otherwise.
-#[tokio::test]
-async fn quiet_wallet_deferral_preserves_exact_publication_entries() {
-    use pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock;
-    let dir = TempDir::new().unwrap();
-    let now = FRESH_END;
-    let phase = (-(now + 3 * 86_400)).rem_euclid(604_800);
-    let quiet = format!("0x{}{:012x}", "22".repeat(14), phase);
-    let deferred = dataset_candidate(&dir, "deferring.db", &[&quiet, PUBLICATION_PRINT_WALLET]);
-    let source = DatasetFetcher {
-        rows: publication_dataset(now, &quiet).0,
-        ..Default::default()
-    };
-    let (_, markets) = publication_dataset(now, &quiet);
-    for (generation, end) in [(1, now - 100), (2, now - 90)] {
-        populate_activity_fresh_v2(
-            &deferred,
-            &source,
-            "https://data.example",
-            generation,
-            end,
-            end + 1,
-        )
-        .await
-        .unwrap();
-    }
-    publication_payouts(&deferred, &markets, now - 89);
-    finalize_cache_v2(&deferred, None, now - 89).unwrap();
-    let control = dir.path().join("control.db");
-    std::fs::copy(&deferred, &control).unwrap();
-    source.calls.lock().unwrap().clear();
-    populate_activity_fresh_v2(
-        &deferred,
-        &source,
-        "https://data.example",
-        3,
-        now - 80,
-        now - 79,
-    )
-    .await
-    .unwrap();
-    assert!(
-        source
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(wallet, _, _)| wallet != &quiet)
-    );
-    populate_activity_fresh_v2_with_clock(
-        &collection_config(&control),
-        &source,
-        "https://data.example",
-        3,
-        std::slice::from_ref(&quiet),
-        || Ok(now - 80),
-        now - 79,
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        fresh_record(&deferred)["deferred_wallets"],
-        serde_json::json!([quiet])
-    );
-    assert_eq!(
-        fresh_record(&control)["deferred_wallets"],
-        serde_json::json!([])
-    );
-    let records = [
-        dir.path().join("deferring.final.json"),
-        dir.path().join("control.final.json"),
-    ];
-    for (path, record) in [(&deferred, &records[0]), (&control, &records[1])] {
-        publication_payouts(path, &markets, now);
-        finalize_cache_v2(path, Some(record), now + 1)
-            .unwrap()
-            .unwrap();
-    }
-    let bridge = Command::new("python3").current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).args(["-c",
-        "import sys; sys.path.insert(0, 'scripts'); from test_ranker_duck_parity import assert_certified_deferred_publication_equivalence; assert_certified_deferred_publication_equivalence(*sys.argv[1:5], int(sys.argv[5]))"])
-        .arg(&deferred).arg(&control).arg(&records[0]).arg(&records[1]).arg(now.to_string()).output().unwrap();
-    assert!(
-        bridge.status.success(),
-        "publication bridge:\n{}\n{}",
-        String::from_utf8_lossy(&bridge.stdout),
-        String::from_utf8_lossy(&bridge.stderr)
-    );
-}
 // PASS: real transition and bulk-root publications carry the AC8 mapping, raw-only and scoped-drop cases;
 // the successor defers quiet history and a token_conditions edit changes no published scope.
 // FAIL: a wallet is excluded for the accepted defects, a dropped market scores, or raw-only BUYs consume.
@@ -16021,9 +15789,12 @@ async fn history_v3_quiet_rule_uses_certificates_and_unfinalized_receipts() {
         .unwrap();
     assert_eq!(
         fresh_record(&side)["deferred_wallets"],
-        serde_json::json!([WALLET])
+        serde_json::json!([])
     );
-    assert!(source.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        *source.calls.lock().unwrap(),
+        [(WALLET.to_owned(), FRESH_END + 2, FRESH_END + 2)]
+    );
     assert_eq!(receipt(&side, 3, WALLET).unwrap().0, 0);
     assert_eq!(generation_rows(&side, 3), 0);
     assert_eq!(history_v3_wallet_count(&side), 1);
@@ -20934,7 +20705,7 @@ async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
         error.to_string().contains("infrastructure-flagged"),
         "{error}"
     );
-    // Discovery cannot re-admit an excluded wallet.
+    // Participant discovery lifts the inherited loser tombstone and flag.
     let mut cache = WalletCache::open(&fresh).unwrap();
     cache
         .upsert_wallets_bulk(&[
@@ -20952,7 +20723,7 @@ async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
                  AND is_active = 1"
             )
         ),
-        0
+        2
     );
 
     let tampered = dir.path().join("tampered.db");

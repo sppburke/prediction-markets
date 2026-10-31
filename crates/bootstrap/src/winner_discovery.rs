@@ -9,14 +9,15 @@
 //! `pe-bootstrap all`). The **datadash** source **soft-fails** — a
 //! [`BootstrapError::Datadash`] is logged and treated as zero counts so a
 //! third-party outage never breaks the run (issue #365 AC9). Non-datadash errors
-//! (e.g. a broken cache) still propagate. Participant collection errors also soft-fail
-//! with a visible status; participant cache and activation errors remain fatal.
+//! (e.g. a broken cache) still propagate. Participant collection errors return temporary failure;
+//! participant cache and activation errors remain fatal.
 //! (The Radion source was retired once its upstream `traders/analysis` endpoint
 //! was removed.)
 //!
 use crate::cache::WalletCache;
 use crate::config::BootstrapConfig;
 use crate::error::BootstrapError;
+use crate::market_scope::ScopeSeries;
 use crate::pile::ActivationPolicy;
 use crate::wallet_discovery::{
     SourceDiscoveryResult, WalletDiscoverySource, run_source_discovery_with_policy,
@@ -39,7 +40,7 @@ pub async fn run_winner_discovery(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
 ) -> Result<WinnerDiscoveryReport, BootstrapError> {
-    run_winner_discovery_with_policy(config, cache, ActivationPolicy::Immediate).await
+    run_winner_discovery_with_policy(config, cache, ActivationPolicy::Immediate, None, None).await
 }
 
 /// Winner discovery with an explicit activation policy. The full rank-and-push
@@ -48,12 +49,16 @@ pub async fn run_winner_discovery_with_policy(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
     activation_policy: ActivationPolicy,
+    pinned: Option<&[ScopeSeries]>,
+    market_floor: Option<i64>,
 ) -> Result<WinnerDiscoveryReport, BootstrapError> {
     let lb = run_source_discovery_with_policy(
         WalletDiscoverySource::Leaderboard,
         config,
         cache,
         activation_policy,
+        pinned,
+        market_floor,
     )
     .await?;
     // Datadash soft-fails: a third-party outage must not break `pe-bootstrap all`.
@@ -64,6 +69,8 @@ pub async fn run_winner_discovery_with_policy(
         config,
         cache,
         activation_policy,
+        pinned,
+        market_floor,
     )
     .await
     {
@@ -83,6 +90,8 @@ pub async fn run_winner_discovery_with_policy(
         config,
         cache,
         activation_policy,
+        pinned,
+        market_floor,
     )
     .await?;
 
@@ -125,12 +134,8 @@ mod tests {
             participant_lookback_secs: 5,
             ..BootstrapConfig::default()
         };
-        let report = run_winner_discovery(&config, &mut cache).await.unwrap();
-        assert_eq!(
-            (report.leaderboard_unique, report.leaderboard_activated),
-            (0, 0)
-        );
-        assert_eq!((report.datadash_unique, report.datadash_activated), (0, 0));
-        assert_eq!(report.participants_status, "failed:gamma");
+        let error = run_winner_discovery(&config, &mut cache).await.unwrap_err();
+        assert_eq!(error.exit_code(), 75);
+        assert!(error.to_string().contains("failed:gamma"));
     }
 }

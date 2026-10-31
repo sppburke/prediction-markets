@@ -1035,7 +1035,6 @@ fn verify_historical_receipts_with(
 pub(super) struct HistoryProof {
     records: BTreeMap<u64, (FreshCollectionIdentity, Option<ActivityCoverageManifestV2>)>,
     links: BTreeMap<u64, String>,
-    last_fetched: BTreeMap<String, (u64, Option<String>)>,
     continuations: BTreeMap<String, (ActivityReadMode, i64)>,
 }
 
@@ -1057,7 +1056,6 @@ impl HistoryProof {
     ) -> Result<Self, BootstrapError> {
         let mut records = BTreeMap::new();
         let mut links = BTreeMap::new();
-        let mut last_fetched = BTreeMap::<String, (u64, Option<String>)>::new();
         let mut continuations = BTreeMap::new();
         let mut identity = head.clone();
         loop {
@@ -1070,27 +1068,6 @@ impl HistoryProof {
                         && let Some(continuation) = receipt.continuation()
                     {
                         continuations.insert(receipt.wallet_hex.clone(), continuation);
-                    }
-                    if (!receipt.excluded() || receipt.partial())
-                        && let Some(acquisition) = receipt.acquisition.as_ref()
-                        && (acquisition.mode == ActivityReadMode::Full
-                            || acquisition
-                                .fetched_aggregate_count
-                                .is_some_and(|count| count > 0))
-                    {
-                        // Decision 4: an unchanged full read commits only its receipt.
-                        // Its fetched rows do not make a certified quiet history active.
-                        let change = (
-                            identity.generation,
-                            (acquisition.mode == ActivityReadMode::Full && !receipt.partial())
-                                .then(|| receipt.ordered_aggregate_digest.clone()),
-                        );
-                        let latest = last_fetched
-                            .entry(receipt.wallet_hex.clone())
-                            .or_insert_with(|| change.clone());
-                        if change.0 > latest.0 {
-                            *latest = change;
-                        }
                     }
                 })?;
             }
@@ -1120,20 +1097,8 @@ impl HistoryProof {
         Ok(Self {
             records,
             links,
-            last_fetched,
             continuations,
         })
-    }
-
-    pub(super) fn has_new_rows(&self, wallet: &str, certificate: &HistoryCertificate) -> bool {
-        self.last_fetched
-            .get(wallet)
-            .is_some_and(|(generation, full_digest)| {
-                *generation > certificate.generation
-                    && full_digest
-                        .as_ref()
-                        .is_none_or(|digest| digest != &certificate.ordered_digest)
-            })
     }
 
     fn identity(&self, generation: u64) -> Option<&FreshCollectionIdentity> {

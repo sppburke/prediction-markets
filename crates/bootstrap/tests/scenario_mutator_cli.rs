@@ -276,6 +276,7 @@ fn create_cache_flag_is_rejected_by_other_subcommands() {
     for sub in [
         "fetch",
         "winner-discovery",
+        "participants-import",
         "cache-populate-payout-v2",
         "cache-stage-v2",
     ] {
@@ -556,6 +557,7 @@ fn every_locking_cli_entry_refuses_before_creating_the_cache() {
         "backfill",
         "classify-infra",
         "winner-discovery",
+        "participants-import",
         "prices-history",
         "purge",
         "activate-next",
@@ -1316,4 +1318,51 @@ fn non_provisioning_openers_never_create_fixed_cache_in_a_rename_gap() {
         assert_eq!(std::fs::read(displaced).unwrap(), b"old generation");
         assert_eq!(std::fs::read(candidate).unwrap(), b"candidate generation");
     }
+}
+
+#[test]
+fn participants_import_db_selection_locks_only_the_side_cache() {
+    let dir = TempDir::new().unwrap();
+    let fixed = dir.path().join("fixed.db");
+    let side = dir.path().join("side.db");
+    drop(WalletCache::open(&fixed).unwrap());
+    drop(WalletCache::open(&side).unwrap());
+    let file = dir.path().join("participants.txt");
+    std::fs::write(&file, wallet_hex(0x71)).unwrap();
+    let args = [
+        "participants-import",
+        "--db",
+        side.to_str().unwrap(),
+        "--wallets",
+        file.to_str().unwrap(),
+        "--series",
+        "7:seven",
+        "--end-date-min",
+        "0",
+        "--covered-from",
+        "10",
+        "--covered-through",
+        "20",
+    ];
+    let fixed_before = std::fs::read(&fixed).unwrap();
+    let side_before = std::fs::read(&side).unwrap();
+    let side_lock = CacheMutationLock::acquire(&side).unwrap();
+    let refused = run_cli(dir.path(), &fixed, &args);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("cache mutation lock failed"));
+    assert_eq!(std::fs::read(&fixed).unwrap(), fixed_before);
+    assert_eq!(std::fs::read(&side).unwrap(), side_before);
+    drop(side_lock);
+    let _fixed_lock = CacheMutationLock::acquire(&fixed).unwrap();
+    let imported = run_cli(dir.path(), &fixed, &args);
+    assert_eq!(imported.status.code(), Some(0), "{imported:?}");
+    assert_eq!(std::fs::read(&fixed).unwrap(), fixed_before);
+    let side = WalletCache::open_read_only(&side).unwrap();
+    assert_eq!(side.wallet_pile_size().unwrap(), 1);
+    let coverage = side.participant_discovery_coverage().unwrap().unwrap();
+    assert_eq!(coverage.scope.series.unwrap()[0].id, "7");
+    assert_eq!(
+        (coverage.covered_from_unix, coverage.covered_through_unix),
+        (10, 20)
+    );
 }

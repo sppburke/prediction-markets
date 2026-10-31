@@ -15,7 +15,7 @@
 //! | 5 | 0b0100000 | _(removed — was Radion; gap kept, persisted)_ |
 //! | 6 | 0b1000000 | 502-gap |
 //! | 7 | 0b10000000 | datadash.xyz cohorts (#365) |
-//! | 8 | 0b1_0000_0000 | Recent 15-minute market takers (#800) |
+//! | 8 | 0b1_0000_0000 | 15-minute market participants (#800) |
 //!
 //! Canonical `wallet_hex` form: `"0x" + 40 lowercase hex chars` (matches
 //! `WalletAddress::Display`). All callers must normalise before inserting.
@@ -64,22 +64,16 @@ pub const SRC_GAP502: i64 = 0b1000000;
 /// the other curation-list sources.
 pub const SRC_DATADASH: i64 = 0b10000000;
 
-/// Taker wallets seen in recent 15-minute markets (#800). Curated like datadash:
-/// preferred activation tier, never lifts a tombstone.
+/// Maker and taker wallets in the ranking market scope. Preferred activation
+/// tier; lifts proven-loser tombstones and inherited flags, preserving infra tombstones.
 pub const SRC_MARKET_PARTICIPANT: i64 = 0b1_0000_0000;
 
 /// Curated sources admitted immediately or preferred in a controlled batch.
 pub const PREFERRED_SOURCE_BITS: i64 =
     SRC_LEADERBOARD | SRC_GAP502 | SRC_DATADASH | SRC_MARKET_PARTICIPANT;
 
-/// Sources whose re-discovery of a tombstoned wallet *lifts* the tombstone and
-/// re-admits it (issue #385): the Polymarket leaderboard only. The lift decision
-/// is read from each `upsert_wallets_bulk` row's own `source_bits` — `bits &
-/// TOMBSTONE_OVERRIDE_SOURCES != 0` lifts (leaderboard 16), any other bit (datadash
-/// 128, market-participant 256, 502-gap 64, trades 2, wallet-set-json 1) leaves
-/// the tombstone intact (`bits & 16 == 0`). No caller passes this explicitly; the discrimination is
-/// automatic because each source tags rows with exactly its bit. (The retired
-/// Radion source's bit 32 no longer lifts — existing radion-tagged rows are inert.)
+/// Sources that lift any non-infra tombstone. Participants separately lift only
+/// `proven_loser` in the cache upsert; all infra tombstones remain blocked.
 pub const TOMBSTONE_OVERRIDE_SOURCES: i64 = SRC_LEADERBOARD;
 
 /// Apply the activation rule. Sticky 0→1; `is_infra = 0` gates every branch.

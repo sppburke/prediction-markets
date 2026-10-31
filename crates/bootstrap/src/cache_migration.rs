@@ -1392,22 +1392,6 @@ fn distinct_wallets(
     Ok(wallets)
 }
 
-fn weekly_due(wallet: &str, start_exclusive: i64, end: i64) -> Result<bool, BootstrapError> {
-    validate_wallet_hex(wallet)?;
-    let phase = i64::from_str_radix(&wallet[wallet.len() - 12..], 16)
-        .map_err(|error| BootstrapError::Invalid {
-            message: format!("invalid weekly wallet phase: {error}"),
-        })?
-        .rem_euclid(REPOLL_PERIOD_SECS);
-    let offset = (end.rem_euclid(REPOLL_PERIOD_SECS) + phase).rem_euclid(REPOLL_PERIOD_SECS);
-    let latest = end
-        .checked_sub(offset)
-        .ok_or_else(|| BootstrapError::Invalid {
-            message: "weekly activity instant underflow".to_owned(),
-        })?;
-    Ok(latest > start_exclusive)
-}
-
 fn begin_or_resume_fresh_collection(
     connection: &mut Connection,
     generation: u64,
@@ -1559,14 +1543,9 @@ fn begin_or_resume_fresh_collection(
 
     let mut prior_wallets = BTreeSet::new();
     let mut full = BTreeSet::new();
-    let mut quiet = BTreeSet::new();
-    let mut due = BTreeSet::new();
     let mut prior_exclusions = BTreeSet::new();
     let mut transition = Vec::new();
     let mut verified_chains = BTreeSet::new();
-    let history_proof = collection_proof
-        .as_ref()
-        .and_then(|proof| proof.history.as_deref());
     if let Some(manifest) = &prior {
         let identity = activity_identity(&transaction)?;
         let prior_generation = to_i64(manifest.generation, "activity generation")?;
@@ -1580,25 +1559,8 @@ fn begin_or_resume_fresh_collection(
                 generation_rows,
                 collection_proof.as_ref(),
                 |validation, receipt| {
-                    let newest = if format_three {
+                    if format_three {
                         validation.record_fetched(receipt)?;
-                        let certificate = incremental::HistoryCertificate::load(
-                            &transaction,
-                            &receipt.wallet_hex,
-                        )?;
-                        if let Some(certificate) = certificate {
-                            let new_rows = history_proof
-                                .as_ref()
-                                .ok_or(BootstrapError::Internal)?
-                                .has_new_rows(&receipt.wallet_hex, &certificate);
-                            if new_rows {
-                                Some(identity.fixed_end_unix)
-                            } else {
-                                certificate.newest_source_unix
-                            }
-                        } else {
-                            Some(identity.fixed_end_unix)
-                        }
                     } else {
                         let mut newest = None;
                         let mut newest_trade = None;
@@ -1639,12 +1601,7 @@ fn begin_or_resume_fresh_collection(
                         {
                             transition.push(certificate);
                         }
-                        newest
-                    };
-                    let deferred = receipt.acquisition.as_ref().is_some_and(|acquisition| {
-                        acquisition.exclusion_reason
-                            == Some(ActivityExclusionReason::DormantDeferred)
-                    });
+                    }
                     if receipt.excluded() {
                         prior_exclusions.insert(receipt.wallet_hex.clone());
                     }
@@ -1652,24 +1609,8 @@ fn begin_or_resume_fresh_collection(
                         if mode == ActivityReadMode::Full {
                             full.insert(receipt.wallet_hex.clone());
                         }
-                    } else if receipt.excluded() && !deferred {
+                    } else if receipt.excluded() {
                         full.insert(receipt.wallet_hex.clone());
-                    } else if let Some(record) = &recorded
-                        && (deferred
-                            || newest
-                                .is_none_or(|time| time < record.fixed_end_unix - QUIET_AFTER_SECS))
-                    {
-                        quiet.insert(receipt.wallet_hex.clone());
-                        if weekly_due(
-                            &receipt.wallet_hex,
-                            record.start_exclusive.unwrap_or(0),
-                            record.fixed_end_unix,
-                        )? {
-                            due.insert(receipt.wallet_hex.clone());
-                            if deferred {
-                                full.insert(receipt.wallet_hex.clone());
-                            }
-                        }
                     }
                     Ok(())
                 },
@@ -1719,13 +1660,6 @@ fn begin_or_resume_fresh_collection(
     } else {
         full.extend(wallets.difference(&prior_wallets).cloned());
     }
-    quiet.retain(|wallet| wallets.contains(wallet));
-    due.retain(|wallet| quiet.contains(wallet));
-    let deferred = quiet
-        .difference(&due)
-        .filter(|wallet| !full.contains(*wallet))
-        .cloned()
-        .collect();
     // All predecessor and membership work is complete before this clock is read.
     let fixed_end_unix = settled_end()?;
     let base = recorded.as_ref().zip(prior.as_ref());
@@ -1750,16 +1684,10 @@ fn begin_or_resume_fresh_collection(
         wallets.into_iter().collect(),
         base,
         full.into_iter().collect(),
-        deferred,
+        Vec::new(),
         repairs,
         digests::certificate_digest(&transaction)?,
     )?;
-    tracing::info!(
-        generation,
-        deferred = record.deferred_wallets.as_ref().map_or(0, Vec::len),
-        due = due.len(),
-        "activity quiet-wallet admission"
-    );
     if bulk_root {
         require_bulk_root_state(&transaction, &record)?;
     }
@@ -7433,21 +7361,6 @@ mod quiet_identity_tests {
         let mut invalid = serde_json::to_value(&v3).unwrap();
         invalid.as_object_mut().unwrap().remove("quiet_after_secs");
         assert!(decode_fresh_identity(&invalid.to_string()).is_err());
-    }
-
-    // PASS: endpoint instants belong to exactly one tiled interval and long
-    // intervals coalesce; FAIL: an instant is skipped or counted twice.
-    #[test]
-    fn weekly_due_tiles_endpoints_and_coalesces_long_intervals() {
-        let wallet = format!("0x{}000000000001", "11".repeat(14));
-        let instant = REPOLL_PERIOD_SECS - 1;
-        assert!(!weekly_due(&wallet, instant - 2, instant - 1).unwrap());
-        assert!(weekly_due(&wallet, instant - 1, instant).unwrap());
-        assert!(!weekly_due(&wallet, instant, instant + 1).unwrap());
-        assert!(weekly_due(&wallet, instant, instant + 3 * REPOLL_PERIOD_SECS).unwrap());
-        assert!(weekly_due(&wallet, 0, 1_800_000_000).unwrap());
-        assert!(!weekly_due(&wallet, i64::MAX - 1, i64::MAX - 1).unwrap());
-        assert!(weekly_due("invalid", 0, instant).is_err());
     }
 
     // PASS: the streamed source digest matches the file hash and damaged or
