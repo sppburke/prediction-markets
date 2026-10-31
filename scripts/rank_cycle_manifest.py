@@ -743,8 +743,8 @@ def _candidate_obligations(side: sqlite3.Connection, head: dict | None, *, compl
                         reason is not None or (count == 0 and any(page["row_count"] > 0 for page in json.loads(pages))))
             if not excluded:
                 continue
-            text = reason or "excluded activity receipt without a reason"
             kind = acquisition.get("exclusion_reason") if acquisition is not None else None
+            text = reason or kind or "excluded activity receipt without a reason"
             if (UNREPRESENTABLE_PRICE in text or UNREPRESENTABLE_MAPPING in text
                     or (ACTIVITY_RESPONSE_JSON in text and UNREPRESENTABLE_DECIMAL in text)):
                 print(f"   [unrepresentable-row] {wallet}: {text}", file=sys.stderr)
