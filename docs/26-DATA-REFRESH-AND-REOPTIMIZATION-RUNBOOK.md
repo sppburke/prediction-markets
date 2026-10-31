@@ -573,7 +573,7 @@ bash scripts/rank_and_push.sh
 ```
 
 In order it runs: **Step 0** data refresh — `winner-discovery
---defer-activation` (leaderboard + datadash ingest) → one transactionally
+--defer-activation` (leaderboard, datadash and market participants) → one transactionally
 audited `activate-next` batch (`bootstrap_pipeline_activation_batch_wallets`;
 `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` admits none; keep the value unchanged
 while a cycle is in flight, because a resumed `activate-next` stops on a changed
@@ -587,10 +587,12 @@ trade-recency, current-eligibility and schema-one completeness filters without d
 schedule `end_date`s, then audits and repairs every traded, scheduled past-end
 market still missing a terminal row. The subcommand runs the full
 `fetch_resolutions_and_schedules`, so no separate `schedules` stage is needed
-(#383/#519). Every ranking run, resumes included, then resolves the window end once (the UTC
-date, unless `--win-end` is given; it also defaults the decay anchor) and runs
-`pe-bootstrap market-scope`: Gamma's 15-minute series and their events ending at or after the
-window start minus one day, about 1,350 requests at ≤ 2/s (14 min on the dev box), written to
+(#383/#519). Before discovery or collection the wrapper resolves the window end and default
+decay anchor: production cycles use their directory's UTC creation day across retries and pauses;
+parameterized runs use today's date, and explicit overrides win
+([`ranker_window_days`](_GLOSSARY.md#live-wallet-source-supabase-ranking-handoff-issue-339), #821).
+After refresh each ranking run, resumes included, runs `pe-bootstrap market-scope`: Gamma's
+15-minute series and their events ending at or after the window start minus one day, about 1,350 requests at ≤ 2/s (14 min on the dev box), written to
 `market_scope.json` in the run directory ([`ranker_market_scope`](_GLOSSARY.md#ranker-market-scope),
 #784). **Stage 1** ranks the full trade universe (`--universe-from-trades` — have-data ⇒
 in-universe), scoring only first entries in the scope's markets. Schema two exports every
@@ -930,12 +932,14 @@ pe-bootstrap cache-migrate-v2 --db "$SIDE" --manifest "$CACHE_BUILD_MANIFEST"   
 pe-bootstrap clear-infra-exclusion --db "$SIDE" --wallet "$WALLET" --purged-at "$PURGED_AT" --confirm
 # Skipped on a retried cycle whose candidate already records $BATCH in wallet_activation_batches
 # (rank_cycle_manifest.py activation-batch; an unreadable probe exits 2) (#788):
-pe-bootstrap winner-discovery --db "$SIDE" --defer-activation
+pe-bootstrap winner-discovery --db "$SIDE" --defer-activation \
+  --recurrences "$RECURRENCES" --series "$SERIES_PIN" --end-date-min "$FLOOR"
 pe-bootstrap activate-next --db "$SIDE" --batch-id "$BATCH" --audit-csv "$AUDIT"
 pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N"
 pe-bootstrap cache-populate-payout-v2 --db "$SIDE"         # skip only when candidate-targets --after-collection returns 1 as field three
 pe-bootstrap cache-finalize-v2 --db "$SIDE"                # certify, checkpoint and sync without a stage record
-pe-bootstrap market-scope --out "$RUN_DIR/market_scope.json" --end-date-min "$FLOOR"   # every ranking run (#784)
+pe-bootstrap market-scope --out "$RUN_DIR/market_scope.json" --end-date-min "$FLOOR" \
+  --recurrences "$RECURRENCES" --series "$SERIES_PIN"   # every ranking run (#784)
 ```
 
 `--fresh-generation N` records the versioned acquisition identity specified in
@@ -945,8 +949,8 @@ sampling/freezing the settled end. New roots read full history; polled successor
 `(previous_end,new_end]` for wallets with usable predecessor history; identity-4 acquisition
 failures resume from their receipt's continuation frontier instead. A partial resumes incrementally;
 a no-progress read keeps its mode and start. New wallets, other previous exclusions and explicit
-repairs read full history. Generation numbers may have gaps; the frozen
-identity binds the predecessor. Acquisition 3 keeps otherwise valid rows missing a condition id or
+repairs read full history. Standalone generation numbers may have gaps; the frozen identity
+binds the predecessor. Wrapper adoption requires the consecutive archived chain described below. Acquisition 3 keeps otherwise valid rows missing a condition id or
 token for scoped classification/ignored-record accounting; acquisition 2 and public service readers
 retain strict acceptance.
 
@@ -959,14 +963,23 @@ in full. Retained rows without usable proof are fatal. Interruption before commi
 after commit, resume returns the frozen identity. Later admissions check certificates/receipts
 without history visits. No separate transition command exists.
 
-Identity-4 successors defer quiet wallets using the unchanged
-[quiet/due/deferred schedule](_GLOSSARY.md#complete-activity-generations-and-incremental-acquisition-648).
-A deferred predecessor stays quiet; committed rows since certification make a wallet active;
-otherwise the quiet decision uses certified newest activity, not an activity-index probe.
-Due complete wallets read incrementally; due `dormant_deferred` wallets read full history. Roots,
-new wallets, continuing acquisitions, other exclusions and repairs never defer. Top-ups use the same rule, resume keeps
-the frozen list, and admission/completion report deferrals separately from failures. A pause
-lengthens the predecessor interval; deferred wallets whose weekly instant fell inside it read in full.
+As of 2026-10-31 (#821), new identity-4 admissions defer no wallet: complete predecessors
+read incrementally every generation, and a historical `dormant_deferred` predecessor reads in
+full. Roots, new wallets, other exclusions and explicit repairs still read full history;
+proved partials continue from their receipt frontier. Identity 4 and its recorded quiet/repoll
+fields remain unchanged for validation and frozen resume, including authentic historical deferred
+receipts. No weekly full-read reconciliation remains. A venue revision behind an incremental
+frontier requires explicit `--full-read-wallets` repair on a new generation; neither incremental
+coverage nor a full re-read proves venue completeness (`15-SOURCES.md`).
+
+The wrapper resolves the window, default decay anchor and market floor before discovery and
+collection from the production cycle's UTC creation day; overrides and parameterized defaults
+follow `ranker_window_days` in the glossary. Discovery and candidate checks use those bounds;
+ranking lists its markets after refresh. A cycle crossing midnight keeps its creation day's
+window. Reports state the actual activity, discovery, `as_of` and publication clocks: a long
+cycle has no promised publication delay, and research retains its own recorded-`as_of` checks.
+In the commands above omit `--series` only for an unpinned scope. Participant discovery uses the
+ranking recurrences, pin and floor, both trade roles, and persisted interval coverage (`docs/27`).
 
 Admission preserves activity rows, receipts, manifests and cumulative drops, clears the derived
 projection/binding and invalidates finalization. Incremental collection strictly inserts only fetched
@@ -1105,9 +1118,13 @@ UNIQUE constraints or index-to-table agreement; no routine full `integrity_check
 Format-3 activation checks candidate hash equality with the export-bound final-stage record,
 `quick_check`, the state's export summary and payout coverage, then outgoing H0. It carries
 re-finalize's record checks to the installed bytes without a history re-read. Logical history damage
-after a wallet's check is caught at its next available-cycle check or quiet weekly due read, a week
-plus at most one cycle. These are the owner's accepted integrity gaps (#739 Decision 6), not proof
-that unchecked history stayed intact. Rankings and publication inputs use only this cycle's checked rows.
+after a wallet's check is caught at its next available-cycle check. As of 2026-10-31 (#821),
+new admissions no longer postpone quiet wallets to a weekly due read; frozen historical deferrals
+remain unavailable until a successor reads them in full. The record-only activation check and the
+time until a wallet's next available check remain integrity gaps, not proof that unchecked history
+stayed intact. Rankings and publication inputs use only this cycle's checked rows. Incremental
+checks verify retained history; they do not discover older venue revisions, which require explicit
+full-read repair. This release adds no automatic reconciliation.
 
 With `RUST_LOG=info` (or `pe_bootstrap::cache_migration=info`) in the loop environment,
 each completed check emits one JSON event to stderr, inherited by the loop journal
@@ -1163,13 +1180,43 @@ completed selected format-3 head skips the collection invocation. Every format-2
 ordinary successor path (`initial + 1`) before finalization, even when fresh; this runs the transition.
 Incomplete and unsealed bulk roots still collect under their frozen acquisition contract;
 standalone collection authenticates receipts, with content checks retained for format 2. The wrapper always calls
-`--after-collection`, including after a skip, so freshness equality and the single-top-up allowance
-are unchanged. Format-3 re-finalize rejects record damage before preparation; activation binds those
-checks to installed bytes without another history read. Format 2 retains its content checks.
-If the completed initial head's age plus `candidate_top_up_reserve_hours` exceeds the
-publisher's unchanged `max_cache_staleness_hours`, the wrapper admits one linked top-up. Its persisted
-base link consumes that allowance across restarts; a stale top-up stops before ranking and never
-starts another. Actual trade/payout source times still govern preparation after downstream work.
+`--after-collection`, including after a skip. The selected head's archived predecessor identities
+must link back to this cycle's initial head and immutable staging baseline; Rust authenticates
+receipts and links on collection. There is no fixed completion-successor count. Before collection
+where inputs exist, and always after collection before payout or request creation,
+`candidate-targets` applies these ordered obligations (#821):
+
+1. Hold on every participant-tagged wallet outside `active_tradeable_wallets` or carrying a
+   tombstone, naming each wallet's inactive/flagged/tombstoned reason. The four exchange contracts
+   stay blocked. Participants skipped for kept `infra` tombstones receive no new participant row
+   and are reported separately, not silently admitted.
+2. Hold unless persisted participant coverage matches the cycle's recurrences and pin, has a
+   market floor at or before the cycle's, starts at or before its window start and reaches the
+   exclusive end `win_end + FILL_WINDOW_SECS`. A recorded activation batch never waives this:
+   print wallets can first appear after the entry window ends.
+3. Classify each head exclusion once from its recorded receipt. First, unrepresentable price,
+   condition/outcome mapping and decimal tokens rejected by the exact-decimal parser are the
+   owner's parser exception: name the wallet and reason every cycle, but neither hold nor take a
+   successor for it, even when it has proved windows. Other parse failures (including a response
+   that is not a JSON array) hold. Then proved partials and historical `DormantDeferred` receipts
+   require a successor; no-progress failures, aggregation failures and collisions hold. Name every
+   held wallet and reason.
+4. Take linked successors while a proved partial or historical deferral remains, an active
+   tradeable wallet is absent from the head's frozen wallet list, or the head's inclusive fixed
+   end precedes `win_end − 1 + FILL_WINDOW_SECS`. This covers participants admitted after the head
+   froze and the final print second. Each successor resumes or completes under its recorded proof.
+5. After those obligations clear, apply the unchanged maximum-age policy. Only the initial head
+   can take a reserve-only successor under
+   [`candidate_top_up_reserve_hours`](_GLOSSARY.md#live-wallet-source-supabase-ranking-handoff-issue-339).
+   A later head within the maximum age proceeds even inside the reserve; one above it holds.
+   Actual trade/payout source times still govern preparation after downstream work.
+
+Holds exit non-75 before payout and request creation; rerunning a held head does not
+clear it. Repair participant/coverage holds on the retained side cache as below. After repairing
+another cause, explicitly admit `cache-populate-activity-v2 --db <side> --fresh-generation <head+1>`;
+the wrapper adopts that authenticated chain. Preserve all frozen configuration and evidence.
+Format-3 re-finalize rejects record damage before preparation; activation binds those checks to
+installed bytes without another history read. Format 2 retains its content checks.
 The payout target is the staging baseline's active walk if present, otherwise its newest completed walk plus one;
 a walk on the candidate is reused only when the newest completed walk's `completed_at_unix` is at or
 after the selected activity head's fixed end. Otherwise the wrapper invokes `cache-populate-payout-v2`,
@@ -1365,8 +1412,10 @@ to the owner. Record each completed step and resume it, rather than starting ano
    Set `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS` to the owner's ordinary-cycle choice. **Explicit owner
    restart consent** is required before setting flag `run` and starting the loop unit. Ordinary
    cycles keep the [interim freshness override](_GLOSSARY.md#catch-up-freshness) through the
-   quiet-wallet re-read wave: deferred wallets due after the catch-up read in full. Remove that
-   override by a `.env` edit between cycles once its glossary removal condition holds. Observe three ordinary publications under the existing batch-application,
+   historical quiet-wallet re-read wave. **2026-10-31 update (#821):** new admissions defer no
+   wallets; complete predecessors read incrementally each generation, historical deferred
+   predecessors read in full, and older venue revisions require explicit full-read repair. Remove
+   the override by a `.env` edit between cycles once its glossary removal condition holds. Observe three ordinary publications under the existing batch-application,
    membership-policy and service-health checks.
 
 For each cycle record stage durations, rows read/written and commitments, drops and ignored records,
@@ -1481,11 +1530,11 @@ with its identity-2 or identity-4 generation-one root, no predecessor, and that 
 wallet rows/receipts are allowed. Rust still owns admission and fails closed. Ordinary interrupted
 roots and unfinished successors use ordinary collection. Completed selected format-3 heads
 skip wrapper collection re-entry; the always-run `--after-collection` check still selects an allowed
-stale-head top-up or refuses a stale completed top-up. A completed format-2 head first selects its
-ordinary successor (`initial + 1`) regardless of freshness. After a transient exit 75 the existing
+completion successor or an initial reserve-only top-up, or holds a stale later head. A completed
+format-2 head first selects its ordinary successor (`initial + 1`) regardless of freshness. After a transient exit 75 the existing
 supervisor re-enters the same cycle, skips staging/migration/discovery/activation for a fenced
-candidate, and resumes bulk collection from its receipts. After sealing, the one allowed top-up
-never receives `--bulk-root`. Payout, finalization and preparation keep their existing gates.
+candidate, and resumes bulk collection from its receipts. After sealing, linked successors
+never receive `--bulk-root`. Payout, finalization and preparation keep their existing gates.
 Exit 2 with `RANK_AND_PUSH_PREPARED_ONLY=…` stops the loop before activation; permanent failures also
 stop it for investigation. Keep `prepare` until operator acceptance of the exact pending request.
 
@@ -1554,7 +1603,8 @@ For an interrupted handoff, install the combined release through the
 [release procedure](#forge-release-deployment-and-rollback), preserving the authentic identities,
 fixed/prior/candidate paths, payout target, cycle configuration and any prepared request. On resume,
 a completed selected head skips re-entry, an unfinished head resumes, and a stale initial head may
-receive exactly one linked top-up. A stale completed top-up stops before ranking. Preparation
+receive a reserve-only linked top-up; completion and coverage obligations follow the ordered
+rules above, without a successor-count cap. A stale later head holds before payout. Preparation
 still requires `RANK_AND_PUSH_PREPARED_ONLY=...`, exit 2, retained pending state and unchanged fixed
 bytes while cutover is `prepare`; unrelated exit-2 failures are not acceptance. Preserve any exact
 prepared request through acceptance and resume rather than recreating it.
@@ -1565,8 +1615,9 @@ Classifier 6 / format 3 changes no loop unit, flag or lock lifecycle. Its
 [catch-up procedure](#classifier-6-catch-up-and-coordinated-release-739) owns the stopped installation,
 detached one-shot acceptance, exact pending-request handoff and explicit owner restart consent.
 The [interim `.env` freshness bound](_GLOSSARY.md#catch-up-freshness) covers catch-up and the
-quiet-wallet re-read wave; remove it between cycles once its removal condition holds. Normal cycles use
-the canonical freshness checks, the owner's frozen activation batch and the one
+historical quiet-wallet re-read wave. As of 2026-10-31 (#821), no new quiet deferrals or weekly
+full reads are scheduled; remove the override between cycles once its glossary condition holds.
+Normal cycles use the canonical freshness checks, the owner's frozen activation batch and the one
 [`MIN_TTR_SECS` scoring value](_GLOSSARY.md#ranking-horizon-floor), with batch limits taken from the
 validated oracle manifest. Scope/coverage publication is atomic; the supervisor adds no special stage.
 
@@ -1810,6 +1861,14 @@ re-verified pin. Admitting 5-minute
 participants is a capacity decision: tens of thousands of wallets trade those markets each month,
 many with long histories. Measure their certified sizes in the old cache first.
 
+**2026-10-31 participant gate (#821).** Before installing or superseding the retained first
+request, accept and archive the read-only full-window sweep and its hashes (`docs/27`), then
+size the complete participant cohort and unfinished histories against available capacity. Keep
+the May `infra` tombstones under the owner's 11:49 CT amendment (`docs/37`); name their skipped
+participants and all unrepresentable-row exclusions in every cycle's report until their separate
+capacity/parser fixes ship. If the preview no longer fits, hold for the owner. This release
+changes no pe-service state or already-published batch.
+
 **Checkout** (no downtime; the old loop keeps running), with this release:
 
 ```bash
@@ -1859,8 +1918,9 @@ that initialization does not write empty, and no wallet's collection fields set,
 that stores no trades still stamps them); anything else is refused and left as it is. Carried drops are
 history-guarded and committed inside the certificate digest after the certificates, so every stable
 proof authenticates them; a wallet's first certificate takes its drops over and removes the carried
-row. The first wrapper cycle then stages, migrates and collects a bulk root as in "Fresh bulk root"
-above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the seeds.
+row. The original seeded root used `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0`. **2026-10-31
+update (#821):** first publication also requires the full-window participant sweep and completion
+below; a recorded batch of zero stays unchanged and cannot waive participant/coverage holds.
 
 **Switch** (a publication boundary of the old loop; post on #588 first):
 
@@ -1895,9 +1955,11 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
 5. `cache-init` as above (rerun it right before the first cycle: it must report
    `already_initialized`).
 6. First cycle, supervisor off: set `PE_RANK_SCHEMA_TWO_CUTOVER=prepare` and
-   `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` in the new `.env`, run the wrapper, and require
-   `RANK_AND_PUSH_PREPARED_ONLY` (exit 2) with nothing published. Compare with the old loop's last
-   batch; run the research tree's frozen `tools-v26f/merge_scopes.py` with gen 26's registered list
+   `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` in the new `.env`. The wrapper stages the side
+   cache and holds before collection until participants and coverage are ready. Complete the
+   accepted import, any missing discovery tail and named activation cohorts there as below. Run or
+   resume the wrapper, and require `RANK_AND_PUSH_PREPARED_ONLY` (exit 2) with nothing published.
+   Compare with the old loop's last batch; run the research tree's frozen `tools-v26f/merge_scopes.py` with gen 26's registered list
    and its recorded sha256 and a one-cycle inventory naming the prepared `market_scope.json` (it must
    exit 0); run `scripts/rank_cycle_manifest.py research-coverage --root
    /mnt/storage/prediction-markets/data/eval-results --since <gen 26's cycle> --candidate <the prepared
@@ -1907,36 +1969,86 @@ above, with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` so the root holds only the
    (whole universes churn between cycles; the frozen tools compare chosen wallets, with their
    registered fallback, and decide research coverage); record pe-service's mode. Then set `PE_RANK_SCHEMA_TWO_CUTOVER=1` in the new `.env` and
    run `--resume-pending` (a prepared request resumes only under `1`).
-7. After pe-service applies the batch and the research fetch accepts the linked cycle, enable
-   supervision only once a summary qualified (step 4): set `PE_RANK_MIN_FREE_GB` by the formula in
-   `_GLOSSARY.md` `rank_min_free_gb` from the latest qualified cycle's summary (the first cycle's when it
-   qualified; conservative: that drop includes the root's whole collection), write `run` to the new flag
-   and `systemctl --user enable --now pe-rank-loop-15m5m` with the activation batch at 0. Until a
-   summary qualifies, keep the estimated margin and run each cycle as an operator-run one-shot as in
-   step 6. Admission stays at 0 until a nonzero batch has its own envelope. To qualify one, first stop
-   the supervisor at a publication boundary as in step 1, for this checkout and unit: the flag stays
-   `run` through the cycle's retries before publication, and `stop` is written only after it has
-   published, within the supervisor's 60-s wait (a late stop that retains a cycle is resolved as in
-   step 1 before any admission or discovery setting changes); then confirm with `PE_FORGE_CHECKOUT` set that
-   `forge_pause.sh status` shows the unit inactive with no descendants or held locks, and that no
-   cycle or pending pointer exists. Then list the wallets the next batch would admit (`activate-next`'s selection: inactive, not infrastructure, not
-   tombstoned, in its preference order; read-only), size their complete histories from the old
-   cache's certificates (source rows × its measured bytes per source row; a wallet it lacks at the
-   planning sample's largest complete history, 27,080 rows read with `start=1`, at the same bytes per
-   row, recorded separately), and only if that
-   plus the measured transient peak fits above installed + margin, run one cycle with that batch as
-   an operator-run one-shot under `prepare` with participant discovery off for that cycle
-   (`PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS=0`; the leaderboard and datadash are already off), so nothing
-   enters the pile between the preview and `activate-next`; check the committed batch's audit against
-   the preview (set `1` and `--resume-pending` after its checks), publish it, and only if its summary,
-   recorded right after the prepare run, qualified as in step 4 (the batch's growth is inside its
-   measured drop), set the margin by the glossary's formula from it, then restore discovery and
-   supervision with that batch (write `run` atomically, `systemctl --user enable --now` the unit and
-   verify it active and enabled); if it did not qualify, run the next cycle with that batch the same
-   way; if the batch does not fit, keep 0, restore supervision the same way and ask the owner. Repeat for any change of admission scope or count. The gate runs
-   wherever a candidate copy is about to be made, new or retained cycle; a resume whose candidate
-   exists is not gated, so before restarting such a cycle after an operator stop, compare free bytes
-   with its remaining envelope from its samples.
+7. After pe-service applies the batch and research accepts the linked cycle, qualify nonzero
+   admission from a nonempty named completion cohort whose **whole collection growth** is inside
+   qualified prepare samples (step 4), with no collection outside sampled wrapper attempts. The
+   original cycle batch and its stored requested count, including 0, stay unchanged. Reuse the
+   first cycle's summary only if it meets that condition. Otherwise keep admission at 0 and run
+   the next cycle as an operator-run one-shot under `prepare`: discovery stays enabled, its
+   unadmitted participants hold before collection, and the retained side cache's previewed cohort
+   is activated as below. No discovery-off cycle supplies qualification.
+
+   Preview `activate-next`'s complete selection read-only (inactive, non-infra, non-tombstoned, in
+   its preference order). Size complete histories from the old cache's certificates at its
+   measured bytes per source row; report estimates for wallets it lacks separately. The historical
+   planning sample's largest complete history was 27,080 rows read with `start=1`; that observation
+   is not a history bound or a substitute for sizing the current cohort. If the remaining envelope
+   fits, admit a positive named completion batch and compare its committed audit with the preview.
+   Check and publish that exact prepared request (set `1`, then `--resume-pending`). Only a qualified
+   summary containing that cohort's entire collection growth calibrates the admission count and
+   margin by [`rank_min_free_gb`](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap). Without a suitable
+   measured cohort keep admission at 0; if it does not fit, hold for the owner.
+
+   Before enabling supervision, regenerate and verify [#815](https://github.com/sppburke/prediction-markets/issues/815)'s
+   task-6 artifact for the qualifying
+   published cycle and completion cohort, the tested release, recorded staleness decision,
+   measured margin and positive admission count. Preserve the original batch-0 record and the
+   existing enable-intent recovery. Stop at a publication boundary as in step 1 before changing
+   settings; verify `forge_pause.sh status` with this checkout, no descendants/locks or retained
+   pointers, and no pause record left after restore. Write `run` atomically, enable/start
+   `pe-rank-loop-15m5m`, and verify it active and enabled. Requalify a changed count or scope.
+   Before **every** start, retry or manual collection recovery compare free space with the remaining
+   envelope; a retained candidate that already exists is not protected by the copy-time gate.
+
+**One-time retained-request supersession (#821, 2026-10-31).** This is an exception only for the
+recorded first incomplete root's unconsumed prepared request (recorded SHA-256 `35a01e4d…f8c6`,
+publish key `bfed342b…8ba8`), not a general request-rebuild path. Accept the sweep and sizing first.
+Install the tested checkout and binary through the release procedure under one pause record,
+using `PE_FORGE_CHECKOUT=/mnt/storage/prediction-markets-15m5m`, with `paused_complete`, no
+descendants/held locks, no accepted record and no activation rename gap. Preserve the original
+rollback pair; parser 2, classifier 6 and identity 4 remain unchanged.
+
+While quiesced, query the recorded request's **exact full** `publish_key` in `ranking_batches`
+using the cache-recovery owner's read-only lookup (`SupabasePublicationProbe` in
+`crates/bootstrap/src/cache_migration.rs`):
+`/rest/v1/ranking_batches?select=batch_id&publish_key=eq.<publish_key>&limit=1`.
+Require a successful, valid zero-row answer and record it beside the request hash. A published
+key, unavailable authority or invalid answer holds supersession. The 10/31 11:33 CT observation
+was zero rows; an interrupted supersession must repeat the lookup using the preserved request.
+
+Record one archive directory and the exact request/pending paths and hashes. Move **the recorded
+request first**, record that move complete, then move **its pending pointer**, recording that move
+complete. Moving the pointer first would let the wrapper rebuild it from the durable request.
+Finish any interrupted pair from that record before invoking either recovery entry; refuse any
+other request or pointer, preserve the archived request's bytes and publish key, and never restore
+it for publication. Keep the cycle pointer and retained side cache. `restore` consumes only this
+deployment's pause record and preserves its recorded stopped intent. Before supersession the
+recorded prior checkout/binary can be reinstalled; afterward the old release cannot resume a
+multi-successor chain, so stay paused on this compatible release and fix forward.
+
+**Completion on the retained side cache.** Resolve `<side>` from `cache_stage.json`; every
+command below uses `--db <side>`. Reload any recorded completion batch under its own stored
+`requested_count`, regenerate its audit, and check members against `activated_count`; cohorts
+are immutable. Import the accepted union with the cycle's recurrences, series pin and floor,
+and the sweep's accepted `--covered-from`/`--covered-through` (`docs/27`). Record kept-`infra`
+skips. If coverage is still short of the window or closed print tail, restore frozen discovery
+settings and run:
+
+```bash
+pe-bootstrap winner-discovery --db <side> --defer-activation \
+  --recurrences <cycle-recurrences> --series <cycle-pin> --end-date-min <cycle-floor>
+```
+
+Record its interval, floor, pages and status; retry the same command on temporary failure.
+A participant hold needs activation, not another discovery read. Preview the full cohort and
+recheck capacity, then use a command-scoped `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=<count>` with
+`activate-next --db <side> --batch-id <cycle>-complete --audit-csv <audit>`. Use `-complete-2`,
+then further names for later cohorts; compare each committed audit with its preview. Keep `.env`
+and the original batch at their recorded count, including 0. Resume the zero-argument wrapper
+under `prepare`; it adopts linked successors until complete and covered, then reaches payout,
+finalize, ranking and prepare. Capture capacity summaries immediately after each prepare attempt;
+collection outside sampled wrapper attempts prevents qualification of its envelope. Check each
+generation's duration and discovery's duration over the ranking scope before supervision.
 
 **Recovery** follows the sections above: a failed `cache-init` reruns; a slow or failed root
 resumes; a full drive during collection or finalization rolls the open transaction back and fails
@@ -1944,8 +2056,10 @@ the stage with the previous generation still installed (free space, then resume)
 or the publication tail it can leave an activation rename gap or the new generation installed:
 preserve every recorded cache role, request and pointer, reclaim only verified disposable space, and
 take the rename-gap resume or the exact-request recovery (with its consumption check where
-required). A top-up exhausted before preparation takes the guarded abandonment in "Recovery and
-damage boundaries", then a fresh cycle (never a second top-up); a prepared request resumes exactly.
+required). A held head remains held on reruns: repair its cause on the retained side cache,
+then use an explicit `--fresh-generation <head+1>` for a collection failure and let the wrapper
+adopt the authenticated chain. Participant admission and coverage use the completion procedure
+above. A prepared request resumes exactly, except for the one recorded supersession above.
 Begin a guarded abandonment only once the loop's unit is inactive, so the pause it requires records
 it inactive; set `PE_FORGE_CHECKOUT` to the 15/5-minute checkout for that pause, every `status` and
 the restore. After the cycle is set aside, `forge_pause.sh restore` puts back the recorded flag and
@@ -2014,8 +2128,9 @@ history-preserving research re-push.
 ## Adding new wallets
 
 New-wallet discovery is **Step 0** of `rank_and_push.sh` (`pe-bootstrap
-winner-discovery`: Polymarket leaderboard + datadash). The wrapper defers the
-legacy immediate activation call sites and admits only its one controlled batch;
-those wallets are backfilled and ranked in the same run — there is no separate
+winner-discovery`: Polymarket leaderboard, datadash and market participants). The wrapper
+defers legacy immediate activation and records its controlled batch; participant holds can require
+additional named completion batches on the retained side cache. Those wallets are collected and
+ranked in the same cycle — there is no separate
 manual-review gate. See `docs/27-WINNER-DISCOVERY-RUNBOOK.md` for the discovery
 sources and their configuration.

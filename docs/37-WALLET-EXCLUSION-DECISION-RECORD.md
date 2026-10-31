@@ -26,10 +26,10 @@ referred to below as `evidence/`; raw captures are retained privately (§8).
 | Cohort verdicts | 2 × **retain with evidence**, 18 × **recommend reclassification for requalification**, 4 × **unresolved** (never ingested). All are qualified review recommendations (§2); none certifies infrastructure identity, and none admits a wallet anywhere. |
 | Follower eligibility | 24 × **not established**. Missing inputs: current ingested history (none of the 24 has a trade row in the live cache), the ranker's follower-price references and fee model, and current resolver evidence. Eligibility is decided only by the unchanged ranking, publication, and service-admission gates after a wallet is back in research. |
 | Breadth label (`breadth>=2000`) | **Retired as a producer** (the Dune CSV importer was removed in #335). Legacy labels are **reviewable per wallet**; **no bulk clearing** (§5, §6). |
-| Density probe (newest cold page) | **Retain** as a bounded-workload guard. A probe flag is a workload/copyability exclusion, not an identity verdict, and is reversible. |
+| Density probe (newest cold page) | **Retain** as a bounded-workload guard on the legacy path. A probe flag is a workload/copyability exclusion, not an identity verdict, and is reversible. **2026-10-31 participant amendment:** participant upserts clear inherited live flags; `infra` tombstones stay (§6–7). The fresh private-candidate wrapper runs neither flag producer. |
 | Retroactive sweep (`classify-infra`, oldest 500 trades) | **Retain as-is, operator-only.** Do not extend it to an any-window rule (§5, §6). |
 | Verified system addresses | **Retain permanently** (the four exchange contracts; all four are `infra` tombstones). |
-| Proven-loser rule | **Retain**; requalification stays evidence-dependent (leaderboard rediscovery lifts the tombstone; a rerank decides). No cooldown number is introduced. |
+| Proven-loser rule | **Retain**; a rerank decides requalification. **2026-10-31 participant amendment:** leaderboard rediscovery still lifts non-`infra` tombstones; participant rediscovery also lifts `proven_loser` tombstones and clears inherited live flags, preserving `infra` tombstones and exchange-contract blocking (§6–7). No cooldown number is introduced. |
 | Reversal path | `clear-infra-exclusion` now removes the infra tombstone **and** a live `wallets.is_infra` flag in one transaction. It still does not recreate or activate a wallet. |
 | Rank/export filtering promise | The documented promise was **not implemented** on any path; the canonical docs now describe the acquisition-gating mechanism. The cross-path filter is deferred to #592. Measured on the ranker host: the last two completed cycles' pass-1 and pass-2 ranking outputs contain zero flagged and zero tombstoned wallets, no pending publication request exists, and every flagged wallet checked holds zero trade rows (§5). |
 
@@ -147,7 +147,7 @@ zero-argument `scripts/rank_and_push.sh` cycle; "operator" = explicit command on
 
 | Stage | Owner | Reads / writes | Reach | Disposition |
 |---|---|---|---|---|
-| Discovery upsert | `cache.rs:3295-3345` `upsert_wallets_bulk` | Reads P; skips tombstoned wallets unless a `tombstone_override_sources` bit lifts a non-`infra` tombstone (`DELETE FROM purged_wallets`); inserts `is_infra` as supplied by the source (`false` for leaderboard/datadash); on conflict `MAX(is_infra, …)` (sticky). | wrapper (`rank_and_push.sh:615`) | Matches docs. |
+| Discovery upsert | `cache.rs` `upsert_wallets_bulk` | Reads P; leaderboard lifts non-`infra` tombstones. **2026-10-31 participant amendment:** participants lift only `proven_loser` tombstones, clear inherited live infra flags, and skip `infra` tombstones (logged by wallet and counted) and the four exchange contracts. Other sources retain the prior sticky-flag/no-lift rules. | wrapper; operator `participants-import` | Owner amendment (§6–7); no other exclusion-policy change. |
 | Cold probe | `infra_probe.rs:66-92`, `polymarket.rs:288-308` | Conclusive when the raw first page has ≥500 rows; fires when the parsed span is `< threshold`; writes `is_infra = 1` (no P row), discards the page, no fetch stamp; logs `span_secs` at `info`. | wrapper (`:624` backfill) | Matches docs after correction. The request does not pin `sortDirection`; "newest page" is the intended, not proven, window. |
 | Retroactive sweep | `cache.rs:3963-4013` `classify_infra_retroactive` | Oldest 500 trades per wallet (`ORDER BY timestamp_unix ASC`, `rn <= 500`, `cnt = 500`); writes `is_infra = 1` in bulk; keeps trades. | operator (`classify-infra`) | Retain as-is (§6). |
 | Flag write | `cache.rs:3927-3945` `mark_infra`, `mark_infra_bulk` | `UPDATE wallets SET is_infra = 1`; sticky; leaves `is_active` untouched (hence `is_infra = 1 AND is_active = 1` rows). | via probe/sweep | Reversal added (this record). |
@@ -194,9 +194,9 @@ any excluded-wallet overlap in artifacts older than the two cycles checked.
 |---|---|---|---|---|---|---|---|---|
 | Verified system addresses | None today (the four came from the CSV `known:*` rows; importer removed #335) | Contract identity (exchange/neg-risk adapters) | Permanent | None (`infra` tombstones are never lifted by discovery) | n/a | Operator command; not expected | Tombstone row; this record | **Retain.** |
 | Explicit operator exclusions | None today; the shape is an `infra` tombstone or `is_infra` flag written under the cache lock | Written evidence recorded with the action | Until reviewed | None | n/a | `clear-infra-exclusion` | Tombstone/flag row plus the operator's audit file (precedent: `data/eval-results/manual-*` batches) | **Retain the capability; add a repository command only when a second case arises.** |
-| Historical losers (`proven_loser`) | Rule A of `pe-bootstrap purge` (report-only unless armed; not in the wrapper) | Ranking-CSV row with `eligible = true AND tstat_net <= bootstrap_purge_loser_tstat_max AND mean_net < 0 AND n_eff >= bootstrap_purge_loser_neff_min`, intersected with active non-infra wallets (`purge.rs:116,427`) | Until leaderboard rediscovery; a current rerank then decides | `tombstone_override_sources` (leaderboard) | Activation batch cap | Automatic lift by leaderboard; otherwise a rerank | Tombstone row `INSERT OR REPLACE`; ranking CSV named in the purge report | **Retain.** No cooldown number is introduced; the two counterexamples show recent positive screens on different price evidence, which is not a rerank. |
+| Historical losers (`proven_loser`) | Rule A of `pe-bootstrap purge` (report-only unless armed; not in the wrapper) | Ranking-CSV row with `eligible = true AND tstat_net <= bootstrap_purge_loser_tstat_max AND mean_net < 0 AND n_eff >= bootstrap_purge_loser_neff_min`, intersected with active non-infra wallets (`purge.rs:116,427`) | Until leaderboard or participant rediscovery; a current rerank then decides | Leaderboard; participants for `proven_loser` only (2026-10-31) | Audited activation cohorts and collection successors | Automatic lift by those sources; a rerank decides | Tombstone row `INSERT OR REPLACE`; ranking CSV named in the purge report | **Retain.** No cooldown number is introduced; the two counterexamples show recent positive screens on different price evidence, which is not a rerank. |
 | Breadth label (`breadth>=2000`) | None (retired #335) | A market-count heuristic; not a density or identity criterion | Legacy labels are reviewable per wallet on evidence | None | Per-wallet review only | `clear-infra-exclusion` per wallet after a recorded verdict | This record; the CSV and archive are the provenance | **Retire the producer (already done); revise legacy handling to per-wallet review; no bulk clearing.** |
-| Density probe (cold, newest page) | Wrapper backfill | `infra_probe_span_secs` on a full 500-row page | Until an operator clears it; the next fetch re-probes | None | The page is discarded; the wallet leaves the backfill queue | `clear-infra-exclusion` (clears the flag; an active wallet with no fetch stamp becomes due at once and is probed again; a wallet flagged after ingestion resumes incremental backfill when stale, without a new probe) | Flag only; `span_secs` in the backfill log | **Retain** as a workload guard. A flag is not an identity verdict. |
+| Density probe (cold, newest page) | Legacy backfill (not the fresh private-candidate wrapper) | `infra_probe_span_secs` on a full 500-row page | Until operator clearance or participant rediscovery (2026-10-31) | Participants clear inherited live flags; no `infra` tombstone lift | The page is discarded; the wallet leaves the backfill queue | `clear-infra-exclusion` (clears the flag; an active wallet with no fetch stamp becomes due at once and is probed again; a wallet flagged after ingestion resumes incremental backfill when stale, without a new probe) | Flag only; `span_secs` in the backfill log | **Retain** as a workload guard. A flag is not an identity verdict. |
 | Retroactive sweep (oldest 500) | Operator `classify-infra` | Same threshold on cached trades | Operator-run | None | Full `trades` scan | `clear-infra-exclusion` | Flag only | **Retain as-is.** In the sample, an any-window variant would flag about 3% of active wallets with ≥500 trades, holding about 18% of their trades; their ingestion cost is already incurred and the future refresh work such flags would save was not measured. |
 | Unknown evidence (`0x88ec…`, the 4 non-dense non-CSV tombstones, and the 56 live probe flags with zero trades) | Cold probe (flag-only shape) | None recoverable beyond the log line | Unresolved until a bounded re-ingestion review | None | Per-wallet | `clear-infra-exclusion` after review | Flag/tombstone row only | **Unresolved; retain.** No schema change: the log line plus this review method suffice until an operator needs durable per-flag evidence. |
 
@@ -205,6 +205,23 @@ automatic lift for non-`infra` tombstones (bounded by the activation batch) and 
 method plus the operator command for `infra` exclusions. No automatic reevaluation lifecycle is
 added; a cleared wallet returns to research through ordinary discovery or an audited activation
 batch and is decided by the unchanged ranking, publication, and service-admission gates.
+(Amended for market participants on 2026-10-31, below.)
+
+**Owner participant decisions, 2026-10-31 (#821).** At approximately 08:31 CT the owner
+approved lifting inherited exclusions for traders seen in the pinned series and required the
+first publication to wait for the full-window participant read. At approximately 11:49 CT the
+owner amended the lift: the May breadth `infra` tombstones stay until the separate capacity issue
+admits those accounts. Participants lift `proven_loser` tombstones and clear inherited live infra
+flags; the four exchange contracts stay blocked. This is the sole participant exception to the
+prior no-lift/sticky-flag policy; leaderboard and other-source rules are unchanged. The breadth
+producer remains retired, and no bulk clearing of `infra` tombstones is authorized.
+
+The retained breadth class's modeled full-copy peak exceeded the new loop's available
+capacity; #815's clone-fragmentation finding must inform the separate capacity fix. Every
+cycle's report names skipped `infra` participants until that fix ships. Outside this participant
+exception, use the recorded per-wallet review and operator command. A lifted wallet returns to
+research through an audited activation cohort and the unchanged ranking, publication and
+service-admission gates; rediscovery alone establishes no follower eligibility.
 
 ## 7. Handoff
 
@@ -243,6 +260,21 @@ Operator actions the record supports (each is separately authorized, idempotent,
    bytes its accepted activation installed, so staging keeps its quick-check skip. The wallet returns
    only through step 2. A retained cycle applies no clears; a list change applies at the next fresh
    cycle. Rollback does not restore a cleared tombstone.
+
+**2026-10-31 participant handoff (#821).** Before the new loop's first publication, accept the
+read-only full-window participant sweep for the frozen ranking scope, including trades after
+market end and the print tail, and archive its inputs, complete interval/page evidence, union
+and hashes. `participants-import --db <side>` imports that accepted union with its scope, floor
+and interval through the same participant upsert (`docs/27`); it does not activate wallets.
+Keep the existing cycle's recorded batch and count, including a batch of zero. Preview capacity
+and use separately named completion batches on that retained side cache for all newly admitted
+participants (`docs/26`). This supersedes neither the reviewed-clear list nor any other policy.
+
+Keep every skipped `infra` participant by name in each cycle's report: reconcile the archived
+accepted union's infra-tombstoned members with all later discovery skip logs, since a resumed
+cycle can skip discovery. The 11:49 amendment keeps those tombstones pending the capacity issue;
+`proven_loser` and inherited-flag lifts proceed without bypassing qualification. The two flag
+writers remain on their legacy/operator paths and neither runs in the fresh wrapper.
 
 Deferred to #592 (multi-owner behavior change; measured impact today nil, §5): apply one
 infra/tombstone predicate at Parquet export, both pass-1 universe sources and engines, publication
