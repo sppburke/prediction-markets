@@ -462,40 +462,60 @@ class RankAndPushScenario(unittest.TestCase):
         for series in (None, pin):
             with self.subTest(series=series):
                 self.tearDown(); self.setUp()
-                result = self._run(exit_env={"PE_RANK_MARKET_SERIES": series} if series else {})
+                env = {"PE_RANK_MARKET_RECURRENCES": "5m,15m"}
+                if series:
+                    env["PE_RANK_MARKET_SERIES"] = series
+                result = self._run(exit_env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
-                if series:
-                    self.assertEqual(scope[scope.index("--series") + 1], pin)
-                else:
-                    self.assertNotIn("--series", scope)
-        print("PASS: PE_RANK_MARKET_SERIES pins market-scope's series only when set")
+                discovery = shlex.split(self._log("pe_bootstrap.log").splitlines()[0])
+                for call in (scope, discovery):
+                    if series:
+                        self.assertEqual(call[call.index("--series") + 1], pin)
+                    else:
+                        self.assertNotIn("--series", call)
+                    self.assertEqual(call[call.index("--recurrences") + 1], "5m,15m")
+                    self.assertEqual(call[call.index("--end-date-min") + 1],
+                                     scope[scope.index("--end-date-min") + 1])
+        print("PASS: discovery and ranking share their pin, recurrences and market floor")
 
-    def test_refresh_crossing_utc_midnight_moves_window_end_scope_and_anchor_together(self):
+    def test_refresh_crossing_utc_midnight_keeps_cycle_day_and_parameterized_today(self):
         sys.path.insert(0, str(WRAPPER.parent))
         from ranker_decay import window_bounds
         real_date = shutil.which("date")
-        for explicit in (None, "2026-02-27"):
-            with self.subTest(explicit=explicit):
-                self.tearDown(); self.setUp()
-                # The clock reads 2026-03-01 until the refresh finishes, then 2026-03-02.
-                shim = self.root / "shim"; shim.mkdir()
-                _write_exec(shim / "date", "#!/usr/bin/env bash\nday=2026-03-01\n"
-                            "[[ -f crossed ]] && day=2026-03-02\n"
-                            f'exec {real_date} -d "$day 23:59:00 UTC" "$@"\n')
-                boot = self.root / "target/release/pe-bootstrap"
-                boot.write_text(boot.read_text().replace(
-                    'sub="$1"', 'if [[ "$1" == "resolutions" ]]; then touch crossed; fi\nsub="$1"'))
-                result = self._run(*(("--as-of", explicit) if explicit else ()),
-                                   exit_env={"PATH": f"{shim}:{os.environ['PATH']}"})
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                rank, rerank = self._log("rank.log").split(), self._log("rerank.log").split()
-                self.assertEqual(rank[rank.index("--win-end") + 1], "2026-03-02")
-                for args in (rank, rerank):
-                    self.assertEqual(args[args.index("--as-of") + 1], explicit or "2026-03-02")
-                scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
-                self.assertEqual(scope[scope.index("--end-date-min") + 1],
-                                 str(window_bounds(None, "2026-03-02")[0] - 86_400))
+        for production in (True, False):
+            for win_end, as_of in ((None, None), ("2026-02-28", None), (None, "2026-02-27")):
+                with self.subTest(production=production, win_end=win_end, as_of=as_of):
+                    self.tearDown(); self.setUp()
+                    shim = self.root / "shim"; shim.mkdir()
+                    _write_exec(shim / "date", "#!/usr/bin/env bash\nday=2026-03-01\n"
+                                "[[ -f crossed ]] && day=2026-03-02\n"
+                                f'exec {real_date} -d "$day 23:59:00 UTC" "$@"\n')
+                    boot = self.root / "target/release/pe-bootstrap"
+                    boot.write_text(boot.read_text().replace(
+                        'sub="$1"', 'if [[ "$1" == "resolutions" ]]; then touch crossed; fi\nsub="$1"'))
+                    args = () if production else ("--out-dir", str(self.root / "parameterized"))
+                    with (self.root / ".env").open("a") as handle:
+                        if win_end:
+                            handle.write(f"WIN_END={win_end}\n")
+                        if as_of:
+                            handle.write(f"AS_OF={as_of}\n")
+                    env = {"PATH": f"{shim}:{os.environ['PATH']}"}
+                    for attempt in range(2):
+                        result = self._run(*args, exit_env=dict(env, STUB_EXIT_rank="75" if attempt == 0 else "0"))
+                        self.assertEqual(result.returncode, 75 if attempt == 0 else 0,
+                                         result.stdout + result.stderr)
+                        expected = win_end or ("2026-03-01" if production or attempt == 0 else "2026-03-02")
+                        rank = shlex.split(self._log("rank.log").splitlines()[-1])
+                        self.assertEqual(rank[rank.index("--win-end") + 1], expected)
+                        self.assertEqual(rank[rank.index("--as-of") + 1], as_of or expected)
+                        calls = [shlex.split(line) for line in self._log("pe_bootstrap.log").splitlines()]
+                        for operation in ("winner-discovery", "market-scope"):
+                            call = [call for call in calls if call[0] == operation][-1]
+                            self.assertEqual(call[call.index("--end-date-min") + 1],
+                                             str(window_bounds(None, expected)[0] - 86_400))
+                    rerank = shlex.split(self._log("rerank.log"))
+                    self.assertEqual(rerank[rerank.index("--as-of") + 1], as_of or expected)
 
     def test_happy_path_default_universe_and_step0_order(self):
         r = self._run()
@@ -2113,9 +2133,16 @@ class RankAndPushScenario(unittest.TestCase):
         CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_groups_v2_source_trade_id
             ON activity_groups_v2(source_trade_id);
         CREATE TABLE IF NOT EXISTS activity_wallet_coverage_staging_v2 (
-            generation INTEGER, wallet_hex TEXT, aggregate_count INTEGER);
+            generation INTEGER, wallet_hex TEXT, aggregate_count INTEGER,
+            acquisition_json TEXT, exclusion_reason TEXT, page_evidence_json TEXT DEFAULT '[]');
         CREATE TABLE IF NOT EXISTS cache_frozen_payload_verifications (activity_generation INTEGER);
         CREATE TABLE IF NOT EXISTS ranker_entries_v2 (source_trade_id TEXT);
+        CREATE TABLE IF NOT EXISTS wallets (
+            wallet_hex TEXT PRIMARY KEY, is_active INTEGER, is_infra INTEGER, source_bits INTEGER DEFAULT 0);
+        CREATE VIEW IF NOT EXISTS active_tradeable_wallets AS
+            SELECT * FROM wallets WHERE is_active = 1 AND is_infra = 0;
+        CREATE TABLE IF NOT EXISTS purged_wallets (wallet_hex TEXT PRIMARY KEY, reason TEXT);
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     """
 
     def _install_candidate_layout(self, *, schema):
@@ -2130,6 +2157,12 @@ class RankAndPushScenario(unittest.TestCase):
         (phys / "wallet_cache.db.lock").symlink_to(self.root / "data" / "wallet_cache.db.lock")
         with sqlite3.connect(fixed) as connection:
             connection.executescript(self.V2_TABLES_SQL)
+            connection.execute("ALTER TABLE wallets ADD COLUMN source_bits INTEGER DEFAULT 0")
+            connection.execute("UPDATE wallets SET wallet_hex=?", ("0x" + "a" * 40,))
+            connection.execute("INSERT INTO meta VALUES ('participant_discovery_coverage', ?)",
+                               (json.dumps(dict(version=1, scope=dict(recurrences=["15m"], series=None),
+                                                market_floor_unix=0, covered_from_unix=0,
+                                                covered_through_unix=253402300799)),))
             if schema == 2:
                 connection.executescript(
                     """
@@ -2137,7 +2170,7 @@ class RankAndPushScenario(unittest.TestCase):
                     DROP TABLE trades; DROP TABLE market_resolutions; DROP TABLE source_cursor;
                     INSERT INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count, group_count) VALUES
                         (1, '[]', 20, 'fresh-1', 1, 'bb', 'cc', 1, 1);
-                    INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1, '0xabc', 1);
+                    INSERT INTO activity_wallet_coverage_staging_v2 (generation, wallet_hex, aggregate_count) VALUES (1, '0xabc', 1);
                     INSERT INTO activity_groups_v2 (wallet_hex, source_time_unix, activity_type, coverage_generation) VALUES ('0xabc', 10, 'TRADE', 1);
                     INSERT INTO clob_payout_coverage_manifests_v2 VALUES
                         (1, 'end_cursor', 30, '{}', 'dd');
@@ -2158,7 +2191,7 @@ class RankAndPushScenario(unittest.TestCase):
         assert marker in body
         emulate = (
             'case "$1" in cache-stage-v2|cache-migrate-v2|cache-populate-activity-v2'
-            '|cache-populate-payout-v2|cache-finalize-v2|cache-activate|activate-next)\n'
+            '|cache-populate-payout-v2|cache-finalize-v2|cache-activate|activate-next|winner-discovery)\n'
             f'  {shlex.quote(sys.executable)} scripts/_stub_cache_ops.py "$@" || exit $?\n'
             'esac\n'
         )
@@ -2181,6 +2214,15 @@ class RankAndPushScenario(unittest.TestCase):
             "    with sqlite3.connect(path) as c: return int(c.execute('PRAGMA user_version').fetchone()[0])\n"
             "now = int(time.time())\n"
             "sub, db = a[0], opt('--db')\n"
+            "if sub == 'winner-discovery':\n"
+            "    from rank_cycle_manifest import _participant_scope\n"
+            "    pin = opt('--series')\n"
+            "    scope = _participant_scope(opt('--recurrences').split(','), None if not pin else [dict(zip(('id', 'slug'), item.split(':', 1))) for item in pin.split(',')])\n"
+            "    coverage = dict(version=1, scope=scope, market_floor_unix=int(opt('--end-date-min')), covered_from_unix=0, covered_through_unix=now)\n"
+            "    if os.environ.get('STUB_COVERAGE'): coverage = json.loads(os.environ['STUB_COVERAGE'])\n"
+            "    with sqlite3.connect(os.environ['PE_BOOTSTRAP_CACHE_PATH']) as c:\n"
+            "        c.execute('INSERT OR REPLACE INTO meta VALUES (?, ?)', ('participant_discovery_coverage', json.dumps(coverage)))\n"
+            "    raise SystemExit(0)\n"
             "if sub == 'cache-stage-v2' and TWO_FILE:\n"
             "    prior, side, manifest = opt('--prior'), opt('--side'), opt('--manifest')\n"
             "    evidence_path = Path(side).with_suffix('.stage.json')\n"
@@ -2221,7 +2263,7 @@ class RankAndPushScenario(unittest.TestCase):
             "                recorded['digest'] = hashlib.sha256(json.dumps(recorded, sort_keys=True, separators=(',', ':')).encode()).hexdigest()\n"
             "                c.execute('INSERT INTO activity_groups_v2 (wallet_hex, source_time_unix, activity_type, coverage_generation) VALUES (?, ?, ?, ?)', ('0xabc', recorded['fixed_end_unix'], 'TRADE', 1))\n"
             "                c.execute('INSERT INTO activity_coverage_manifests_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (1, '{}', now, recorded['digest'], 1, 'bb', 'cc', 1, json.dumps(recorded), 1))\n"
-            "                c.execute('INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1, ?, 1)', ('0xabc',))\n"
+            "                c.execute('INSERT INTO activity_wallet_coverage_staging_v2 (generation, wallet_hex, aggregate_count) VALUES (1, ?, 1)', ('0xabc',))\n"
             "                c.execute('INSERT OR IGNORE INTO cache_v2_migration_state (singleton, ranker_projection_count, ranker_projection_digest, ranker_classifier_version, fresh_collection_json) VALUES (1, NULL, NULL, NULL, NULL)')\n"
             "                c.execute('UPDATE cache_v2_migration_state SET fresh_collection_json = ?', (json.dumps(recorded),))\n"
             "    shutil.copyfile(prior, side)\n"
@@ -2239,12 +2281,14 @@ class RankAndPushScenario(unittest.TestCase):
             "    print(json.dumps({'resumed': True}))\n"
             "elif sub == 'cache-populate-activity-v2':\n"
             "    generation = int(opt('--fresh-generation'))\n"
+            "    if os.environ.get('STUB_FAIL_BEFORE_ACTIVITY_GENERATION') == str(generation): raise SystemExit(75)\n"
             "    with sqlite3.connect(db) as c:\n"
             "        row = c.execute('SELECT fresh_collection_json FROM cache_v2_migration_state').fetchone()\n"
             "        recorded = json.loads(row[0]) if row and row[0] else None\n"
             "        if recorded is None or recorded['generation'] != generation:\n"
             "            base = recorded['generation'] if recorded else None\n"
             "            end = now - int(os.environ.get('STUB_ACTIVITY_AGE_' + str(generation), '120'))\n"
+            "            if base: end = max(end, recorded['fixed_end_unix'] + 1)\n"
             "            recorded = {'version': 4, 'generation': generation, 'fixed_end_unix': end, 'wallets': ['0x'+'a'*40], 'base_generation': base, 'base_manifest_sha256': 'a'*64 if base else None, 'start_exclusive': recorded['fixed_end_unix'] if base else 0, 'full_read_wallets': [] if base else ['0x'+'a'*40]}\n"
             "            recorded.update(deferred_wallets=[], repair_wallets=[], quiet_after_secs=2592000, repoll_period_secs=604800, certified_digest=hashlib.sha256(b'[]').hexdigest())\n"
             "            recorded['digest'] = hashlib.sha256(json.dumps(recorded, sort_keys=True, separators=(',', ':')).encode()).hexdigest()\n"
@@ -2261,7 +2305,10 @@ class RankAndPushScenario(unittest.TestCase):
             "            c.execute('INSERT INTO activity_groups_v2 (wallet_hex, source_time_unix, activity_type, coverage_generation) VALUES (?, ?, ?, ?)', ('0xabc', recorded['fixed_end_unix'], 'TRADE', generation))\n"
             "            rows = c.execute('SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?', (generation,)).fetchone()[0]\n"
             "            c.execute('INSERT INTO activity_coverage_manifests_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (generation, '{}', now, recorded['digest'], 1, 'bb', 'cc', 1, json.dumps(recorded), rows))\n"
-            "            c.execute('INSERT INTO activity_wallet_coverage_staging_v2 VALUES (?, ?, ?)', (generation, '0xabc', rows))\n"
+            "            c.execute('INSERT INTO activity_wallet_coverage_staging_v2 (generation, wallet_hex, aggregate_count) VALUES (?, ?, ?)', (generation, '0xabc', rows))\n"
+            "            exclusions = json.loads(os.environ.get('STUB_EXCLUSIONS_' + str(generation), '[]'))\n"
+            "            for wallet, reason, proof in exclusions:\n"
+            "                c.execute('INSERT INTO activity_wallet_coverage_staging_v2 (generation, wallet_hex, aggregate_count, acquisition_json, exclusion_reason) VALUES (?, ?, 0, ?, ?)', (generation, wallet, json.dumps(proof), reason))\n"
             "        if '--bulk-root' in a:\n"
             "            c.execute('CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id ON activity_groups_v2(source_trade_id)')\n"
             "            c.execute('PRAGMA user_version = 2')\n"
@@ -2279,7 +2326,7 @@ class RankAndPushScenario(unittest.TestCase):
             "        generation = json.loads(c.execute('SELECT fresh_collection_json FROM cache_v2_migration_state').fetchone()[0])['generation']\n"
             "        rows = c.execute('SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?', (generation,)).fetchone()[0]\n"
             "        if c.execute('INSERT OR IGNORE INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count, group_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (generation, '[]', now, f'fresh-{generation}', 1, 'bb', 'cc', 1, rows)).rowcount:\n"
-            "            c.execute('INSERT INTO activity_wallet_coverage_staging_v2 VALUES (?, ?, ?)', (generation, '0xabc', rows))\n"
+            "            c.execute('INSERT INTO activity_wallet_coverage_staging_v2 (generation, wallet_hex, aggregate_count) VALUES (?, ?, ?)', (generation, '0xabc', rows))\n"
             "        c.execute('CREATE TABLE IF NOT EXISTS activity_wallet_history_v3 (wallet_hex TEXT PRIMARY KEY, generation INTEGER, newest_source_unix INTEGER, newest_trade_unix INTEGER, aggregate_count INTEGER, source_row_count INTEGER, ordered_digest TEXT, scope_drops_json TEXT)')\n"
             "        for wallet, count in c.execute('SELECT wallet_hex, aggregate_count FROM activity_wallet_coverage_staging_v2 WHERE generation=?', (generation,)).fetchall():\n"
             "            newest = c.execute('SELECT MAX(source_time_unix) FROM activity_groups_v2 WHERE wallet_hex=? AND coverage_generation=?', (wallet,generation)).fetchone()[0]\n"
@@ -2614,6 +2661,106 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
+    @staticmethod
+    def _excluded_receipt(reason, **changes):
+        proof = dict(version=3, disposition="excluded", exclusion_reason="acquisition_failure",
+                     aggregation_status="not_attempted", start_exclusive=0, fixed_end_unix=100)
+        proof.update(changes)
+        return ["0x" + "a" * 40, reason, proof]
+
+    def _assert_candidate_held(self, result, reason):
+        self.assertNotIn(result.returncode, (0, 75), result.stdout + result.stderr)
+        self.assertIn(reason, result.stderr)
+        self.assertNotIn("cache-populate-payout-v2", self._bootstrap_ops())
+        self.assertIsNone(self._log("rank.log"))
+        self.assertFalse((self.root / "data/eval-results/rank_and_push.pending").exists())
+        self.assertEqual(list((self.root / "data/eval-results").glob("cron-*/ranking_publish_request.json")), [])
+
+    def test_three_linked_generations_resume_before_and_after_successor_creation(self):
+        partial = self._excluded_receipt("held-row limit reached", aggregation_status="complete")
+        for failure in ("STUB_FAIL_BEFORE_ACTIVITY_GENERATION", "STUB_FAIL_ACTIVITY_GENERATION"):
+            with self.subTest(failure=failure):
+                self.tearDown(); self.setUp()
+                fixed = self._prepare_incremental_fixture(two_file=True)
+                before = fixed.read_bytes()
+                env = {"STUB_EXCLUSIONS_1": json.dumps([partial]), "STUB_EXCLUSIONS_2": json.dumps([partial])}
+                first = self._run(exit_env=dict(env, **{failure: "3"}))
+                self.assertEqual(first.returncode, 75, first.stdout + first.stderr)
+                self.assertNotIn("cache-populate-payout-v2", self._bootstrap_ops())
+                side = next(fixed.parent.glob("*.side.db"))
+                with sqlite3.connect(side) as c:
+                    head = json.loads(c.execute("SELECT fresh_collection_json FROM cache_v2_migration_state").fetchone()[0])
+                self.assertEqual(head["generation"], 2 if "BEFORE" in failure else 3)
+                resumed = self._run(exit_env=env)
+                self.assertEqual(resumed.returncode, 2, resumed.stdout + resumed.stderr)
+                self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
+                self.assertEqual(fixed.read_bytes(), before)
+                with sqlite3.connect(side) as c:
+                    self.assertEqual(c.execute("SELECT MAX(generation) FROM activity_coverage_manifests_v2").fetchone()[0], 3)
+                lines = self._bootstrap_lines("cache-populate-activity-v2")
+                self.assertEqual(len(lines), 4)
+                self.assertIn("--fresh-generation 3", lines[-1])
+
+    def test_candidate_participant_and_coverage_holds_precede_collection(self):
+        for kind in ("inactive", "flagged", "tombstoned", "coverage"):
+            with self.subTest(kind=kind):
+                self.tearDown(); self.setUp()
+                fixed = self._prepare_incremental_fixture(two_file=True)
+                env = {}
+                with sqlite3.connect(fixed) as c:
+                    c.execute("UPDATE wallets SET source_bits=256")
+                    if kind == "inactive":
+                        c.execute("UPDATE wallets SET is_active=0")
+                    elif kind == "flagged":
+                        c.execute("UPDATE wallets SET is_infra=1")
+                    elif kind == "tombstoned":
+                        c.execute("INSERT INTO purged_wallets VALUES (?, 'proven_loser')", ("0x" + "a" * 40,))
+                    else:
+                        env["STUB_COVERAGE"] = json.dumps(dict(version=1, scope=dict(recurrences=["15m"], series=None),
+                                                               market_floor_unix=0, covered_from_unix=0, covered_through_unix=1))
+                result = self._run(exit_env=env)
+                self._assert_candidate_held(result, "print tail" if kind == "coverage" else kind + " participant")
+                self.assertNotIn("cache-populate-activity-v2", self._bootstrap_ops())
+
+    def test_candidate_parse_no_progress_and_collision_holds_persist_then_operator_recovers(self):
+        for reason, kind in (("activity response json: expected an array", "acquisition_failure"),
+                             ("acquisition budget exhausted", "acquisition_failure"),
+                             ("cross-boundary collision", "cross_boundary_collision")):
+            with self.subTest(reason=reason):
+                self.tearDown(); self.setUp()
+                fixed = self._prepare_incremental_fixture(two_file=True)
+                env = {"STUB_EXCLUSIONS_1": json.dumps([self._excluded_receipt(reason, exclusion_reason=kind)]),
+                       "STUB_RECORD_ACTIVATION": "1"}
+                for _ in range(2):
+                    held = self._run(exit_env=env)
+                    self._assert_candidate_held(held, "0x" + "a" * 40 + ": " + reason)
+                self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), 1)
+                side = next(fixed.parent.glob("*.side.db"))
+                manual = subprocess.run([str(self.root / "target/release/pe-bootstrap"), "cache-populate-activity-v2",
+                                         "--db", str(side), "--fresh-generation", "2"],
+                                        cwd=self.root, capture_output=True, text=True)
+                self.assertEqual(manual.returncode, 0, manual.stderr)
+                resumed = self._run()
+                self.assertEqual(resumed.returncode, 2, resumed.stdout + resumed.stderr)
+                self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
+
+    def test_unrepresentable_exclusions_are_listed_and_prepare_without_a_successor(self):
+        from rank_cycle_manifest import (UNREPRESENTABLE_PRICE, UNREPRESENTABLE_MAPPING,
+                                         UNREPRESENTABLE_DECIMAL, ACTIVITY_RESPONSE_JSON)
+        reasons = (UNREPRESENTABLE_PRICE + " 3.2: out of range", UNREPRESENTABLE_MAPPING,
+                   ACTIVITY_RESPONSE_JSON + " row 1: 4.212e-7 " + UNREPRESENTABLE_DECIMAL)
+        for proved in (False, True):
+            for reason in reasons:
+                with self.subTest(proved=proved, reason=reason):
+                    self.tearDown(); self.setUp()
+                    self._prepare_incremental_fixture(two_file=True)
+                    receipt = self._excluded_receipt(reason, aggregation_status="complete" if proved else "not_attempted")
+                    result = self._run(exit_env={"STUB_EXCLUSIONS_1": json.dumps([receipt])})
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", result.stdout)
+                    self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), 1)
+                    self.assertIn("[unrepresentable-row] 0x" + "a" * 40 + ": " + reason, result.stderr)
+
     def test_stale_initial_head_gets_one_top_up_then_prepares(self):
         fixed = self._prepare_incremental_fixture()
         before = fixed.read_bytes()
@@ -2813,15 +2960,17 @@ try:
     identity["digest"] = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     with sqlite3.connect(side) as connection:
         connection.execute("UPDATE cache_v2_migration_state SET fresh_collection_json = ?", (json.dumps(identity),))
+        connection.execute("UPDATE activity_coverage_manifests_v2 SET collection_identity_json = NULL WHERE generation = 2")
     try:
         candidate_targets(prior, side)
     except ValueError as error:
-        assert "single top-up allowance" in str(error)
+        assert "predecessor" in str(error)
     else:
         raise AssertionError("unrelated third head accepted")
 finally:
     with sqlite3.connect(side) as connection:
         connection.execute("UPDATE cache_v2_migration_state SET fresh_collection_json = ?", (raw,))
+        connection.execute("UPDATE activity_coverage_manifests_v2 SET collection_identity_json = ? WHERE generation = 2", (raw,))
 """, str(WRAPPER.parent), str(prior), str(side)], capture_output=True, text=True)
         self.assertEqual(check.returncode, 0, check.stderr)
         before = len(self._bootstrap_lines("cache-populate-activity-v2"))
@@ -2829,10 +2978,33 @@ finally:
         self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout, resumed.stderr)
         self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), before)
 
+    def test_manually_completed_three_generation_chain_is_adopted(self):
+        fixed = self._prepare_incremental_fixture(two_file=True)
+        first = self._run(exit_env={"STUB_EXIT_cache_finalize_v2": "75"})
+        self.assertEqual(first.returncode, 75, first.stderr)
+        side = next(fixed.parent.glob("*.side.db"))
+        for generation in (2, 3):
+            manual = subprocess.run([str(self.root / "target/release/pe-bootstrap"), "cache-populate-activity-v2",
+                                     "--db", str(side), "--fresh-generation", str(generation)],
+                                    cwd=self.root, capture_output=True, text=True)
+            self.assertEqual(manual.returncode, 0, manual.stderr)
+        before = self._bootstrap_lines("cache-populate-activity-v2")
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 2, resumed.stdout + resumed.stderr)
+        self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
+        self.assertEqual(self._bootstrap_lines("cache-populate-activity-v2"), before)
+
     def test_stale_completed_top_up_stops_before_ranking_on_every_restart(self):
         self._prepare_incremental_fixture()
+        # Keep the print tail behind both old heads so this isolates the
+        # unchanged maximum-age refusal, after completion obligations are clear.
+        real_date = shutil.which("date")
+        shim = self.root / "shim"
+        shim.mkdir()
+        _write_exec(shim / "date", f'#!/usr/bin/env bash\nexec {real_date} -d "3 days ago" "$@"\n')
+        env = {"PATH": f"{shim}:{os.environ['PATH']}", "STUB_ACTIVITY_AGE_1": "180000", "STUB_ACTIVITY_AGE_2": "90000"}
         for _ in range(2):
-            result = self._run(exit_env={"STUB_ACTIVITY_AGE_1": "180000", "STUB_ACTIVITY_AGE_2": "90000"})
+            result = self._run(exit_env=env)
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("RANK_AND_PUSH_PREPARED_ONLY=", result.stdout)
             self.assertIn("top-up is stale", result.stderr)
