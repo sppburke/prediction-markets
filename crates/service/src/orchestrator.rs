@@ -652,105 +652,107 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         sealed_cutoff_unix: i64,
         candidate: pe_event_log::LogTailBinding,
     ) -> Result<(), String> {
-        let (paper_log_path, _) = self
-            .financial_log_paths
-            .as_ref()
-            .ok_or_else(|| "qualification seal is unavailable before Start".to_owned())?;
-        let frames = self
-            .paper_writer
-            .snapshot()
-            .map_err(|error| error.to_string())?;
-        if crate::paper_recovery::generation_qualification_sealed(&frames) {
-            return Ok(());
-        }
-        let era = crate::paper_recovery::paper_generation(frames);
-        let (start_receipt, started) = era
-            .start
-            .as_ref()
-            .ok_or_else(|| "qualification seal has no verified Start".to_owned())?;
-        if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
-            return Err("qualification seal waits for the oldest unmatched Prepared".to_owned());
-        }
-        let source_receipts = self.source_receipts.as_ref().ok_or_else(|| {
-            "qualification seal is unavailable before the receipt index is installed".to_owned()
-        })?;
-        let seal_started = std::time::Instant::now();
-        info!(
-            reason = ?reason,
-            candidate_sequence = ?candidate.last_sequence,
-            "qualification seal started"
-        );
-        let qualification_error = |error| match error {
-            crate::qualification::QualificationError::EventLog(error) => error.to_string(),
-            other => other.to_string(),
-        };
-        let (sealed_source_prefix, selected) =
-            crate::qualification::indexed_source_prefix_selection(
-                &self.paper_state,
-                source_receipts,
-                &candidate,
-                &started.source_prefix,
-            )
-            .map_err(qualification_error)?;
-        let frames_walked = sealed_source_prefix
-            .last_sequence
-            .map_or(0, |sequence| sequence.0.saturating_add(1));
-        let (decision_evidence, reason) = match (selected, reason) {
-            (Ok(decisions), reason) => {
-                let decision_keys = decisions
-                    .rows
-                    .into_iter()
-                    .map(|row| (row.source_trade_id, row.semantic_revision))
-                    .collect::<Vec<_>>();
-                let evidence = self
-                    .paper_state
-                    .seal_decision_evidence_for_source_prefix(
-                        &decision_keys,
-                        &decisions.in_prefix,
-                        sealed_source_prefix.last_sequence,
-                    )
-                    .map_err(|error| error.to_string())?;
-                (evidence, reason)
+        pe_event_log::run_blocking(|| {
+            let (paper_log_path, _) = self
+                .financial_log_paths
+                .as_ref()
+                .ok_or_else(|| "qualification seal is unavailable before Start".to_owned())?;
+            let frames = self
+                .paper_writer
+                .snapshot()
+                .map_err(|error| error.to_string())?;
+            if crate::paper_recovery::generation_qualification_sealed(&frames) {
+                return Ok(());
             }
-            // An insufficient-evidence seal still closes the verified prefix when its decision
-            // evidence cannot be assembled (a bracket's recorded pages whose install never
-            // committed leave source trades without durable groups): its digest covers no
-            // decisions and its reason says why. A Complete seal still requires the evidence.
-            (
-                Err(crate::qualification::QualificationError::InsufficientEvidence(detail)),
-                SealReason::InsufficientEvidence(why),
-            ) => (
-                Vec::new(),
-                SealReason::InsufficientEvidence(format!(
-                    "{why}; decision evidence unavailable: {detail}"
-                )),
-            ),
-            (Err(error), _) => return Err(qualification_error(error)),
-        };
-        let financial_prefix = self.paper_writer.verified_tail().map_err(|error| {
-            self.intake_stopped = true;
-            error.to_string()
-        })?;
-        let live_prefix = pe_execution_core::LiveJournal::verified_tail(
-            paper_log_path.with_file_name("live_journal.log"),
-        )
-        .map_err(|error| error.to_string())?;
-        self.append_paper_record(&PaperLogRecord::QualificationSealed(Box::new(
-            QualificationSealed {
-                start_receipt: *start_receipt,
-                source_prefix: sealed_source_prefix,
-                financial_prefix: TailBinding::from(&financial_prefix),
-                live_prefix: TailBinding::from(&live_prefix),
-                decision_evidence_digest: blake3::hash(&decision_evidence).to_hex().to_string(),
-                sealed_cutoff_unix,
-                reason,
-            },
-        )))?;
-        info!(
-            elapsed_ms = u64::try_from(seal_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            frames_walked, "qualification seal completed"
-        );
-        Ok(())
+            let era = crate::paper_recovery::paper_generation(frames);
+            let (start_receipt, started) = era
+                .start
+                .as_ref()
+                .ok_or_else(|| "qualification seal has no verified Start".to_owned())?;
+            if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
+                return Err("qualification seal waits for the oldest unmatched Prepared".to_owned());
+            }
+            let source_receipts = self.source_receipts.as_ref().ok_or_else(|| {
+                "qualification seal is unavailable before the receipt index is installed".to_owned()
+            })?;
+            let seal_started = std::time::Instant::now();
+            info!(
+                reason = ?reason,
+                candidate_sequence = ?candidate.last_sequence,
+                "qualification seal started"
+            );
+            let qualification_error = |error| match error {
+                crate::qualification::QualificationError::EventLog(error) => error.to_string(),
+                other => other.to_string(),
+            };
+            let (sealed_source_prefix, selected) =
+                crate::qualification::indexed_source_prefix_selection(
+                    &self.paper_state,
+                    source_receipts,
+                    &candidate,
+                    &started.source_prefix,
+                )
+                .map_err(qualification_error)?;
+            let frames_walked = sealed_source_prefix
+                .last_sequence
+                .map_or(0, |sequence| sequence.0.saturating_add(1));
+            let (decision_evidence, reason) = match (selected, reason) {
+                (Ok(decisions), reason) => {
+                    let decision_keys = decisions
+                        .rows
+                        .into_iter()
+                        .map(|row| (row.source_trade_id, row.semantic_revision))
+                        .collect::<Vec<_>>();
+                    let evidence = self
+                        .paper_state
+                        .seal_decision_evidence_for_source_prefix(
+                            &decision_keys,
+                            &decisions.in_prefix,
+                            sealed_source_prefix.last_sequence,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    (evidence, reason)
+                }
+                // An insufficient-evidence seal still closes the verified prefix when its decision
+                // evidence cannot be assembled (a bracket's recorded pages whose install never
+                // committed leave source trades without durable groups): its digest covers no
+                // decisions and its reason says why. A Complete seal still requires the evidence.
+                (
+                    Err(crate::qualification::QualificationError::InsufficientEvidence(detail)),
+                    SealReason::InsufficientEvidence(why),
+                ) => (
+                    Vec::new(),
+                    SealReason::InsufficientEvidence(format!(
+                        "{why}; decision evidence unavailable: {detail}"
+                    )),
+                ),
+                (Err(error), _) => return Err(qualification_error(error)),
+            };
+            let financial_prefix = self.paper_writer.verified_tail().map_err(|error| {
+                self.intake_stopped = true;
+                error.to_string()
+            })?;
+            let live_prefix = pe_execution_core::LiveJournal::verified_tail(
+                paper_log_path.with_file_name("live_journal.log"),
+            )
+            .map_err(|error| error.to_string())?;
+            self.append_paper_record(&PaperLogRecord::QualificationSealed(Box::new(
+                QualificationSealed {
+                    start_receipt: *start_receipt,
+                    source_prefix: sealed_source_prefix,
+                    financial_prefix: TailBinding::from(&financial_prefix),
+                    live_prefix: TailBinding::from(&live_prefix),
+                    decision_evidence_digest: blake3::hash(&decision_evidence).to_hex().to_string(),
+                    sealed_cutoff_unix,
+                    reason,
+                },
+            )))?;
+            info!(
+                elapsed_ms = u64::try_from(seal_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                frames_walked, "qualification seal completed"
+            );
+            Ok(())
+        })
     }
 
     fn apply_seal_check(
@@ -1516,26 +1518,27 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         } else {
             cash
         };
-        let (source_tail, byte_offset, last_receipt, previous_hash) = source_receipts
-            .tail_with_last_frame()
+        let source_tail = pe_event_log::run_blocking(|| {
+            let (source_tail, byte_offset, last_receipt, previous_hash) = source_receipts
+                .tail_with_last_frame()
+                .map_err(|error| error.to_string())?;
+            let (last_frame, end_offset) = pe_event_log::Reader::read_at(
+                &source_tail.path,
+                byte_offset,
+                last_receipt.sequence,
+                previous_hash,
+            )
             .map_err(|error| error.to_string())?;
-        let (last_frame, end_offset) = pe_event_log::Reader::read_at(
-            &source_tail.path,
-            byte_offset,
-            last_receipt.sequence,
-            previous_hash,
-        )
-        .map_err(|error| error.to_string())?;
-        if end_offset != source_tail.physical_tail
-            || Some(last_frame.seq) != source_tail.last_sequence
-            || last_frame.this_hash != source_tail.last_hash
-        {
-            return Err(
-                "daily boundary source receipt index tail differs from log frame"
-                    .to_owned()
-                    .into(),
-            );
-        }
+            if end_offset != source_tail.physical_tail
+                || Some(last_frame.seq) != source_tail.last_sequence
+                || last_frame.this_hash != source_tail.last_hash
+            {
+                return Err(
+                    "daily boundary source receipt index tail differs from log frame".to_owned(),
+                );
+            }
+            Ok::<_, String>(source_tail)
+        })?;
         let mark = PortfolioMark {
             boundary_receipt,
             cutoff_unix,
@@ -1809,8 +1812,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 request,
                 acknowledged,
             } => {
-                let result = crate::source_checkpoint::retention::commit(*request)
-                    .map_err(|error| format!("{error:#}"));
+                let result = pe_event_log::run_blocking(|| {
+                    crate::source_checkpoint::retention::commit(*request)
+                })
+                .map_err(|error| format!("{error:#}"));
                 let _ = acknowledged.send(result);
             }
             OrchestratorControl::ActivityFrameDecision { receipt } => {

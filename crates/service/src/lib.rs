@@ -65,3 +65,7 @@ pub mod frame_admission;
 pub mod feed_audit;
 
 pub use market_membership::{fetch_market_membership, record_market_membership};
+
+#[cfg(test)]
+#[path = "../../event-log/tests/support/runtime_progress.rs"]
+mod runtime_progress;

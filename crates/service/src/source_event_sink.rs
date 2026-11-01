@@ -124,39 +124,41 @@ impl SourceEventSink {
     /// durability uncertainty discards that poisoned instance until
     /// [`Self::try_reopen`] succeeds.
     pub fn append_durable(&mut self, envelope: EnvelopeIn) -> Result<AppendReceipt, LogError> {
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_append) {
-            self.writer = None;
-            return Err(LogError::Io(std::io::Error::other(
-                "injected append failure",
-            )));
-        }
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_sync) {
+        pe_event_log::run_blocking(|| {
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_append) {
+                self.writer = None;
+                return Err(LogError::Io(std::io::Error::other(
+                    "injected append failure",
+                )));
+            }
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_sync) {
+                let Some(writer) = self.writer.as_mut() else {
+                    return Err(LogError::Io(std::io::Error::other(
+                        "source event sink poisoned",
+                    )));
+                };
+                writer.append(envelope)?;
+                writer.flush()?;
+                self.writer = None;
+                return Err(LogError::Io(std::io::Error::other(
+                    "injected synchronization uncertainty",
+                )));
+            }
             let Some(writer) = self.writer.as_mut() else {
                 return Err(LogError::Io(std::io::Error::other(
                     "source event sink poisoned",
                 )));
             };
-            writer.append(envelope)?;
-            writer.flush()?;
-            self.writer = None;
-            return Err(LogError::Io(std::io::Error::other(
-                "injected synchronization uncertainty",
-            )));
-        }
-        let Some(writer) = self.writer.as_mut() else {
-            return Err(LogError::Io(std::io::Error::other(
-                "source event sink poisoned",
-            )));
-        };
-        let result = writer.append_synced(envelope);
-        if writer.poisoned().is_some() {
-            // Partial frame bytes may be on disk. Drop the poisoned instance (releasing the
-            // lock); a new writer repairs only a proven incomplete EOF and resynchronizes.
-            self.writer = None;
-        }
-        result
+            let result = writer.append_synced(envelope);
+            if writer.poisoned().is_some() {
+                // Partial frame bytes may be on disk. Drop the poisoned instance (releasing the
+                // lock); a new writer repairs only a proven incomplete EOF and resynchronizes.
+                self.writer = None;
+            }
+            result
+        })
     }
 
     /// Whether the sink is poisoned (websocket delivery must stay blocked).
@@ -170,24 +172,26 @@ impl SourceEventSink {
     /// hash chain. Only a successful reopen clears poison. Called from the
     /// reconnect cycle so recovery needs no dedicated timer.
     pub fn try_reopen(&mut self) -> bool {
-        if !self.poisoned() {
-            return true;
-        }
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_reopen) {
-            return false;
-        }
-        match crate::source_log_boot::reopen_source_sink(&self.path) {
-            Ok(reopened) => {
-                self.writer = reopened.writer;
-                true
+        pe_event_log::run_blocking(|| {
+            if !self.poisoned() {
+                return true;
             }
-            Err(error) => {
-                tracing::warn!(error = %error, path = %self.path.display(),
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_next_reopen) {
+                return false;
+            }
+            match crate::source_log_boot::reopen_source_sink(&self.path) {
+                Ok(reopened) => {
+                    self.writer = reopened.writer;
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, path = %self.path.display(),
                     "source event log reopen failed; sink stays poisoned");
-                false
+                    false
+                }
             }
-        }
+        })
     }
 }
 

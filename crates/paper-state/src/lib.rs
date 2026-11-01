@@ -22,13 +22,11 @@
 //!
 //! # Async
 //!
-//! All methods are synchronous and brief (single-row indexed writes under WAL +
-//! `synchronous = NORMAL`). The orchestrator consumes trades sequentially, so a
-//! short blocking call on the async worker is acceptable for v1; revisit with
-//! `spawn_blocking` if RTDS volume (issue #282 Phase 2) makes it material.
-//! Retention transactions and their warm reads take longer. WAL checkpoints run on
-//! their own connection, never holding the shared one; the service runs them in a
-//! blocking task.
+//! Connection acquisition and use run through `pe_event_log::run_blocking`, handing
+//! off multi-thread runtime workers before synchronous database work or lock waits.
+//! Current-thread runtimes and callers outside a runtime run directly. Maintenance
+//! reads and WAL checkpoints use separate connections; caller-owned SQL batches
+//! retain their lifecycle across calls.
 
 mod migration;
 mod schema;
@@ -1063,29 +1061,30 @@ impl PaperStateDb {
             WARM_SUPERSEDED_ANCHOR_PROOFS_SQL,
             params![limit, after.wallet_hex, after.anchor_seq],
         )?;
-        let mut conn = self.lock();
-        let started = std::time::Instant::now();
-        if !conn.is_autocommit() {
-            return Err(PaperStateError::RetentionBatchOpen);
-        }
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (mut blanked, mut next) = (0, after.clone());
-        {
-            let mut stmt = tx.prepare(BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL)?;
-            let mut rows = stmt.query(params![limit, after.wallet_hex, after.anchor_seq])?;
-            // RETURNING order is unspecified, so the cursor takes the largest key.
-            while let Some(row) = rows.next()? {
-                blanked += 1;
-                next = next.max(AnchorProofCursor {
-                    wallet_hex: row.get(0)?,
-                    anchor_seq: row.get(1)?,
-                });
+        self.with(|conn| {
+            let started = std::time::Instant::now();
+            if !conn.is_autocommit() {
+                return Err(PaperStateError::RetentionBatchOpen);
             }
-        }
-        tx.commit()?;
-        Ok(RetentionTransaction {
-            result: (blanked, next),
-            lock_time: started.elapsed(),
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (mut blanked, mut next) = (0, after.clone());
+            {
+                let mut stmt = tx.prepare(BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL)?;
+                let mut rows = stmt.query(params![limit, after.wallet_hex, after.anchor_seq])?;
+                // RETURNING order is unspecified, so the cursor takes the largest key.
+                while let Some(row) = rows.next()? {
+                    blanked += 1;
+                    next = next.max(AnchorProofCursor {
+                        wallet_hex: row.get(0)?,
+                        anchor_seq: row.get(1)?,
+                    });
+                }
+            }
+            tx.commit()?;
+            Ok(RetentionTransaction {
+                result: (blanked, next),
+                lock_time: started.elapsed(),
+            })
         })
     }
 
@@ -1102,19 +1101,20 @@ impl PaperStateDb {
             i64::try_from(limit).map_err(|error| PaperStateError::Internal(error.to_string()))?;
         let after = after.map_or_else(String::new, |wallet| wallet.to_string());
         self.warm(RETENTION_CANDIDATES_SQL, params![after, limit])?;
-        let conn = self.lock();
-        let started = std::time::Instant::now();
-        let mut stmt = conn.prepare(RETENTION_CANDIDATES_SQL)?;
-        let rows = stmt.query_map(params![after, limit], |row| row.get::<_, String>(0))?;
-        let result = rows
-            .map(|row| {
-                WalletAddress::from_hex(&row?)
-                    .map_err(|error| PaperStateError::Corrupt(error.to_string()))
+        self.with(|conn| {
+            let started = std::time::Instant::now();
+            let mut stmt = conn.prepare(RETENTION_CANDIDATES_SQL)?;
+            let rows = stmt.query_map(params![after, limit], |row| row.get::<_, String>(0))?;
+            let result = rows
+                .map(|row| {
+                    WalletAddress::from_hex(&row?)
+                        .map_err(|error| PaperStateError::Corrupt(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(RetentionTransaction {
+                result,
+                lock_time: started.elapsed(),
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(RetentionTransaction {
-            result,
-            lock_time: started.elapsed(),
         })
     }
 
@@ -1127,18 +1127,17 @@ impl PaperStateDb {
         latest_prepared: Option<EventSeq>,
     ) -> Result<RetentionTransaction<Option<WalletRetentionWait>>, PaperStateError> {
         // The same check on the maintenance connection first, so the hold reads its pages cached.
-        tx_wallet_retention_wait(
-            &self.maintenance(),
-            wallet,
-            recent_since_unix,
-            latest_prepared,
-        )?;
-        let conn = self.lock();
-        let started = std::time::Instant::now();
-        let result = tx_wallet_retention_wait(&conn, wallet, recent_since_unix, latest_prepared)?;
-        Ok(RetentionTransaction {
-            result,
-            lock_time: started.elapsed(),
+        self.with_maintenance(|conn| {
+            tx_wallet_retention_wait(conn, wallet, recent_since_unix, latest_prepared)
+        })?;
+        self.with(|conn| {
+            let started = std::time::Instant::now();
+            let result =
+                tx_wallet_retention_wait(conn, wallet, recent_since_unix, latest_prepared)?;
+            Ok(RetentionTransaction {
+                result,
+                lock_time: started.elapsed(),
+            })
         })
     }
 
@@ -1176,68 +1175,69 @@ impl PaperStateDb {
         recent_since_unix: i64,
         latest_prepared: Option<EventSeq>,
     ) -> Result<RetentionTransaction<Option<WalletRetentionWait>>, PaperStateError> {
-        let mut conn = self.lock();
-        let started = std::time::Instant::now();
-        if !conn.is_autocommit() {
-            return Err(PaperStateError::RetentionBatchOpen);
-        }
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(reason) =
-            tx_wallet_retention_wait(&tx, wallet, recent_since_unix, latest_prepared)?
-        {
-            return Ok(RetentionTransaction {
-                result: Some(reason),
+        self.with(|conn| {
+            let started = std::time::Instant::now();
+            if !conn.is_autocommit() {
+                return Err(PaperStateError::RetentionBatchOpen);
+            }
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Some(reason) =
+                tx_wallet_retention_wait(&tx, wallet, recent_since_unix, latest_prepared)?
+            {
+                return Ok(RetentionTransaction {
+                    result: Some(reason),
+                    lock_time: started.elapsed(),
+                });
+            }
+            let wallet_hex = wallet.to_string();
+            // A temporary indexed set avoids a wallet-sized Rust allocation or SQLite parameter list.
+            tx.execute_batch("CREATE TEMP TABLE wallet_retirement_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL);")?;
+            tx.execute(RETIREMENT_DECISION_IDS_SQL, params![wallet_hex])?;
+            for table in TRADE_ROW_TABLES {
+                tx.execute(&format!("DELETE FROM {table} WHERE source_trade_id IN (SELECT source_trade_id FROM wallet_retirement_trade_ids)"), [])?;
+            }
+            tx.execute(RETIREMENT_TERMINAL_DECISIONS_SQL, params![wallet_hex])?;
+            for table in WALLET_STATE_TABLES {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE wallet_hex = ?1"),
+                    params![wallet_hex],
+                )?;
+            }
+            let frontiers: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'feed_history_frontiers'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(bytes) = frontiers {
+                let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+                if value["version"] != 1 {
+                    return Err(PaperStateError::Corrupt(
+                        "unsupported frontier collection".to_owned(),
+                    ));
+                }
+                let frontiers = value["frontiers"].as_array_mut().ok_or_else(|| {
+                    PaperStateError::Corrupt("invalid frontier collection".to_owned())
+                })?;
+                for frontier in frontiers.iter() {
+                    let _: WalletAddress = serde_json::from_value(frontier["wallet"].clone())?;
+                }
+                frontiers.retain(|frontier| frontier["wallet"].as_str() != Some(wallet_hex.as_str()));
+                tx.execute(
+                    "UPDATE meta SET value = ?1 WHERE key = 'feed_history_frontiers'",
+                    params![serde_json::to_vec(&value)?],
+                )?;
+            }
+            let mut drains = retirement_drains_in(&tx)?;
+            drains.push(wallet_hex);
+            write_retirement_drains(&tx, &drains)?;
+            tx.execute_batch("DROP TABLE wallet_retirement_trade_ids;")?;
+            tx.commit()?;
+            Ok(RetentionTransaction {
+                result: None,
                 lock_time: started.elapsed(),
-            });
-        }
-        let wallet_hex = wallet.to_string();
-        // A temporary indexed set avoids a wallet-sized Rust allocation or SQLite parameter list.
-        tx.execute_batch("CREATE TEMP TABLE wallet_retirement_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL);")?;
-        tx.execute(RETIREMENT_DECISION_IDS_SQL, params![wallet_hex])?;
-        for table in TRADE_ROW_TABLES {
-            tx.execute(&format!("DELETE FROM {table} WHERE source_trade_id IN (SELECT source_trade_id FROM wallet_retirement_trade_ids)"), [])?;
-        }
-        tx.execute(RETIREMENT_TERMINAL_DECISIONS_SQL, params![wallet_hex])?;
-        for table in WALLET_STATE_TABLES {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE wallet_hex = ?1"),
-                params![wallet_hex],
-            )?;
-        }
-        let frontiers: Option<Vec<u8>> = tx
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'feed_history_frontiers'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(bytes) = frontiers {
-            let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
-            if value["version"] != 1 {
-                return Err(PaperStateError::Corrupt(
-                    "unsupported frontier collection".to_owned(),
-                ));
-            }
-            let frontiers = value["frontiers"].as_array_mut().ok_or_else(|| {
-                PaperStateError::Corrupt("invalid frontier collection".to_owned())
-            })?;
-            for frontier in frontiers.iter() {
-                let _: WalletAddress = serde_json::from_value(frontier["wallet"].clone())?;
-            }
-            frontiers.retain(|frontier| frontier["wallet"].as_str() != Some(wallet_hex.as_str()));
-            tx.execute(
-                "UPDATE meta SET value = ?1 WHERE key = 'feed_history_frontiers'",
-                params![serde_json::to_vec(&value)?],
-            )?;
-        }
-        let mut drains = retirement_drains_in(&tx)?;
-        drains.push(wallet_hex);
-        write_retirement_drains(&tx, &drains)?;
-        tx.execute_batch("DROP TABLE wallet_retirement_trade_ids;")?;
-        tx.commit()?;
-        Ok(RetentionTransaction {
-            result: None,
-            lock_time: started.elapsed(),
+            })
         })
     }
 
@@ -1246,11 +1246,11 @@ impl PaperStateDb {
     pub fn retirement_drains(
         &self,
     ) -> Result<RetentionTransaction<Vec<WalletAddress>>, PaperStateError> {
-        let conn = self.lock();
-        let started = std::time::Instant::now();
-        let listed = retirement_drains_in(&conn)?;
-        let lock_time = started.elapsed();
-        drop(conn);
+        let (listed, lock_time) = self.with(|conn| {
+            let started = std::time::Instant::now();
+            let listed = retirement_drains_in(conn)?;
+            Ok::<_, PaperStateError>((listed, started.elapsed()))
+        })?;
         let result = listed
             .iter()
             .map(|wallet| {
@@ -1272,48 +1272,49 @@ impl PaperStateDb {
     ) -> Result<RetentionTransaction<WalletDrain>, PaperStateError> {
         let limit =
             i64::try_from(limit).map_err(|error| PaperStateError::Internal(error.to_string()))?;
-        let mut conn = self.lock();
-        let started = std::time::Instant::now();
-        if !conn.is_autocommit() {
-            return Err(PaperStateError::RetentionBatchOpen);
-        }
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let wallet_hex = wallet.to_string();
-        let mut drains = retirement_drains_in(&tx)?;
-        if !drains.contains(&wallet_hex) {
-            return Ok(RetentionTransaction {
+        self.with(|conn| {
+            let started = std::time::Instant::now();
+            if !conn.is_autocommit() {
+                return Err(PaperStateError::RetentionBatchOpen);
+            }
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let wallet_hex = wallet.to_string();
+            let mut drains = retirement_drains_in(&tx)?;
+            if !drains.contains(&wallet_hex) {
+                return Ok(RetentionTransaction {
+                    result: WalletDrain {
+                        trade_ids: 0,
+                        finished: true,
+                    },
+                    lock_time: started.elapsed(),
+                });
+            }
+            tx.execute_batch(
+                "CREATE TEMP TABLE wallet_drain_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL);",
+            )?;
+            let mut owner = "activity_groups";
+            let mut trade_ids = tx.execute(DRAIN_GROUP_IDS_SQL, params![wallet_hex, limit])?;
+            if trade_ids == 0 {
+                owner = "entry_gate_results";
+                trade_ids = tx.execute(DRAIN_GATE_IDS_SQL, params![wallet_hex, limit])?;
+            }
+            if trade_ids == 0 {
+                drains.retain(|listed| listed != &wallet_hex);
+                write_retirement_drains(&tx, &drains)?;
+            } else {
+                for table in TRADE_ROW_TABLES.into_iter().chain([owner]) {
+                    tx.execute(&format!("DELETE FROM {table} WHERE source_trade_id IN (SELECT source_trade_id FROM wallet_drain_trade_ids)"), [])?;
+                }
+            }
+            tx.execute_batch("DROP TABLE wallet_drain_trade_ids;")?;
+            tx.commit()?;
+            Ok(RetentionTransaction {
                 result: WalletDrain {
-                    trade_ids: 0,
-                    finished: true,
+                    trade_ids,
+                    finished: trade_ids == 0,
                 },
                 lock_time: started.elapsed(),
-            });
-        }
-        tx.execute_batch(
-            "CREATE TEMP TABLE wallet_drain_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL);",
-        )?;
-        let mut owner = "activity_groups";
-        let mut trade_ids = tx.execute(DRAIN_GROUP_IDS_SQL, params![wallet_hex, limit])?;
-        if trade_ids == 0 {
-            owner = "entry_gate_results";
-            trade_ids = tx.execute(DRAIN_GATE_IDS_SQL, params![wallet_hex, limit])?;
-        }
-        if trade_ids == 0 {
-            drains.retain(|listed| listed != &wallet_hex);
-            write_retirement_drains(&tx, &drains)?;
-        } else {
-            for table in TRADE_ROW_TABLES.into_iter().chain([owner]) {
-                tx.execute(&format!("DELETE FROM {table} WHERE source_trade_id IN (SELECT source_trade_id FROM wallet_drain_trade_ids)"), [])?;
-            }
-        }
-        tx.execute_batch("DROP TABLE wallet_drain_trade_ids;")?;
-        tx.commit()?;
-        Ok(RetentionTransaction {
-            result: WalletDrain {
-                trade_ids,
-                finished: trade_ids == 0,
-            },
-            lock_time: started.elapsed(),
+            })
         })
     }
 
@@ -1416,9 +1417,9 @@ impl PaperStateDb {
     /// Stop SQLite's automatic WAL checkpoints inside shared-connection commits; the caller then runs
     /// [`Self::checkpoint_wal`] (#813). Returns the setting read back.
     pub fn stop_auto_checkpoint(&self) -> Result<i64, PaperStateError> {
-        Ok(self
-            .lock()
-            .pragma_update_and_check(None, "wal_autocheckpoint", 0, |row| row.get(0))?)
+        Ok(self.with(|conn| {
+            conn.pragma_update_and_check(None, "wal_autocheckpoint", 0, |row| row.get(0))
+        })?)
     }
 
     /// One passive WAL checkpoint on the checkpoint connection, so its disk syncs hold neither the
@@ -1426,8 +1427,9 @@ impl PaperStateDb {
     /// concurrent commit can limit it, and a checkpoint in another process can make it report busy
     /// and copy nothing; the next one continues. Only an SQL error fails it.
     pub fn checkpoint_wal(&self) -> Result<(), PaperStateError> {
-        self.checkpointer()
-            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
+        self.with_checkpoint(|conn| {
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+        })?;
         Ok(())
     }
 
@@ -1437,28 +1439,29 @@ impl PaperStateDb {
     /// the checkpoint connection, so the shared one is never held through its syncs; a concurrent
     /// commit's read mark can leave it partial, so it is retried twice before the barrier fails.
     pub fn sync_checkpoint_dispositions(&self) -> Result<(), PaperStateError> {
-        if !self.lock().is_autocommit() {
+        if !self.with(|conn| conn.is_autocommit()) {
             return Err(PaperStateError::Internal(
                 "checkpoint barrier during a paper-state batch".to_owned(),
             ));
         }
-        let checkpoint = self.checkpointer();
-        let mut incomplete = (0, 0, 0);
-        for _ in 0..3 {
-            let (busy, log, checkpointed): (i64, i64, i64) =
-                checkpoint.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?;
-            if busy == 0 && log == checkpointed {
-                return Ok(());
+        self.with_checkpoint(|checkpoint| {
+            let mut incomplete = (0, 0, 0);
+            for _ in 0..3 {
+                let (busy, log, checkpointed): (i64, i64, i64) =
+                    checkpoint.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?;
+                if busy == 0 && log == checkpointed {
+                    return Ok(());
+                }
+                incomplete = (busy, log, checkpointed);
             }
-            incomplete = (busy, log, checkpointed);
-        }
-        let (busy, log, checkpointed) = incomplete;
-        Err(PaperStateError::MigrationCheckpointIncomplete {
-            busy,
-            log,
-            checkpointed,
+            let (busy, log, checkpointed) = incomplete;
+            Err(PaperStateError::MigrationCheckpointIncomplete {
+                busy,
+                log,
+                checkpointed,
+            })
         })
     }
 
@@ -1503,52 +1506,62 @@ impl PaperStateDb {
         })
     }
 
-    /// Lock the connection, recovering the guard if a previous holder panicked.
-    /// rusqlite operations are transactional (an uncommitted `Transaction` rolls
-    /// back on drop), so a recovered guard never exposes a half-applied write.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Use the connection, recovering its guard if a previous holder panicked.
+    fn with<T>(&self, f: impl FnOnce(&mut Connection) -> T) -> T {
+        pe_event_log::run_blocking(|| {
+            let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
+            f(&mut conn)
+        })
     }
 
-    /// Lock the maintenance connection, recovering the guard as [`Self::lock`] does.
-    fn maintenance(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.maintenance
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    /// Use the maintenance connection with the same poison recovery as [`Self::with`].
+    fn with_maintenance<T>(&self, f: impl FnOnce(&mut Connection) -> T) -> T {
+        pe_event_log::run_blocking(|| {
+            let mut conn = self
+                .maintenance
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            f(&mut conn)
+        })
     }
 
-    /// Lock the checkpoint connection, recovering the guard as [`Self::lock`] does.
-    fn checkpointer(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.checkpoint
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    /// Use the checkpoint connection with the same poison recovery as [`Self::with`].
+    fn with_checkpoint<T>(&self, f: impl FnOnce(&mut Connection) -> T) -> T {
+        pe_event_log::run_blocking(|| {
+            let mut conn = self
+                .checkpoint
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            f(&mut conn)
+        })
     }
 
     /// Run a read on the maintenance connection and discard its rows, so a following hold finds
     /// their pages in the operating system's cache.
     fn warm(&self, sql: &str, params: impl rusqlite::Params) -> Result<(), PaperStateError> {
-        let conn = self.maintenance();
-        let mut statement = conn.prepare(sql)?;
-        let mut rows = statement.query(params)?;
-        while rows.next()?.is_some() {}
-        Ok(())
+        self.with_maintenance(|conn| {
+            let mut statement = conn.prepare(sql)?;
+            let mut rows = statement.query(params)?;
+            while rows.next()?.is_some() {}
+            Ok(())
+        })
     }
 
     /// Begin one caller-owned batch spanning multiple activity-bucket savepoints.
     pub fn begin_batch(&self) -> Result<(), PaperStateError> {
-        self.lock().execute_batch("BEGIN IMMEDIATE")?;
+        self.with(|conn| conn.execute_batch("BEGIN IMMEDIATE"))?;
         Ok(())
     }
 
     /// Commit the caller-owned activity-bucket batch.
     pub fn commit_batch(&self) -> Result<(), PaperStateError> {
-        self.lock().execute_batch("COMMIT")?;
+        self.with(|conn| conn.execute_batch("COMMIT"))?;
         Ok(())
     }
 
     /// Roll back the caller-owned activity-bucket batch.
     pub fn rollback_batch(&self) -> Result<(), PaperStateError> {
-        self.lock().execute_batch("ROLLBACK")?;
+        self.with(|conn| conn.execute_batch("ROLLBACK"))?;
         Ok(())
     }
 
@@ -1577,31 +1590,33 @@ impl PaperStateDb {
         keys: &(impl Serialize + ?Sized),
     ) -> Result<Vec<AssetIdentityRow>, PaperStateError> {
         let keys = serde_json::to_string(keys)?;
-        let conn = self.lock();
-        let mut statement = conn.prepare(query)?;
-        statement
-            .query_map(params![generation, keys], |row| {
-                Ok(AssetIdentityRow {
-                    token: PolymarketTokenId(row.get(0)?),
-                    condition_id: PolymarketConditionId(row.get(1)?),
-                    outcome: row.get(2)?,
-                    source_log_sequence: row.get(3)?,
-                    canonical_page_hash: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(PaperStateError::from)
+        self.with(|conn| {
+            let mut statement = conn.prepare(query)?;
+            statement
+                .query_map(params![generation, keys], |row| {
+                    Ok(AssetIdentityRow {
+                        token: PolymarketTokenId(row.get(0)?),
+                        condition_id: PolymarketConditionId(row.get(1)?),
+                        outcome: row.get(2)?,
+                        source_log_sequence: row.get(3)?,
+                        canonical_page_hash: row.get(4)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(PaperStateError::from)
+        })
     }
 
     /// Distinct source-log sequences that recorded asset identities, ascending; the daily source
     /// retention keeps those frames readable. Answered from a covering index, not a table scan.
     pub fn asset_identity_source_sequences(&self) -> Result<Vec<i64>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(ASSET_IDENTITY_SOURCE_SEQUENCES)?;
-        statement
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(PaperStateError::from)
+        self.with(|conn| {
+            let mut statement = conn.prepare(ASSET_IDENTITY_SOURCE_SEQUENCES)?;
+            statement
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(PaperStateError::from)
+        })
     }
 
     /// Point lookup of a condition's monotonic rejection, independent of its token rows.
@@ -1610,14 +1625,15 @@ impl PaperStateDb {
         generation: &str,
         condition: &str,
     ) -> Result<Option<i64>, PaperStateError> {
-        self.lock()
-            .query_row(
+        self.with(|conn| {
+            conn.query_row(
                 "SELECT value FROM meta WHERE key = ?1",
                 [format!("rejected_asset_condition:{generation}:{condition}")],
                 |row| row.get(0),
             )
             .optional()
             .map_err(PaperStateError::from)
+        })
     }
 
     /// Fetch completed lookup absences for only the requested tokens in this generation.
@@ -1644,18 +1660,19 @@ impl PaperStateDb {
         tokens: &[PolymarketTokenId],
         prefix: &str,
     ) -> Result<BTreeMap<PolymarketTokenId, i64>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT requested.value, meta.value FROM json_each(?2) AS requested \
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT requested.value, meta.value FROM json_each(?2) AS requested \
              JOIN meta ON meta.key = ?3 || ?1 || ':' || requested.value",
-        )?;
-        statement
-            .query_map(
-                params![generation, serde_json::to_string(tokens)?, prefix],
-                |row| Ok((PolymarketTokenId(row.get(0)?), row.get(1)?)),
-            )?
-            .collect::<Result<_, _>>()
-            .map_err(PaperStateError::from)
+            )?;
+            statement
+                .query_map(
+                    params![generation, serde_json::to_string(tokens)?, prefix],
+                    |row| Ok((PolymarketTokenId(row.get(0)?), row.get(1)?)),
+                )?
+                .collect::<Result<_, _>>()
+                .map_err(PaperStateError::from)
+        })
     }
 
     /// Commit verified rows independently, retaining their original provenance.
@@ -1684,51 +1701,52 @@ impl PaperStateDb {
         rejected_tokens: &BTreeMap<PolymarketTokenId, i64>,
     ) -> Result<(), PaperStateError> {
         Self::check_identity_mutation_bound(identities.len())?;
-        let mut conn = self.lock();
-        Self::require_identity_autocommit(&conn)?;
-        let tx = conn.transaction()?;
-        tx.execute(
+        self.with(|conn| {
+            Self::require_identity_autocommit(conn)?;
+            let tx = conn.transaction()?;
+            tx.execute(
             "INSERT INTO asset_identities \
              (generation, token, condition_id, outcome, source_log_sequence, canonical_page_hash) \
              SELECT ?1, json_extract(value, '$.token'), json_extract(value, '$.condition_id'), \
              json_extract(value, '$.outcome'), \
              json_extract(value, '$.source_log_sequence'), json_extract(value, '$.canonical_page_hash') \
              FROM json_each(?2) WHERE true \
-             ON CONFLICT(generation, token) DO NOTHING",
-            params![generation, serde_json::to_string(identities)?],
-        )?;
-        let rejections = rejections.iter().collect::<Vec<_>>();
-        for chunk in rejections.chunks(ASSET_IDENTITY_INSERT_LIMIT) {
-            tx.execute(
+                 ON CONFLICT(generation, token) DO NOTHING",
+                params![generation, serde_json::to_string(identities)?],
+            )?;
+            let rejections = rejections.iter().collect::<Vec<_>>();
+            for chunk in rejections.chunks(ASSET_IDENTITY_INSERT_LIMIT) {
+                tx.execute(
                 "INSERT INTO meta (key, value) \
                  SELECT 'rejected_asset_condition:' || ?1 || ':' || json_extract(value, '$[0]'), \
                  json_extract(value, '$[1]') FROM json_each(?2) WHERE true \
-                 ON CONFLICT(key) DO NOTHING",
-                params![generation, serde_json::to_string(chunk)?],
-            )?;
-        }
-        let absences = absences.iter().collect::<Vec<_>>();
-        for chunk in absences.chunks(ASSET_IDENTITY_INSERT_LIMIT) {
-            tx.execute(
+                     ON CONFLICT(key) DO NOTHING",
+                    params![generation, serde_json::to_string(chunk)?],
+                )?;
+            }
+            let absences = absences.iter().collect::<Vec<_>>();
+            for chunk in absences.chunks(ASSET_IDENTITY_INSERT_LIMIT) {
+                tx.execute(
                 "INSERT INTO meta (key, value) \
                  SELECT 'absent_asset_token:' || ?1 || ':' || json_extract(value, '$[0]'), \
                  json_extract(value, '$[1]') FROM json_each(?2) WHERE true \
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![generation, serde_json::to_string(chunk)?],
-            )?;
-        }
-        let rejected_tokens = rejected_tokens.iter().collect::<Vec<_>>();
-        for chunk in rejected_tokens.chunks(ASSET_IDENTITY_INSERT_LIMIT) {
-            tx.execute(
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![generation, serde_json::to_string(chunk)?],
+                )?;
+            }
+            let rejected_tokens = rejected_tokens.iter().collect::<Vec<_>>();
+            for chunk in rejected_tokens.chunks(ASSET_IDENTITY_INSERT_LIMIT) {
+                tx.execute(
                 "INSERT INTO meta (key, value) \
                  SELECT 'rejected_asset_token:' || ?1 || ':' || json_extract(value, '$[0]'), \
                  json_extract(value, '$[1]') FROM json_each(?2) WHERE true \
-                 ON CONFLICT(key) DO NOTHING",
-                params![generation, serde_json::to_string(chunk)?],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+                     ON CONFLICT(key) DO NOTHING",
+                    params![generation, serde_json::to_string(chunk)?],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Remove unauthenticated rows independently; rejected conditions remain recorded.
@@ -1738,16 +1756,17 @@ impl PaperStateDb {
         tokens: &[PolymarketTokenId],
     ) -> Result<(), PaperStateError> {
         Self::check_identity_mutation_bound(tokens.len())?;
-        let mut conn = self.lock();
-        Self::require_identity_autocommit(&conn)?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "DELETE FROM asset_identities WHERE generation = ?1 \
+        self.with(|conn| {
+            Self::require_identity_autocommit(conn)?;
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM asset_identities WHERE generation = ?1 \
              AND token IN (SELECT value FROM json_each(?2))",
-            params![generation, serde_json::to_string(tokens)?],
-        )?;
-        tx.commit()?;
-        Ok(())
+                params![generation, serde_json::to_string(tokens)?],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     fn check_identity_mutation_bound(rows: usize) -> Result<(), PaperStateError> {
@@ -1771,15 +1790,16 @@ impl PaperStateDb {
     /// Whether this `source_trade_id` has already been processed. Checked as the
     /// first action in the trade handler, before any ledger mutation.
     pub fn is_seen(&self, source_trade_id: &SourceTradeId) -> Result<bool, PaperStateError> {
-        let conn = self.lock();
-        let found: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM seen_trades WHERE source_trade_id = ?1",
-                params![source_trade_id.0],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(found.is_some())
+        self.with(|conn| {
+            let found: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM seen_trades WHERE source_trade_id = ?1",
+                    params![source_trade_id.0],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(found.is_some())
+        })
     }
 
     /// Read the immutable initially applied semantics for a reconciled group.
@@ -1787,23 +1807,24 @@ impl PaperStateDb {
         &self,
         source_trade_id: &SourceTradeId,
     ) -> Result<Option<ActivityGroupState>, PaperStateError> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT transaction_hash, semantic_revision, source_epoch, disposition, proof_json \
+        self.with(|conn| {
+            conn.query_row(
+                "SELECT transaction_hash, semantic_revision, source_epoch, disposition, proof_json \
              FROM activity_groups WHERE source_trade_id = ?1",
-            params![source_trade_id.0],
-            |row| {
-                Ok(ActivityGroupState {
-                    transaction_hash: row.get(0)?,
-                    semantic_revision: row.get(1)?,
-                    source_epoch: row.get(2)?,
-                    disposition: row.get(3)?,
-                    proof_json: row.get(4)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(PaperStateError::from)
+                params![source_trade_id.0],
+                |row| {
+                    Ok(ActivityGroupState {
+                        transaction_hash: row.get(0)?,
+                        semantic_revision: row.get(1)?,
+                        source_epoch: row.get(2)?,
+                        disposition: row.get(3)?,
+                        proof_json: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(PaperStateError::from)
+        })
     }
 
     /// Whether this exact aggregate revision has a durable disposition, including a refused
@@ -1813,8 +1834,8 @@ impl PaperStateDb {
         source_trade_id: &SourceTradeId,
         semantic_revision: &str,
     ) -> Result<bool, PaperStateError> {
-        self.lock()
-            .query_row(
+        self.with(|conn| {
+            conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM activity_group_revisions \
                  WHERE source_trade_id = ?1 AND semantic_revision = ?2) \
                  OR EXISTS(SELECT 1 FROM activity_groups \
@@ -1823,6 +1844,7 @@ impl PaperStateDb {
                 |row| row.get(0),
             )
             .map_err(PaperStateError::from)
+        })
     }
 
     pub fn activity_revision_state(
@@ -1830,11 +1852,11 @@ impl PaperStateDb {
         id: &SourceTradeId,
         revision: &str,
     ) -> Result<Option<ActivityGroupState>, PaperStateError> {
-        self.lock().query_row("SELECT r.transaction_hash, r.semantic_revision, g.source_epoch, r.disposition, r.proof_json
+        self.with(|conn| conn.query_row("SELECT r.transaction_hash, r.semantic_revision, g.source_epoch, r.disposition, r.proof_json
             FROM activity_group_revisions r JOIN activity_groups g USING (source_trade_id)
             WHERE r.source_trade_id = ?1 AND r.semantic_revision = ?2", params![id.0, revision], |row| Ok(ActivityGroupState {
                 transaction_hash: row.get(0)?, semantic_revision: row.get(1)?, source_epoch: row.get(2)?, disposition: row.get(3)?, proof_json: row.get(4)?,
-            })).optional().map_err(PaperStateError::from)
+            })).optional().map_err(PaperStateError::from))
     }
 
     /// Exact disposed revision with its canonical transaction identity.
@@ -1844,14 +1866,15 @@ impl PaperStateDb {
         revision: &str,
         transaction_hash: &str,
     ) -> Result<bool, PaperStateError> {
-        self.lock()
-            .query_row(
+        self.with(|conn| {
+            conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM activity_group_revisions WHERE source_trade_id = ?1
              AND semantic_revision = ?2 AND transaction_hash = ?3)",
                 params![id.0, revision, transaction_hash],
                 |row| row.get(0),
             )
             .map_err(PaperStateError::from)
+        })
     }
 
     /// Recognize an exact revision retained as a scoped exclusion or a no-scope record.
@@ -1860,13 +1883,15 @@ impl PaperStateDb {
         id: &SourceTradeId,
         revision: &str,
     ) -> Result<bool, PaperStateError> {
-        Ok(self.lock().query_row(
-            "SELECT EXISTS(SELECT 1 FROM activity_group_revisions \
+        Ok(self.with(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM activity_group_revisions \
              WHERE source_trade_id = ?1 AND semantic_revision = ?2 \
              AND disposition IN ('scope_dropped', 'raw_only'))",
-            params![id.0, revision],
-            |row| row.get(0),
-        )?)
+                params![id.0, revision],
+                |row| row.get(0),
+            )
+        })?)
     }
 
     /// All original effects and all retained revisions through an accepted source cutoff.
@@ -1875,9 +1900,9 @@ impl PaperStateDb {
         wallet: &WalletAddress,
         cutoff: i64,
     ) -> Result<Vec<RecoveryActivityRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT source_trade_id, source_epoch, proof_json FROM (
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT source_trade_id, source_epoch, proof_json FROM (
              SELECT g.source_trade_id, g.source_epoch, g.proof_json, g.semantic_revision
              FROM activity_groups g WHERE g.wallet_hex = ?1 AND g.source_epoch <= ?2
              UNION ALL
@@ -1885,16 +1910,17 @@ impl PaperStateDb {
              FROM activity_groups g JOIN activity_group_revisions r USING (source_trade_id)
              WHERE g.wallet_hex = ?1 AND g.source_epoch <= ?2)
              ORDER BY source_epoch, source_trade_id, semantic_revision",
-        )?;
-        let rows = statement.query_map(params![wallet.to_string(), cutoff], |row| {
-            Ok(RecoveryActivityRow {
-                source_trade_id: SourceTradeId(row.get(0)?),
-                source_epoch: row.get(1)?,
-                proof_json: row.get(2)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(PaperStateError::from)
+            )?;
+            let rows = statement.query_map(params![wallet.to_string(), cutoff], |row| {
+                Ok(RecoveryActivityRow {
+                    source_trade_id: SourceTradeId(row.get(0)?),
+                    source_epoch: row.get(1)?,
+                    proof_json: row.get(2)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(PaperStateError::from)
+        })
     }
 
     /// Unique revised fence trigger, attributed through the original group and source epoch.
@@ -1903,21 +1929,21 @@ impl PaperStateDb {
         fence: &WalletFenceRecord,
         epoch: i64,
     ) -> Result<bool, PaperStateError> {
-        self.lock().query_row(
+        self.with(|conn| conn.query_row(
             "SELECT COUNT(*) = 1 FROM activity_group_revisions r JOIN activity_groups g USING (source_trade_id)
              WHERE g.source_trade_id = ?1 AND g.wallet_hex = ?2 AND g.source_epoch = ?3
                AND r.semantic_revision != g.semantic_revision AND r.transaction_hash = g.transaction_hash
                AND r.recorded_at_unix = ?4 AND r.disposition IN ('revised_applied_aggregate', 'raw_only')",
             params![fence.source_trade_id.0, fence.wallet.to_string(), epoch, fence.fenced_at_unix],
             |row| row.get(0),
-        ).map_err(PaperStateError::from)
+        ).map_err(PaperStateError::from))
     }
 
     pub fn wallet_fence(
         &self,
         wallet: &WalletAddress,
     ) -> Result<Option<WalletFenceRecord>, PaperStateError> {
-        read_wallet_fence(&self.lock(), wallet)
+        self.with(|conn| read_wallet_fence(conn, wallet))
     }
 
     /// Greatest fully committed version-two bucket epoch for one wallet.
@@ -1925,13 +1951,14 @@ impl PaperStateDb {
         &self,
         wallet: &WalletAddress,
     ) -> Result<Option<i64>, PaperStateError> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT MAX(source_epoch) FROM activity_groups WHERE wallet_hex = ?1",
-            params![wallet.to_string()],
-            |row| row.get(0),
-        )
-        .map_err(PaperStateError::from)
+        self.with(|conn| {
+            conn.query_row(
+                "SELECT MAX(source_epoch) FROM activity_groups WHERE wallet_hex = ?1",
+                params![wallet.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(PaperStateError::from)
+        })
     }
 
     /// Replayable activity groups strictly after `cutoff_unix`, in causal order.
@@ -1940,33 +1967,35 @@ impl PaperStateDb {
         wallet: &WalletAddress,
         cutoff_unix: i64,
     ) -> Result<Vec<ActivityGroupRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT source_trade_id, source_epoch, semantic_revision, disposition, proof_json \
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT source_trade_id, source_epoch, semantic_revision, disposition, proof_json \
              FROM activity_groups WHERE wallet_hex = ?1 AND source_epoch > ?2 \
              ORDER BY source_epoch, source_trade_id",
-        )?;
-        let rows = statement.query_map(params![wallet.to_string(), cutoff_unix], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
-        let mut groups = Vec::new();
-        for row in rows {
-            let (source_trade_id, source_epoch, semantic_revision, disposition, proof_json) = row?;
-            groups.push(ActivityGroupRow {
-                source_trade_id: SourceTradeId(source_trade_id),
-                source_epoch,
-                semantic_revision,
-                disposition,
-                proof_json,
-            });
-        }
-        Ok(groups)
+            )?;
+            let rows = statement.query_map(params![wallet.to_string(), cutoff_unix], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            let mut groups = Vec::new();
+            for row in rows {
+                let (source_trade_id, source_epoch, semantic_revision, disposition, proof_json) =
+                    row?;
+                groups.push(ActivityGroupRow {
+                    source_trade_id: SourceTradeId(source_trade_id),
+                    source_epoch,
+                    semantic_revision,
+                    disposition,
+                    proof_json,
+                });
+            }
+            Ok(groups)
+        })
     }
 
     /// Append-only activity row boundary for a receipt-ordered admission capture.
@@ -1974,13 +2003,14 @@ impl PaperStateDb {
         &self,
         wallet: &WalletAddress,
     ) -> Result<Option<i64>, PaperStateError> {
-        self.lock()
-            .query_row(
+        self.with(|conn| {
+            conn.query_row(
                 "SELECT MAX(rowid) FROM activity_groups WHERE wallet_hex = ?1",
                 params![wallet.to_string()],
                 |row| row.get(0),
             )
             .map_err(Into::into)
+        })
     }
 
     /// Frozen append prefix; later same-second rows cannot change this boundary.
@@ -1990,21 +2020,22 @@ impl PaperStateDb {
         cutoff: i64,
         boundary: Option<i64>,
     ) -> Result<Vec<ActivityGroupRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare("SELECT source_trade_id, source_epoch, semantic_revision, disposition, proof_json FROM activity_groups WHERE wallet_hex = ?1 AND source_epoch > ?2 AND rowid <= ?3 ORDER BY source_epoch, source_trade_id")?;
-        let rows = statement.query_map(
-            params![wallet.to_string(), cutoff, boundary.unwrap_or(0)],
-            |row| {
-                Ok(ActivityGroupRow {
-                    source_trade_id: SourceTradeId(row.get(0)?),
-                    source_epoch: row.get(1)?,
-                    semantic_revision: row.get(2)?,
-                    disposition: row.get(3)?,
-                    proof_json: row.get(4)?,
-                })
-            },
-        )?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        self.with(|conn| {
+            let mut statement = conn.prepare("SELECT source_trade_id, source_epoch, semantic_revision, disposition, proof_json FROM activity_groups WHERE wallet_hex = ?1 AND source_epoch > ?2 AND rowid <= ?3 ORDER BY source_epoch, source_trade_id")?;
+            let rows = statement.query_map(
+                params![wallet.to_string(), cutoff, boundary.unwrap_or(0)],
+                |row| {
+                    Ok(ActivityGroupRow {
+                        source_trade_id: SourceTradeId(row.get(0)?),
+                        source_epoch: row.get(1)?,
+                        semantic_revision: row.get(2)?,
+                        disposition: row.get(3)?,
+                        proof_json: row.get(4)?,
+                    })
+                },
+            )?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
     }
 
     /// First consumption owner, written atomically with the admission transaction.
@@ -2013,10 +2044,10 @@ impl PaperStateDb {
         wallet: &WalletAddress,
         market: &MarketId,
     ) -> Result<Option<MarketHistoryRecord>, PaperStateError> {
-        self.lock().query_row("SELECT first_epoch, source_trade_id FROM wallet_market_history_v2 WHERE wallet_hex = ?1 AND market_id = ?2",
+        self.with(|conn| conn.query_row("SELECT first_epoch, source_trade_id FROM wallet_market_history_v2 WHERE wallet_hex = ?1 AND market_id = ?2",
             params![wallet.to_string(), market.to_string()], |row| Ok(MarketHistoryRecord {
                 wallet: *wallet, market_id: market.clone(), first_epoch: row.get(0)?, source_trade_id: SourceTradeId(row.get(1)?)
-            })).optional().map_err(Into::into)
+            })).optional().map_err(Into::into))
     }
 
     // ── Write shapes ─────────────────────────────────────────────────────────
@@ -2053,18 +2084,19 @@ impl PaperStateDb {
         flip: Option<DispatchFlip<'_>>,
         pending: Option<PendingTerminalEvidence<'_>>,
     ) -> Result<(), PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        tx_mark_seen(&tx, source_trade_id, None)?;
-        if !tx_is_frame_decision(&tx, source_trade_id)? {
-            tx_upsert_leader(&tx, leader)?;
-        }
-        if let Some(flip) = flip {
-            tx_flip_dispatch_ready(&tx, flip)?;
-        }
-        tx_terminalize_pending(&tx, source_trade_id, "no_fill", pending)?;
-        tx.commit()?;
-        Ok(())
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            tx_mark_seen(&tx, source_trade_id, None)?;
+            if !tx_is_frame_decision(&tx, source_trade_id)? {
+                tx_upsert_leader(&tx, leader)?;
+            }
+            if let Some(flip) = flip {
+                tx_flip_dispatch_ready(&tx, flip)?;
+            }
+            tx_terminalize_pending(&tx, source_trade_id, "no_fill", pending)?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Commit a stale REST-fallback trade with its typed no-copy disposition (#530):
@@ -2105,24 +2137,25 @@ impl PaperStateDb {
         flip: Option<DispatchFlip<'_>>,
         pending: Option<PendingTerminalEvidence<'_>>,
     ) -> Result<(), PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        tx_mark_seen(&tx, source_trade_id, None)?;
-        if !tx_is_frame_decision(&tx, source_trade_id)? {
-            tx_upsert_leader(&tx, leader)?;
-        }
-        tx_record_no_copy_disposition(&tx, source_trade_id, disposition)?;
-        if let Some(flip) = flip {
-            tx_flip_dispatch_ready(&tx, flip)?;
-        }
-        tx_terminalize_pending(
-            &tx,
-            source_trade_id,
-            &format!("no_copy:{}", disposition.reason),
-            pending,
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            tx_mark_seen(&tx, source_trade_id, None)?;
+            if !tx_is_frame_decision(&tx, source_trade_id)? {
+                tx_upsert_leader(&tx, leader)?;
+            }
+            tx_record_no_copy_disposition(&tx, source_trade_id, disposition)?;
+            if let Some(flip) = flip {
+                tx_flip_dispatch_ready(&tx, flip)?;
+            }
+            tx_terminalize_pending(
+                &tx,
+                source_trade_id,
+                &format!("no_copy:{}", disposition.reason),
+                pending,
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Read back a no-copy disposition (audit/scenario surface).
@@ -2130,23 +2163,24 @@ impl PaperStateDb {
         &self,
         source_trade_id: &SourceTradeId,
     ) -> Result<Option<(String, i64, String)>, PaperStateError> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT provenance, age_secs, reason FROM no_copy_dispositions
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT provenance, age_secs, reason FROM no_copy_dispositions
               WHERE source_trade_id = ?1",
-        )?;
-        let mut rows = stmt.query(params![source_trade_id.0])?;
-        match rows.next()? {
-            Some(row) => Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?))),
-            None => Ok(None),
-        }
+            )?;
+            let mut rows = stmt.query(params![source_trade_id.0])?;
+            match rows.next()? {
+                Some(row) => Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?))),
+                None => Ok(None),
+            }
+        })
     }
 
     pub fn entry_gate_result(
         &self,
         id: &SourceTradeId,
     ) -> Result<Option<EntryGateResultRecord>, PaperStateError> {
-        let tuple: Option<(String, String, i64, String, i64)> = self.lock().query_row("SELECT wallet_hex, market_id, source_epoch, result, history_consumed FROM entry_gate_results WHERE source_trade_id = ?1", params![id.0], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).optional()?;
+        let tuple: Option<(String, String, i64, String, i64)> = self.with(|conn| conn.query_row("SELECT wallet_hex, market_id, source_epoch, result, history_consumed FROM entry_gate_results WHERE source_trade_id = ?1", params![id.0], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).optional())?;
         tuple
             .map(|(wallet, market, epoch, result, consumed)| {
                 Ok(EntryGateResultRecord {
@@ -2187,29 +2221,30 @@ impl PaperStateDb {
                 "invalid frame admission transaction".to_owned(),
             ));
         }
-        let mut conn = self.lock();
-        let tx = conn.savepoint()?;
-        let disposed = tx
-            .query_row(
-                "SELECT 1 FROM activity_groups WHERE source_trade_id = ?1",
-                params![pending.source_trade_id.0],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .is_some();
-        if disposed {
-            return Err(PaperStateError::Internal(
-                "frame identity already disposed by REST".to_owned(),
-            ));
-        }
-        tx_persist_admission(
-            &tx,
-            std::slice::from_ref(gate),
-            std::slice::from_ref(history),
-            std::slice::from_ref(pending),
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.with(|conn| {
+            let tx = conn.savepoint()?;
+            let disposed = tx
+                .query_row(
+                    "SELECT 1 FROM activity_groups WHERE source_trade_id = ?1",
+                    params![pending.source_trade_id.0],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some();
+            if disposed {
+                return Err(PaperStateError::Internal(
+                    "frame identity already disposed by REST".to_owned(),
+                ));
+            }
+            tx_persist_admission(
+                &tx,
+                std::slice::from_ref(gate),
+                std::slice::from_ref(history),
+                std::slice::from_ref(pending),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Record membership once: a group id, empty for ungrouped, or `absent`.
@@ -2218,16 +2253,17 @@ impl PaperStateDb {
         market_id: &str,
         group_id: &str,
     ) -> Result<(), PaperStateError> {
-        let conn = self.lock();
-        if !conn.is_autocommit() {
-            return Err(PaperStateError::MembershipBatchOpen);
-        }
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('neg_risk_group:' || ?1, ?2) \
+        self.with(|conn| {
+            if !conn.is_autocommit() {
+                return Err(PaperStateError::MembershipBatchOpen);
+            }
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('neg_risk_group:' || ?1, ?2) \
              ON CONFLICT(key) DO NOTHING",
-            params![market_id, group_id],
-        )?;
-        Ok(())
+                params![market_id, group_id],
+            )?;
+            Ok(())
+        })
     }
 
     /// Read acquired evidence distinctly from a market that has never been looked up.
@@ -2235,14 +2271,14 @@ impl PaperStateDb {
         &self,
         market_id: &str,
     ) -> Result<Option<MarketMembership>, PaperStateError> {
-        let value: Option<String> = self
-            .lock()
-            .query_row(
+        let value: Option<String> = self.with(|conn| {
+            conn.query_row(
                 "SELECT value FROM meta WHERE key = 'neg_risk_group:' || ?1",
                 [market_id],
                 |row| row.get(0),
             )
-            .optional()?;
+            .optional()
+        })?;
         Ok(value.map(|value| match value.as_str() {
             "absent" => MarketMembership::Absent,
             "" => MarketMembership::Ungrouped,
@@ -2252,9 +2288,7 @@ impl PaperStateDb {
 
     /// Positive group evidence from recorded memberships or the newest imported batch.
     pub fn is_group(&self, id: &str) -> Result<bool, PaperStateError> {
-        Ok(self
-            .lock()
-            .query_row(IS_GROUP_SQL, [id], |row| row.get(0))?)
+        Ok(self.with(|conn| conn.query_row(IS_GROUP_SQL, [id], |row| row.get(0)))?)
     }
 
     /// Test a market and its known group against this wallet's cumulative drops.
@@ -2265,7 +2299,7 @@ impl PaperStateDb {
         group_id: Option<&str>,
         source_epoch: i64,
     ) -> Result<bool, PaperStateError> {
-        scope_is_dropped(&self.lock(), wallet, market_id, group_id, source_epoch)
+        self.with(|conn| scope_is_dropped(conn, wallet, market_id, group_id, source_epoch))
     }
 
     /// Read exclusions in effect at this second, including their certification seconds.
@@ -2274,26 +2308,27 @@ impl PaperStateDb {
         wallet: &WalletAddress,
         source_epoch: i64,
     ) -> Result<Vec<WalletScopeDrop>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT scope_kind, scope_id, cause, source_trade_id, dropped_at_epoch, \
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT scope_kind, scope_id, cause, source_trade_id, dropped_at_epoch, \
                     proof_json, recorded_at_unix FROM wallet_scope_drops \
              WHERE wallet_hex = ?1 AND dropped_at_epoch <= ?2 ORDER BY scope_kind, scope_id",
-        )?;
-        Ok(statement
-            .query_map(params![wallet.to_string(), source_epoch], |row| {
-                Ok(WalletScopeDrop {
-                    wallet: *wallet,
-                    scope_kind: row.get(0)?,
-                    scope_id: row.get(1)?,
-                    cause: row.get(2)?,
-                    source_trade_id: row.get::<_, Option<String>>(3)?.map(SourceTradeId),
-                    dropped_at_epoch: row.get(4)?,
-                    proof_json: row.get(5)?,
-                    recorded_at_unix: row.get(6)?,
-                })
-            })?
-            .collect::<Result<_, _>>()?)
+            )?;
+            Ok(statement
+                .query_map(params![wallet.to_string(), source_epoch], |row| {
+                    Ok(WalletScopeDrop {
+                        wallet: *wallet,
+                        scope_kind: row.get(0)?,
+                        scope_id: row.get(1)?,
+                        cause: row.get(2)?,
+                        source_trade_id: row.get::<_, Option<String>>(3)?.map(SourceTradeId),
+                        dropped_at_epoch: row.get(4)?,
+                        proof_json: row.get(5)?,
+                        recorded_at_unix: row.get(6)?,
+                    })
+                })?
+                .collect::<Result<_, _>>()?)
+        })
     }
 
     /// Atomically import drops and advance only the newest batch's exact group set.
@@ -2303,102 +2338,107 @@ impl PaperStateDb {
         drops: &[(WalletScopeDrop, AppendReceipt)],
         group_ids: &BTreeSet<String>,
     ) -> Result<(), PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        for (drop, receipt) in drops {
-            let mut imported = drop.clone();
-            imported.source_trade_id = None;
-            imported.proof_json = serde_json::to_string(&serde_json::json!({
-                "batch_id": batch_id,
-                "receipt": receipt,
-            }))?;
-            tx_upsert_scope_drop(&tx, &imported)?;
-        }
-        let current: Option<i64> = tx
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'ranker_group_batch'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if current.is_none_or(|current| batch_id > current) {
-            let groups_json = serde_json::to_string(group_ids)?;
-            tx.execute(
-                "DELETE FROM meta WHERE key GLOB 'ranker_group:*' \
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            for (drop, receipt) in drops {
+                let mut imported = drop.clone();
+                imported.source_trade_id = None;
+                imported.proof_json = serde_json::to_string(&serde_json::json!({
+                    "batch_id": batch_id,
+                    "receipt": receipt,
+                }))?;
+                tx_upsert_scope_drop(&tx, &imported)?;
+            }
+            let current: Option<i64> = tx
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'ranker_group_batch'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current.is_none_or(|current| batch_id > current) {
+                let groups_json = serde_json::to_string(group_ids)?;
+                tx.execute(
+                    "DELETE FROM meta WHERE key GLOB 'ranker_group:*' \
                  AND key NOT IN (SELECT 'ranker_group:' || value FROM json_each(?1))",
-                [&groups_json],
-            )?;
-            tx.execute(
-                "INSERT INTO meta(key, value) \
+                    [&groups_json],
+                )?;
+                tx.execute(
+                    "INSERT INTO meta(key, value) \
                  SELECT 'ranker_group:' || value, 1 FROM json_each(?1) WHERE true \
                  ON CONFLICT(key) DO NOTHING",
-                [&groups_json],
-            )?;
-            tx.execute(
-                "INSERT INTO meta(key, value) VALUES ('ranker_group_batch', ?1) \
+                    [&groups_json],
+                )?;
+                tx.execute(
+                    "INSERT INTO meta(key, value) VALUES ('ranker_group_batch', ?1) \
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [batch_id],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES ('scope_drop_imported:' || ?1, 1) \
+             ON CONFLICT(key) DO NOTHING",
                 [batch_id],
             )?;
-        }
-        tx.execute(
-            "INSERT INTO meta(key, value) VALUES ('scope_drop_imported:' || ?1, 1) \
-             ON CONFLICT(key) DO NOTHING",
-            [batch_id],
-        )?;
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Whether this batch's full import committed.
     pub fn scope_drop_batch_imported(&self, batch_id: i64) -> Result<bool, PaperStateError> {
-        Ok(self.lock().query_row(
-            "SELECT EXISTS(SELECT 1 FROM meta WHERE key = 'scope_drop_imported:' || ?1)",
-            [batch_id],
-            |row| row.get(0),
-        )?)
+        Ok(self.with(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key = 'scope_drop_imported:' || ?1)",
+                [batch_id],
+                |row| row.get(0),
+            )
+        })?)
     }
 
     /// Read the published batch and its exact group set under one connection lock.
     pub fn ranker_group_snapshot(
         &self,
     ) -> Result<(Option<i64>, BTreeSet<String>), PaperStateError> {
-        let conn = self.lock();
-        let batch = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'ranker_group_batch'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let mut statement = conn.prepare(
-            "SELECT substr(key, 14) FROM meta WHERE key GLOB 'ranker_group:*' ORDER BY key",
-        )?;
-        let groups = statement
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        Ok((batch, groups))
+        self.with(|conn| {
+            let batch = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'ranker_group_batch'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let mut statement = conn.prepare(
+                "SELECT substr(key, 14) FROM meta WHERE key GLOB 'ranker_group:*' ORDER BY key",
+            )?;
+            let groups = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            Ok((batch, groups))
+        })
     }
 
     /// Persist the rollback boundary before a live scope-drop journal append.
     pub fn record_scope_drop_boundary(&self, recorded_at_unix: i64) -> Result<(), PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        tx_record_scope_drop_boundary(&tx, recorded_at_unix)?;
-        tx.commit()?;
-        drop(conn);
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            tx_record_scope_drop_boundary(&tx, recorded_at_unix)?;
+            tx.commit()?;
+            Ok::<_, PaperStateError>(())
+        })?;
         self.sync_checkpoint_dispositions()
     }
 
     /// First forward-only scope-drop write, or no boundary yet.
     pub fn scope_drop_boundary_unix(&self) -> Result<Option<i64>, PaperStateError> {
-        Ok(self
-            .lock()
-            .query_row(
+        Ok(self.with(|conn| {
+            conn.query_row(
                 "SELECT value FROM meta WHERE key = 'scope_drop_boundary_unix'",
                 [],
                 |row| row.get(0),
             )
-            .optional()?)
+            .optional()
+        })?)
     }
 
     /// Find the lowest sibling market holding an unsettled YES buy.
@@ -2407,9 +2447,8 @@ impl PaperStateDb {
         market_id: &str,
         group_id: &str,
     ) -> Result<Option<String>, PaperStateError> {
-        Ok(self
-            .lock()
-            .query_row(
+        Ok(self.with(|conn| {
+            conn.query_row(
                 "SELECT f.market_id FROM fills f \
                  JOIN meta g ON g.key = 'neg_risk_group:' || f.market_id \
                  WHERE g.value = ?2 AND f.market_id <> ?1 AND f.outcome_id = 0 AND f.side = 'buy' \
@@ -2418,7 +2457,8 @@ impl PaperStateDb {
                 params![market_id, group_id],
                 |row| row.get(0),
             )
-            .optional()?)
+            .optional()
+        })?)
     }
 
     /// Acknowledged retirement of a non-admitted source observation. Keep its exact receipt
@@ -2428,7 +2468,7 @@ impl PaperStateDb {
         receipt: AppendReceipt,
         unbound: bool,
     ) -> Result<(), PaperStateError> {
-        tx_retire_activity_observation(&self.lock(), receipt, unbound)
+        self.with(|conn| tx_retire_activity_observation(conn, receipt, unbound))
     }
 
     pub fn activity_observation_retired(
@@ -2451,23 +2491,24 @@ impl PaperStateDb {
         &self,
         receipt: AppendReceipt,
     ) -> Result<Option<ActivityObservationRetirement>, PaperStateError> {
-        read_activity_observation_retirement(&self.lock(), receipt)
+        self.with(|conn| read_activity_observation_retirement(conn, receipt))
     }
 
     /// One versioned collection, stored in the existing metadata owner.
     pub fn feed_history_frontiers(&self) -> Result<serde_json::Value, PaperStateError> {
-        let conn = self.lock();
-        let bytes: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'feed_history_frontiers'",
-                [],
-                |row| row.get(0),
+        self.with(|conn| {
+            let bytes: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'feed_history_frontiers'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            bytes.map_or_else(
+                || Ok(serde_json::json!({"version": 1, "frontiers": []})),
+                |bytes| Ok(serde_json::from_slice(&bytes)?),
             )
-            .optional()?;
-        bytes.map_or_else(
-            || Ok(serde_json::json!({"version": 1, "frontiers": []})),
-            |bytes| Ok(serde_json::from_slice(&bytes)?),
-        )
+        })
     }
 
     /// Call only after authenticating the complete-read evidence and all bucket acknowledgements.
@@ -2476,7 +2517,7 @@ impl PaperStateDb {
         value: &serde_json::Value,
     ) -> Result<(), PaperStateError> {
         let bytes = serde_json::to_vec(value)?;
-        self.lock().execute("INSERT INTO meta (key, value) VALUES ('feed_history_frontiers', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![bytes])?;
+        self.with(|conn| conn.execute("INSERT INTO meta (key, value) VALUES ('feed_history_frontiers', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![bytes]))?;
         Ok(())
     }
 
@@ -2490,331 +2531,334 @@ impl PaperStateDb {
         bucket: &ActivityBucketCommit,
     ) -> Result<(), PaperStateError> {
         validate_activity_bucket(bucket)?;
-        let mut conn = self.lock();
-        let tx = conn.savepoint()?;
-        let is_revision_fence = bucket
-            .fence
-            .as_ref()
-            .is_some_and(|fence| fence.cause == "revised_applied_aggregate");
-        let wallet_already_fenced = tx
-            .query_row(
-                "SELECT 1 FROM wallet_fences WHERE wallet_hex = ?1",
-                params![bucket.wallet.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .is_some();
-        let mut invalidates_position_validation = false;
-        let mut inserts_reanchor_trigger = false;
-        let mut retains_novel_revision = false;
-        let mut inserts_group = false;
-
-        for drop in &bucket.scope_drops {
-            tx_upsert_scope_drop(&tx, drop)?;
-        }
-        for (receipt, unbound) in &bucket.observation_retirements {
-            tx_retire_activity_observation(&tx, *receipt, *unbound)?;
-        }
-        for record in &bucket.dispositions {
-            let mut non_original = false;
-            let durable_revision: Option<(String, String, String)> = tx
+        self.with(|conn| {
+            let tx = conn.savepoint()?;
+            let is_revision_fence = bucket
+                .fence
+                .as_ref()
+                .is_some_and(|fence| fence.cause == "revised_applied_aggregate");
+            let wallet_already_fenced = tx
                 .query_row(
-                    "SELECT transaction_hash, disposition, proof_json \
+                    "SELECT 1 FROM wallet_fences WHERE wallet_hex = ?1",
+                    params![bucket.wallet.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some();
+            let mut invalidates_position_validation = false;
+            let mut inserts_reanchor_trigger = false;
+            let mut retains_novel_revision = false;
+            let mut inserts_group = false;
+
+            for drop in &bucket.scope_drops {
+                tx_upsert_scope_drop(&tx, drop)?;
+            }
+            for (receipt, unbound) in &bucket.observation_retirements {
+                tx_retire_activity_observation(&tx, *receipt, *unbound)?;
+            }
+            for record in &bucket.dispositions {
+                let mut non_original = false;
+                let durable_revision: Option<(String, String, String)> = tx
+                    .query_row(
+                        "SELECT transaction_hash, disposition, proof_json \
                      FROM activity_group_revisions \
                      WHERE source_trade_id = ?1 AND semantic_revision = ?2",
-                    params![record.source_trade_id.0, record.semantic_revision],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?;
-            let requested_revision = (
-                record.transaction_hash.clone(),
-                record.disposition.clone(),
-                record.proof_json.clone(),
-            );
-            if durable_revision
-                .as_ref()
-                .is_some_and(|stored| stored != &requested_revision)
-            {
-                return Err(PaperStateError::ActivityRevisionConflict(
-                    record.source_trade_id.0.clone(),
-                ));
-            }
-            let authorized = bucket.unfenced_revisions.iter().any(|(id, revision)| {
-                id == &record.source_trade_id && revision == &record.semantic_revision
-            });
-            let known_scoped_revision = durable_revision.is_some()
-                && matches!(record.disposition.as_str(), "scope_dropped" | "raw_only");
-            if durable_revision.is_none() && record.disposition == "scope_dropped" {
-                tx_record_bucket_scope_drop_boundary(&tx, bucket)?;
-            }
-            let existing: Option<(String, String, String, String, i64, String, String)> = tx
-                .query_row(
-                    "SELECT transaction_hash, semantic_revision, disposition, wallet_hex, \
-                            source_epoch, activity_type, proof_json \
-                     FROM activity_groups WHERE source_trade_id = ?1",
-                    params![record.source_trade_id.0],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                            row.get(6)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            if let Some((
-                transaction_hash,
-                revision,
-                disposition,
-                wallet_hex,
-                source_epoch,
-                activity_type,
-                proof_json,
-            )) = existing
-            {
-                let exact_retry = transaction_hash == record.transaction_hash
-                    && revision == record.semantic_revision
-                    && disposition == record.disposition
-                    && wallet_hex == record.wallet.to_string()
-                    && source_epoch == record.source_epoch
-                    && activity_type == record.activity_type
-                    && proof_json == record.proof_json;
-                let retained_revision = transaction_hash == record.transaction_hash
-                    && revision != record.semantic_revision
-                    && (is_revision_fence
-                        || wallet_already_fenced
-                        || ((authorized || known_scoped_revision)
-                            && wallet_hex == record.wallet.to_string()
-                            && activity_type == record.activity_type));
-                if !exact_retry && !retained_revision {
+                        params![record.source_trade_id.0, record.semantic_revision],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                let requested_revision = (
+                    record.transaction_hash.clone(),
+                    record.disposition.clone(),
+                    record.proof_json.clone(),
+                );
+                if durable_revision
+                    .as_ref()
+                    .is_some_and(|stored| stored != &requested_revision)
+                {
                     return Err(PaperStateError::ActivityRevisionConflict(
                         record.source_trade_id.0.clone(),
                     ));
                 }
-                non_original = revision != record.semantic_revision;
-                if non_original
-                    && durable_revision.is_none()
-                    && bucket.fence.is_none()
-                    && !wallet_already_fenced
-                {
+                let authorized = bucket.unfenced_revisions.iter().any(|(id, revision)| {
+                    id == &record.source_trade_id && revision == &record.semantic_revision
+                });
+                let known_scoped_revision = durable_revision.is_some()
+                    && matches!(record.disposition.as_str(), "scope_dropped" | "raw_only");
+                if durable_revision.is_none() && record.disposition == "scope_dropped" {
                     tx_record_bucket_scope_drop_boundary(&tx, bucket)?;
                 }
-            } else {
-                invalidates_position_validation = true;
-                inserts_group |= record.disposition != "raw_only";
-                inserts_reanchor_trigger |= bucket
-                    .reanchor
-                    .as_ref()
-                    .is_some_and(|reanchor| reanchor.source_trade_id == record.source_trade_id);
-                tx.execute(
-                    "INSERT INTO activity_groups \
+                let existing: Option<(String, String, String, String, i64, String, String)> = tx
+                    .query_row(
+                        "SELECT transaction_hash, semantic_revision, disposition, wallet_hex, \
+                            source_epoch, activity_type, proof_json \
+                     FROM activity_groups WHERE source_trade_id = ?1",
+                        params![record.source_trade_id.0],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((
+                    transaction_hash,
+                    revision,
+                    disposition,
+                    wallet_hex,
+                    source_epoch,
+                    activity_type,
+                    proof_json,
+                )) = existing
+                {
+                    let exact_retry = transaction_hash == record.transaction_hash
+                        && revision == record.semantic_revision
+                        && disposition == record.disposition
+                        && wallet_hex == record.wallet.to_string()
+                        && source_epoch == record.source_epoch
+                        && activity_type == record.activity_type
+                        && proof_json == record.proof_json;
+                    let retained_revision = transaction_hash == record.transaction_hash
+                        && revision != record.semantic_revision
+                        && (is_revision_fence
+                            || wallet_already_fenced
+                            || ((authorized || known_scoped_revision)
+                                && wallet_hex == record.wallet.to_string()
+                                && activity_type == record.activity_type));
+                    if !exact_retry && !retained_revision {
+                        return Err(PaperStateError::ActivityRevisionConflict(
+                            record.source_trade_id.0.clone(),
+                        ));
+                    }
+                    non_original = revision != record.semantic_revision;
+                    if non_original
+                        && durable_revision.is_none()
+                        && bucket.fence.is_none()
+                        && !wallet_already_fenced
+                    {
+                        tx_record_bucket_scope_drop_boundary(&tx, bucket)?;
+                    }
+                } else {
+                    invalidates_position_validation = true;
+                    inserts_group |= record.disposition != "raw_only";
+                    inserts_reanchor_trigger |= bucket
+                        .reanchor
+                        .as_ref()
+                        .is_some_and(|reanchor| reanchor.source_trade_id == record.source_trade_id);
+                    tx.execute(
+                        "INSERT INTO activity_groups \
                          (source_trade_id, transaction_hash, wallet_hex, source_epoch, \
                           semantic_revision, activity_type, disposition, proof_json) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        record.source_trade_id.0,
-                        record.transaction_hash,
-                        record.wallet.to_string(),
-                        record.source_epoch,
-                        record.semantic_revision,
-                        record.activity_type,
-                        record.disposition,
-                        record.proof_json,
-                    ],
-                )?;
-            }
-            if durable_revision.is_none() {
-                retains_novel_revision |= non_original;
-                invalidates_position_validation |= non_original;
-                tx.execute(
-                    "INSERT INTO activity_group_revisions \
+                        params![
+                            record.source_trade_id.0,
+                            record.transaction_hash,
+                            record.wallet.to_string(),
+                            record.source_epoch,
+                            record.semantic_revision,
+                            record.activity_type,
+                            record.disposition,
+                            record.proof_json,
+                        ],
+                    )?;
+                }
+                if durable_revision.is_none() {
+                    retains_novel_revision |= non_original;
+                    invalidates_position_validation |= non_original;
+                    tx.execute(
+                        "INSERT INTO activity_group_revisions \
                          (source_trade_id, semantic_revision, transaction_hash, disposition, \
                           proof_json, recorded_at_unix) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        record.source_trade_id.0,
-                        record.semantic_revision,
-                        requested_revision.0,
-                        requested_revision.1,
-                        requested_revision.2,
-                        bucket.fence.as_ref().map_or(
-                            bucket
-                                .scope_drop_boundary_unix
-                                .unwrap_or(record.source_epoch),
-                            |fence| fence.fenced_at_unix,
-                        ),
-                    ],
-                )?;
-            }
-            tx_mark_seen(&tx, &record.source_trade_id, Some(&record.transaction_hash))?;
-            // The frame owns this identifier's terminal, even for late/covered/fenced echoes.
-            if tx_is_frame_decision(&tx, &record.source_trade_id)? {
-                continue;
-            }
-            if let Some(disposition) = &record.no_copy {
-                tx_record_no_copy_disposition(&tx, &record.source_trade_id, disposition)?;
-            } else if record.disposition != "applied"
-                && record.disposition != "decision_pending"
-                && record.disposition != "raw_only"
-            {
-                tx_record_no_copy_disposition(
-                    &tx,
-                    &record.source_trade_id,
-                    &NoCopyDisposition {
-                        provenance: "reconciled_rest".to_owned(),
-                        age_secs: 0,
-                        reason: record.disposition.clone(),
-                        recorded_at_unix: record.source_epoch,
-                    },
-                )?;
-            }
-        }
-
-        if inserts_reanchor_trigger {
-            let reanchor = bucket.reanchor.as_ref().ok_or_else(|| {
-                PaperStateError::Internal("missing activity re-anchor marker".to_owned())
-            })?;
-            let updated = tx.execute(
-                "UPDATE poll_cursors SET reanchor_required = 1, \
-                     coverage_generation = coverage_generation + 1 WHERE wallet_hex = ?1",
-                params![bucket.wallet.to_string()],
-            )?;
-            if updated != 1 {
-                return Err(PaperStateError::Internal(format!(
-                    "reanchor mark for {} ({}) requires an existing wallet cursor for {}",
-                    reanchor.source_trade_id, reanchor.reason, bucket.wallet
-                )));
-            }
-            invalidates_position_validation = true;
-        }
-
-        // A retained revision changes coverage. So does a bucket of new groups for a wallet awaiting
-        // re-anchoring: its late-group commits deliver past what they store, so the generation,
-        // not the cursor, signals them. Raw-only groups are restamp twins, which have no coverage
-        // effect, or unresolved groups, which carry their own re-anchor trigger when they need one.
-        if (retains_novel_revision || inserts_group) && !inserts_reanchor_trigger {
-            tx.execute(
-                "UPDATE poll_cursors SET coverage_generation = coverage_generation + 1 \
-                 WHERE wallet_hex = ?1 AND (?2 OR reanchor_required = 1)",
-                params![bucket.wallet.to_string(), retains_novel_revision],
-            )?;
-        }
-
-        for leader in &bucket.leader_positions {
-            tx_upsert_leader(&tx, leader)?;
-        }
-        tx_persist_admission(
-            &tx,
-            &bucket.gate_results,
-            &bucket.history_effects,
-            &bucket.pending,
-        )?;
-        if let Some(status) = &bucket.history_status {
-            upsert_history_status(&tx, status, false)?;
-        }
-        if let Some(fence) = &bucket.fence {
-            let durable: Option<(String, String, String, i64)> = tx
-                .query_row(
-                    "SELECT source_trade_id, cause, proof_json, fenced_at_unix \
-                     FROM wallet_fences WHERE wallet_hex = ?1",
-                    params![fence.wallet.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()?;
-            let requested = (
-                fence.source_trade_id.0.clone(),
-                fence.cause.clone(),
-                fence.proof_json.clone(),
-                fence.fenced_at_unix,
-            );
-            if let Some(durable) = durable {
-                if durable != requested {
-                    return Err(PaperStateError::ActivityRevisionConflict(
-                        fence.source_trade_id.0.clone(),
-                    ));
+                        params![
+                            record.source_trade_id.0,
+                            record.semantic_revision,
+                            requested_revision.0,
+                            requested_revision.1,
+                            requested_revision.2,
+                            bucket.fence.as_ref().map_or(
+                                bucket
+                                    .scope_drop_boundary_unix
+                                    .unwrap_or(record.source_epoch),
+                                |fence| fence.fenced_at_unix,
+                            ),
+                        ],
+                    )?;
                 }
-            } else {
+                tx_mark_seen(&tx, &record.source_trade_id, Some(&record.transaction_hash))?;
+                // The frame owns this identifier's terminal, even for late/covered/fenced echoes.
+                if tx_is_frame_decision(&tx, &record.source_trade_id)? {
+                    continue;
+                }
+                if let Some(disposition) = &record.no_copy {
+                    tx_record_no_copy_disposition(&tx, &record.source_trade_id, disposition)?;
+                } else if record.disposition != "applied"
+                    && record.disposition != "decision_pending"
+                    && record.disposition != "raw_only"
+                {
+                    tx_record_no_copy_disposition(
+                        &tx,
+                        &record.source_trade_id,
+                        &NoCopyDisposition {
+                            provenance: "reconciled_rest".to_owned(),
+                            age_secs: 0,
+                            reason: record.disposition.clone(),
+                            recorded_at_unix: record.source_epoch,
+                        },
+                    )?;
+                }
+            }
+
+            if inserts_reanchor_trigger {
+                let reanchor = bucket.reanchor.as_ref().ok_or_else(|| {
+                    PaperStateError::Internal("missing activity re-anchor marker".to_owned())
+                })?;
+                let updated = tx.execute(
+                    "UPDATE poll_cursors SET reanchor_required = 1, \
+                     coverage_generation = coverage_generation + 1 WHERE wallet_hex = ?1",
+                    params![bucket.wallet.to_string()],
+                )?;
+                if updated != 1 {
+                    return Err(PaperStateError::Internal(format!(
+                        "reanchor mark for {} ({}) requires an existing wallet cursor for {}",
+                        reanchor.source_trade_id, reanchor.reason, bucket.wallet
+                    )));
+                }
+                invalidates_position_validation = true;
+            }
+
+            // A retained revision changes coverage. So does a bucket of new groups for a wallet awaiting
+            // re-anchoring: its late-group commits deliver past what they store, so the generation,
+            // not the cursor, signals them. Raw-only groups are restamp twins, which have no coverage
+            // effect, or unresolved groups, which carry their own re-anchor trigger when they need one.
+            if (retains_novel_revision || inserts_group) && !inserts_reanchor_trigger {
                 tx.execute(
-                    "INSERT INTO wallet_fences \
+                    "UPDATE poll_cursors SET coverage_generation = coverage_generation + 1 \
+                 WHERE wallet_hex = ?1 AND (?2 OR reanchor_required = 1)",
+                    params![bucket.wallet.to_string(), retains_novel_revision],
+                )?;
+            }
+
+            for leader in &bucket.leader_positions {
+                tx_upsert_leader(&tx, leader)?;
+            }
+            tx_persist_admission(
+                &tx,
+                &bucket.gate_results,
+                &bucket.history_effects,
+                &bucket.pending,
+            )?;
+            if let Some(status) = &bucket.history_status {
+                upsert_history_status(&tx, status, false)?;
+            }
+            if let Some(fence) = &bucket.fence {
+                let durable: Option<(String, String, String, i64)> = tx
+                    .query_row(
+                        "SELECT source_trade_id, cause, proof_json, fenced_at_unix \
+                     FROM wallet_fences WHERE wallet_hex = ?1",
+                        params![fence.wallet.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()?;
+                let requested = (
+                    fence.source_trade_id.0.clone(),
+                    fence.cause.clone(),
+                    fence.proof_json.clone(),
+                    fence.fenced_at_unix,
+                );
+                if let Some(durable) = durable {
+                    if durable != requested {
+                        return Err(PaperStateError::ActivityRevisionConflict(
+                            fence.source_trade_id.0.clone(),
+                        ));
+                    }
+                } else {
+                    tx.execute(
+                        "INSERT INTO wallet_fences \
                          (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) \
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        fence.wallet.to_string(),
-                        requested.0,
-                        requested.1,
-                        requested.2,
-                        requested.3,
-                    ],
-                )?;
+                        params![
+                            fence.wallet.to_string(),
+                            requested.0,
+                            requested.1,
+                            requested.2,
+                            requested.3,
+                        ],
+                    )?;
+                }
             }
-        }
-        if bucket.advance_cursor {
-            tx.execute(
-                "INSERT INTO poll_cursors (wallet_hex, last_ts_unix, last_activity_unix) \
+            if bucket.advance_cursor {
+                tx.execute(
+                    "INSERT INTO poll_cursors (wallet_hex, last_ts_unix, last_activity_unix) \
                  VALUES (?1, ?2, ?2) \
                  ON CONFLICT(wallet_hex) DO UPDATE SET \
                     last_ts_unix = MAX(poll_cursors.last_ts_unix, excluded.last_ts_unix), \
                     last_activity_unix = MAX(COALESCE(poll_cursors.last_activity_unix, 0), \
                                              excluded.last_activity_unix)",
-                params![bucket.wallet.to_string(), bucket.source_epoch],
-            )?;
-        }
-        if invalidates_position_validation {
-            tx.execute(
-                "DELETE FROM position_validations WHERE wallet_hex = ?1",
-                params![bucket.wallet.to_string()],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+                    params![bucket.wallet.to_string(), bucket.source_epoch],
+                )?;
+            }
+            if invalidates_position_validation {
+                tx.execute(
+                    "DELETE FROM position_validations WHERE wallet_hex = ?1",
+                    params![bucket.wallet.to_string()],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Rebuild the in-memory first-entry projection from its durable owner.
     pub fn gate_history(
         &self,
     ) -> Result<HashMap<WalletAddress, HashSet<MarketId>>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT wallet_hex, market_id FROM wallet_market_history_v2 \
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT wallet_hex, market_id FROM wallet_market_history_v2 \
              ORDER BY wallet_hex, market_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut history: HashMap<WalletAddress, HashSet<MarketId>> = HashMap::new();
-        for row in rows {
-            let (wallet, market) = row?;
-            history
-                .entry(parse_wallet(&wallet)?)
-                .or_default()
-                .insert(MarketId(VenueMarketId(market)));
-        }
-        let mut completed = conn.prepare(
-            "SELECT wallet_hex FROM wallet_history_status_v2 WHERE complete = 1 \
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut history: HashMap<WalletAddress, HashSet<MarketId>> = HashMap::new();
+            for row in rows {
+                let (wallet, market) = row?;
+                history
+                    .entry(parse_wallet(&wallet)?)
+                    .or_default()
+                    .insert(MarketId(VenueMarketId(market)));
+            }
+            let mut completed = conn.prepare(
+                "SELECT wallet_hex FROM wallet_history_status_v2 WHERE complete = 1 \
              ORDER BY wallet_hex",
-        )?;
-        let wallets = completed.query_map([], |row| row.get::<_, String>(0))?;
-        for wallet in wallets {
-            history.entry(parse_wallet(&wallet?)?).or_default();
-        }
-        Ok(history)
+            )?;
+            let wallets = completed.query_map([], |row| row.get::<_, String>(0))?;
+            for wallet in wallets {
+                history.entry(parse_wallet(&wallet?)?).or_default();
+            }
+            Ok(history)
+        })
     }
 
     /// Whether complete reconciled history permits this wallet's membership publication.
     pub fn wallet_history_complete(&self, wallet: &WalletAddress) -> Result<bool, PaperStateError> {
-        let conn = self.lock();
-        let complete: Option<i64> = conn
-            .query_row(
-                "SELECT complete FROM wallet_history_status_v2 WHERE wallet_hex = ?1",
-                params![wallet.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(complete == Some(1))
+        self.with(|conn| {
+            let complete: Option<i64> = conn
+                .query_row(
+                    "SELECT complete FROM wallet_history_status_v2 WHERE wallet_hex = ?1",
+                    params![wallet.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(complete == Some(1))
+        })
     }
 
     /// Return the exact durable complete-history proof for one wallet.
@@ -2825,30 +2869,31 @@ impl PaperStateDb {
         &self,
         wallet: &WalletAddress,
     ) -> Result<Option<WalletHistoryStatusRecord>, PaperStateError> {
-        let conn = self.lock();
-        let row = conn
-            .query_row(
-                "SELECT complete, proof_json, updated_at_unix \
+        self.with(|conn| {
+            let row = conn
+                .query_row(
+                    "SELECT complete, proof_json, updated_at_unix \
                  FROM wallet_history_status_v2 WHERE wallet_hex = ?1",
-                params![wallet.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        row.map(|(complete, proof_json, updated_at_unix)| {
-            Ok(WalletHistoryStatusRecord {
-                wallet: *wallet,
-                complete: parse_bool_flag(complete, "wallet history complete")?,
-                proof_json,
-                updated_at_unix,
+                    params![wallet.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(|(complete, proof_json, updated_at_unix)| {
+                Ok(WalletHistoryStatusRecord {
+                    wallet: *wallet,
+                    complete: parse_bool_flag(complete, "wallet history complete")?,
+                    proof_json,
+                    updated_at_unix,
+                })
             })
+            .transpose()
         })
-        .transpose()
     }
 
     /// Persist the result of a complete reconciled-history obligation (#544).
@@ -2858,9 +2903,10 @@ impl PaperStateDb {
         &self,
         status: &WalletHistoryStatusRecord,
     ) -> Result<(), PaperStateError> {
-        let conn = self.lock();
-        upsert_history_status(&conn, status, false)?;
-        Ok(())
+        self.with(|conn| {
+            upsert_history_status(conn, status, false)?;
+            Ok(())
+        })
     }
 
     /// Promote SEEDED history rows to complete for wallets whose causal bracket
@@ -2875,17 +2921,18 @@ impl PaperStateDb {
         validated_at_unix: i64,
     ) -> Result<usize, PaperStateError> {
         serde_json::from_str::<serde_json::Value>(proof_json)?;
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let mut promoted = 0usize;
-        for wallet in wallets {
-            promoted += tx.execute(
-                "UPDATE wallet_history_status_v2                      SET complete = 1, proof_json = ?2, updated_at_unix = ?3                  WHERE wallet_hex = ?1 AND complete = 0",
-                params![wallet.to_string(), proof_json, validated_at_unix],
-            )?;
-        }
-        tx.commit()?;
-        Ok(promoted)
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            let mut promoted = 0usize;
+            for wallet in wallets {
+                promoted += tx.execute(
+                    "UPDATE wallet_history_status_v2                      SET complete = 1, proof_json = ?2, updated_at_unix = ?3                  WHERE wallet_hex = ?1 AND complete = 0",
+                    params![wallet.to_string(), proof_json, validated_at_unix],
+                )?;
+            }
+            tx.commit()?;
+            Ok(promoted)
+        })
     }
 
     /// Install one all-or-nothing batch of venue-authoritative position anchors.
@@ -2921,140 +2968,141 @@ impl PaperStateDb {
             prepared.push((install, balances, balances_json));
         }
 
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        for (install, balances, balances_json) in prepared {
-            let wallet_hex = install.wallet.to_string();
-            if read_wallet_fence(&tx, &install.wallet)? != install.expected_fence {
-                return Err(PaperStateError::Internal(format!(
-                    "active fence changed before anchor install for {}",
-                    install.wallet
-                )));
-            }
-            for history in &install.repaired_history {
-                if history.wallet != install.wallet {
-                    return Err(PaperStateError::Internal(
-                        "repaired history wallet mismatch".to_owned(),
-                    ));
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            for (install, balances, balances_json) in prepared {
+                let wallet_hex = install.wallet.to_string();
+                if read_wallet_fence(&tx, &install.wallet)? != install.expected_fence {
+                    return Err(PaperStateError::Internal(format!(
+                        "active fence changed before anchor install for {}",
+                        install.wallet
+                    )));
                 }
-                tx.execute(
-                    "INSERT OR IGNORE INTO wallet_market_history_v2
+                for history in &install.repaired_history {
+                    if history.wallet != install.wallet {
+                        return Err(PaperStateError::Internal(
+                            "repaired history wallet mismatch".to_owned(),
+                        ));
+                    }
+                    tx.execute(
+                        "INSERT OR IGNORE INTO wallet_market_history_v2
                     (wallet_hex, market_id, first_epoch, source_trade_id, origin)
                     VALUES (?1, ?2, ?3, ?4, 'activity_v2')",
-                    params![
-                        wallet_hex,
-                        history.market_id.to_string(),
-                        history.first_epoch,
-                        history.source_trade_id.0
-                    ],
-                )?;
-            }
-            let stored_cutoff: Option<Option<i64>> = tx
-                .query_row(
-                    "SELECT activity_cutoff_unix FROM poll_cursors WHERE wallet_hex = ?1",
-                    params![wallet_hex],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let stored_cutoff = stored_cutoff.ok_or_else(|| {
-                PaperStateError::Internal(format!(
-                    "anchor install requires an existing wallet cursor for {}",
-                    install.wallet
-                ))
-            })?;
-            if let Some(stored_cutoff_unix) = stored_cutoff
-                && stored_cutoff_unix > install.activity_cutoff_unix
-            {
-                return Err(PaperStateError::AnchorCutoffRegression {
-                    wallet: install.wallet,
-                    stored_cutoff_unix,
-                    candidate_cutoff_unix: install.activity_cutoff_unix,
-                });
-            }
-
-            let previous_anchor_seq: Option<i64> = tx.query_row(
-                "SELECT MAX(anchor_seq) FROM position_anchors WHERE wallet_hex = ?1",
-                params![wallet_hex],
-                |row| row.get(0),
-            )?;
-            let anchor_seq = match previous_anchor_seq {
-                Some(previous) => previous.checked_add(1).ok_or_else(|| {
+                        params![
+                            wallet_hex,
+                            history.market_id.to_string(),
+                            history.first_epoch,
+                            history.source_trade_id.0
+                        ],
+                    )?;
+                }
+                let stored_cutoff: Option<Option<i64>> = tx
+                    .query_row(
+                        "SELECT activity_cutoff_unix FROM poll_cursors WHERE wallet_hex = ?1",
+                        params![wallet_hex],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let stored_cutoff = stored_cutoff.ok_or_else(|| {
                     PaperStateError::Internal(format!(
-                        "anchor sequence overflow for {}",
+                        "anchor install requires an existing wallet cursor for {}",
                         install.wallet
                     ))
-                })?,
-                None => 0,
-            };
-            tx.execute(
-                "INSERT INTO position_anchors \
+                })?;
+                if let Some(stored_cutoff_unix) = stored_cutoff
+                    && stored_cutoff_unix > install.activity_cutoff_unix
+                {
+                    return Err(PaperStateError::AnchorCutoffRegression {
+                        wallet: install.wallet,
+                        stored_cutoff_unix,
+                        candidate_cutoff_unix: install.activity_cutoff_unix,
+                    });
+                }
+
+                let previous_anchor_seq: Option<i64> = tx.query_row(
+                    "SELECT MAX(anchor_seq) FROM position_anchors WHERE wallet_hex = ?1",
+                    params![wallet_hex],
+                    |row| row.get(0),
+                )?;
+                let anchor_seq = match previous_anchor_seq {
+                    Some(previous) => previous.checked_add(1).ok_or_else(|| {
+                        PaperStateError::Internal(format!(
+                            "anchor sequence overflow for {}",
+                            install.wallet
+                        ))
+                    })?,
+                    None => 0,
+                };
+                tx.execute(
+                    "INSERT INTO position_anchors \
                      (wallet_hex, anchor_seq, anchored_at_unix, activity_cutoff_unix, \
                       balances_json, ledger_hash_after, proof_json) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    wallet_hex,
-                    anchor_seq,
-                    install.anchored_at_unix,
-                    install.activity_cutoff_unix,
-                    balances_json,
-                    install.ledger_hash_after,
-                    install.proof_json,
-                ],
-            )?;
-
-            tx.execute(
-                "DELETE FROM leader_positions WHERE wallet_hex = ?1",
-                params![wallet_hex],
-            )?;
-            {
-                let mut statement = tx.prepare(
-                    "INSERT INTO leader_positions \
-                         (wallet_hex, market_id, outcome_id, long_amount_str, short_amount_str) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                )?;
-                for (market_id, outcome_id, long) in balances {
-                    statement.execute(params![
+                    params![
                         wallet_hex,
-                        market_id,
-                        i64::from(outcome_id),
-                        long.to_decimal().to_string(),
-                        ShareAmount::ZERO.to_decimal().to_string(),
-                    ])?;
-                }
-            }
+                        anchor_seq,
+                        install.anchored_at_unix,
+                        install.activity_cutoff_unix,
+                        balances_json,
+                        install.ledger_hash_after,
+                        install.proof_json,
+                    ],
+                )?;
 
-            let validation = PositionValidationRecord {
-                wallet: install.wallet,
-                ledger_hash: install.ledger_hash_after.clone(),
-                positions_proof_hash: install.positions_proof_hash.clone(),
-                activity_bounds_json: install.activity_bounds_json.clone(),
-                source_log_generation: install.source_log_generation.clone(),
-                proof_json: install.proof_json.clone(),
-                recorded_at_unix: install.recorded_at_unix,
-            };
-            if let Some(status) = &install.history_status {
-                upsert_history_status(&tx, status, true)?;
-            }
-            if install.expected_fence.is_some() {
                 tx.execute(
-                    "DELETE FROM wallet_fences WHERE wallet_hex = ?1",
+                    "DELETE FROM leader_positions WHERE wallet_hex = ?1",
                     params![wallet_hex],
                 )?;
-            }
-            tx_upsert_position_validation(&tx, &validation)?;
-            tx.execute(
-                "UPDATE poll_cursors SET activity_cutoff_unix = ?2, reanchor_required = 0 \
+                {
+                    let mut statement = tx.prepare(
+                        "INSERT INTO leader_positions \
+                         (wallet_hex, market_id, outcome_id, long_amount_str, short_amount_str) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    )?;
+                    for (market_id, outcome_id, long) in balances {
+                        statement.execute(params![
+                            wallet_hex,
+                            market_id,
+                            i64::from(outcome_id),
+                            long.to_decimal().to_string(),
+                            ShareAmount::ZERO.to_decimal().to_string(),
+                        ])?;
+                    }
+                }
+
+                let validation = PositionValidationRecord {
+                    wallet: install.wallet,
+                    ledger_hash: install.ledger_hash_after.clone(),
+                    positions_proof_hash: install.positions_proof_hash.clone(),
+                    activity_bounds_json: install.activity_bounds_json.clone(),
+                    source_log_generation: install.source_log_generation.clone(),
+                    proof_json: install.proof_json.clone(),
+                    recorded_at_unix: install.recorded_at_unix,
+                };
+                if let Some(status) = &install.history_status {
+                    upsert_history_status(&tx, status, true)?;
+                }
+                if install.expected_fence.is_some() {
+                    tx.execute(
+                        "DELETE FROM wallet_fences WHERE wallet_hex = ?1",
+                        params![wallet_hex],
+                    )?;
+                }
+                tx_upsert_position_validation(&tx, &validation)?;
+                tx.execute(
+                    "UPDATE poll_cursors SET activity_cutoff_unix = ?2, reanchor_required = 0 \
                  WHERE wallet_hex = ?1",
-                params![wallet_hex, install.activity_cutoff_unix],
-            )?;
-        }
-        if fail_before_commit {
-            return Err(PaperStateError::Internal(
-                "injected anchor install failure before commit".to_owned(),
-            ));
-        }
-        tx.commit()?;
-        Ok(())
+                    params![wallet_hex, install.activity_cutoff_unix],
+                )?;
+            }
+            if fail_before_commit {
+                return Err(PaperStateError::Internal(
+                    "injected anchor install failure before commit".to_owned(),
+                ));
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Return the currently accepted bracket, if no later activity invalidated it.
@@ -3062,26 +3110,27 @@ impl PaperStateDb {
         &self,
         wallet: &WalletAddress,
     ) -> Result<Option<PositionValidationRecord>, PaperStateError> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT ledger_hash, positions_proof_hash, activity_bounds_json, \
+        self.with(|conn| {
+            conn.query_row(
+                "SELECT ledger_hash, positions_proof_hash, activity_bounds_json, \
                     source_log_generation, proof_json, recorded_at_unix \
              FROM position_validations WHERE wallet_hex = ?1",
-            params![wallet.to_string()],
-            |row| {
-                Ok(PositionValidationRecord {
-                    wallet: *wallet,
-                    ledger_hash: row.get(0)?,
-                    positions_proof_hash: row.get(1)?,
-                    activity_bounds_json: row.get(2)?,
-                    source_log_generation: row.get(3)?,
-                    proof_json: row.get(4)?,
-                    recorded_at_unix: row.get(5)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(PaperStateError::from)
+                params![wallet.to_string()],
+                |row| {
+                    Ok(PositionValidationRecord {
+                        wallet: *wallet,
+                        ledger_hash: row.get(0)?,
+                        positions_proof_hash: row.get(1)?,
+                        activity_bounds_json: row.get(2)?,
+                        source_log_generation: row.get(3)?,
+                        proof_json: row.get(4)?,
+                        recorded_at_unix: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(PaperStateError::from)
+        })
     }
 
     /// Whether a causal position bracket is still current for publication.
@@ -3099,50 +3148,51 @@ impl PaperStateDb {
     ) -> Result<WalletCoverage, PaperStateError> {
         type RawCoverageRow = (Option<i64>, i64, i64, Option<i64>, Option<i64>);
 
-        let conn = self.lock();
-        let row: Option<RawCoverageRow> = conn
-            .query_row(
-                "SELECT activity_cutoff_unix, coverage_generation, reanchor_required, \
+        self.with(|conn| {
+            let row: Option<RawCoverageRow> = conn
+                .query_row(
+                    "SELECT activity_cutoff_unix, coverage_generation, reanchor_required, \
                         (SELECT MAX(anchor_seq) FROM position_anchors \
                          WHERE wallet_hex = poll_cursors.wallet_hex), \
                         (SELECT anchored_at_unix FROM position_anchors \
                          WHERE wallet_hex = poll_cursors.wallet_hex \
                          ORDER BY anchor_seq DESC LIMIT 1) \
                  FROM poll_cursors WHERE wallet_hex = ?1",
-                params![wallet.to_string()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((
-            activity_cutoff_unix,
-            coverage_generation,
-            reanchor_required,
-            anchor_seq,
-            anchored_at_unix,
-        )) = row
-        else {
-            return Ok(WalletCoverage {
-                activity_cutoff_unix: None,
-                coverage_generation: 0,
-                reanchor_required: false,
-                anchor_seq: None,
-                anchored_at_unix: None,
-            });
-        };
-        Ok(WalletCoverage {
-            activity_cutoff_unix,
-            coverage_generation,
-            reanchor_required: parse_bool_flag(reanchor_required, "reanchor_required")?,
-            anchor_seq,
-            anchored_at_unix,
+                    params![wallet.to_string()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                activity_cutoff_unix,
+                coverage_generation,
+                reanchor_required,
+                anchor_seq,
+                anchored_at_unix,
+            )) = row
+            else {
+                return Ok(WalletCoverage {
+                    activity_cutoff_unix: None,
+                    coverage_generation: 0,
+                    reanchor_required: false,
+                    anchor_seq: None,
+                    anchored_at_unix: None,
+                });
+            };
+            Ok(WalletCoverage {
+                activity_cutoff_unix,
+                coverage_generation,
+                reanchor_required: parse_bool_flag(reanchor_required, "reanchor_required")?,
+                anchor_seq,
+                anchored_at_unix,
+            })
         })
     }
 
@@ -3153,22 +3203,23 @@ impl PaperStateDb {
         wallets: &[WalletAddress],
         now_unix: i64,
     ) -> Result<Option<i64>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT anchored_at_unix FROM position_anchors WHERE wallet_hex = ?1 \
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT anchored_at_unix FROM position_anchors WHERE wallet_hex = ?1 \
              ORDER BY anchor_seq DESC LIMIT 1",
-        )?;
-        let mut anchored_at_unix = None;
-        for wallet in wallets {
-            let latest = statement
-                .query_row(params![wallet.to_string()], |row| row.get::<_, i64>(0))
-                .optional()?;
-            if let Some(latest) = latest {
-                anchored_at_unix =
-                    Some(anchored_at_unix.map_or(latest, |oldest: i64| oldest.min(latest)));
+            )?;
+            let mut anchored_at_unix = None;
+            for wallet in wallets {
+                let latest = statement
+                    .query_row(params![wallet.to_string()], |row| row.get::<_, i64>(0))
+                    .optional()?;
+                if let Some(latest) = latest {
+                    anchored_at_unix =
+                        Some(anchored_at_unix.map_or(latest, |oldest: i64| oldest.min(latest)));
+                }
             }
-        }
-        Ok(anchored_at_unix.map(|anchored| now_unix.saturating_sub(anchored).max(0)))
+            Ok(anchored_at_unix.map(|anchored| now_unix.saturating_sub(anchored).max(0)))
+        })
     }
 
     /// Read only the proof of the durable anchor selected by wallet coverage.
@@ -3177,14 +3228,15 @@ impl PaperStateDb {
         wallet: &WalletAddress,
         anchor_seq: i64,
     ) -> Result<Option<String>, PaperStateError> {
-        self.lock()
-            .query_row(
+        self.with(|conn| {
+            conn.query_row(
                 "SELECT proof_json FROM position_anchors WHERE wallet_hex = ?1 AND anchor_seq = ?2",
                 params![wallet.to_string(), anchor_seq],
                 |row| row.get(0),
             )
             .optional()
             .map_err(PaperStateError::from)
+        })
     }
 
     /// Exact immutable anchor selected by an admission or replay capture.
@@ -3193,8 +3245,8 @@ impl PaperStateDb {
         wallet: &WalletAddress,
         anchor_seq: i64,
     ) -> Result<Option<PositionAnchorRow>, PaperStateError> {
-        self.lock()
-            .query_row(
+        self.with(|conn| {
+            conn.query_row(
                 "SELECT anchor_seq, anchored_at_unix, activity_cutoff_unix, balances_json, \
                     ledger_hash_after, proof_json FROM position_anchors \
              WHERE wallet_hex = ?1 AND anchor_seq = ?2",
@@ -3213,6 +3265,7 @@ impl PaperStateDb {
             )
             .optional()
             .map_err(PaperStateError::from)
+        })
     }
 
     /// All position anchors for one wallet in append order.
@@ -3220,73 +3273,76 @@ impl PaperStateDb {
         &self,
         wallet: &WalletAddress,
     ) -> Result<Vec<PositionAnchorRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT anchor_seq, anchored_at_unix, activity_cutoff_unix, balances_json, \
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT anchor_seq, anchored_at_unix, activity_cutoff_unix, balances_json, \
                     ledger_hash_after, proof_json FROM position_anchors \
              WHERE wallet_hex = ?1 ORDER BY anchor_seq",
-        )?;
-        let rows = statement.query_map(params![wallet.to_string()], |row| {
-            Ok(PositionAnchorRow {
-                wallet: *wallet,
-                anchor_seq: row.get(0)?,
-                anchored_at_unix: row.get(1)?,
-                activity_cutoff_unix: row.get(2)?,
-                balances_json: row.get(3)?,
-                ledger_hash_after: row.get(4)?,
-                proof_json: row.get(5)?,
-            })
-        })?;
-        let mut anchors = Vec::new();
-        for row in rows {
-            anchors.push(row?);
-        }
-        Ok(anchors)
+            )?;
+            let rows = statement.query_map(params![wallet.to_string()], |row| {
+                Ok(PositionAnchorRow {
+                    wallet: *wallet,
+                    anchor_seq: row.get(0)?,
+                    anchored_at_unix: row.get(1)?,
+                    activity_cutoff_unix: row.get(2)?,
+                    balances_json: row.get(3)?,
+                    ledger_hash_after: row.get(4)?,
+                    proof_json: row.get(5)?,
+                })
+            })?;
+            let mut anchors = Vec::new();
+            for row in rows {
+                anchors.push(row?);
+            }
+            Ok(anchors)
+        })
     }
 
     /// Complete-history wallet set used to initialize the bucket gate owner.
     pub fn complete_history_wallets(&self) -> Result<HashSet<WalletAddress>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT wallet_hex FROM wallet_history_status_v2 WHERE complete = 1 \
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT wallet_hex FROM wallet_history_status_v2 WHERE complete = 1 \
              ORDER BY wallet_hex",
-        )?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        let mut wallets = HashSet::new();
-        for wallet in rows {
-            wallets.insert(parse_wallet(&wallet?)?);
-        }
-        Ok(wallets)
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            let mut wallets = HashSet::new();
+            for wallet in rows {
+                wallets.insert(parse_wallet(&wallet?)?);
+            }
+            Ok(wallets)
+        })
     }
 
     /// Load the monotonic fence set before membership/producers/replay.
     pub fn wallet_fences(&self) -> Result<Vec<WalletFenceRecord>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix \
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix \
              FROM wallet_fences ORDER BY wallet_hex",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?;
-        let mut fences = Vec::new();
-        for row in rows {
-            let (wallet, source_trade_id, cause, proof_json, fenced_at_unix) = row?;
-            fences.push(WalletFenceRecord {
-                wallet: parse_wallet(&wallet)?,
-                source_trade_id: SourceTradeId(source_trade_id),
-                cause,
-                proof_json,
-                fenced_at_unix,
-            });
-        }
-        Ok(fences)
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?;
+            let mut fences = Vec::new();
+            for row in rows {
+                let (wallet, source_trade_id, cause, proof_json, fenced_at_unix) = row?;
+                fences.push(WalletFenceRecord {
+                    wallet: parse_wallet(&wallet)?,
+                    source_trade_id: SourceTradeId(source_trade_id),
+                    cause,
+                    proof_json,
+                    fenced_at_unix,
+                });
+            }
+            Ok(fences)
+        })
     }
 
     /// Replace the pre-activation census while the side main is still the sole
@@ -3299,103 +3355,107 @@ impl PaperStateDb {
     ) -> Result<String, PaperStateError> {
         let rendered = serde_json::to_string(facts)?;
         let hash = blake3::hash(rendered.as_bytes()).to_hex().to_string();
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO migration_activation_facts_v2
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO migration_activation_facts_v2
                  (singleton, facts_json, facts_blake3, binary_identity)
              VALUES (1, ?1, ?2, ?3)
              ON CONFLICT(singleton) DO UPDATE SET
                  facts_json = excluded.facts_json,
                  facts_blake3 = excluded.facts_blake3,
                  binary_identity = excluded.binary_identity",
-            params![rendered, hash, binary_identity],
-        )?;
-        Ok(hash)
+                params![rendered, hash, binary_identity],
+            )?;
+            Ok(hash)
+        })
     }
 
     pub fn is_wallet_fenced(&self, wallet: &WalletAddress) -> Result<bool, PaperStateError> {
-        let conn = self.lock();
-        let exists = conn
-            .query_row(
-                "SELECT 1 FROM wallet_fences WHERE wallet_hex = ?1",
-                params![wallet.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .is_some();
-        Ok(exists)
+        self.with(|conn| {
+            let exists = conn
+                .query_row(
+                    "SELECT 1 FROM wallet_fences WHERE wallet_hex = ?1",
+                    params![wallet.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some();
+            Ok(exists)
+        })
     }
 
     /// Open production continuations, in causal order, for boot recovery before producers.
     pub fn open_decision_pending(&self) -> Result<Vec<DecisionPendingRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT source_trade_id, semantic_revision, wallet_hex, source_epoch, \
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT source_trade_id, semantic_revision, wallet_hex, source_epoch, \
                     frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition, \
                     updated_at_unix \
              FROM decision_pending WHERE state = 'open' \
              ORDER BY source_epoch, source_trade_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, i64>(8)?,
-            ))
-        })?;
-        let mut pending = Vec::new();
-        for row in rows {
-            let (id, revision, wallet, epoch, frozen, post, state, terminal, updated) = row?;
-            pending.push(DecisionPendingRow {
-                source_trade_id: SourceTradeId(id),
-                semantic_revision: revision,
-                wallet: parse_wallet(&wallet)?,
-                source_epoch: epoch,
-                frozen_inputs_json: frozen,
-                post_commit_inputs_json: post,
-                state: parse_pending_state(&state)?,
-                terminal_disposition: terminal,
-                updated_at_unix: updated,
-            });
-        }
-        Ok(pending)
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?;
+            let mut pending = Vec::new();
+            for row in rows {
+                let (id, revision, wallet, epoch, frozen, post, state, terminal, updated) = row?;
+                pending.push(DecisionPendingRow {
+                    source_trade_id: SourceTradeId(id),
+                    semantic_revision: revision,
+                    wallet: parse_wallet(&wallet)?,
+                    source_epoch: epoch,
+                    frozen_inputs_json: frozen,
+                    post_commit_inputs_json: post,
+                    state: parse_pending_state(&state)?,
+                    terminal_disposition: terminal,
+                    updated_at_unix: updated,
+                });
+            }
+            Ok(pending)
+        })
     }
 
     /// Complete continuation history for deterministic replay and boot-time terminal verification
     /// (#584): the orchestrator replays every terminal row at boot, while open recovery separately
     /// resumes only open rows.
     pub fn decision_pending_history(&self) -> Result<Vec<DecisionPendingRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT source_trade_id, semantic_revision, wallet_hex, source_epoch, \
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT source_trade_id, semantic_revision, wallet_hex, source_epoch, \
                     frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition, \
                     updated_at_unix \
              FROM decision_pending ORDER BY source_epoch, source_trade_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, i64>(8)?,
-            ))
-        })?;
-        let mut history = Vec::new();
-        for row in rows {
-            history.push(decision_pending_row(row?)?);
-        }
-        Ok(history)
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?;
+            let mut history = Vec::new();
+            for row in rows {
+                history.push(decision_pending_row(row?)?);
+            }
+            Ok(history)
+        })
     }
 
     /// Compact frame authority for suppression/audit discovery. SQLite projects only immutable
@@ -3429,8 +3489,8 @@ impl PaperStateDb {
         } else {
             ("?1 IS NULL", None)
         };
-        let conn = self.lock();
-        let sql = format!(
+        self.with(|conn| {
+            let sql = format!(
             "SELECT json_object(
                 'version', json_extract(frozen_inputs_json, '$.version'),
                 'semantic_revision', json_extract(frozen_inputs_json, '$.semantic_revision'),
@@ -3448,34 +3508,35 @@ impl PaperStateDb {
              FROM decision_pending
              WHERE {predicate}
                AND json_extract(frozen_inputs_json, '$.source_authority') = 'activity_frame'
-             ORDER BY source_epoch, source_trade_id",
-        );
-        let mut statement = conn.prepare(&sql)?;
-        let rows = statement.query_map(params![value], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (json, id, wallet, epoch, revision) = row?;
-            let frame: ActivityFrameDecisionIndex = serde_json::from_str(&json)?;
-            if frame.version != 7
-                || frame.source_trade_id.0 != id
-                || frame.wallet != parse_wallet(&wallet)?
-                || frame.source_epoch != epoch
-                || frame.semantic_revision != revision
-            {
-                return Err(PaperStateError::Internal(
-                    "frame index differs from durable row".to_owned(),
-                ));
-            }
-            Ok(frame)
+                 ORDER BY source_epoch, source_trade_id",
+            );
+            let mut statement = conn.prepare(&sql)?;
+            let rows = statement.query_map(params![value], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            rows.map(|row| {
+                let (json, id, wallet, epoch, revision) = row?;
+                let frame: ActivityFrameDecisionIndex = serde_json::from_str(&json)?;
+                if frame.version != 7
+                    || frame.source_trade_id.0 != id
+                    || frame.wallet != parse_wallet(&wallet)?
+                    || frame.source_epoch != epoch
+                    || frame.semantic_revision != revision
+                {
+                    return Err(PaperStateError::Internal(
+                        "frame index differs from durable row".to_owned(),
+                    ));
+                }
+                Ok(frame)
+            })
+            .collect()
         })
-        .collect()
     }
 
     /// Read one durable decision continuation by its source trade id (`None` when absent).
@@ -3483,29 +3544,30 @@ impl PaperStateDb {
         &self,
         source_trade_id: &SourceTradeId,
     ) -> Result<Option<DecisionPendingRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT source_trade_id, semantic_revision, wallet_hex, source_epoch, \
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT source_trade_id, semantic_revision, wallet_hex, source_epoch, \
                     frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition, \
                     updated_at_unix \
              FROM decision_pending WHERE source_trade_id = ?1",
-        )?;
-        let mut rows = statement.query_map([source_trade_id.0.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, i64>(8)?,
-            ))
-        })?;
-        rows.next()
-            .map(|row| decision_pending_row(row?))
-            .transpose()
+            )?;
+            let mut rows = statement.query_map([source_trade_id.0.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?;
+            rows.next()
+                .map(|row| decision_pending_row(row?))
+                .transpose()
+        })
     }
 
     /// Select the immutable decision evidence named by an ordered source-prefix replay.
@@ -3520,11 +3582,12 @@ impl PaperStateDb {
     ) -> Result<Vec<u8>, PaperStateError> {
         validate_seal_decision_keys(keys)?;
 
-        let mut conn = self.lock();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let bytes = Self::seal_decision_evidence_in_transaction(&tx, keys)?;
-        tx.commit()?;
-        Ok(bytes)
+        self.with(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let bytes = Self::seal_decision_evidence_in_transaction(&tx, keys)?;
+            tx.commit()?;
+            Ok(bytes)
+        })
     }
 
     /// Seal the selected keys and atomically recheck the service's classification of every
@@ -3540,96 +3603,97 @@ impl PaperStateDb {
     ) -> Result<Vec<u8>, PaperStateError> {
         let requested = validate_seal_decision_keys(selected)?;
         let classified = validate_seal_decision_keys(in_prefix)?;
-        let mut conn = self.lock();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let mut statement = tx.prepare(
-            "SELECT source_trade_id, semantic_revision, frozen_inputs_json \
+        self.with(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let mut statement = tx.prepare(
+                "SELECT source_trade_id, semantic_revision, frozen_inputs_json \
              FROM decision_pending ORDER BY source_trade_id",
-        )?;
-        let candidates = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        let mut stored = BTreeSet::new();
-        for candidate in candidates {
-            let (source_trade_id, semantic_revision, frozen_inputs_json) = candidate?;
-            let scope: SealDecisionScope = serde_json::from_str(&frozen_inputs_json)?;
-            match (scope.version, scope.source_authority.as_deref()) {
-                (2..=6, None) | (7, Some("complete_read" | "activity_frame")) => {}
-                _ => {
-                    return Err(PaperStateError::SealEvidenceSelectionMismatch {
-                        requested: requested.len(),
-                        stored: stored.len(),
+            )?;
+            let candidates = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut stored = BTreeSet::new();
+            for candidate in candidates {
+                let (source_trade_id, semantic_revision, frozen_inputs_json) = candidate?;
+                let scope: SealDecisionScope = serde_json::from_str(&frozen_inputs_json)?;
+                match (scope.version, scope.source_authority.as_deref()) {
+                    (2..=6, None) | (7, Some("complete_read" | "activity_frame")) => {}
+                    _ => {
+                        return Err(PaperStateError::SealEvidenceSelectionMismatch {
+                            requested: requested.len(),
+                            stored: stored.len(),
+                        });
+                    }
+                }
+                let mut receipts = scope
+                    .page_occurrences
+                    .iter()
+                    .map(|page| page.receipt)
+                    .chain(scope.observed_source_receipt)
+                    .chain(scope.read_commitment)
+                    .collect::<Vec<_>>();
+                if scope.source_authority.as_deref() == Some("activity_frame") {
+                    if !scope.page_occurrences.is_empty()
+                        || scope.read_commitment.is_some()
+                        || scope.observed_source_receipt.is_none()
+                    {
+                        return Err(PaperStateError::SealEvidenceSelectionMismatch {
+                            requested: requested.len(),
+                            stored: stored.len(),
+                        });
+                    }
+                    let admission: AppendReceipt =
+                        serde_json::from_value(scope.decision_inputs["admission_receipt"].clone())?;
+                    receipts.push(admission);
+                    let frontier = &scope.decision_inputs["inputs"]["frontier"];
+                    receipts.push(serde_json::from_value(frontier["commitment"].clone())?);
+                    for page in frontier["page_occurrences"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                    {
+                        receipts.push(serde_json::from_value(page["receipt"].clone())?);
+                    }
+                    for earlier in scope.decision_inputs["inputs"]["earlier_frames"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                    {
+                        receipts.push(serde_json::from_value(earlier["receipt"].clone())?);
+                    }
+                    // Version-2 admissions freeze the frame's original Gamma identity receipt; the
+                    // service's authority receipts include it, so seal selection does too.
+                    if let Some(identity) = scope.decision_inputs["inputs"]
+                        .get("identity")
+                        .filter(|identity| !identity.is_null())
+                    {
+                        receipts.push(serde_json::from_value(identity["receipt"].clone())?);
+                    }
+                }
+                let in_scope = matches!(scope.version, 3..=7)
+                    && !receipts.is_empty()
+                    && receipts.iter().all(|receipt| {
+                        sealed_inclusive.is_some_and(|sealed| receipt.sequence <= sealed)
                     });
+                if in_scope {
+                    stored.insert((source_trade_id, semantic_revision));
                 }
             }
-            let mut receipts = scope
-                .page_occurrences
-                .iter()
-                .map(|page| page.receipt)
-                .chain(scope.observed_source_receipt)
-                .chain(scope.read_commitment)
-                .collect::<Vec<_>>();
-            if scope.source_authority.as_deref() == Some("activity_frame") {
-                if !scope.page_occurrences.is_empty()
-                    || scope.read_commitment.is_some()
-                    || scope.observed_source_receipt.is_none()
-                {
-                    return Err(PaperStateError::SealEvidenceSelectionMismatch {
-                        requested: requested.len(),
-                        stored: stored.len(),
-                    });
-                }
-                let admission: AppendReceipt =
-                    serde_json::from_value(scope.decision_inputs["admission_receipt"].clone())?;
-                receipts.push(admission);
-                let frontier = &scope.decision_inputs["inputs"]["frontier"];
-                receipts.push(serde_json::from_value(frontier["commitment"].clone())?);
-                for page in frontier["page_occurrences"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                {
-                    receipts.push(serde_json::from_value(page["receipt"].clone())?);
-                }
-                for earlier in scope.decision_inputs["inputs"]["earlier_frames"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                {
-                    receipts.push(serde_json::from_value(earlier["receipt"].clone())?);
-                }
-                // Version-2 admissions freeze the frame's original Gamma identity receipt; the
-                // service's authority receipts include it, so seal selection does too.
-                if let Some(identity) = scope.decision_inputs["inputs"]
-                    .get("identity")
-                    .filter(|identity| !identity.is_null())
-                {
-                    receipts.push(serde_json::from_value(identity["receipt"].clone())?);
-                }
-            }
-            let in_scope = matches!(scope.version, 3..=7)
-                && !receipts.is_empty()
-                && receipts.iter().all(|receipt| {
-                    sealed_inclusive.is_some_and(|sealed| receipt.sequence <= sealed)
+            drop(statement);
+            if classified != stored || !requested.is_subset(&classified) {
+                return Err(PaperStateError::SealEvidenceSelectionMismatch {
+                    requested: requested.len(),
+                    stored: stored.len(),
                 });
-            if in_scope {
-                stored.insert((source_trade_id, semantic_revision));
             }
-        }
-        drop(statement);
-        if classified != stored || !requested.is_subset(&classified) {
-            return Err(PaperStateError::SealEvidenceSelectionMismatch {
-                requested: requested.len(),
-                stored: stored.len(),
-            });
-        }
-        let bytes = Self::seal_decision_evidence_in_transaction(&tx, selected)?;
-        tx.commit()?;
-        Ok(bytes)
+            let bytes = Self::seal_decision_evidence_in_transaction(&tx, selected)?;
+            tx.commit()?;
+            Ok(bytes)
+        })
     }
 
     fn seal_decision_evidence_in_transaction(
@@ -3877,17 +3941,18 @@ impl PaperStateDb {
         &self,
         source_trade_id: &SourceTradeId,
     ) -> Result<bool, PaperStateError> {
-        let conn = self.lock();
-        let open = conn
-            .query_row(
-                "SELECT 1 FROM decision_pending \
+        self.with(|conn| {
+            let open = conn
+                .query_row(
+                    "SELECT 1 FROM decision_pending \
                  WHERE source_trade_id = ?1 AND state = 'open'",
-                params![source_trade_id.0],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .is_some();
-        Ok(open)
+                    params![source_trade_id.0],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .is_some();
+            Ok(open)
+        })
     }
 
     /// Persist the complete post-boundary decision inputs before a paper-log or
@@ -3900,32 +3965,33 @@ impl PaperStateDb {
         updated_at_unix: i64,
     ) -> Result<(), PaperStateError> {
         serde_json::from_str::<serde_json::Value>(post_commit_inputs_json)?;
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let state: Option<String> = tx
-            .query_row(
-                "SELECT state FROM decision_pending WHERE source_trade_id = ?1",
-                params![source_trade_id.0],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match state.as_deref() {
-            Some("open") => {
-                tx.execute(
-                    "UPDATE decision_pending SET post_commit_inputs_json = ?2, \
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            let state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM decision_pending WHERE source_trade_id = ?1",
+                    params![source_trade_id.0],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match state.as_deref() {
+                Some("open") => {
+                    tx.execute(
+                        "UPDATE decision_pending SET post_commit_inputs_json = ?2, \
                          updated_at_unix = ?3 WHERE source_trade_id = ?1 AND state = 'open'",
-                    params![source_trade_id.0, post_commit_inputs_json, updated_at_unix],
-                )?;
+                        params![source_trade_id.0, post_commit_inputs_json, updated_at_unix],
+                    )?;
+                }
+                Some("terminal") => {}
+                _ => {
+                    return Err(PaperStateError::DecisionPendingConflict(
+                        source_trade_id.0.clone(),
+                    ));
+                }
             }
-            Some("terminal") => {}
-            _ => {
-                return Err(PaperStateError::DecisionPendingConflict(
-                    source_trade_id.0.clone(),
-                ));
-            }
-        }
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Record the post-commit inputs and terminal transition. A same-value retry
@@ -3938,47 +4004,48 @@ impl PaperStateDb {
         updated_at_unix: i64,
     ) -> Result<(), PaperStateError> {
         serde_json::from_str::<serde_json::Value>(post_commit_inputs_json)?;
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let current: Option<(String, Option<String>, String)> = tx
-            .query_row(
-                "SELECT state, terminal_disposition, post_commit_inputs_json \
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            let current: Option<(String, Option<String>, String)> = tx
+                .query_row(
+                    "SELECT state, terminal_disposition, post_commit_inputs_json \
                  FROM decision_pending WHERE source_trade_id = ?1",
-                params![source_trade_id.0],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        match current {
-            Some((state, terminal, inputs)) if state == "terminal" => {
-                if terminal.as_deref() != Some(terminal_disposition)
-                    || inputs != post_commit_inputs_json
-                {
+                    params![source_trade_id.0],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            match current {
+                Some((state, terminal, inputs)) if state == "terminal" => {
+                    if terminal.as_deref() != Some(terminal_disposition)
+                        || inputs != post_commit_inputs_json
+                    {
+                        return Err(PaperStateError::DecisionPendingConflict(
+                            source_trade_id.0.clone(),
+                        ));
+                    }
+                }
+                Some(_) => {
+                    tx.execute(
+                        "UPDATE decision_pending SET state = 'terminal', \
+                         post_commit_inputs_json = ?2, terminal_disposition = ?3, \
+                         updated_at_unix = ?4 WHERE source_trade_id = ?1 AND state = 'open'",
+                        params![
+                            source_trade_id.0,
+                            post_commit_inputs_json,
+                            terminal_disposition,
+                            updated_at_unix,
+                        ],
+                    )?;
+                }
+                None => {
                     return Err(PaperStateError::DecisionPendingConflict(
                         source_trade_id.0.clone(),
                     ));
                 }
             }
-            Some(_) => {
-                tx.execute(
-                    "UPDATE decision_pending SET state = 'terminal', \
-                         post_commit_inputs_json = ?2, terminal_disposition = ?3, \
-                         updated_at_unix = ?4 WHERE source_trade_id = ?1 AND state = 'open'",
-                    params![
-                        source_trade_id.0,
-                        post_commit_inputs_json,
-                        terminal_disposition,
-                        updated_at_unix,
-                    ],
-                )?;
-            }
-            None => {
-                return Err(PaperStateError::DecisionPendingConflict(
-                    source_trade_id.0.clone(),
-                ));
-            }
-        }
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Import a captured legacy `wallet_market_history.json` exactly once.
@@ -3989,112 +4056,114 @@ impl PaperStateDb {
         imported_at_unix: i64,
     ) -> Result<LegacyHistoryImport, PaperStateError> {
         const IMPORT_NAME: &str = "wallet_market_history_v1";
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let existing: Option<(String, i64, String, i64)> = tx
-            .query_row(
-                "SELECT source_hash, parsed_row_count, result, imported_at_unix \
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            let existing: Option<(String, i64, String, i64)> = tx
+                .query_row(
+                    "SELECT source_hash, parsed_row_count, result, imported_at_unix \
                  FROM legacy_history_imports WHERE import_name = ?1",
-                params![IMPORT_NAME],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
-        if let Some((source_hash, count, result, imported_at_unix)) = existing {
-            let existing = LegacyHistoryImport {
-                source_hash,
-                parsed_row_count: parse_u64(count)?,
-                result,
-                imported_at_unix,
-                already_imported: true,
-            };
-            tx.commit()?;
-            return Ok(existing);
-        }
+                    params![IMPORT_NAME],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            if let Some((source_hash, count, result, imported_at_unix)) = existing {
+                let existing = LegacyHistoryImport {
+                    source_hash,
+                    parsed_row_count: parse_u64(count)?,
+                    result,
+                    imported_at_unix,
+                    already_imported: true,
+                };
+                tx.commit()?;
+                return Ok(existing);
+            }
 
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Sidecar {
-            wallets: Vec<Entry>,
-        }
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Entry {
-            wallet: WalletAddress,
-            markets: Vec<MarketId>,
-        }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Sidecar {
+                wallets: Vec<Entry>,
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Entry {
+                wallet: WalletAddress,
+                markets: Vec<MarketId>,
+            }
 
-        let sidecar: Sidecar = serde_json::from_slice(bytes)
-            .map_err(|error| PaperStateError::InvalidLegacyHistory(error.to_string()))?;
-        let parsed_row_count = u64::try_from(sidecar.wallets.len())
-            .map_err(|_| PaperStateError::InvalidLegacyHistory("row count overflow".to_owned()))?;
-        let source_hash = blake3::hash(bytes).to_hex().to_string();
-        let source_trade_id = format!("legacy:v1:{source_hash}");
-        let mut merged: HashMap<WalletAddress, HashSet<MarketId>> = HashMap::new();
-        for entry in sidecar.wallets {
-            merged
-                .entry(entry.wallet)
-                .or_default()
-                .extend(entry.markets);
-        }
+            let sidecar: Sidecar = serde_json::from_slice(bytes)
+                .map_err(|error| PaperStateError::InvalidLegacyHistory(error.to_string()))?;
+            let parsed_row_count = u64::try_from(sidecar.wallets.len()).map_err(|_| {
+                PaperStateError::InvalidLegacyHistory("row count overflow".to_owned())
+            })?;
+            let source_hash = blake3::hash(bytes).to_hex().to_string();
+            let source_trade_id = format!("legacy:v1:{source_hash}");
+            let mut merged: HashMap<WalletAddress, HashSet<MarketId>> = HashMap::new();
+            for entry in sidecar.wallets {
+                merged
+                    .entry(entry.wallet)
+                    .or_default()
+                    .extend(entry.markets);
+            }
 
-        let expected_entries = merged
-            .iter()
-            .flat_map(|(wallet, markets)| {
-                markets.iter().map(move |market| (*wallet, market.clone()))
-            })
-            .collect::<Vec<_>>();
-        for (wallet, markets) in merged {
-            for market in markets {
-                tx.execute(
-                    "INSERT OR IGNORE INTO wallet_market_history_v2 \
+            let expected_entries = merged
+                .iter()
+                .flat_map(|(wallet, markets)| {
+                    markets.iter().map(move |market| (*wallet, market.clone()))
+                })
+                .collect::<Vec<_>>();
+            for (wallet, markets) in merged {
+                for market in markets {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO wallet_market_history_v2 \
                          (wallet_hex, market_id, first_epoch, source_trade_id, origin) \
                      VALUES (?1, ?2, 0, ?3, 'legacy_seed_v1')",
-                    params![wallet.to_string(), market.to_string(), source_trade_id],
-                )?;
-            }
-            tx.execute(
-                "INSERT OR IGNORE INTO wallet_history_status_v2 \
+                        params![wallet.to_string(), market.to_string(), source_trade_id],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO wallet_history_status_v2 \
                      (wallet_hex, complete, proof_json, updated_at_unix) \
                  VALUES (?1, 0, ?2, ?3)",
+                    params![
+                        wallet.to_string(),
+                        format!("{{\"legacy_source_hash\":\"{source_hash}\"}}"),
+                        imported_at_unix,
+                    ],
+                )?;
+            }
+            for (wallet, market) in &expected_entries {
+                let present: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM wallet_market_history_v2 \
+                 WHERE wallet_hex = ?1 AND market_id = ?2 AND source_trade_id = ?3 \
+                       AND origin = 'legacy_seed_v1')",
+                    params![wallet.to_string(), market.to_string(), source_trade_id],
+                    |row| row.get(0),
+                )?;
+                if !present {
+                    return Err(PaperStateError::InvalidLegacyHistory(format!(
+                        "import proof omitted {wallet}/{market}"
+                    )));
+                }
+            }
+            tx.execute(
+                "INSERT INTO legacy_history_imports \
+                 (import_name, source_hash, parsed_row_count, result, imported_at_unix) \
+             VALUES (?1, ?2, ?3, 'imported', ?4)",
                 params![
-                    wallet.to_string(),
-                    format!("{{\"legacy_source_hash\":\"{source_hash}\"}}"),
+                    IMPORT_NAME,
+                    source_hash,
+                    to_i64(parsed_row_count)?,
                     imported_at_unix,
                 ],
             )?;
-        }
-        for (wallet, market) in &expected_entries {
-            let present: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM wallet_market_history_v2 \
-                 WHERE wallet_hex = ?1 AND market_id = ?2 AND source_trade_id = ?3 \
-                       AND origin = 'legacy_seed_v1')",
-                params![wallet.to_string(), market.to_string(), source_trade_id],
-                |row| row.get(0),
-            )?;
-            if !present {
-                return Err(PaperStateError::InvalidLegacyHistory(format!(
-                    "import proof omitted {wallet}/{market}"
-                )));
-            }
-        }
-        tx.execute(
-            "INSERT INTO legacy_history_imports \
-                 (import_name, source_hash, parsed_row_count, result, imported_at_unix) \
-             VALUES (?1, ?2, ?3, 'imported', ?4)",
-            params![
-                IMPORT_NAME,
+            tx.commit()?;
+            Ok(LegacyHistoryImport {
                 source_hash,
-                to_i64(parsed_row_count)?,
+                parsed_row_count,
+                result: "imported".to_owned(),
                 imported_at_unix,
-            ],
-        )?;
-        tx.commit()?;
-        Ok(LegacyHistoryImport {
-            source_hash,
-            parsed_row_count,
-            result: "imported".to_owned(),
-            imported_at_unix,
-            already_imported: false,
+                already_imported: false,
+            })
         })
     }
 
@@ -4154,53 +4223,54 @@ impl PaperStateDb {
         fill_pending: Option<PendingTerminalEvidence<'_>>,
         settled_pending: Option<PendingTerminalEvidence<'_>>,
     ) -> Result<FillCommitOutcome, PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        tx_mark_seen(&tx, source_trade_id, None)?;
-        if !tx_is_frame_decision(&tx, source_trade_id)? {
-            tx_upsert_leader(&tx, leader)?;
-        }
-        // #511: no fill may enter a settled market — the resolution for it already ran
-        // and can never credit the position (`settle_and_credit` retries credit zero).
-        // Checked INSIDE the transaction: the single-connection mutex serializes this
-        // against the local settle txn, so there is no check-then-commit window.
-        if tx_is_settled(&tx, &fill.market_id)? {
-            if let Some(flip) = flip {
-                tx_flip_dispatch_ready(
-                    &tx,
-                    DispatchFlip {
-                        dispatch_id: flip.dispatch_id,
-                        paper_outcome: "no_fill:market_settled",
-                    },
-                )?;
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            tx_mark_seen(&tx, source_trade_id, None)?;
+            if !tx_is_frame_decision(&tx, source_trade_id)? {
+                tx_upsert_leader(&tx, leader)?;
             }
-            tx_set_last_applied_max(&tx, fill_seq)?;
-            tx_terminalize_pending(
-                &tx,
-                source_trade_id,
-                "no_fill:market_settled",
-                settled_pending,
-            )?;
-            let bankroll = tx_read_bankroll(&tx)?;
+            // #511: no fill may enter a settled market — the resolution for it already ran
+            // and can never credit the position (`settle_and_credit` retries credit zero).
+            // Checked INSIDE the transaction: the single-connection mutex serializes this
+            // against the local settle txn, so there is no check-then-commit window.
+            if tx_is_settled(&tx, &fill.market_id)? {
+                if let Some(flip) = flip {
+                    tx_flip_dispatch_ready(
+                        &tx,
+                        DispatchFlip {
+                            dispatch_id: flip.dispatch_id,
+                            paper_outcome: "no_fill:market_settled",
+                        },
+                    )?;
+                }
+                tx_set_last_applied_max(&tx, fill_seq)?;
+                tx_terminalize_pending(
+                    &tx,
+                    source_trade_id,
+                    "no_fill:market_settled",
+                    settled_pending,
+                )?;
+                let bankroll = tx_read_bankroll(&tx)?;
+                tx.commit()?;
+                return Ok(FillCommitOutcome::RefusedSettled(bankroll));
+            }
+            let inserted = tx_record_fill(&tx, fill, fill_seq)?;
+            let bankroll = if inserted {
+                tx_apply_our_position(&tx, fill)?;
+                let after = tx_apply_bankroll(&tx, fill)?;
+                tx_set_last_applied(&tx, fill_seq)?;
+                after
+            } else {
+                // Duplicate idempotency key: fill already applied; do not double-count.
+                tx_read_bankroll(&tx)?
+            };
+            if let Some(flip) = flip {
+                tx_flip_dispatch_ready(&tx, flip)?;
+            }
+            tx_terminalize_pending(&tx, source_trade_id, "fill", fill_pending)?;
             tx.commit()?;
-            return Ok(FillCommitOutcome::RefusedSettled(bankroll));
-        }
-        let inserted = tx_record_fill(&tx, fill, fill_seq)?;
-        let bankroll = if inserted {
-            tx_apply_our_position(&tx, fill)?;
-            let after = tx_apply_bankroll(&tx, fill)?;
-            tx_set_last_applied(&tx, fill_seq)?;
-            after
-        } else {
-            // Duplicate idempotency key: fill already applied; do not double-count.
-            tx_read_bankroll(&tx)?
-        };
-        if let Some(flip) = flip {
-            tx_flip_dispatch_ready(&tx, flip)?;
-        }
-        tx_terminalize_pending(&tx, source_trade_id, "fill", fill_pending)?;
-        tx.commit()?;
-        Ok(FillCommitOutcome::Applied(bankroll))
+            Ok(FillCommitOutcome::Applied(bankroll))
+        })
     }
 
     /// Terminal disposition for a frame the authority refused (settled market) or a
@@ -4227,21 +4297,22 @@ impl PaperStateDb {
         flip: Option<DispatchFlip<'_>>,
         pending: Option<PendingTerminalEvidence<'_>>,
     ) -> Result<(), PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        tx_mark_seen(&tx, source_trade_id, None)?;
-        if let Some(leader) = leader
-            && !tx_is_frame_decision(&tx, source_trade_id)?
-        {
-            tx_upsert_leader(&tx, leader)?;
-        }
-        if let Some(flip) = flip {
-            tx_flip_dispatch_ready(&tx, flip)?;
-        }
-        tx_set_last_applied_max(&tx, seq)?;
-        tx_terminalize_pending(&tx, source_trade_id, "no_fill:market_settled", pending)?;
-        tx.commit()?;
-        Ok(())
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            tx_mark_seen(&tx, source_trade_id, None)?;
+            if let Some(leader) = leader
+                && !tx_is_frame_decision(&tx, source_trade_id)?
+            {
+                tx_upsert_leader(&tx, leader)?;
+            }
+            if let Some(flip) = flip {
+                tx_flip_dispatch_ready(&tx, flip)?;
+            }
+            tx_set_last_applied_max(&tx, seq)?;
+            tx_terminalize_pending(&tx, source_trade_id, "no_fill:market_settled", pending)?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Convergence transaction for an authority-confirmed fill (#511): mirror the
@@ -4286,47 +4357,49 @@ impl PaperStateDb {
         flip: Option<DispatchFlip<'_>>,
         pending: Option<PendingTerminalEvidence<'_>>,
     ) -> Result<(), PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        if let Some(id) = source_trade_id {
-            tx_mark_seen(&tx, id, None)?;
-        }
-        if let Some(leader) = leader
-            && !source_trade_id
-                .map(|id| tx_is_frame_decision(&tx, id))
-                .transpose()?
-                .unwrap_or(false)
-        {
-            tx_upsert_leader(&tx, leader)?;
-        }
-        let inserted = tx_record_fill(&tx, fill, canonical_seq)?;
-        if inserted {
-            tx_apply_our_position(&tx, fill)?;
-        }
-        tx_set_bankroll(&tx, canonical_bankroll)?;
-        if let Some(flip) = flip {
-            tx_flip_dispatch_ready(&tx, flip)?;
-        }
-        tx_set_last_applied_max(&tx, current_seq)?;
-        if let Some(id) = source_trade_id {
-            tx_terminalize_pending(&tx, id, "fill", pending)?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            if let Some(id) = source_trade_id {
+                tx_mark_seen(&tx, id, None)?;
+            }
+            if let Some(leader) = leader
+                && !source_trade_id
+                    .map(|id| tx_is_frame_decision(&tx, id))
+                    .transpose()?
+                    .unwrap_or(false)
+            {
+                tx_upsert_leader(&tx, leader)?;
+            }
+            let inserted = tx_record_fill(&tx, fill, canonical_seq)?;
+            if inserted {
+                tx_apply_our_position(&tx, fill)?;
+            }
+            tx_set_bankroll(&tx, canonical_bankroll)?;
+            if let Some(flip) = flip {
+                tx_flip_dispatch_ready(&tx, flip)?;
+            }
+            tx_set_last_applied_max(&tx, current_seq)?;
+            if let Some(id) = source_trade_id {
+                tx_terminalize_pending(&tx, id, "fill", pending)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// `true` when a fill row exists for `idempotency_key` (#511: dispatch recovery
     /// flips by disposition — fills row = "fill"; disposed row-less frame = refused).
     pub fn fill_exists(&self, idempotency_key: &str) -> Result<bool, PaperStateError> {
-        let conn = self.lock();
-        let found: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM fills WHERE idempotency_key = ?1",
-                params![idempotency_key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(found.is_some())
+        self.with(|conn| {
+            let found: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM fills WHERE idempotency_key = ?1",
+                    params![idempotency_key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(found.is_some())
+        })
     }
 
     /// Replay a logged fill whose SQLite commit was lost to a crash between the
@@ -4350,33 +4423,34 @@ impl PaperStateDb {
         fill: &FillRecord,
         fill_seq: EventSeq,
     ) -> Result<bool, PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        // `last_applied` is `None` until the first fill is mirrored, so a fill at the
-        // 0-based first event-log seq is not mistaken for "already applied".
-        if let Some(last_applied) = tx_last_applied(&tx)?
-            && fill_seq.0 <= last_applied
-        {
-            tx.commit()?;
-            return Ok(false);
-        }
-        // #511: never resurrect a fill into a settled market — the resolution already ran
-        // and can never credit it. Advance the cursor (terminal disposition) without
-        // applying. Covers legacy replay and `--rebuild-state` (which restores
-        // `settled_markets` from its backup before replaying).
-        if tx_is_settled(&tx, &fill.market_id)? {
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            // `last_applied` is `None` until the first fill is mirrored, so a fill at the
+            // 0-based first event-log seq is not mistaken for "already applied".
+            if let Some(last_applied) = tx_last_applied(&tx)?
+                && fill_seq.0 <= last_applied
+            {
+                tx.commit()?;
+                return Ok(false);
+            }
+            // #511: never resurrect a fill into a settled market — the resolution already ran
+            // and can never credit it. Advance the cursor (terminal disposition) without
+            // applying. Covers legacy replay and `--rebuild-state` (which restores
+            // `settled_markets` from its backup before replaying).
+            if tx_is_settled(&tx, &fill.market_id)? {
+                tx_set_last_applied(&tx, fill_seq)?;
+                tx.commit()?;
+                return Ok(false);
+            }
+            let inserted = tx_record_fill(&tx, fill, fill_seq)?;
+            if inserted {
+                tx_apply_our_position(&tx, fill)?;
+                tx_apply_bankroll(&tx, fill)?;
+            }
             tx_set_last_applied(&tx, fill_seq)?;
             tx.commit()?;
-            return Ok(false);
-        }
-        let inserted = tx_record_fill(&tx, fill, fill_seq)?;
-        if inserted {
-            tx_apply_our_position(&tx, fill)?;
-            tx_apply_bankroll(&tx, fill)?;
-        }
-        tx_set_last_applied(&tx, fill_seq)?;
-        tx.commit()?;
-        Ok(inserted)
+            Ok(inserted)
+        })
     }
 
     // ── Live dispatch aggregate (#508 Decision 10) ───────────────────────────
@@ -4394,79 +4468,82 @@ impl PaperStateDb {
         seed: &DispatchSeedRecord,
         pending: Option<DispatchStagingEvidence<'_>>,
     ) -> Result<bool, PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO dispatch_seeds
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO dispatch_seeds
                  (dispatch_id, state, signal_json, paper_outcome, source_trade_id,
                   created_at_unix, finalized_at_unix)
              VALUES (?1, 'pending_paper', ?2, NULL, ?3, ?4, NULL)",
-            params![
-                seed.dispatch_id,
-                seed.signal_json,
-                seed.source_trade_id,
-                seed.created_at_unix
-            ],
-        )? == 1;
-        if inserted {
-            for (rank, target) in seed.targets.iter().enumerate() {
-                let rank = i64::try_from(rank)
-                    .map_err(|_| PaperStateError::Internal("target rank overflow".into()))?;
-                tx.execute(
-                    "INSERT INTO dispatch_targets
+                params![
+                    seed.dispatch_id,
+                    seed.signal_json,
+                    seed.source_trade_id,
+                    seed.created_at_unix
+                ],
+            )? == 1;
+            if inserted {
+                for (rank, target) in seed.targets.iter().enumerate() {
+                    let rank = i64::try_from(rank)
+                        .map_err(|_| PaperStateError::Internal("target rank overflow".into()))?;
+                    tx.execute(
+                        "INSERT INTO dispatch_targets
                          (dispatch_id, account_id, exec_rank, credential_bundle_version,
                           credential_key_id, state, terminal_reason, updated_at_unix)
                      VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL, ?6)",
-                    params![
-                        seed.dispatch_id,
-                        target.account_id,
-                        rank,
-                        target.credential_bundle_version,
-                        target.credential_key_id,
-                        seed.created_at_unix
-                    ],
-                )?;
-            }
-        }
-        match pending {
-            Some(DispatchStagingEvidence::PaperOutcomeCheckpoint(evidence)) => {
-                if inserted {
-                    serde_json::from_str::<serde_json::Value>(evidence.post_commit_inputs_json)?;
-                    let updated = tx.execute(
-                        "UPDATE decision_pending SET post_commit_inputs_json = ?2, \
-                             updated_at_unix = ?3 WHERE source_trade_id = ?1 AND state = 'open'",
                         params![
-                            seed.source_trade_id,
-                            evidence.post_commit_inputs_json,
-                            evidence.updated_at_unix
+                            seed.dispatch_id,
+                            target.account_id,
+                            rank,
+                            target.credential_bundle_version,
+                            target.credential_key_id,
+                            seed.created_at_unix
                         ],
                     )?;
-                    if updated != 1 {
-                        return Err(PaperStateError::DecisionPendingConflict(
-                            seed.source_trade_id.clone(),
-                        ));
-                    }
                 }
             }
-            Some(DispatchStagingEvidence::LegacyTerminal(evidence)) => {
-                tx_terminalize_pending(
-                    &tx,
-                    &SourceTradeId(seed.source_trade_id.clone()),
-                    "dispatch_staged",
-                    Some(evidence),
-                )?;
+            match pending {
+                Some(DispatchStagingEvidence::PaperOutcomeCheckpoint(evidence)) => {
+                    if inserted {
+                        serde_json::from_str::<serde_json::Value>(
+                            evidence.post_commit_inputs_json,
+                        )?;
+                        let updated = tx.execute(
+                            "UPDATE decision_pending SET post_commit_inputs_json = ?2, \
+                             updated_at_unix = ?3 WHERE source_trade_id = ?1 AND state = 'open'",
+                            params![
+                                seed.source_trade_id,
+                                evidence.post_commit_inputs_json,
+                                evidence.updated_at_unix
+                            ],
+                        )?;
+                        if updated != 1 {
+                            return Err(PaperStateError::DecisionPendingConflict(
+                                seed.source_trade_id.clone(),
+                            ));
+                        }
+                    }
+                }
+                Some(DispatchStagingEvidence::LegacyTerminal(evidence)) => {
+                    tx_terminalize_pending(
+                        &tx,
+                        &SourceTradeId(seed.source_trade_id.clone()),
+                        "dispatch_staged",
+                        Some(evidence),
+                    )?;
+                }
+                None => {
+                    tx_terminalize_pending(
+                        &tx,
+                        &SourceTradeId(seed.source_trade_id.clone()),
+                        "dispatch_staged",
+                        None,
+                    )?;
+                }
             }
-            None => {
-                tx_terminalize_pending(
-                    &tx,
-                    &SourceTradeId(seed.source_trade_id.clone()),
-                    "dispatch_staged",
-                    None,
-                )?;
-            }
-        }
-        tx.commit()?;
-        Ok(inserted)
+            tx.commit()?;
+            Ok(inserted)
+        })
     }
 
     /// Standalone `pending_paper → ready` flip (boot stuck-seed finalization, #508
@@ -4479,17 +4556,18 @@ impl PaperStateDb {
         dispatch_id: &str,
         paper_outcome: &str,
     ) -> Result<bool, PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let flipped = tx_flip_dispatch_ready(
-            &tx,
-            DispatchFlip {
-                dispatch_id,
-                paper_outcome,
-            },
-        )?;
-        tx.commit()?;
-        Ok(flipped)
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            let flipped = tx_flip_dispatch_ready(
+                &tx,
+                DispatchFlip {
+                    dispatch_id,
+                    paper_outcome,
+                },
+            )?;
+            tx.commit()?;
+            Ok(flipped)
+        })
     }
 
     /// Read one dispatch aggregate row, or `None`.
@@ -4497,25 +4575,27 @@ impl PaperStateDb {
         &self,
         dispatch_id: &str,
     ) -> Result<Option<DispatchSeedRow>, PaperStateError> {
-        let conn = self.lock();
-        conn.query_row(
-            "SELECT dispatch_id, state, signal_json, paper_outcome, source_trade_id,
+        self.with(|conn| {
+            conn.query_row(
+                "SELECT dispatch_id, state, signal_json, paper_outcome, source_trade_id,
                     created_at_unix, finalized_at_unix
              FROM dispatch_seeds WHERE dispatch_id = ?1",
-            params![dispatch_id],
-            row_to_dispatch_seed,
-        )
-        .optional()
-        .map_err(Into::into)
+                params![dispatch_id],
+                row_to_dispatch_seed,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
     }
 
     /// Whether any dispatch seed exists; the daily source retention pauses while one does.
     pub fn dispatch_seeds_exist(&self) -> Result<bool, PaperStateError> {
-        self.lock()
-            .query_row("SELECT EXISTS(SELECT 1 FROM dispatch_seeds)", [], |row| {
+        self.with(|conn| {
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM dispatch_seeds)", [], |row| {
                 row.get(0)
             })
             .map_err(PaperStateError::from)
+        })
     }
 
     /// Every `pending_paper` seed, oldest first (boot stuck-seed finalization input).
@@ -4535,18 +4615,19 @@ impl PaperStateDb {
         &self,
         predicate: &str,
     ) -> Result<Vec<DispatchSeedRow>, PaperStateError> {
-        let conn = self.lock();
-        let sql = format!(
-            "SELECT dispatch_id, state, signal_json, paper_outcome, source_trade_id,
+        self.with(|conn| {
+            let sql = format!(
+                "SELECT dispatch_id, state, signal_json, paper_outcome, source_trade_id,
                     created_at_unix, finalized_at_unix
              FROM dispatch_seeds WHERE {predicate}
              ORDER BY created_at_unix ASC, dispatch_id ASC"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map([], row_to_dispatch_seed)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map([], row_to_dispatch_seed)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
     }
 
     /// The frozen targets of one aggregate, in execution order.
@@ -4554,32 +4635,34 @@ impl PaperStateDb {
         &self,
         dispatch_id: &str,
     ) -> Result<Vec<DispatchTargetRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT dispatch_id, account_id, exec_rank, credential_bundle_version,
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT dispatch_id, account_id, exec_rank, credential_bundle_version,
                     credential_key_id, state, terminal_reason, updated_at_unix
              FROM dispatch_targets WHERE dispatch_id = ?1 ORDER BY exec_rank ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![dispatch_id], row_to_dispatch_target)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+            )?;
+            let rows = stmt
+                .query_map(params![dispatch_id], row_to_dispatch_target)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
     }
 
     /// All retained terminal targets, including those whose seed was finalized.
     pub fn retained_terminal_dispatch_targets(
         &self,
     ) -> Result<Vec<DispatchTargetRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT dispatch_id, account_id, exec_rank, credential_bundle_version,
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT dispatch_id, account_id, exec_rank, credential_bundle_version,
                     credential_key_id, state, terminal_reason, updated_at_unix
              FROM dispatch_targets WHERE state = 'terminal'
              ORDER BY dispatch_id, exec_rank",
-        )?;
-        Ok(stmt
-            .query_map([], row_to_dispatch_target)?
-            .collect::<Result<Vec<_>, _>>()?)
+            )?;
+            Ok(stmt
+                .query_map([], row_to_dispatch_target)?
+                .collect::<Result<Vec<_>, _>>()?)
+        })
     }
 
     /// Durably transition one target's lifecycle state (`pending` / `submitted` /
@@ -4592,19 +4675,20 @@ impl PaperStateDb {
         terminal_reason: Option<&str>,
         now_unix: i64,
     ) -> Result<(), PaperStateError> {
-        let conn = self.lock();
-        let updated = conn.execute(
-            "UPDATE dispatch_targets
+        self.with(|conn| {
+            let updated = conn.execute(
+                "UPDATE dispatch_targets
              SET state = ?3, terminal_reason = ?4, updated_at_unix = ?5
              WHERE dispatch_id = ?1 AND account_id = ?2",
-            params![dispatch_id, account_id, state, terminal_reason, now_unix],
-        )?;
-        if updated != 1 {
-            return Err(PaperStateError::Internal(format!(
-                "dispatch target {dispatch_id}/{account_id} not found"
-            )));
-        }
-        Ok(())
+                params![dispatch_id, account_id, state, terminal_reason, now_unix],
+            )?;
+            if updated != 1 {
+                return Err(PaperStateError::Internal(format!(
+                    "dispatch target {dispatch_id}/{account_id} not found"
+                )));
+            }
+            Ok(())
+        })
     }
 
     /// Check cumulative drops and record `submitted` in the same immediate transaction.
@@ -4618,24 +4702,25 @@ impl PaperStateDb {
         source_epoch: i64,
         now_unix: i64,
     ) -> Result<bool, PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if scope_is_dropped(&tx, wallet, market_id, group_id, source_epoch)? {
-            return Ok(false);
-        }
-        let updated = tx.execute(
-            "UPDATE dispatch_targets SET state = 'submitted', terminal_reason = NULL,
+        self.with(|conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if scope_is_dropped(&tx, wallet, market_id, group_id, source_epoch)? {
+                return Ok(false);
+            }
+            let updated = tx.execute(
+                "UPDATE dispatch_targets SET state = 'submitted', terminal_reason = NULL,
              updated_at_unix = ?3 WHERE dispatch_id = ?1 AND account_id = ?2",
-            params![target.dispatch_id, target.account_id, now_unix],
-        )?;
-        if updated != 1 {
-            return Err(PaperStateError::Internal(format!(
-                "dispatch target {}/{} not found",
-                target.dispatch_id, target.account_id
-            )));
-        }
-        tx.commit()?;
-        Ok(true)
+                params![target.dispatch_id, target.account_id, now_unix],
+            )?;
+            if updated != 1 {
+                return Err(PaperStateError::Internal(format!(
+                    "dispatch target {}/{} not found",
+                    target.dispatch_id, target.account_id
+                )));
+            }
+            tx.commit()?;
+            Ok(true)
+        })
     }
 
     /// Stamp `finalized_at_unix` when every target of a `ready` aggregate is terminal
@@ -4646,18 +4731,19 @@ impl PaperStateDb {
         dispatch_id: &str,
         now_unix: i64,
     ) -> Result<bool, PaperStateError> {
-        let conn = self.lock();
-        let updated = conn.execute(
-            "UPDATE dispatch_seeds SET finalized_at_unix = ?2
+        self.with(|conn| {
+            let updated = conn.execute(
+                "UPDATE dispatch_seeds SET finalized_at_unix = ?2
              WHERE dispatch_id = ?1 AND finalized_at_unix IS NULL
                AND NOT EXISTS (
                    SELECT 1 FROM dispatch_targets
                    WHERE dispatch_targets.dispatch_id = dispatch_seeds.dispatch_id
                      AND dispatch_targets.state != 'terminal'
                )",
-            params![dispatch_id, now_unix],
-        )?;
-        Ok(updated == 1)
+                params![dispatch_id, now_unix],
+            )?;
+            Ok(updated == 1)
+        })
     }
 
     /// Delete terminal aggregates finalized more than `retention_secs` ago (#508:
@@ -4667,23 +4753,24 @@ impl PaperStateDb {
         now_unix: i64,
         retention_secs: i64,
     ) -> Result<usize, PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let cutoff = now_unix.saturating_sub(retention_secs);
-        tx.execute(
-            "DELETE FROM dispatch_targets WHERE dispatch_id IN (
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            let cutoff = now_unix.saturating_sub(retention_secs);
+            tx.execute(
+                "DELETE FROM dispatch_targets WHERE dispatch_id IN (
                  SELECT dispatch_id FROM dispatch_seeds
                  WHERE finalized_at_unix IS NOT NULL AND finalized_at_unix < ?1
              )",
-            params![cutoff],
-        )?;
-        let pruned = tx.execute(
-            "DELETE FROM dispatch_seeds
+                params![cutoff],
+            )?;
+            let pruned = tx.execute(
+                "DELETE FROM dispatch_seeds
              WHERE finalized_at_unix IS NOT NULL AND finalized_at_unix < ?1",
-            params![cutoff],
-        )?;
-        tx.commit()?;
-        Ok(pruned)
+                params![cutoff],
+            )?;
+            tx.commit()?;
+            Ok(pruned)
+        })
     }
 
     // ── Bankroll ─────────────────────────────────────────────────────────────
@@ -4691,25 +4778,27 @@ impl PaperStateDb {
     /// Initialise the bankroll to `initial` if not already present, then return
     /// the current (possibly already drawn-down) bankroll. Idempotent across runs.
     pub fn init_bankroll(&self, initial: Decimal) -> Result<Decimal, PaperStateError> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT OR IGNORE INTO bankroll (id, bankroll_str) VALUES (?1, ?2)",
-            params![BANKROLL_ROW_ID, initial.to_string()],
-        )?;
-        read_bankroll(&conn)
+        self.with(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO bankroll (id, bankroll_str) VALUES (?1, ?2)",
+                params![BANKROLL_ROW_ID, initial.to_string()],
+            )?;
+            read_bankroll(conn)
+        })
     }
 
     /// Current bankroll, or `None` if it has not been initialised.
     pub fn bankroll(&self) -> Result<Option<Decimal>, PaperStateError> {
-        let conn = self.lock();
-        let raw: Option<String> = conn
-            .query_row(
-                "SELECT bankroll_str FROM bankroll WHERE id = ?1",
-                params![BANKROLL_ROW_ID],
-                |row| row.get(0),
-            )
-            .optional()?;
-        raw.map(|s| parse_decimal(&s)).transpose()
+        self.with(|conn| {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT bankroll_str FROM bankroll WHERE id = ?1",
+                    params![BANKROLL_ROW_ID],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            raw.map(|s| parse_decimal(&s)).transpose()
+        })
     }
 
     /// Credit `amount` to the bankroll (e.g. on market resolution payout).
@@ -4719,17 +4808,18 @@ impl PaperStateDb {
     /// this is called at most once per market. `credit_bankroll` itself does not track
     /// which markets have been settled.
     pub fn credit_bankroll(&self, amount: Decimal) -> Result<Decimal, PaperStateError> {
-        let conn = self.lock();
-        let current = read_bankroll(&conn)?;
-        let new = current
-            .checked_add(amount)
-            .ok_or_else(|| PaperStateError::Internal("bankroll credit overflow".to_string()))?;
-        conn.execute(
-            "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
+        self.with(|conn| {
+            let current = read_bankroll(conn)?;
+            let new = current
+                .checked_add(amount)
+                .ok_or_else(|| PaperStateError::Internal("bankroll credit overflow".to_string()))?;
+            conn.execute(
+                "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
              ON CONFLICT(id) DO UPDATE SET bankroll_str = excluded.bankroll_str",
-            params![BANKROLL_ROW_ID, new.to_string()],
-        )?;
-        Ok(new)
+                params![BANKROLL_ROW_ID, new.to_string()],
+            )?;
+            Ok(new)
+        })
     }
 
     /// Overwrite the bankroll to `value` unconditionally (issue #397 boot pull): the
@@ -4739,21 +4829,24 @@ impl PaperStateDb {
     /// for mirroring the authoritative store into SQLite. Not used on the non-authoritative
     /// path, where the bankroll only ever moves through `commit_fill`/`credit_bankroll`.
     pub fn set_bankroll(&self, value: Decimal) -> Result<(), PaperStateError> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
              ON CONFLICT(id) DO UPDATE SET bankroll_str = excluded.bankroll_str",
-            params![BANKROLL_ROW_ID, value.to_string()],
-        )?;
-        Ok(())
+                params![BANKROLL_ROW_ID, value.to_string()],
+            )?;
+            Ok(())
+        })
     }
 
     /// Number of fills recorded in the `fills` table.
     pub fn fills_count(&self) -> Result<usize, PaperStateError> {
-        let conn = self.lock();
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM fills", [], |row| row.get(0))?;
-        usize::try_from(n)
-            .map_err(|_| PaperStateError::Internal(format!("fills_count {n} exceeds usize::MAX")))
+        self.with(|conn| {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM fills", [], |row| row.get(0))?;
+            usize::try_from(n).map_err(|_| {
+                PaperStateError::Internal(format!("fills_count {n} exceeds usize::MAX"))
+            })
+        })
     }
 
     /// Number of genuinely OPEN positions: net-nonzero rows whose market has not settled
@@ -4762,16 +4855,17 @@ impl PaperStateDb {
     /// and records `settled_markets` but never zeroes/deletes position rows, because
     /// `apply_resolution_v2` computes the credit FROM those rows at settlement time.
     pub fn positions_count(&self) -> Result<usize, PaperStateError> {
-        let conn = self.lock();
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM positions p \
+        self.with(|conn| {
+            let n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM positions p \
              WHERE (CAST(p.long_str AS NUMERIC) > 0 OR CAST(p.short_str AS NUMERIC) > 0) \
                AND NOT EXISTS (SELECT 1 FROM settled_markets s WHERE s.market_id = p.market_id)",
-            [],
-            |row| row.get(0),
-        )?;
-        usize::try_from(n).map_err(|_| {
-            PaperStateError::Internal(format!("positions_count {n} exceeds usize::MAX"))
+                [],
+                |row| row.get(0),
+            )?;
+            usize::try_from(n).map_err(|_| {
+                PaperStateError::Internal(format!("positions_count {n} exceeds usize::MAX"))
+            })
         })
     }
 
@@ -4779,100 +4873,104 @@ impl PaperStateDb {
     /// same semantic as `positions_count`, portfolio valuation, and the financial snapshot. Risk
     /// pricing must select markets from this set, never from the cumulative `positions` table.
     pub fn open_positions(&self) -> Result<Vec<PaperPositionRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT p.market_id, p.outcome_id, p.long_str, p.short_str FROM positions p \
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT p.market_id, p.outcome_id, p.long_str, p.short_str FROM positions p \
              WHERE (CAST(p.long_str AS NUMERIC) > 0 OR CAST(p.short_str AS NUMERIC) > 0) \
                AND NOT EXISTS (SELECT 1 FROM settled_markets s WHERE s.market_id = p.market_id) \
              ORDER BY p.market_id, p.outcome_id",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (market, outcome, long, short) = row?;
-            out.push(PaperPositionRow {
-                market_id: MarketId(VenueMarketId(market)),
-                outcome_id: OutcomeId(parse_u16(outcome)?),
-                long: parse_share_amount(&long)?,
-                short: parse_share_amount(&short)?,
-            });
-        }
-        Ok(out)
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (market, outcome, long, short) = row?;
+                out.push(PaperPositionRow {
+                    market_id: MarketId(VenueMarketId(market)),
+                    outcome_id: OutcomeId(parse_u16(outcome)?),
+                    long: parse_share_amount(&long)?,
+                    short: parse_share_amount(&short)?,
+                });
+            }
+            Ok(out)
+        })
     }
 
     /// Number of settled-market rows. Cheap `COUNT(*)` for the status snapshot.
     pub fn settled_count(&self) -> Result<usize, PaperStateError> {
-        let conn = self.lock();
-        let n: i64 =
-            conn.query_row("SELECT COUNT(*) FROM settled_markets", [], |row| row.get(0))?;
-        usize::try_from(n)
-            .map_err(|_| PaperStateError::Internal(format!("settled_count {n} exceeds usize::MAX")))
+        self.with(|conn| {
+            let n: i64 =
+                conn.query_row("SELECT COUNT(*) FROM settled_markets", [], |row| row.get(0))?;
+            usize::try_from(n).map_err(|_| {
+                PaperStateError::Internal(format!("settled_count {n} exceeds usize::MAX"))
+            })
+        })
     }
 
     /// Exact lifetime fill history in Prepared/event-log order. Risk continues to use the bounded
     /// transactional [`FinancialSnapshot`]; this reader preserves endpoint and maintenance scope.
     pub fn list_fills(&self) -> Result<Vec<FillRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT idempotency_key, market_id, outcome_id, side, quantity_str, \
+        self.with(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT idempotency_key, market_id, outcome_id, side, quantity_str, \
                     fill_price_str, principal_str, fee_str, event_seq, prepared_seq, \
                     source_receipt_seq \
              FROM fills ORDER BY prepared_seq, idempotency_key",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, i64>(9)?,
-                row.get::<_, Option<i64>>(10)?,
-            ))
-        })?;
-        let mut result = Vec::new();
-        for row in rows {
-            let (
-                key,
-                market,
-                outcome,
-                side,
-                quantity,
-                price,
-                principal,
-                fee,
-                event,
-                prepared,
-                source_receipt,
-            ) = row?;
-            result.push(FillRow {
-                idempotency_key: key,
-                market_id: MarketId(VenueMarketId(market)),
-                outcome_id: OutcomeId(parse_u16(outcome)?),
-                side: parse_side(&side)?,
-                quantity: parse_share_amount(&quantity)?,
-                fill_price: Price::new(parse_decimal(&price)?).map_err(|error| {
-                    PaperStateError::Corrupt(format!("financial fill price: {error}"))
-                })?,
-                principal: parse_collateral_amount(&principal)?,
-                fee: parse_collateral_amount(&fee)?,
-                event_seq: EventSeq(parse_u64(event)?),
-                prepared_seq: EventSeq(parse_u64(prepared)?),
-                source_receipt_seq: source_receipt.map(parse_u64).transpose()?.map(EventSeq),
-            });
-        }
-        Ok(result)
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                ))
+            })?;
+            let mut result = Vec::new();
+            for row in rows {
+                let (
+                    key,
+                    market,
+                    outcome,
+                    side,
+                    quantity,
+                    price,
+                    principal,
+                    fee,
+                    event,
+                    prepared,
+                    source_receipt,
+                ) = row?;
+                result.push(FillRow {
+                    idempotency_key: key,
+                    market_id: MarketId(VenueMarketId(market)),
+                    outcome_id: OutcomeId(parse_u16(outcome)?),
+                    side: parse_side(&side)?,
+                    quantity: parse_share_amount(&quantity)?,
+                    fill_price: Price::new(parse_decimal(&price)?).map_err(|error| {
+                        PaperStateError::Corrupt(format!("financial fill price: {error}"))
+                    })?,
+                    principal: parse_collateral_amount(&principal)?,
+                    fee: parse_collateral_amount(&fee)?,
+                    event_seq: EventSeq(parse_u64(event)?),
+                    prepared_seq: EventSeq(parse_u64(prepared)?),
+                    source_receipt_seq: source_receipt.map(parse_u64).transpose()?.map(EventSeq),
+                });
+            }
+            Ok(result)
+        })
     }
 
     // ── Reconciliation cursor ────────────────────────────────────────────────
@@ -4880,8 +4978,7 @@ impl PaperStateDb {
     /// The highest event-log `seq` whose fill has been mirrored into SQLite.
     /// Defaults to `EventSeq(0)` before any fill has been committed.
     pub fn last_applied_event_seq(&self) -> Result<EventSeq, PaperStateError> {
-        let conn = self.lock();
-        Ok(EventSeq(read_last_applied(&conn)?.unwrap_or(0)))
+        self.with(|conn| Ok(EventSeq(read_last_applied(conn)?.unwrap_or(0))))
     }
 
     /// Absent-vs-zero variant of [`last_applied_event_seq`](Self::last_applied_event_seq)
@@ -4889,8 +4986,7 @@ impl PaperStateDb {
     /// distinct from `Some(0)` = seq 0 disposed. Dispatch recovery uses this to avoid
     /// misreading an undisposed seq-0 frame as a settled refusal.
     pub fn last_applied_event_seq_opt(&self) -> Result<Option<EventSeq>, PaperStateError> {
-        let conn = self.lock();
-        Ok(read_last_applied(&conn)?.map(EventSeq))
+        self.with(|conn| Ok(read_last_applied(conn)?.map(EventSeq)))
     }
 
     /// The highest event-log `seq` whose fill has been applied to the **authoritative
@@ -4902,15 +4998,16 @@ impl PaperStateDb {
     /// [`last_applied_event_seq`](Self::last_applied_event_seq) so a local-only
     /// reconcile never advances the Supabase catch-up cursor.
     pub fn last_supabase_applied_event_seq(&self) -> Result<Option<EventSeq>, PaperStateError> {
-        let conn = self.lock();
-        let raw: Option<i64> = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                params![META_LAST_SUPABASE_APPLIED_EVENT_SEQ],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(raw.map(parse_u64).transpose()?.map(EventSeq))
+        self.with(|conn| {
+            let raw: Option<i64> = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    params![META_LAST_SUPABASE_APPLIED_EVENT_SEQ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(raw.map(parse_u64).transpose()?.map(EventSeq))
+        })
     }
 
     /// Persist the Supabase authoritative catch-up watermark (issue #397). Set to the
@@ -4918,13 +5015,14 @@ impl PaperStateDb {
     /// advanced as boot catch-up confirms each fill against Supabase, and advanced at
     /// runtime by `commit_fill_authoritative` on each confirmed successor fill (#510).
     pub fn set_supabase_applied_event_seq(&self, seq: EventSeq) -> Result<(), PaperStateError> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![META_LAST_SUPABASE_APPLIED_EVENT_SEQ, to_i64(seq.0)?],
-        )?;
-        Ok(())
+                params![META_LAST_SUPABASE_APPLIED_EVENT_SEQ, to_i64(seq.0)?],
+            )?;
+            Ok(())
+        })
     }
 
     // ── #545 exact financial protocol ──────────────────────────────────────
@@ -4941,109 +5039,109 @@ impl PaperStateDb {
         starting_bankroll: CollateralAmount,
         predecessor: Option<AppendReceipt>,
     ) -> Result<(), PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let stored = tx_financial_start(&tx)?;
-        if stored == Some(start) {
-            let cash = tx_read_bankroll(&tx)?;
-            let empty = tx.query_row(
-                "SELECT (SELECT COUNT(*) FROM fills) + \
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            let stored = tx_financial_start(&tx)?;
+            if stored == Some(start) {
+                let cash = tx_read_bankroll(&tx)?;
+                let empty = tx.query_row(
+                    "SELECT (SELECT COUNT(*) FROM fills) + \
                         (SELECT COUNT(*) FROM positions) + \
                         (SELECT COUNT(*) FROM settled_markets) + \
                         (SELECT COUNT(*) FROM fill_market_snapshots)",
-                [],
-                |row| row.get::<_, i64>(0),
-            )? == 0;
-            if empty
-                && cash == starting_bankroll.to_decimal()
-                && tx_financial_last_prepared(&tx)?.is_none()
-            {
-                tx.commit()?;
-                return Ok(());
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? == 0;
+                if empty
+                    && cash == starting_bankroll.to_decimal()
+                    && tx_financial_last_prepared(&tx)?.is_none()
+                {
+                    tx.commit()?;
+                    return Ok(());
+                }
+                return Err(PaperStateError::FinancialConflict(
+                    "financial-era reset retry differs from stored state".to_owned(),
+                ));
             }
-            return Err(PaperStateError::FinancialConflict(
-                "financial-era reset retry differs from stored state".to_owned(),
-            ));
-        }
-        if stored != predecessor {
-            return Err(PaperStateError::FinancialStartConflict);
-        }
+            if stored != predecessor {
+                return Err(PaperStateError::FinancialStartConflict);
+            }
 
-        tx.execute("DELETE FROM fill_market_snapshots", [])?;
-        tx.execute("DELETE FROM fills", [])?;
-        tx.execute("DELETE FROM positions", [])?;
-        tx.execute("DELETE FROM settled_markets", [])?;
-        tx.execute("DELETE FROM bankroll", [])?;
-        tx.execute(
-            "DELETE FROM meta WHERE key IN (?1, ?2, ?3, ?4, ?5)",
-            params![
-                META_LAST_APPLIED_EVENT_SEQ,
-                META_LAST_SUPABASE_APPLIED_EVENT_SEQ,
-                META_FINANCIAL_START_SEQ,
-                META_FINANCIAL_START_HASH,
-                META_FINANCIAL_LAST_PREPARED_SEQ,
-            ],
-        )?;
-        tx.execute(
-            "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2)",
-            params![BANKROLL_ROW_ID, starting_bankroll.to_decimal().to_string()],
-        )?;
-        tx.execute(
-            "INSERT INTO meta (key, value) VALUES (?1, ?2)",
-            params![META_FINANCIAL_START_SEQ, to_i64(start.sequence.0)?],
-        )?;
-        tx.execute(
-            "INSERT INTO meta (key, value) VALUES (?1, ?2)",
-            params![
-                META_FINANCIAL_START_HASH,
-                start.this_hash.to_hex().to_string()
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
+            tx.execute("DELETE FROM fill_market_snapshots", [])?;
+            tx.execute("DELETE FROM fills", [])?;
+            tx.execute("DELETE FROM positions", [])?;
+            tx.execute("DELETE FROM settled_markets", [])?;
+            tx.execute("DELETE FROM bankroll", [])?;
+            tx.execute(
+                "DELETE FROM meta WHERE key IN (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    META_LAST_APPLIED_EVENT_SEQ,
+                    META_LAST_SUPABASE_APPLIED_EVENT_SEQ,
+                    META_FINANCIAL_START_SEQ,
+                    META_FINANCIAL_START_HASH,
+                    META_FINANCIAL_LAST_PREPARED_SEQ,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2)",
+                params![BANKROLL_ROW_ID, starting_bankroll.to_decimal().to_string()],
+            )?;
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                params![META_FINANCIAL_START_SEQ, to_i64(start.sequence.0)?],
+            )?;
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                params![
+                    META_FINANCIAL_START_HASH,
+                    start.this_hash.to_hex().to_string()
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Install the one QualificationStarted receipt in local metadata. An equal retry is
     /// idempotent; a later distinct Start is a conflict and can never reset the book.
     pub fn seed_financial_start(&self, start: AppendReceipt) -> Result<(), PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        match tx_financial_start(&tx)? {
-            None => {
-                if tx_financial_last_prepared(&tx)?.is_some() {
-                    return Err(PaperStateError::FinancialConflict(
-                        "last Prepared exists without a Start".to_owned(),
-                    ));
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            match tx_financial_start(&tx)? {
+                None => {
+                    if tx_financial_last_prepared(&tx)?.is_some() {
+                        return Err(PaperStateError::FinancialConflict(
+                            "last Prepared exists without a Start".to_owned(),
+                        ));
+                    }
+                    tx.execute(
+                        "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                        params![META_FINANCIAL_START_SEQ, to_i64(start.sequence.0)?],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                        params![
+                            META_FINANCIAL_START_HASH,
+                            start.this_hash.to_hex().to_string()
+                        ],
+                    )?;
                 }
-                tx.execute(
-                    "INSERT INTO meta (key, value) VALUES (?1, ?2)",
-                    params![META_FINANCIAL_START_SEQ, to_i64(start.sequence.0)?],
-                )?;
-                tx.execute(
-                    "INSERT INTO meta (key, value) VALUES (?1, ?2)",
-                    params![
-                        META_FINANCIAL_START_HASH,
-                        start.this_hash.to_hex().to_string()
-                    ],
-                )?;
+                Some(stored) if stored == start => {}
+                Some(_) => return Err(PaperStateError::FinancialStartConflict),
             }
-            Some(stored) if stored == start => {}
-            Some(_) => return Err(PaperStateError::FinancialStartConflict),
-        }
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// The active Start identity, if any. Partial metadata is reported as corruption.
     pub fn financial_start(&self) -> Result<Option<AppendReceipt>, PaperStateError> {
-        let conn = self.lock();
-        tx_financial_start(&conn)
+        self.with(|conn| tx_financial_start(conn))
     }
 
     /// Last Prepared sequence projected locally in the active era.
     pub fn financial_last_prepared_seq(&self) -> Result<Option<EventSeq>, PaperStateError> {
-        let conn = self.lock();
-        tx_financial_last_prepared(&conn)
+        self.with(|conn| tx_financial_last_prepared(conn))
     }
 
     /// Apply one exact fill under the Start/predecessor protocol. `canonical_cash` is the
@@ -5066,71 +5164,72 @@ impl PaperStateDb {
                 fill.outcome_id.0
             )));
         }
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        require_financial_start(&tx, start)?;
-        require_financial_sequence(start, expected_prior, prepared_seq)?;
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            require_financial_start(&tx, start)?;
+            require_financial_sequence(start, expected_prior, prepared_seq)?;
 
-        if let Some(stored) = tx_financial_fill(&tx, &fill.idempotency_key)? {
-            if stored.record != *fill
-                || stored.prepared_seq != prepared_seq
-                || stored.source_receipt != source_receipt
-                || stored.causal_received_at_unix != causal_received_at_unix
-                || tx_completed_prior_before(&tx, prepared_seq)? != expected_prior
-                || tx_financial_last_prepared(&tx)? != Some(prepared_seq)
-            {
+            if let Some(stored) = tx_financial_fill(&tx, &fill.idempotency_key)? {
+                if stored.record != *fill
+                    || stored.prepared_seq != prepared_seq
+                    || stored.source_receipt != source_receipt
+                    || stored.causal_received_at_unix != causal_received_at_unix
+                    || tx_completed_prior_before(&tx, prepared_seq)? != expected_prior
+                    || tx_financial_last_prepared(&tx)? != Some(prepared_seq)
+                {
+                    return Err(PaperStateError::FinancialConflict(
+                        "fill retry identity or economics changed".to_owned(),
+                    ));
+                }
+                let cash = tx_read_bankroll(&tx)?;
+                if cash != canonical_cash {
+                    return Err(PaperStateError::FinancialConflict(
+                        "existing fill bankroll differs from authority".to_owned(),
+                    ));
+                }
+                tx.commit()?;
+                return Ok(FinancialApplyOutcome::Existing { cash });
+            }
+
+            require_financial_predecessor(&tx, expected_prior)?;
+            if tx_is_settled(&tx, &fill.market_id)? {
                 return Err(PaperStateError::FinancialConflict(
-                    "fill retry identity or economics changed".to_owned(),
+                    "fill market is already settled".to_owned(),
                 ));
             }
-            let cash = tx_read_bankroll(&tx)?;
-            if cash != canonical_cash {
+            let cash_before = tx_read_bankroll(&tx)?;
+            let debit = fill
+                .principal
+                .checked_add(fill.fee)
+                .map_err(|error| PaperStateError::Internal(error.to_string()))?
+                .to_decimal();
+            if cash_before < debit {
                 return Err(PaperStateError::FinancialConflict(
-                    "existing fill bankroll differs from authority".to_owned(),
+                    "fill debit exceeds the local bankroll".to_owned(),
                 ));
             }
+            let derived_cash = cash_before.checked_sub(debit).ok_or_else(|| {
+                PaperStateError::Internal("financial fill debit overflow".to_owned())
+            })?;
+            if derived_cash != canonical_cash {
+                return Err(PaperStateError::FinancialConflict(
+                    "fill bankroll arithmetic differs from authority".to_owned(),
+                ));
+            }
+
+            tx_insert_financial_fill(
+                &tx,
+                fill,
+                prepared_seq,
+                source_receipt,
+                causal_received_at_unix,
+            )?;
+            tx_apply_financial_position(&tx, fill)?;
+            tx_set_bankroll(&tx, derived_cash)?;
+            tx_set_financial_last_prepared(&tx, prepared_seq)?;
             tx.commit()?;
-            return Ok(FinancialApplyOutcome::Existing { cash });
-        }
-
-        require_financial_predecessor(&tx, expected_prior)?;
-        if tx_is_settled(&tx, &fill.market_id)? {
-            return Err(PaperStateError::FinancialConflict(
-                "fill market is already settled".to_owned(),
-            ));
-        }
-        let cash_before = tx_read_bankroll(&tx)?;
-        let debit = fill
-            .principal
-            .checked_add(fill.fee)
-            .map_err(|error| PaperStateError::Internal(error.to_string()))?
-            .to_decimal();
-        if cash_before < debit {
-            return Err(PaperStateError::FinancialConflict(
-                "fill debit exceeds the local bankroll".to_owned(),
-            ));
-        }
-        let derived_cash = cash_before
-            .checked_sub(debit)
-            .ok_or_else(|| PaperStateError::Internal("financial fill debit overflow".to_owned()))?;
-        if derived_cash != canonical_cash {
-            return Err(PaperStateError::FinancialConflict(
-                "fill bankroll arithmetic differs from authority".to_owned(),
-            ));
-        }
-
-        tx_insert_financial_fill(
-            &tx,
-            fill,
-            prepared_seq,
-            source_receipt,
-            causal_received_at_unix,
-        )?;
-        tx_apply_financial_position(&tx, fill)?;
-        tx_set_bankroll(&tx, derived_cash)?;
-        tx_set_financial_last_prepared(&tx, prepared_seq)?;
-        tx.commit()?;
-        Ok(FinancialApplyOutcome::Applied { cash: derived_cash })
+            Ok(FinancialApplyOutcome::Applied { cash: derived_cash })
+        })
     }
 
     /// Apply one authority-canonical resolution under the same Start/predecessor lock.
@@ -5149,79 +5248,82 @@ impl PaperStateDb {
         credit: CollateralAmount,
         canonical_cash: Decimal,
     ) -> Result<FinancialApplyOutcome, PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        require_financial_start(&tx, start)?;
-        require_financial_sequence(start, expected_prior, prepared_seq)?;
-        let existing = tx
-            .query_row(
-                "SELECT outcome_prices, credit_applied, settled_at_unix, prepared_seq, \
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            require_financial_start(&tx, start)?;
+            require_financial_sequence(start, expected_prior, prepared_seq)?;
+            let existing = tx
+                .query_row(
+                    "SELECT outcome_prices, credit_applied, settled_at_unix, prepared_seq, \
                         source_receipt_seq FROM settled_markets WHERE market_id = ?1",
-                params![condition.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                    ))
-                },
-            )
-            .optional()?;
-        if let Some((payout, stored_credit, settled_at, stored_prepared, stored_source)) = existing
-        {
-            if payout != payout_by_outcome_index_json
-                || parse_decimal(&stored_credit)? != credit.to_decimal()
-                || settled_at != settled_at_unix
-                || stored_prepared.map(parse_u64).transpose()?.map(EventSeq) != Some(prepared_seq)
-                || stored_source.map(parse_u64).transpose()?.map(EventSeq)
-                    != Some(source_receipt.sequence)
-                || tx_completed_prior_before(&tx, prepared_seq)? != expected_prior
-                || tx_financial_last_prepared(&tx)? != Some(prepared_seq)
+                    params![condition.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((payout, stored_credit, settled_at, stored_prepared, stored_source)) =
+                existing
             {
-                return Err(PaperStateError::FinancialConflict(
-                    "resolution retry identity or economics changed".to_owned(),
-                ));
+                if payout != payout_by_outcome_index_json
+                    || parse_decimal(&stored_credit)? != credit.to_decimal()
+                    || settled_at != settled_at_unix
+                    || stored_prepared.map(parse_u64).transpose()?.map(EventSeq)
+                        != Some(prepared_seq)
+                    || stored_source.map(parse_u64).transpose()?.map(EventSeq)
+                        != Some(source_receipt.sequence)
+                    || tx_completed_prior_before(&tx, prepared_seq)? != expected_prior
+                    || tx_financial_last_prepared(&tx)? != Some(prepared_seq)
+                {
+                    return Err(PaperStateError::FinancialConflict(
+                        "resolution retry identity or economics changed".to_owned(),
+                    ));
+                }
+                let cash = tx_read_bankroll(&tx)?;
+                if cash != canonical_cash {
+                    return Err(PaperStateError::FinancialConflict(
+                        "existing resolution bankroll differs from authority".to_owned(),
+                    ));
+                }
+                tx.commit()?;
+                return Ok(FinancialApplyOutcome::Existing { cash });
             }
-            let cash = tx_read_bankroll(&tx)?;
-            if cash != canonical_cash {
-                return Err(PaperStateError::FinancialConflict(
-                    "existing resolution bankroll differs from authority".to_owned(),
-                ));
-            }
-            tx.commit()?;
-            return Ok(FinancialApplyOutcome::Existing { cash });
-        }
 
-        require_financial_predecessor(&tx, expected_prior)?;
-        let cash = tx_read_bankroll(&tx)?;
-        let derived_cash = cash
-            .checked_add(credit.to_decimal())
-            .ok_or_else(|| PaperStateError::Internal("resolution credit overflow".to_owned()))?;
-        if derived_cash != canonical_cash {
-            return Err(PaperStateError::FinancialConflict(
-                "resolution bankroll arithmetic differs from authority".to_owned(),
-            ));
-        }
-        tx.execute(
-            "INSERT INTO settled_markets \
+            require_financial_predecessor(&tx, expected_prior)?;
+            let cash = tx_read_bankroll(&tx)?;
+            let derived_cash = cash.checked_add(credit.to_decimal()).ok_or_else(|| {
+                PaperStateError::Internal("resolution credit overflow".to_owned())
+            })?;
+            if derived_cash != canonical_cash {
+                return Err(PaperStateError::FinancialConflict(
+                    "resolution bankroll arithmetic differs from authority".to_owned(),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO settled_markets \
                 (market_id, outcome_prices, credit_applied, settled_at_unix, \
                  prepared_seq, source_receipt_seq) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                condition.to_string(),
-                payout_by_outcome_index_json,
-                credit.to_decimal().to_string(),
-                settled_at_unix,
-                to_i64(prepared_seq.0)?,
-                to_i64(source_receipt.sequence.0)?,
-            ],
-        )?;
-        tx_set_bankroll(&tx, derived_cash)?;
-        tx_set_financial_last_prepared(&tx, prepared_seq)?;
-        tx.commit()?;
-        Ok(FinancialApplyOutcome::Applied { cash: derived_cash })
+                params![
+                    condition.to_string(),
+                    payout_by_outcome_index_json,
+                    credit.to_decimal().to_string(),
+                    settled_at_unix,
+                    to_i64(prepared_seq.0)?,
+                    to_i64(source_receipt.sequence.0)?,
+                ],
+            )?;
+            tx_set_bankroll(&tx, derived_cash)?;
+            tx_set_financial_last_prepared(&tx, prepared_seq)?;
+            tx.commit()?;
+            Ok(FinancialApplyOutcome::Applied { cash: derived_cash })
+        })
     }
 
     /// Reconstruct the coherent financial view at `cutoff_unix` from causal fill and resolution
@@ -5259,127 +5361,132 @@ impl PaperStateDb {
         let lower = cutoff_unix
             .checked_sub(SEVEN_DAYS_SECS)
             .ok_or_else(|| PaperStateError::Internal("snapshot window underflow".to_owned()))?;
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let start = tx_financial_start(&tx)?.map(|value| (value.sequence, value.this_hash));
-        let all_fills = read_causal_financial_fills(&tx, i64::MAX, None)?;
-        let all_settlements = read_causal_settlements(&tx, i64::MAX, None)?;
-        let mut starting_cash = tx_read_bankroll(&tx)?;
-        for fill in &all_fills {
-            starting_cash = starting_cash
-                .checked_add(fill.principal.to_decimal())
-                .and_then(|cash| cash.checked_add(fill.fee.to_decimal()))
-                .ok_or_else(|| PaperStateError::Internal("starting cash overflow".to_owned()))?;
-        }
-        for settlement in &all_settlements {
-            starting_cash = starting_cash
-                .checked_sub(settlement.credit_applied)
-                .ok_or_else(|| PaperStateError::Internal("starting cash overflow".to_owned()))?;
-        }
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            let start = tx_financial_start(&tx)?.map(|value| (value.sequence, value.this_hash));
+            let all_fills = read_causal_financial_fills(&tx, i64::MAX, None)?;
+            let all_settlements = read_causal_settlements(&tx, i64::MAX, None)?;
+            let mut starting_cash = tx_read_bankroll(&tx)?;
+            for fill in &all_fills {
+                starting_cash = starting_cash
+                    .checked_add(fill.principal.to_decimal())
+                    .and_then(|cash| cash.checked_add(fill.fee.to_decimal()))
+                    .ok_or_else(|| {
+                        PaperStateError::Internal("starting cash overflow".to_owned())
+                    })?;
+            }
+            for settlement in &all_settlements {
+                starting_cash = starting_cash
+                    .checked_sub(settlement.credit_applied)
+                    .ok_or_else(|| {
+                        PaperStateError::Internal("starting cash overflow".to_owned())
+                    })?;
+            }
 
-        let source_bound = boundary.map(|(bound, _)| bound);
-        let completed =
-            boundary.map(|(_, sequences)| sequences.iter().copied().collect::<HashSet<_>>());
-        let fills = read_causal_financial_fills(&tx, cutoff_unix, source_bound)?
-            .into_iter()
-            .filter(|fill| {
-                completed
-                    .as_ref()
-                    .is_none_or(|set| set.contains(&fill.prepared_seq))
-            })
-            .collect::<Vec<_>>();
-        let settlements = read_causal_settlements(&tx, cutoff_unix, source_bound)?
-            .into_iter()
-            .filter(|settlement| {
-                completed.as_ref().is_none_or(|set| {
-                    settlement
-                        .prepared_seq
-                        .is_some_and(|sequence| set.contains(&sequence))
+            let source_bound = boundary.map(|(bound, _)| bound);
+            let completed =
+                boundary.map(|(_, sequences)| sequences.iter().copied().collect::<HashSet<_>>());
+            let fills = read_causal_financial_fills(&tx, cutoff_unix, source_bound)?
+                .into_iter()
+                .filter(|fill| {
+                    completed
+                        .as_ref()
+                        .is_none_or(|set| set.contains(&fill.prepared_seq))
                 })
-            })
-            .collect::<Vec<_>>();
-        let mut cash = starting_cash;
-        let mut position_map = HashMap::new();
-        for fill in &fills {
-            cash = cash
-                .checked_sub(fill.principal.to_decimal())
-                .and_then(|value| value.checked_sub(fill.fee.to_decimal()))
-                .ok_or_else(|| {
-                    PaperStateError::Internal("snapshot fill debit overflow".to_owned())
+                .collect::<Vec<_>>();
+            let settlements = read_causal_settlements(&tx, cutoff_unix, source_bound)?
+                .into_iter()
+                .filter(|settlement| {
+                    completed.as_ref().is_none_or(|set| {
+                        settlement
+                            .prepared_seq
+                            .is_some_and(|sequence| set.contains(&sequence))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut cash = starting_cash;
+            let mut position_map = HashMap::new();
+            for fill in &fills {
+                cash = cash
+                    .checked_sub(fill.principal.to_decimal())
+                    .and_then(|value| value.checked_sub(fill.fee.to_decimal()))
+                    .ok_or_else(|| {
+                        PaperStateError::Internal("snapshot fill debit overflow".to_owned())
+                    })?;
+                let entry = position_map
+                    .entry((fill.market_id.clone(), fill.outcome_id))
+                    .or_insert((ShareAmount::ZERO, ShareAmount::ZERO));
+                *entry = apply_exact_fill_to_net(entry.0, entry.1, fill.side, fill.quantity)?;
+            }
+            let settled_markets = settlements
+                .iter()
+                .map(|settlement| settlement.market_id.clone())
+                .collect::<HashSet<_>>();
+            for settlement in &settlements {
+                cash = cash.checked_add(settlement.credit_applied).ok_or_else(|| {
+                    PaperStateError::Internal("snapshot settlement overflow".to_owned())
                 })?;
-            let entry = position_map
-                .entry((fill.market_id.clone(), fill.outcome_id))
-                .or_insert((ShareAmount::ZERO, ShareAmount::ZERO));
-            *entry = apply_exact_fill_to_net(entry.0, entry.1, fill.side, fill.quantity)?;
-        }
-        let settled_markets = settlements
-            .iter()
-            .map(|settlement| settlement.market_id.clone())
-            .collect::<HashSet<_>>();
-        for settlement in &settlements {
-            cash = cash.checked_add(settlement.credit_applied).ok_or_else(|| {
-                PaperStateError::Internal("snapshot settlement overflow".to_owned())
-            })?;
-        }
-        let mut positions = position_map
-            .into_iter()
-            .filter(|((market, _), (long, short))| {
-                !settled_markets.contains(market)
-                    && (*long != ShareAmount::ZERO || *short != ShareAmount::ZERO)
+            }
+            let mut positions = position_map
+                .into_iter()
+                .filter(|((market, _), (long, short))| {
+                    !settled_markets.contains(market)
+                        && (*long != ShareAmount::ZERO || *short != ShareAmount::ZERO)
+                })
+                .map(
+                    |((market_id, outcome_id), (long, short))| PaperPositionRow {
+                        market_id,
+                        outcome_id,
+                        long,
+                        short,
+                    },
+                )
+                .collect::<Vec<_>>();
+            positions.sort_by(|left, right| {
+                left.market_id
+                    .to_string()
+                    .cmp(&right.market_id.to_string())
+                    .then(left.outcome_id.0.cmp(&right.outcome_id.0))
+            });
+            let open_markets = positions
+                .iter()
+                .map(|position| position.market_id.clone())
+                .collect::<HashSet<_>>();
+            let settlements_7d = settlements
+                .iter()
+                .filter(|settlement| settlement.settled_at_unix > lower)
+                .cloned()
+                .collect::<Vec<_>>();
+            let recent_settled_markets = settlements_7d
+                .iter()
+                .map(|settlement| settlement.market_id.clone())
+                .collect::<HashSet<_>>();
+            let fills_for_open_and_7d = fills
+                .iter()
+                .filter(|fill| {
+                    open_markets.contains(&fill.market_id)
+                        || recent_settled_markets.contains(&fill.market_id)
+                })
+                .map(|fill| fill.row.clone())
+                .collect::<Vec<_>>();
+            let last_prepared_seq = fills
+                .iter()
+                .map(|fill| fill.prepared_seq)
+                .chain(
+                    settlements
+                        .iter()
+                        .filter_map(|settlement| settlement.prepared_seq),
+                )
+                .max_by_key(|sequence| sequence.0);
+            tx.commit()?;
+            Ok(FinancialSnapshot {
+                cash,
+                positions,
+                settlements_7d,
+                fills_for_open_and_7d,
+                last_prepared_seq,
+                start,
             })
-            .map(
-                |((market_id, outcome_id), (long, short))| PaperPositionRow {
-                    market_id,
-                    outcome_id,
-                    long,
-                    short,
-                },
-            )
-            .collect::<Vec<_>>();
-        positions.sort_by(|left, right| {
-            left.market_id
-                .to_string()
-                .cmp(&right.market_id.to_string())
-                .then(left.outcome_id.0.cmp(&right.outcome_id.0))
-        });
-        let open_markets = positions
-            .iter()
-            .map(|position| position.market_id.clone())
-            .collect::<HashSet<_>>();
-        let settlements_7d = settlements
-            .iter()
-            .filter(|settlement| settlement.settled_at_unix > lower)
-            .cloned()
-            .collect::<Vec<_>>();
-        let recent_settled_markets = settlements_7d
-            .iter()
-            .map(|settlement| settlement.market_id.clone())
-            .collect::<HashSet<_>>();
-        let fills_for_open_and_7d = fills
-            .iter()
-            .filter(|fill| {
-                open_markets.contains(&fill.market_id)
-                    || recent_settled_markets.contains(&fill.market_id)
-            })
-            .map(|fill| fill.row.clone())
-            .collect::<Vec<_>>();
-        let last_prepared_seq = fills
-            .iter()
-            .map(|fill| fill.prepared_seq)
-            .chain(
-                settlements
-                    .iter()
-                    .filter_map(|settlement| settlement.prepared_seq),
-            )
-            .max_by_key(|sequence| sequence.0);
-        tx.commit()?;
-        Ok(FinancialSnapshot {
-            cash,
-            positions,
-            settlements_7d,
-            fills_for_open_and_7d,
-            last_prepared_seq,
-            start,
         })
     }
 
@@ -5387,58 +5494,60 @@ impl PaperStateDb {
 
     /// All leader position rows, for rehydrating the in-memory `PositionLedger`.
     pub fn leader_positions(&self) -> Result<Vec<LeaderPositionRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT wallet_hex, market_id, outcome_id, long_amount_str, short_amount_str \
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT wallet_hex, market_id, outcome_id, long_amount_str, short_amount_str \
              FROM leader_positions",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (wallet_hex, market, outcome, long, short) = row?;
-            out.push(LeaderPositionRow {
-                wallet: parse_wallet(&wallet_hex)?,
-                market_id: MarketId(VenueMarketId(market)),
-                outcome_id: OutcomeId(parse_u16(outcome)?),
-                long_contracts: parse_share_amount(&long)?,
-                short_contracts: parse_share_amount(&short)?,
-            });
-        }
-        Ok(out)
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (wallet_hex, market, outcome, long, short) = row?;
+                out.push(LeaderPositionRow {
+                    wallet: parse_wallet(&wallet_hex)?,
+                    market_id: MarketId(VenueMarketId(market)),
+                    outcome_id: OutcomeId(parse_u16(outcome)?),
+                    long_contracts: parse_share_amount(&long)?,
+                    short_contracts: parse_share_amount(&short)?,
+                });
+            }
+            Ok(out)
+        })
     }
 
     /// All of our own paper position rows, for restoring open positions on restart.
     pub fn paper_positions(&self) -> Result<Vec<PaperPositionRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut stmt =
-            conn.prepare("SELECT market_id, outcome_id, long_str, short_str FROM positions")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (market, outcome, long, short) = row?;
-            out.push(PaperPositionRow {
-                market_id: MarketId(VenueMarketId(market)),
-                outcome_id: OutcomeId(parse_u16(outcome)?),
-                long: parse_share_amount(&long)?,
-                short: parse_share_amount(&short)?,
-            });
-        }
-        Ok(out)
+        self.with(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT market_id, outcome_id, long_str, short_str FROM positions")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (market, outcome, long, short) = row?;
+                out.push(PaperPositionRow {
+                    market_id: MarketId(VenueMarketId(market)),
+                    outcome_id: OutcomeId(parse_u16(outcome)?),
+                    long: parse_share_amount(&long)?,
+                    short: parse_share_amount(&short)?,
+                });
+            }
+            Ok(out)
+        })
     }
 
     /// Upsert one of our own net paper positions (issue #397 boot pull): mirror an
@@ -5452,22 +5561,23 @@ impl PaperStateDb {
         long: ShareAmount,
         short: ShareAmount,
     ) -> Result<(), PaperStateError> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO positions \
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO positions \
                 (market_id, outcome_id, long_str, short_str) \
              VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(market_id, outcome_id) DO UPDATE SET \
                 long_str = excluded.long_str, \
                 short_str = excluded.short_str",
-            params![
-                market_id.to_string(),
-                i64::from(outcome_id.0),
-                long.to_decimal().to_string(),
-                short.to_decimal().to_string(),
-            ],
-        )?;
-        Ok(())
+                params![
+                    market_id.to_string(),
+                    i64::from(outcome_id.0),
+                    long.to_decimal().to_string(),
+                    short.to_decimal().to_string(),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Atomically replace the complete authoritative bankroll/positions snapshot (#544).
@@ -5518,60 +5628,63 @@ impl PaperStateDb {
             ));
         }
 
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
              ON CONFLICT(id) DO UPDATE SET bankroll_str = excluded.bankroll_str",
-            params![BANKROLL_ROW_ID, bankroll.to_string()],
-        )?;
-        tx.execute("DELETE FROM positions", [])?;
-        {
-            let mut statement = tx.prepare(
-                "INSERT INTO positions \
+                params![BANKROLL_ROW_ID, bankroll.to_string()],
+            )?;
+            tx.execute("DELETE FROM positions", [])?;
+            {
+                let mut statement = tx.prepare(
+                    "INSERT INTO positions \
                  (market_id, outcome_id, long_str, short_str) \
                  VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (index, (market_id, outcome_id, long_str, short_str)) in
-                encoded.into_iter().enumerate()
-            {
-                if fail_after == Some(index) {
-                    return Err(PaperStateError::Internal(
-                        "injected authoritative replacement failure".to_owned(),
-                    ));
+                )?;
+                for (index, (market_id, outcome_id, long_str, short_str)) in
+                    encoded.into_iter().enumerate()
+                {
+                    if fail_after == Some(index) {
+                        return Err(PaperStateError::Internal(
+                            "injected authoritative replacement failure".to_owned(),
+                        ));
+                    }
+                    statement.execute(params![market_id, outcome_id, long_str, short_str,])?;
                 }
-                statement.execute(params![market_id, outcome_id, long_str, short_str,])?;
             }
-        }
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     // ── Poll cursors ─────────────────────────────────────────────────────────
 
     /// Last-seen `observed_at` unix timestamp for `wallet`, or `None`.
     pub fn cursor(&self, wallet: &WalletAddress) -> Result<Option<i64>, PaperStateError> {
-        let conn = self.lock();
-        let ts: Option<i64> = conn
-            .query_row(
-                "SELECT last_ts_unix FROM poll_cursors WHERE wallet_hex = ?1",
-                params![wallet.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(ts)
+        self.with(|conn| {
+            let ts: Option<i64> = conn
+                .query_row(
+                    "SELECT last_ts_unix FROM poll_cursors WHERE wallet_hex = ?1",
+                    params![wallet.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(ts)
+        })
     }
 
     /// Advance `wallet`'s poll cursor to `ts_unix`.
     pub fn set_cursor(&self, wallet: &WalletAddress, ts_unix: i64) -> Result<(), PaperStateError> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO poll_cursors (wallet_hex, last_ts_unix) VALUES (?1, ?2) \
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO poll_cursors (wallet_hex, last_ts_unix) VALUES (?1, ?2) \
              ON CONFLICT(wallet_hex) DO UPDATE SET \
                 last_ts_unix = MAX(poll_cursors.last_ts_unix, excluded.last_ts_unix)",
-            params![wallet.to_string(), ts_unix],
-        )?;
-        Ok(())
+                params![wallet.to_string(), ts_unix],
+            )?;
+            Ok(())
+        })
     }
 
     /// Atomically advance several poll cursors in one SQLite transaction.
@@ -5579,35 +5692,37 @@ impl PaperStateDb {
     /// Membership transitions use this before publishing newly admitted wallets, so either every
     /// admission has a bounded activity cursor or none of the cursor batch is committed.
     pub fn set_cursors(&self, cursors: &[(WalletAddress, i64)]) -> Result<(), PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        {
-            let mut statement = tx.prepare(
-                "INSERT INTO poll_cursors (wallet_hex, last_ts_unix) VALUES (?1, ?2) \
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut statement = tx.prepare(
+                    "INSERT INTO poll_cursors (wallet_hex, last_ts_unix) VALUES (?1, ?2) \
                  ON CONFLICT(wallet_hex) DO UPDATE SET \
                     last_ts_unix = MAX(poll_cursors.last_ts_unix, excluded.last_ts_unix)",
-            )?;
-            for (wallet, ts_unix) in cursors {
-                statement.execute(params![wallet.to_string(), ts_unix])?;
+                )?;
+                for (wallet, ts_unix) in cursors {
+                    statement.execute(params![wallet.to_string(), ts_unix])?;
+                }
             }
-        }
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Newest trade timestamp ever observed for `wallet` (#511 activity clock), or
     /// `None` (no row / unmigrated / never observed). Feeds the inactivity knockout;
     /// callers fall back to [`cursor`](Self::cursor) on `None`.
     pub fn activity(&self, wallet: &WalletAddress) -> Result<Option<i64>, PaperStateError> {
-        let conn = self.lock();
-        let ts: Option<Option<i64>> = conn
-            .query_row(
-                "SELECT last_activity_unix FROM poll_cursors WHERE wallet_hex = ?1",
-                params![wallet.to_string()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(ts.flatten())
+        self.with(|conn| {
+            let ts: Option<Option<i64>> = conn
+                .query_row(
+                    "SELECT last_activity_unix FROM poll_cursors WHERE wallet_hex = ?1",
+                    params![wallet.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            Ok(ts.flatten())
+        })
     }
 
     /// MAX-advance `wallet`'s activity clock (#511). UPDATE-only: a wallet with no
@@ -5618,12 +5733,13 @@ impl PaperStateDb {
         wallet: &WalletAddress,
         ts_unix: i64,
     ) -> Result<(), PaperStateError> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE poll_cursors              SET last_activity_unix = MAX(COALESCE(last_activity_unix, 0), ?2)              WHERE wallet_hex = ?1",
-            params![wallet.to_string(), ts_unix],
-        )?;
-        Ok(())
+        self.with(|conn| {
+            conn.execute(
+                "UPDATE poll_cursors              SET last_activity_unix = MAX(COALESCE(last_activity_unix, 0), ?2)              WHERE wallet_hex = ?1",
+                params![wallet.to_string(), ts_unix],
+            )?;
+            Ok(())
+        })
     }
 
     /// Seed `wallet`'s delivery cursor ONLY when it has none (#511): an existing cursor
@@ -5634,12 +5750,13 @@ impl PaperStateDb {
         wallet: &WalletAddress,
         ts_unix: i64,
     ) -> Result<(), PaperStateError> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO poll_cursors (wallet_hex, last_ts_unix, last_activity_unix)              VALUES (?1, ?2, ?2)              ON CONFLICT(wallet_hex) DO UPDATE SET                 last_activity_unix = MAX(COALESCE(poll_cursors.last_activity_unix, 0),                                          excluded.last_activity_unix)",
-            params![wallet.to_string(), ts_unix],
-        )?;
-        Ok(())
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO poll_cursors (wallet_hex, last_ts_unix, last_activity_unix)              VALUES (?1, ?2, ?2)              ON CONFLICT(wallet_hex) DO UPDATE SET                 last_activity_unix = MAX(COALESCE(poll_cursors.last_activity_unix, 0),                                          excluded.last_activity_unix)",
+                params![wallet.to_string(), ts_unix],
+            )?;
+            Ok(())
+        })
     }
 
     /// Batch [`seed_cursor_if_absent`](Self::seed_cursor_if_absent) in one transaction
@@ -5648,18 +5765,19 @@ impl PaperStateDb {
         &self,
         cursors: &[(WalletAddress, i64)],
     ) -> Result<(), PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        {
-            let mut statement = tx.prepare(
-                "INSERT INTO poll_cursors (wallet_hex, last_ts_unix, last_activity_unix)                  VALUES (?1, ?2, ?2)                  ON CONFLICT(wallet_hex) DO UPDATE SET                     last_activity_unix = MAX(COALESCE(poll_cursors.last_activity_unix, 0),                                              excluded.last_activity_unix)",
-            )?;
-            for (wallet, ts_unix) in cursors {
-                statement.execute(params![wallet.to_string(), ts_unix])?;
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut statement = tx.prepare(
+                    "INSERT INTO poll_cursors (wallet_hex, last_ts_unix, last_activity_unix)                  VALUES (?1, ?2, ?2)                  ON CONFLICT(wallet_hex) DO UPDATE SET                     last_activity_unix = MAX(COALESCE(poll_cursors.last_activity_unix, 0),                                              excluded.last_activity_unix)",
+                )?;
+                for (wallet, ts_unix) in cursors {
+                    statement.execute(params![wallet.to_string(), ts_unix])?;
+                }
             }
-        }
-        tx.commit()?;
-        Ok(())
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     // ── Settled markets (resolution double-credit guard) ──────────────────────
@@ -5675,20 +5793,21 @@ impl PaperStateDb {
         credit_applied: Decimal,
         settled_at_unix: i64,
     ) -> Result<(), PaperStateError> {
-        let conn = self.lock();
-        conn.execute(
-            "INSERT INTO settled_markets \
+        self.with(|conn| {
+            conn.execute(
+                "INSERT INTO settled_markets \
                 (market_id, outcome_prices, credit_applied, settled_at_unix) \
              VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(market_id) DO NOTHING",
-            params![
-                market_id.to_string(),
-                outcome_prices_json,
-                credit_applied.to_string(),
-                settled_at_unix,
-            ],
-        )?;
-        Ok(())
+                params![
+                    market_id.to_string(),
+                    outcome_prices_json,
+                    credit_applied.to_string(),
+                    settled_at_unix,
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Atomically record a settled market (guard-insert) and, **only when the row is
@@ -5727,17 +5846,18 @@ impl PaperStateDb {
             }
         }
         let n = rows.len();
-        let conn = self.lock();
-        for (market, prices, credit, at, prepared_seq, source_receipt_seq) in rows {
-            conn.execute(
-                "INSERT INTO settled_markets \
+        self.with(|conn| {
+            for (market, prices, credit, at, prepared_seq, source_receipt_seq) in rows {
+                conn.execute(
+                    "INSERT INTO settled_markets \
                     (market_id, outcome_prices, credit_applied, settled_at_unix, \
                      prepared_seq, source_receipt_seq) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(market_id) DO NOTHING",
-                params![market, prices, credit, at, prepared_seq, source_receipt_seq],
-            )?;
-        }
-        Ok(n)
+                    params![market, prices, credit, at, prepared_seq, source_receipt_seq],
+                )?;
+            }
+            Ok(n)
+        })
     }
 
     /// Legacy-mode settle (#511): compute the credit **inside** the settle transaction
@@ -5756,34 +5876,35 @@ impl PaperStateDb {
     where
         F: FnOnce(&[PaperPositionRow]) -> Result<Decimal, PaperStateError>,
     {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        if tx_is_settled(&tx, market_id)? {
-            let bankroll = tx_read_bankroll(&tx)?;
-            tx.commit()?;
-            return Ok((Decimal::ZERO, bankroll));
-        }
-        let positions = tx_positions_for_market(&tx, market_id)?;
-        let credit = credit_fn(&positions)?;
-        tx.execute(
-            "INSERT INTO settled_markets \
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            if tx_is_settled(&tx, market_id)? {
+                let bankroll = tx_read_bankroll(&tx)?;
+                tx.commit()?;
+                return Ok((Decimal::ZERO, bankroll));
+            }
+            let positions = tx_positions_for_market(&tx, market_id)?;
+            let credit = credit_fn(&positions)?;
+            tx.execute(
+                "INSERT INTO settled_markets \
                 (market_id, outcome_prices, credit_applied, settled_at_unix) \
              VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(market_id) DO NOTHING",
-            params![
-                market_id.to_string(),
-                outcome_prices_json,
-                credit.to_string(),
-                settled_at_unix,
-            ],
-        )?;
-        let current = tx_read_bankroll(&tx)?;
-        let new = current
-            .checked_add(credit)
-            .ok_or_else(|| PaperStateError::Internal("bankroll credit overflow".to_string()))?;
-        tx_set_bankroll(&tx, new)?;
-        tx.commit()?;
-        Ok((credit, new))
+                params![
+                    market_id.to_string(),
+                    outcome_prices_json,
+                    credit.to_string(),
+                    settled_at_unix,
+                ],
+            )?;
+            let current = tx_read_bankroll(&tx)?;
+            let new = current
+                .checked_add(credit)
+                .ok_or_else(|| PaperStateError::Internal("bankroll credit overflow".to_string()))?;
+            tx_set_bankroll(&tx, new)?;
+            tx.commit()?;
+            Ok((credit, new))
+        })
     }
 
     pub fn settle_and_credit(
@@ -5793,78 +5914,83 @@ impl PaperStateDb {
         credit: Decimal,
         settled_at_unix: i64,
     ) -> Result<Decimal, PaperStateError> {
-        let mut conn = self.lock();
-        let tx = conn.transaction()?;
-        let inserted = tx.execute(
-            "INSERT INTO settled_markets \
+        self.with(|conn| {
+            let tx = conn.transaction()?;
+            let inserted = tx.execute(
+                "INSERT INTO settled_markets \
                 (market_id, outcome_prices, credit_applied, settled_at_unix) \
              VALUES (?1, ?2, ?3, ?4) \
              ON CONFLICT(market_id) DO NOTHING",
-            params![
-                market_id.to_string(),
-                outcome_prices_json,
-                credit.to_string(),
-                settled_at_unix,
-            ],
-        )? > 0;
-        let bankroll = if inserted {
-            let current = tx_read_bankroll(&tx)?;
-            let new = current
-                .checked_add(credit)
-                .ok_or_else(|| PaperStateError::Internal("bankroll credit overflow".to_string()))?;
-            tx.execute(
-                "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
+                params![
+                    market_id.to_string(),
+                    outcome_prices_json,
+                    credit.to_string(),
+                    settled_at_unix,
+                ],
+            )? > 0;
+            let bankroll = if inserted {
+                let current = tx_read_bankroll(&tx)?;
+                let new = current.checked_add(credit).ok_or_else(|| {
+                    PaperStateError::Internal("bankroll credit overflow".to_string())
+                })?;
+                tx.execute(
+                    "INSERT INTO bankroll (id, bankroll_str) VALUES (?1, ?2) \
                  ON CONFLICT(id) DO UPDATE SET bankroll_str = excluded.bankroll_str",
-                params![BANKROLL_ROW_ID, new.to_string()],
-            )?;
-            new
-        } else {
-            // Already settled: no double-credit; return the existing bankroll.
-            tx_read_bankroll(&tx)?
-        };
-        tx.commit()?;
-        Ok(bankroll)
+                    params![BANKROLL_ROW_ID, new.to_string()],
+                )?;
+                new
+            } else {
+                // Already settled: no double-credit; return the existing bankroll.
+                tx_read_bankroll(&tx)?
+            };
+            tx.commit()?;
+            Ok(bankroll)
+        })
     }
 
     /// All settled markets, for hydrating the resolution store's double-credit guard
     /// on restart. Unordered (the guard is a set lookup, not a sequence).
     pub fn list_settled_markets(&self) -> Result<Vec<SettledMarketRow>, PaperStateError> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT market_id, outcome_prices, credit_applied, settled_at_unix, \
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT market_id, outcome_prices, credit_applied, settled_at_unix, \
                     prepared_seq, source_receipt_seq \
              FROM settled_markets",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (
-                market,
-                prices_json,
-                credit_str,
-                settled_at_unix,
-                prepared_seq,
-                source_receipt_seq,
-            ) = row?;
-            out.push(SettledMarketRow {
-                market_id: MarketId(VenueMarketId(market)),
-                outcome_prices_json: prices_json,
-                credit_applied: parse_decimal(&credit_str)?,
-                settled_at_unix,
-                prepared_seq: prepared_seq.map(parse_u64).transpose()?.map(EventSeq),
-                source_receipt_seq: source_receipt_seq.map(parse_u64).transpose()?.map(EventSeq),
-            });
-        }
-        Ok(out)
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (
+                    market,
+                    prices_json,
+                    credit_str,
+                    settled_at_unix,
+                    prepared_seq,
+                    source_receipt_seq,
+                ) = row?;
+                out.push(SettledMarketRow {
+                    market_id: MarketId(VenueMarketId(market)),
+                    outcome_prices_json: prices_json,
+                    credit_applied: parse_decimal(&credit_str)?,
+                    settled_at_unix,
+                    prepared_seq: prepared_seq.map(parse_u64).transpose()?.map(EventSeq),
+                    source_receipt_seq: source_receipt_seq
+                        .map(parse_u64)
+                        .transpose()?
+                        .map(EventSeq),
+                });
+            }
+            Ok(out)
+        })
     }
 
     /// Upsert a fill-time market-liquidity snapshot, keyed by `idempotency_key`
@@ -5884,12 +6010,12 @@ impl PaperStateDb {
         &self,
         snapshot: &FillMarketSnapshot,
     ) -> Result<(), PaperStateError> {
-        let conn = self.lock();
-        let liquidity = snapshot.liquidity.map(|d| d.to_string());
-        let volume = snapshot.volume.map(|d| d.to_string());
-        let absorbable = snapshot.absorbable_usd_100bps.map(|d| d.to_string());
-        conn.execute(
-            "INSERT INTO fill_market_snapshots \
+        self.with(|conn| {
+            let liquidity = snapshot.liquidity.map(|d| d.to_string());
+            let volume = snapshot.volume.map(|d| d.to_string());
+            let absorbable = snapshot.absorbable_usd_100bps.map(|d| d.to_string());
+            conn.execute(
+                "INSERT INTO fill_market_snapshots \
                 (idempotency_key, liquidity, volume, absorbable_usd_100bps, \
                  ask_levels_json, captured_at_unix) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
@@ -5899,50 +6025,52 @@ impl PaperStateDb {
                 absorbable_usd_100bps = excluded.absorbable_usd_100bps, \
                 ask_levels_json = excluded.ask_levels_json, \
                 captured_at_unix = excluded.captured_at_unix",
-            params![
-                snapshot.idempotency_key,
-                liquidity,
-                volume,
-                absorbable,
-                snapshot.ask_levels_json,
-                snapshot.captured_at_unix,
-            ],
-        )?;
-        Ok(())
+                params![
+                    snapshot.idempotency_key,
+                    liquidity,
+                    volume,
+                    absorbable,
+                    snapshot.ask_levels_json,
+                    snapshot.captured_at_unix,
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// All fill-market snapshots, unordered (keyed lookups and capacity analysis, not
     /// a sequence). Optional Gamma/CLOB scalars surface as `None` when the stored cell
     /// is `NULL` (a partial row).
     pub fn list_fill_snapshots(&self) -> Result<Vec<FillMarketSnapshot>, PaperStateError> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT idempotency_key, liquidity, volume, absorbable_usd_100bps, \
+        self.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT idempotency_key, liquidity, volume, absorbable_usd_100bps, \
              ask_levels_json, captured_at_unix FROM fill_market_snapshots",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, i64>(5)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (key, liquidity, volume, absorbable, ask_levels_json, captured_at_unix) = row?;
-            out.push(FillMarketSnapshot {
-                idempotency_key: key,
-                liquidity: liquidity.map(|s| parse_decimal(&s)).transpose()?,
-                volume: volume.map(|s| parse_decimal(&s)).transpose()?,
-                absorbable_usd_100bps: absorbable.map(|s| parse_decimal(&s)).transpose()?,
-                ask_levels_json,
-                captured_at_unix,
-            });
-        }
-        Ok(out)
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (key, liquidity, volume, absorbable, ask_levels_json, captured_at_unix) = row?;
+                out.push(FillMarketSnapshot {
+                    idempotency_key: key,
+                    liquidity: liquidity.map(|s| parse_decimal(&s)).transpose()?,
+                    volume: volume.map(|s| parse_decimal(&s)).transpose()?,
+                    absorbable_usd_100bps: absorbable.map(|s| parse_decimal(&s)).transpose()?,
+                    ask_levels_json,
+                    captured_at_unix,
+                });
+            }
+            Ok(out)
+        })
     }
 }
 
@@ -7569,6 +7697,131 @@ mod tests {
     use rusqlite::trace::{TraceEvent, TraceEventCodes};
     use rust_decimal_macros::dec;
 
+    #[test]
+    fn blocking_shared_connection_preserves_runtime_progress() {
+        connection_preserves_runtime_progress(false);
+    }
+
+    #[test]
+    fn blocking_maintenance_connection_preserves_runtime_progress() {
+        connection_preserves_runtime_progress(true);
+    }
+
+    fn connection_preserves_runtime_progress(maintenance: bool) {
+        let (_dir, db) = db();
+        let db = std::sync::Arc::new(db);
+        let holder = std::sync::Arc::clone(&db);
+        crate::runtime_progress::assert_progress(
+            move |entered, release| {
+                let hold = |_: &mut Connection| {
+                    entered.send(()).unwrap();
+                    release.recv().unwrap();
+                };
+                if maintenance {
+                    holder.with_maintenance(hold);
+                } else {
+                    holder.with(hold);
+                }
+            },
+            move || {
+                let read = |conn: &mut Connection| {
+                    assert_eq!(
+                        conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                            .unwrap(),
+                        1
+                    );
+                };
+                if maintenance {
+                    db.with_maintenance(read);
+                } else {
+                    db.with(read);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn blocking_connections_run_directly_with_contention_without_multi_thread_runtime() {
+        let (_dir, db) = db();
+        let db = std::sync::Arc::new(db);
+        for current_thread in [false, true] {
+            for connection in 0..3 {
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+                let (started_tx, started_rx) = std::sync::mpsc::channel();
+                let holder = std::sync::Arc::clone(&db);
+                let thread = std::thread::spawn(move || {
+                    let hold = |_: &mut Connection| {
+                        entered_tx.send(()).unwrap();
+                        started_rx
+                            .recv_timeout(std::time::Duration::from_secs(2))
+                            .unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    };
+                    match connection {
+                        0 => holder.with(hold),
+                        1 => holder.with_maintenance(hold),
+                        _ => holder.with_checkpoint(hold),
+                    }
+                });
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                let call = || {
+                    started_tx.send(()).unwrap();
+                    let caller = std::thread::current().id();
+                    let read = |conn: &mut Connection| {
+                        assert_eq!(std::thread::current().id(), caller);
+                        assert!(conn.is_autocommit());
+                    };
+                    match connection {
+                        0 => db.with(read),
+                        1 => db.with_maintenance(read),
+                        _ => db.with_checkpoint(read),
+                    }
+                };
+                if current_thread {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    runtime.block_on(async { call() });
+                    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+                } else {
+                    call();
+                }
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn blocking_connections_recover_poisoned_guards() {
+        let (_dir, db) = db();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                db.with(|_| panic!("poison shared connection"));
+            }))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                db.with_maintenance(|_| panic!("poison maintenance connection"));
+            }))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                db.with_checkpoint(|_| panic!("poison checkpoint connection"));
+            }))
+            .is_err()
+        );
+        db.with(|conn| assert!(conn.is_autocommit()));
+        db.with_maintenance(|conn| assert!(conn.is_autocommit()));
+        db.with_checkpoint(|conn| assert!(conn.is_autocommit()));
+        db.init_bankroll(dec!(10)).unwrap();
+        assert_eq!(db.bankroll().unwrap(), Some(dec!(10)));
+    }
+
     static TRACED_STATEMENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     fn record_traced_statement(event: TraceEvent<'_>) {
@@ -7629,24 +7882,25 @@ mod tests {
         );
         assert!(db.asset_identities("generation", &[]).unwrap().is_empty());
         let query = format!("EXPLAIN QUERY PLAN {ASSET_IDENTITY_LOOKUP}");
-        let conn = db.lock();
-        let plan = conn
-            .prepare(&query)
-            .unwrap()
-            .query_map(
-                params!["generation", serde_json::to_string(&requested).unwrap()],
-                |row| row.get::<_, String>(3),
-            )
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(
-            plan.iter().any(
-                |detail| detail.contains("SEARCH asset_identities USING INDEX")
-                    && detail.contains("generation=? AND token=?")
-            ),
-            "{plan:?}"
-        );
+        db.with(|conn| {
+            let plan = conn
+                .prepare(&query)
+                .unwrap()
+                .query_map(
+                    params!["generation", serde_json::to_string(&requested).unwrap()],
+                    |row| row.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(
+                    |detail| detail.contains("SEARCH asset_identities USING INDEX")
+                        && detail.contains("generation=? AND token=?")
+                ),
+                "{plan:?}"
+            );
+        })
     }
 
     #[test]
@@ -7672,23 +7926,24 @@ mod tests {
                 .is_empty()
         );
         let query = format!("EXPLAIN QUERY PLAN {ASSET_IDENTITY_CONDITION_LOOKUP}");
-        let conn = db.lock();
-        let plan = conn
-            .prepare(&query)
-            .unwrap()
-            .query_map(
-                params!["generation", serde_json::to_string(&conditions).unwrap()],
-                |row| row.get::<_, String>(3),
-            )
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(
-            plan.iter().any(|detail| detail.contains(
-                "SEARCH asset_identities USING INDEX idx_asset_identities_condition_outcome"
-            ) && detail.contains("generation=? AND condition_id=?")),
-            "{plan:?}"
-        );
+        db.with(|conn| {
+            let plan = conn
+                .prepare(&query)
+                .unwrap()
+                .query_map(
+                    params!["generation", serde_json::to_string(&conditions).unwrap()],
+                    |row| row.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|detail| detail.contains(
+                    "SEARCH asset_identities USING INDEX idx_asset_identities_condition_outcome"
+                ) && detail.contains("generation=? AND condition_id=?")),
+                "{plan:?}"
+            );
+        })
     }
 
     #[test]
@@ -7709,23 +7964,24 @@ mod tests {
             db.asset_identity_source_sequences().unwrap(),
             vec![3, 7, 11]
         );
-        let conn = db.lock();
-        let plan = conn
-            .prepare(&format!(
+        db.with(|conn| {
+            let plan = conn
+                .prepare(&format!(
                 "EXPLAIN QUERY PLAN {ASSET_IDENTITY_SOURCE_SEQUENCES}"
-            ))
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(
-            plan,
-            vec![
+                ))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                plan,
+                vec![
                 "SCAN asset_identities USING COVERING INDEX idx_asset_identities_source_log_sequence"
-            ],
+                ],
             "the hourly retention read must not scan the table or sort into a temporary tree"
-        );
+            );
+        })
     }
 
     #[test]
@@ -7816,13 +8072,14 @@ mod tests {
     #[test]
     fn asset_identities_rows_and_rejection_markers_commit_atomically() {
         let (_dir, db) = db();
-        db.lock()
-            .execute_batch(
+        db.with(|conn| {
+            conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_identity_rejection BEFORE INSERT ON meta \
              WHEN NEW.key LIKE 'rejected_asset_condition:%' \
              BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END;",
             )
-            .unwrap();
+            .unwrap()
+        });
         let row = asset_identity_row("token-a", "condition");
         let rejections = BTreeMap::from([("condition".to_owned(), 8)]);
         assert!(
@@ -7845,9 +8102,10 @@ mod tests {
                 .unwrap(),
             None
         );
-        db.lock()
-            .execute_batch("DROP TRIGGER fail_identity_rejection")
-            .unwrap();
+        db.with(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_identity_rejection")
+                .unwrap()
+        });
         db.save_asset_identities(
             "generation",
             std::slice::from_ref(&row),
@@ -7990,13 +8248,14 @@ mod tests {
     #[test]
     fn asset_identities_absences_commit_with_rows_and_rejections() {
         let (_dir, db) = db();
-        db.lock()
-            .execute_batch(
+        db.with(|conn| {
+            conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_identity_absence BEFORE INSERT ON meta \
                  WHEN NEW.key LIKE 'absent_asset_token:%' \
                  BEGIN SELECT RAISE(ABORT, 'injected absence failure'); END;",
             )
-            .unwrap();
+            .unwrap()
+        });
         let row = asset_identity_row("token-a", "condition");
         let tokens = [row.token.clone(), PolymarketTokenId("absent".into())];
         let rejections = BTreeMap::from([("condition".to_owned(), 8)]);
@@ -8032,9 +8291,10 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        db.lock()
-            .execute_batch("DROP TRIGGER fail_identity_absence")
-            .unwrap();
+        db.with(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_identity_absence")
+                .unwrap()
+        });
         db.save_asset_identities(
             "generation",
             std::slice::from_ref(&row),
@@ -8124,12 +8384,12 @@ mod tests {
         ));
         reader.execute_batch("ROLLBACK").unwrap();
         db.sync_checkpoint_dispositions().unwrap();
-        let (busy, log, checkpointed): (i64, i64, i64) = db
-            .lock()
-            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+        let (busy, log, checkpointed): (i64, i64, i64) = db.with(|conn| {
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
-            .unwrap();
+            .unwrap()
+        });
         assert_eq!(busy, 0);
         assert_eq!(log, checkpointed);
         let readonly = PaperStateDb::open_read_only(&dir.path().join("paper_state.db")).unwrap();
@@ -8160,13 +8420,14 @@ mod tests {
     #[test]
     fn stopped_auto_checkpoint_keeps_frames_until_checkpoint_wal_backfills_them() {
         let write = |db: &PaperStateDb| {
-            let conn = db.lock();
-            conn.execute_batch("CREATE TABLE frames (bytes BLOB NOT NULL)")
-                .unwrap();
-            for _ in 0..1_600 {
-                conn.execute("INSERT INTO frames VALUES (?1)", params![vec![7_u8; 3_000]])
+            db.with(|conn| {
+                conn.execute_batch("CREATE TABLE frames (bytes BLOB NOT NULL)")
                     .unwrap();
-            }
+                for _ in 0..1_600 {
+                    conn.execute("INSERT INTO frames VALUES (?1)", params![vec![7_u8; 3_000]])
+                        .unwrap();
+                }
+            })
         };
         let (dir, stopped) = db();
         assert_eq!(stopped.stop_auto_checkpoint().unwrap(), 0);
@@ -8187,9 +8448,10 @@ mod tests {
     fn background_checkpoints_leave_barriers_complete_and_writes_working() {
         let (_dir, db) = db();
         db.stop_auto_checkpoint().unwrap();
-        db.lock()
-            .execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
-            .unwrap();
+        db.with(|conn| {
+            conn.execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
+                .unwrap()
+        });
         let done = std::sync::atomic::AtomicBool::new(false);
         let (checkpoints, barriers) = std::thread::scope(|scope| {
             let (started, first) = std::sync::mpsc::channel();
@@ -8210,9 +8472,8 @@ mod tests {
             // Results are collected so a failure still stops the checkpoint thread.
             let barriers: Vec<_> = (0..200)
                 .map(|n| {
-                    let written = db
-                        .lock()
-                        .execute("INSERT INTO writes VALUES (?1)", params![n]);
+                    let written =
+                        db.with(|conn| conn.execute("INSERT INTO writes VALUES (?1)", params![n]));
                     written
                         .map_err(PaperStateError::from)
                         .and_then(|_| db.sync_checkpoint_dispositions())
@@ -8230,14 +8491,13 @@ mod tests {
     fn checkpoint_wal_backfills_committed_frames_during_an_open_batch() {
         let (dir, db) = db();
         db.stop_auto_checkpoint().unwrap();
-        db.lock()
-            .execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
-            .unwrap();
+        db.with(|conn| {
+            conn.execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
+                .unwrap()
+        });
         let (committed, _) = wal_frames(&dir);
         db.begin_batch().unwrap();
-        db.lock()
-            .execute("INSERT INTO writes VALUES (1)", [])
-            .unwrap();
+        db.with(|conn| conn.execute("INSERT INTO writes VALUES (1)", []).unwrap());
         db.checkpoint_wal().unwrap();
         assert_eq!(wal_frames(&dir), (committed, committed));
         db.commit_batch().unwrap();
@@ -8251,17 +8511,18 @@ mod tests {
     fn checkpoint_wal_never_waits_for_the_shared_connection() {
         let (dir, db) = db();
         db.stop_auto_checkpoint().unwrap();
-        db.lock()
-            .execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
-            .unwrap();
+        db.with(|conn| {
+            conn.execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
+                .unwrap()
+        });
         std::thread::scope(|scope| {
-            let shared = db.lock();
-            let (sent, received) = std::sync::mpsc::channel();
-            let db = &db;
-            scope.spawn(move || sent.send(db.checkpoint_wal()).unwrap());
-            let checkpointed = received.recv_timeout(std::time::Duration::from_secs(10));
-            drop(shared);
-            checkpointed.unwrap().unwrap();
+            let result = db.with(|_| {
+                let (sent, received) = std::sync::mpsc::channel();
+                let db = &db;
+                scope.spawn(move || sent.send(db.checkpoint_wal()).unwrap());
+                received.recv_timeout(std::time::Duration::from_secs(10))
+            });
+            result.unwrap().unwrap();
         });
         let (frames, backfilled) = wal_frames(&dir);
         assert_eq!(backfilled, frames);
@@ -8271,15 +8532,18 @@ mod tests {
     fn sync_checkpoint_dispositions_never_checkpoints_on_the_shared_connection() {
         let (dir, db) = db();
         db.stop_auto_checkpoint().unwrap();
-        db.lock()
-            .execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
-            .unwrap();
-        db.lock().trace_v2(
-            TraceEventCodes::SQLITE_TRACE_STMT,
-            Some(record_barrier_statement),
-        );
+        db.with(|conn| {
+            conn.execute_batch("CREATE TABLE writes (n INTEGER NOT NULL)")
+                .unwrap()
+        });
+        db.with(|conn| {
+            conn.trace_v2(
+                TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(record_barrier_statement),
+            )
+        });
         db.sync_checkpoint_dispositions().unwrap();
-        db.lock().trace_v2(TraceEventCodes::empty(), None);
+        db.with(|conn| conn.trace_v2(TraceEventCodes::empty(), None));
         let statements = BARRIER_STATEMENTS.lock().unwrap();
         assert!(
             !statements.iter().any(|sql| sql.contains("wal_checkpoint")),
@@ -8308,30 +8572,30 @@ mod tests {
         .unwrap();
         let start = AnchorProofCursor::start();
         std::thread::scope(|scope| {
-            let shared = db.lock();
-            let (sent, received) = std::sync::mpsc::channel();
-            let db = &db;
-            scope.spawn(move || {
-                sent.send((
-                    db.warm_retirement(wallet),
-                    db.warm(
-                        WARM_SUPERSEDED_ANCHOR_PROOFS_SQL,
-                        params![1, start.wallet_hex, start.anchor_seq],
-                    ),
-                    db.warm(RETENTION_CANDIDATES_SQL, params!["", 32]),
-                    tx_wallet_retention_wait(&db.maintenance(), wallet, 0, None),
-                ))
-                .unwrap();
+            let result = db.with(|_| {
+                let (sent, received) = std::sync::mpsc::channel();
+                let db = &db;
+                scope.spawn(move || {
+                    sent.send((
+                        db.warm_retirement(wallet),
+                        db.warm(
+                            WARM_SUPERSEDED_ANCHOR_PROOFS_SQL,
+                            params![1, start.wallet_hex, start.anchor_seq],
+                        ),
+                        db.warm(RETENTION_CANDIDATES_SQL, params!["", 32]),
+                        db.with_maintenance(|conn| tx_wallet_retention_wait(conn, wallet, 0, None)),
+                    ))
+                    .unwrap();
+                });
+                received.recv_timeout(std::time::Duration::from_secs(10))
             });
-            let warmed = received.recv_timeout(std::time::Duration::from_secs(10));
-            drop(shared);
-            let (retirement, blanking, candidates, eligibility) = warmed.unwrap();
+            let (retirement, blanking, candidates, eligibility) = result.unwrap();
             retirement.unwrap();
             blanking.unwrap();
             candidates.unwrap();
             eligibility.unwrap();
         });
-        assert_eq!(db.maintenance().total_changes(), 0);
+        assert_eq!(db.with_maintenance(|conn| conn.total_changes()), 0);
     }
 
     /// Run `call` on another thread while this one holds the shared connection, and require `warm`
@@ -8345,21 +8609,22 @@ mod tests {
         let prefix = warm.split('?').next().unwrap();
         WARM_STATEMENTS.lock().unwrap().clear();
         std::thread::scope(|scope| {
-            let shared = db.lock();
-            let caller = scope.spawn(|| call(db));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            let warmed = loop {
-                let traced = WARM_STATEMENTS.lock().unwrap();
-                if traced.iter().any(|statement| statement.starts_with(prefix)) {
-                    break true;
-                }
-                drop(traced);
-                if std::time::Instant::now() > deadline {
-                    break false;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            };
-            drop(shared);
+            let (caller, warmed) = db.with(|_| {
+                let caller = scope.spawn(|| call(db));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let warmed = loop {
+                    let traced = WARM_STATEMENTS.lock().unwrap();
+                    if traced.iter().any(|statement| statement.starts_with(prefix)) {
+                        break true;
+                    }
+                    drop(traced);
+                    if std::time::Instant::now() > deadline {
+                        break false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                };
+                (caller, warmed)
+            });
             caller.join().unwrap();
             assert!(
                 warmed,
@@ -8374,10 +8639,12 @@ mod tests {
         let conn = Connection::open(dir.path().join("paper_state.db")).unwrap();
         insert_anchor(&conn, 1, 1, "{\"proof\": 1}");
         insert_anchor(&conn, 1, 2, "{\"proof\": 2}");
-        db.maintenance().trace_v2(
-            TraceEventCodes::SQLITE_TRACE_STMT,
-            Some(record_warm_statement),
-        );
+        db.with_maintenance(|conn| {
+            conn.trace_v2(
+                TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(record_warm_statement),
+            )
+        });
         assert_warms_before_lock(&db, WARM_SUPERSEDED_ANCHOR_PROOFS_SQL, |db| {
             db.blank_superseded_anchor_proofs(&AnchorProofCursor::start(), 1)
                 .unwrap();
@@ -8389,7 +8656,7 @@ mod tests {
             db.wallet_retention_wait(WalletAddress([1; 20]), 0, None)
                 .unwrap();
         });
-        db.maintenance().trace_v2(TraceEventCodes::empty(), None);
+        db.with_maintenance(|conn| conn.trace_v2(TraceEventCodes::empty(), None));
     }
 
     fn wallet() -> WalletAddress {
@@ -8608,11 +8875,13 @@ mod tests {
                 .unwrap()
         );
         {
-            let mut conn = db.lock();
-            let savepoint = conn.savepoint().unwrap();
-            assert!(
-                scope_is_dropped(&savepoint, &wallet(), "market-b", Some("group-b"), 110).unwrap()
-            );
+            db.with(|conn| {
+                let savepoint = conn.savepoint().unwrap();
+                assert!(
+                    scope_is_dropped(&savepoint, &wallet(), "market-b", Some("group-b"), 110)
+                        .unwrap()
+                );
+            })
         }
         db.commit_batch().unwrap();
         for (market, group, second, expected) in [
@@ -8711,32 +8980,34 @@ mod tests {
     fn scope_drops_group_lookup_uses_partial_index_and_pre_upgrade_rows() {
         let (dir, db) = db();
         {
-            let conn = db.lock();
-            conn.execute_batch(
-                "DROP INDEX idx_meta_neg_risk_group;
+            db.with(|conn| {
+                conn.execute_batch(
+                    "DROP INDEX idx_meta_neg_risk_group;
                 INSERT INTO meta(key, value) VALUES ('neg_risk_group:old-market', 'old-group');
                 INSERT INTO meta(key, value) VALUES ('unrelated', 'fabricated');",
-            )
-            .unwrap();
+                )
+                .unwrap();
+            })
         }
         drop(db);
         let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
         assert!(db.is_group("old-group").unwrap());
         assert!(!db.is_group("fabricated").unwrap());
-        let conn = db.lock();
-        let plan: Vec<String> = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {IS_GROUP_SQL}"))
-            .unwrap()
-            .query_map(["old-group"], |row| row.get(3))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert!(
-            plan.iter()
-                .any(|detail| detail.contains("idx_meta_neg_risk_group (value=?)")),
-            "{plan:?}"
-        );
-        assert!(!plan.iter().any(|detail| detail == "SCAN meta"), "{plan:?}");
+        db.with(|conn| {
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {IS_GROUP_SQL}"))
+                .unwrap()
+                .query_map(["old-group"], |row| row.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("idx_meta_neg_risk_group (value=?)")),
+                "{plan:?}"
+            );
+            assert!(!plan.iter().any(|detail| detail == "SCAN meta"), "{plan:?}");
+        })
     }
 
     #[test]
@@ -8758,7 +9029,7 @@ mod tests {
         )
         .unwrap();
         db.record_market_group("local-market", "a").unwrap();
-        db.lock().execute_batch(
+        db.with(|conn| conn.execute_batch(
             "CREATE TABLE group_changes(key TEXT);
              CREATE TEMP TRIGGER note_group_insert AFTER INSERT ON meta WHEN NEW.key GLOB 'ranker_group:*'
              BEGIN INSERT INTO group_changes VALUES (NEW.key); END;
@@ -8766,7 +9037,7 @@ mod tests {
              BEGIN INSERT INTO group_changes VALUES (OLD.key); END;
              CREATE TEMP TRIGGER fail_import_marker BEFORE INSERT ON meta WHEN NEW.key = 'scope_drop_imported:11'
              BEGIN SELECT RAISE(ABORT, 'injected import failure'); END;",
-        ).unwrap();
+        ).unwrap());
         assert!(
             db.import_scope_drops(
                 11,
@@ -8781,10 +9052,14 @@ mod tests {
         assert!(db.is_group("b").unwrap());
         assert!(!db.is_group("c").unwrap());
         assert!(!db.scope_is_dropped(&wallet(), "failed", None, 100).unwrap());
-        assert!(stored_rows(&db.lock(), "SELECT * FROM group_changes").is_empty());
-        db.lock()
-            .execute_batch("DROP TRIGGER fail_import_marker;")
-            .unwrap();
+        assert!(
+            db.with(|conn| stored_rows(conn, "SELECT * FROM group_changes"))
+                .is_empty()
+        );
+        db.with(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_import_marker;")
+                .unwrap()
+        });
         db.import_scope_drops(
             11,
             &[(scope_drop("market", "imported", 90), receipt)],
@@ -8796,7 +9071,7 @@ mod tests {
         assert!(db.is_group("a").unwrap()); // Local CLOB evidence outlives the batch's set.
         assert!(db.is_group("c").unwrap());
         assert_eq!(
-            stored_rows(&db.lock(), "SELECT * FROM group_changes ORDER BY key"),
+            db.with(|conn| stored_rows(conn, "SELECT * FROM group_changes ORDER BY key")),
             vec![
                 vec![rusqlite::types::Value::Text("ranker_group:a".to_owned())],
                 vec![rusqlite::types::Value::Text("ranker_group:c".to_owned())]
@@ -8846,8 +9121,8 @@ mod tests {
         bucket.observation_retirements.push((receipt, true));
         bucket.scope_drop_boundary_unix = Some(1000);
         bucket.dispositions[0].disposition = "scope_dropped".to_owned();
-        db.lock()
-            .execute_batch(
+        db.with(|conn| {
+            conn.execute_batch(
                 "CREATE TEMP TRIGGER require_scope_drop_boundary BEFORE INSERT ON activity_groups
              WHEN NEW.disposition = 'scope_dropped' AND NOT EXISTS
                (SELECT 1 FROM meta WHERE key = 'scope_drop_boundary_unix')
@@ -8856,27 +9131,30 @@ mod tests {
              WHEN NEW.key = 'scope_drop_boundary_unix'
              BEGIN SELECT RAISE(ABORT, 'boundary failure'); END;",
             )
-            .unwrap();
+            .unwrap()
+        });
         assert!(db.commit_activity_bucket(&bucket).is_err());
         assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
         assert!(db.wallet_scope_drops(&wallet(), 200).unwrap().is_empty());
         assert!(!db.activity_observation_retired(receipt).unwrap());
         assert!(db.activity_group_state(&group_id('a')).unwrap().is_none());
-        db.lock()
-            .execute_batch(
+        db.with(|conn| {
+            conn.execute_batch(
                 "DROP TRIGGER fail_scope_drop_boundary;
              CREATE TEMP TRIGGER fail_bucket_seen BEFORE INSERT ON seen_trades_v2
              BEGIN SELECT RAISE(ABORT, 'after-boundary failure'); END;",
             )
-            .unwrap();
+            .unwrap()
+        });
         assert!(db.commit_activity_bucket(&bucket).is_err());
         assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
         assert!(db.wallet_scope_drops(&wallet(), 200).unwrap().is_empty());
         assert!(!db.activity_observation_retired(receipt).unwrap());
         assert!(db.activity_group_state(&group_id('a')).unwrap().is_none());
-        db.lock()
-            .execute_batch("DROP TRIGGER fail_bucket_seen;")
-            .unwrap();
+        db.with(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_bucket_seen;")
+                .unwrap()
+        });
         db.begin_batch().unwrap();
         db.commit_activity_bucket(&bucket).unwrap();
         assert_eq!(db.scope_drop_boundary_unix().unwrap(), Some(1000));
@@ -8921,18 +9199,17 @@ mod tests {
     #[test]
     fn scope_drops_live_boundary_is_first_write_wins_and_never_joins_a_batch() {
         let (dir, db) = db();
-        db.lock()
-            .execute_batch(
+        db.with(|conn| {
+            conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_boundary BEFORE INSERT ON meta
              WHEN NEW.key = 'scope_drop_boundary_unix'
              BEGIN SELECT RAISE(ABORT, 'boundary failure'); END;",
             )
-            .unwrap();
+            .unwrap()
+        });
         assert!(db.record_scope_drop_boundary(1000).is_err());
         assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
-        db.lock()
-            .execute_batch("DROP TRIGGER fail_boundary;")
-            .unwrap();
+        db.with(|conn| conn.execute_batch("DROP TRIGGER fail_boundary;").unwrap());
         db.begin_batch().unwrap();
         assert!(db.record_scope_drop_boundary(1000).is_err());
         db.rollback_batch().unwrap();
@@ -9006,14 +9283,14 @@ mod tests {
             revised.scope_drop_boundary_unix = None;
             assert!(db.commit_activity_bucket(&revised).is_err());
             revised.scope_drop_boundary_unix = Some(1000);
-            db.lock().execute_batch(
+            db.with(|conn| conn.execute_batch(
                 "CREATE TEMP TRIGGER require_revision_boundary BEFORE INSERT ON activity_group_revisions
                  WHEN NEW.semantic_revision = 'r2' AND NOT EXISTS
                    (SELECT 1 FROM meta WHERE key = 'scope_drop_boundary_unix')
                  BEGIN SELECT RAISE(ABORT, 'missing boundary'); END;
                  CREATE TEMP TRIGGER fail_revision_seen BEFORE INSERT ON seen_trades_v2
                  BEGIN SELECT RAISE(ABORT, 'revision rollback'); END;",
-            ).unwrap();
+            ).unwrap());
             assert!(db.commit_activity_bucket(&revised).is_err());
             assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
             assert!(
@@ -9025,9 +9302,10 @@ mod tests {
                 before
             );
             assert!(db.position_validation(&wallet()).unwrap().is_some());
-            db.lock()
-                .execute_batch("DROP TRIGGER fail_revision_seen;")
-                .unwrap();
+            db.with(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_revision_seen;")
+                    .unwrap()
+            });
             db.commit_activity_bucket(&revised).unwrap();
             assert!(db.position_validation(&wallet()).unwrap().is_none());
             assert_eq!(
@@ -9509,10 +9787,11 @@ mod tests {
             install.proof_json = proof.to_owned();
             db.install_anchors(&[install]).unwrap();
         }
-        db.lock()
-            .execute("DELETE FROM position_validations", [])
-            .unwrap();
-        let path = db.lock().path().unwrap().to_owned();
+        db.with(|conn| {
+            conn.execute("DELETE FROM position_validations", [])
+                .unwrap()
+        });
+        let path = db.with(|conn| conn.path().unwrap().to_owned());
         drop(db);
         let db = PaperStateDb::open(std::path::Path::new(&path)).unwrap();
         assert!(db.position_validation(&first).unwrap().is_none());
@@ -9905,10 +10184,12 @@ mod tests {
     fn activity_bucket_batch_uses_one_outer_transaction_and_one_savepoint_per_bucket() {
         let (_dir, db) = db();
         TRACED_STATEMENTS.lock().unwrap().clear();
-        db.lock().trace_v2(
-            TraceEventCodes::SQLITE_TRACE_STMT,
-            Some(record_traced_statement),
-        );
+        db.with(|conn| {
+            conn.trace_v2(
+                TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(record_traced_statement),
+            )
+        });
 
         db.begin_batch().unwrap();
         for (source_epoch, suffix) in [(100, 'a'), (101, 'b'), (102, 'c')] {
@@ -9916,7 +10197,7 @@ mod tests {
                 .unwrap();
         }
         db.commit_batch().unwrap();
-        db.lock().trace_v2(TraceEventCodes::empty(), None);
+        db.with(|conn| conn.trace_v2(TraceEventCodes::empty(), None));
 
         let statements = std::mem::take(&mut *TRACED_STATEMENTS.lock().unwrap());
         assert_eq!(
@@ -9985,74 +10266,75 @@ mod tests {
     #[test]
     fn retention_queries_read_every_table_through_an_index() {
         let (_dir, db) = db();
-        let conn = db.lock();
-        conn.execute_batch(
+        db.with(|conn| {
+            conn.execute_batch(
             "CREATE TEMP TABLE wallet_drain_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL);
-             CREATE TEMP TABLE wallet_retirement_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL);",
-        )
-        .unwrap();
-        let wallet = wallet().to_string();
-        let mut statements: Vec<(&str, Vec<rusqlite::types::Value>)> = vec![
-            (
-                RETENTION_CANDIDATES_SQL,
-                vec![String::new().into(), 128_i64.into()],
-            ),
-            (
-                RETENTION_CANDIDATES_SQL,
-                vec![wallet.clone().into(), 128_i64.into()],
-            ),
-            (
-                DRAIN_GROUP_IDS_SQL,
-                vec![wallet.clone().into(), 500_i64.into()],
-            ),
-            (
-                DRAIN_GATE_IDS_SQL,
-                vec![wallet.clone().into(), 500_i64.into()],
-            ),
-            (RETIREMENT_DECISION_IDS_SQL, vec![wallet.clone().into()]),
-            (
-                RETIREMENT_TERMINAL_DECISIONS_SQL,
-                vec![wallet.clone().into()],
-            ),
-        ];
-        for (query, _) in RETENTION_WAIT_QUERIES {
-            let parameters = if query.contains("?2") {
-                vec![wallet.clone().into(), 100_i64.into()]
-            } else {
-                vec![wallet.clone().into()]
-            };
-            statements.push((query, parameters));
-        }
-        for (query, parameters) in statements {
-            let plan: Vec<String> = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
-                .unwrap()
-                .query_map(rusqlite::params_from_iter(parameters), |row| row.get(3))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
-            for table in [
-                "activity_groups",
-                "decision_pending",
-                "entry_gate_results",
-                "position_anchors",
-                "position_validations",
-                "wallet_history_status_v2",
-                "leader_positions",
-                "poll_cursors",
-                "wallet_fences",
-            ] {
-                assert!(
-                    plan.iter()
-                        .all(|detail| !detail.starts_with(&format!("SCAN {table}"))),
+                 CREATE TEMP TABLE wallet_retirement_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL);",
+            )
+            .unwrap();
+            let wallet = wallet().to_string();
+            let mut statements: Vec<(&str, Vec<rusqlite::types::Value>)> = vec![
+                (
+                    RETENTION_CANDIDATES_SQL,
+                    vec![String::new().into(), 128_i64.into()],
+                ),
+                (
+                    RETENTION_CANDIDATES_SQL,
+                    vec![wallet.clone().into(), 128_i64.into()],
+                ),
+                (
+                    DRAIN_GROUP_IDS_SQL,
+                    vec![wallet.clone().into(), 500_i64.into()],
+                ),
+                (
+                    DRAIN_GATE_IDS_SQL,
+                    vec![wallet.clone().into(), 500_i64.into()],
+                ),
+                (RETIREMENT_DECISION_IDS_SQL, vec![wallet.clone().into()]),
+                (
+                    RETIREMENT_TERMINAL_DECISIONS_SQL,
+                    vec![wallet.clone().into()],
+                ),
+            ];
+            for (query, _) in RETENTION_WAIT_QUERIES {
+                let parameters = if query.contains("?2") {
+                    vec![wallet.clone().into(), 100_i64.into()]
+                } else {
+                    vec![wallet.clone().into()]
+                };
+                statements.push((query, parameters));
+            }
+            for (query, parameters) in statements {
+                let plan: Vec<String> = conn
+                    .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                    .unwrap()
+                    .query_map(rusqlite::params_from_iter(parameters), |row| row.get(3))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                for table in [
+                    "activity_groups",
+                    "decision_pending",
+                    "entry_gate_results",
+                    "position_anchors",
+                    "position_validations",
+                    "wallet_history_status_v2",
+                    "leader_positions",
+                    "poll_cursors",
+                    "wallet_fences",
+                ] {
+                    assert!(
+                        plan.iter()
+                            .all(|detail| !detail.starts_with(&format!("SCAN {table}"))),
                     "{table} must be read through an index, not walked: {plan:?} for {query}"
+                    );
+                }
+                assert!(
+                    plan.iter().any(|detail| detail.starts_with("SEARCH ")),
+                "no indexed read in {plan:?} for {query}"
                 );
             }
-            assert!(
-                plan.iter().any(|detail| detail.starts_with("SEARCH ")),
-                "no indexed read in {plan:?} for {query}"
-            );
-        }
+        })
     }
 
     fn insert_anchor(conn: &Connection, wallet: u8, anchor_seq: i64, proof_json: &str) {
@@ -10078,23 +10360,24 @@ mod tests {
     fn blanking_returns_the_largest_blanked_key_and_resumes_after_it() {
         let (_dir, db) = db();
         {
-            let conn = db.lock();
-            for (wallet, anchor_seq) in [
-                (3, 1),
-                (1, 0),
-                (2, 2),
-                (1, 2),
-                (3, 0),
-                (2, 0),
-                (1, 1),
-                (3, 2),
-                (2, 1),
-                (1, 3),
-                (3, 3),
-                (2, 3),
-            ] {
-                insert_anchor(&conn, wallet, anchor_seq, "{\"proof\":1}");
-            }
+            db.with(|conn| {
+                for (wallet, anchor_seq) in [
+                    (3, 1),
+                    (1, 0),
+                    (2, 2),
+                    (1, 2),
+                    (3, 0),
+                    (2, 0),
+                    (1, 1),
+                    (3, 2),
+                    (2, 1),
+                    (1, 3),
+                    (3, 3),
+                    (2, 3),
+                ] {
+                    insert_anchor(conn, wallet, anchor_seq, "{\"proof\":1}");
+                }
+            })
         }
         let first = db
             .blank_superseded_anchor_proofs(&AnchorProofCursor::start(), 4)
@@ -10116,26 +10399,26 @@ mod tests {
             .unwrap()
             .result;
         assert_eq!(fourth, (0, anchor_key(3, 2)));
-        let conn = db.lock();
-        let nonblank: Vec<(String, i64)> = conn
-            .prepare("SELECT wallet_hex, anchor_seq FROM position_anchors WHERE proof_json != '{}' ORDER BY 1, 2")
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(
-            nonblank,
-            [1, 2, 3].map(|wallet| (WalletAddress([wallet; 20]).to_string(), 3))
-        );
+        db.with(|conn| {
+            let nonblank: Vec<(String, i64)> = conn
+                .prepare("SELECT wallet_hex, anchor_seq FROM position_anchors WHERE proof_json != '{}' ORDER BY 1, 2")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                nonblank,
+                [1, 2, 3].map(|wallet| (WalletAddress([wallet; 20]).to_string(), 3))
+            );
+        })
     }
 
     #[test]
     fn blanking_seeks_after_the_cursor_without_reading_the_cleared_prefix() {
         let (_plan_dir, plan_db) = db();
-        let plan: Vec<String> = plan_db
-            .lock()
-            .prepare(&format!(
+        let plan: Vec<String> = plan_db.with(|conn| {
+            conn.prepare(&format!(
                 "EXPLAIN QUERY PLAN {BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL}"
             ))
             .unwrap()
@@ -10144,7 +10427,8 @@ mod tests {
             })
             .unwrap()
             .collect::<Result<_, _>>()
-            .unwrap();
+            .unwrap()
+        });
         assert!(
             plan.iter().any(|detail| detail
                 == "SEARCH old USING INDEX sqlite_autoindex_position_anchors_1 ((wallet_hex,anchor_seq)>(?,?))"),
@@ -10158,26 +10442,27 @@ mod tests {
         // precede it, each counted on a freshly prepared statement.
         let steps = |cleared: i64| {
             let (_dir, db) = db();
-            let conn = db.lock();
-            for anchor_seq in 0..cleared {
-                insert_anchor(&conn, 1, anchor_seq, "{}");
-            }
-            insert_anchor(&conn, 1, cleared, "{\"proof\":1}");
-            for anchor_seq in 0..9 {
-                insert_anchor(&conn, 2, anchor_seq, "{\"proof\":1}");
-            }
-            let after = anchor_key(1, i64::MAX);
-            let mut stmt = conn.prepare(BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL).unwrap();
-            let mut rows = stmt
-                .query(params![4_i64, after.wallet_hex, after.anchor_seq])
-                .unwrap();
-            let mut blanked = 0;
-            while rows.next().unwrap().is_some() {
-                blanked += 1;
-            }
-            drop(rows);
-            assert_eq!(blanked, 4);
-            stmt.get_status(rusqlite::StatementStatus::VmStep)
+            db.with(|conn| {
+                for anchor_seq in 0..cleared {
+                    insert_anchor(conn, 1, anchor_seq, "{}");
+                }
+                insert_anchor(conn, 1, cleared, "{\"proof\":1}");
+                for anchor_seq in 0..9 {
+                    insert_anchor(conn, 2, anchor_seq, "{\"proof\":1}");
+                }
+                let after = anchor_key(1, i64::MAX);
+                let mut stmt = conn.prepare(BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL).unwrap();
+                let mut rows = stmt
+                    .query(params![4_i64, after.wallet_hex, after.anchor_seq])
+                    .unwrap();
+                let mut blanked = 0;
+                while rows.next().unwrap().is_some() {
+                    blanked += 1;
+                }
+                drop(rows);
+                assert_eq!(blanked, 4);
+                stmt.get_status(rusqlite::StatementStatus::VmStep)
+            })
         };
         let without_prefix = steps(0);
         assert!(without_prefix > 0);
@@ -10191,33 +10476,34 @@ mod tests {
         // for the byte length alone (`OPFLAG_BYTELENARG`, 0xc0), which comes from the record header, so passing
         // an already blank row never walks its overflow chain. Only the row being blanked is read in full.
         let (_dir, db) = db();
-        let conn = db.lock();
-        let program: Vec<(String, i64, i64)> = conn
-            .prepare(&format!("EXPLAIN {BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL}"))
-            .unwrap()
-            .query_map(params![1_i64, wallet().to_string(), 0_i64], |row| {
-                Ok((row.get(1)?, row.get(3)?, row.get(6)?))
-            })
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        let write = program
-            .iter()
-            .position(|(opcode, _, _)| opcode == "OpenWrite")
-            .unwrap();
-        let selection_reads: Vec<i64> = program[..write]
-            .iter()
-            .filter(|(opcode, column, _)| opcode == "Column" && *column == 6)
-            .map(|(_, _, p5)| *p5)
-            .collect();
-        assert!(
-            !selection_reads.is_empty(),
-            "no proof_json read while choosing candidates: {program:?}"
-        );
-        assert!(
-            selection_reads.iter().all(|p5| p5 & 0xc0 == 0xc0),
-            "candidates must be chosen by proof_json's length only: {program:?}"
-        );
+        db.with(|conn| {
+            let program: Vec<(String, i64, i64)> = conn
+                .prepare(&format!("EXPLAIN {BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL}"))
+                .unwrap()
+                .query_map(params![1_i64, wallet().to_string(), 0_i64], |row| {
+                    Ok((row.get(1)?, row.get(3)?, row.get(6)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let write = program
+                .iter()
+                .position(|(opcode, _, _)| opcode == "OpenWrite")
+                .unwrap();
+            let selection_reads: Vec<i64> = program[..write]
+                .iter()
+                .filter(|(opcode, column, _)| opcode == "Column" && *column == 6)
+                .map(|(_, _, p5)| *p5)
+                .collect();
+            assert!(
+                !selection_reads.is_empty(),
+                "no proof_json read while choosing candidates: {program:?}"
+            );
+            assert!(
+                selection_reads.iter().all(|p5| p5 & 0xc0 == 0xc0),
+                "candidates must be chosen by proof_json's length only: {program:?}"
+            );
+        })
     }
 
     #[test]
@@ -10239,53 +10525,54 @@ mod tests {
             );
         }
         {
-            let conn = db.lock();
-            let columns: Vec<String> = conn
-                .prepare("PRAGMA index_info('idx_activity_groups_wallet_epoch_trade')")
-                .unwrap()
-                .query_map([], |row| row.get(2))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
-            assert_eq!(columns, ["wallet_hex", "source_epoch", "source_trade_id"]);
-            for (query, parameters, covering) in [
-                (
-                    "EXPLAIN QUERY PLAN \
-                     SELECT MAX(source_epoch) FROM activity_groups WHERE wallet_hex = ?1",
-                    vec![rusqlite::types::Value::Text(wallet().to_string())],
-                    true,
-                ),
-                (
-                    "EXPLAIN QUERY PLAN \
-                     SELECT source_trade_id, source_epoch, semantic_revision, disposition, proof_json \
-                     FROM activity_groups WHERE wallet_hex = ?1 AND source_epoch > ?2 \
-                     ORDER BY source_epoch, source_trade_id",
-                    vec![wallet().to_string().into(), 100_i64.into()],
-                    false,
-                ),
-            ] {
-                let plan: Vec<String> = conn
-                    .prepare(query)
+            db.with(|conn| {
+                let columns: Vec<String> = conn
+                    .prepare("PRAGMA index_info('idx_activity_groups_wallet_epoch_trade')")
                     .unwrap()
-                    .query_map(rusqlite::params_from_iter(parameters), |row| row.get(3))
+                    .query_map([], |row| row.get(2))
                     .unwrap()
                     .collect::<Result<_, _>>()
                     .unwrap();
-                assert!(
-                    plan.iter().any(|detail| {
-                        detail.contains("idx_activity_groups_wallet_epoch_trade")
-                            && (!covering || detail.contains("COVERING INDEX"))
-                    }),
+                assert_eq!(columns, ["wallet_hex", "source_epoch", "source_trade_id"]);
+                for (query, parameters, covering) in [
+                    (
+                    "EXPLAIN QUERY PLAN \
+                         SELECT MAX(source_epoch) FROM activity_groups WHERE wallet_hex = ?1",
+                        vec![rusqlite::types::Value::Text(wallet().to_string())],
+                        true,
+                    ),
+                    (
+                    "EXPLAIN QUERY PLAN \
+                     SELECT source_trade_id, source_epoch, semantic_revision, disposition, proof_json \
+                     FROM activity_groups WHERE wallet_hex = ?1 AND source_epoch > ?2 \
+                         ORDER BY source_epoch, source_trade_id",
+                        vec![wallet().to_string().into(), 100_i64.into()],
+                        false,
+                    ),
+                ] {
+                    let plan: Vec<String> = conn
+                        .prepare(query)
+                        .unwrap()
+                        .query_map(rusqlite::params_from_iter(parameters), |row| row.get(3))
+                        .unwrap()
+                        .collect::<Result<_, _>>()
+                        .unwrap();
+                    assert!(
+                        plan.iter().any(|detail| {
+                            detail.contains("idx_activity_groups_wallet_epoch_trade")
+                                && (!covering || detail.contains("COVERING INDEX"))
+                        }),
                     "activity query must use the wallet/epoch index: {plan:?}"
-                );
-                assert!(
-                    plan.iter()
-                        .all(|detail| !detail.contains("USE TEMP B-TREE")),
+                    );
+                    assert!(
+                        plan.iter()
+                            .all(|detail| !detail.contains("USE TEMP B-TREE")),
                     "activity order must not require a temporary b-tree: {plan:?}"
-                );
-            }
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-                .unwrap();
+                    );
+                }
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+            })
         }
 
         let scratch_path = dir.path().join("without_activity_index.db");
@@ -10336,27 +10623,28 @@ mod tests {
             recorded_at_unix: 103,
         };
         {
-            let mut conn = db.lock();
-            replace_no_copy_shape(
-                &conn,
-                "provenance TEXT NOT NULL CHECK(provenance = 'rest_poll')",
-            );
-            let tx = conn.transaction().unwrap();
-            tx_record_no_copy_disposition(&tx, &group_id('a'), &original).unwrap();
-            tx_record_no_copy_disposition(
-                &tx,
-                &group_id('a'),
-                &NoCopyDisposition {
-                    age_secs: 4,
-                    reason: "duplicate".to_owned(),
-                    recorded_at_unix: 104,
-                    ..original.clone()
-                },
-            )
-            .unwrap();
-            tx.commit().unwrap();
+            db.with(|conn| {
+                replace_no_copy_shape(
+                    conn,
+                    "provenance TEXT NOT NULL CHECK(provenance = 'rest_poll')",
+                );
+                let tx = conn.transaction().unwrap();
+                tx_record_no_copy_disposition(&tx, &group_id('a'), &original).unwrap();
+                tx_record_no_copy_disposition(
+                    &tx,
+                    &group_id('a'),
+                    &NoCopyDisposition {
+                        age_secs: 4,
+                        reason: "duplicate".to_owned(),
+                        recorded_at_unix: 104,
+                        ..original.clone()
+                    },
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            })
         }
-        let before = stored_rows(&db.lock(), "SELECT * FROM no_copy_dispositions");
+        let before = db.with(|conn| stored_rows(conn, "SELECT * FROM no_copy_dispositions"));
         assert_eq!(
             before,
             vec![vec![
@@ -10380,9 +10668,12 @@ mod tests {
             assert!(db.activity_group_state(&source_trade_id).unwrap().is_none());
             assert!(!db.is_seen(&source_trade_id).unwrap());
         }
-        assert!(stored_rows(&db.lock(), "SELECT * FROM activity_group_revisions").is_empty());
+        assert!(
+            db.with(|conn| stored_rows(conn, "SELECT * FROM activity_group_revisions"))
+                .is_empty()
+        );
         assert_eq!(
-            stored_rows(&db.lock(), "SELECT * FROM no_copy_dispositions"),
+            db.with(|conn| stored_rows(conn, "SELECT * FROM no_copy_dispositions")),
             before
         );
     }
@@ -10392,16 +10683,17 @@ mod tests {
         let (_dir, db) = db();
         let source_trade_id = SourceTradeId("g2:checkpoint".to_owned());
         {
-            let conn = db.lock();
-            conn.execute(
-                "INSERT INTO decision_pending \
+            db.with(|conn| {
+                conn.execute(
+                    "INSERT INTO decision_pending \
                      (source_trade_id, semantic_revision, wallet_hex, source_epoch, \
                       frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition, \
                       updated_at_unix) \
                  VALUES (?1, 'revision', ?2, 1, '{}', '[]', 'open', NULL, 1)",
-                params![source_trade_id.0, wallet().to_string()],
-            )
-            .unwrap();
+                    params![source_trade_id.0, wallet().to_string()],
+                )
+                .unwrap();
+            })
         }
 
         db.checkpoint_decision_pending(&source_trade_id, "{\"checkpoint\":1}", 2)
@@ -11263,41 +11555,42 @@ mod tests {
     }
 
     fn insert_seal_fixture(db: &PaperStateDb, pending_revision: &str) {
-        let conn = db.lock();
-        conn.execute(
-            "INSERT INTO activity_groups \
+        db.with(|conn| {
+            conn.execute(
+                "INSERT INTO activity_groups \
              (source_trade_id, transaction_hash, wallet_hex, source_epoch, semantic_revision, \
               activity_type, disposition, proof_json) \
              VALUES ('g2:seal', '0xtx', '0x1111111111111111111111111111111111111111', \
                      1700, 'rev-1', 'trade', 'admitted', '{\"proof\":1}')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO activity_group_revisions \
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO activity_group_revisions \
              (source_trade_id, semantic_revision, transaction_hash, disposition, proof_json, \
               recorded_at_unix) \
              VALUES ('g2:seal', 'rev-1', '0xtx', 'admitted', '{\"proof\":1}', 1701)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO entry_gate_results \
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entry_gate_results \
              (source_trade_id, wallet_hex, market_id, source_epoch, result, history_consumed) \
              VALUES ('g2:seal', '0x1111111111111111111111111111111111111111', \
                      'market-1', 1700, 'admitted', 1)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO decision_pending \
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO decision_pending \
              (source_trade_id, semantic_revision, wallet_hex, source_epoch, frozen_inputs_json, \
               post_commit_inputs_json, state, terminal_disposition, updated_at_unix) \
              VALUES ('g2:seal', ?1, '0x1111111111111111111111111111111111111111', \
                      1700, '{\"frozen\":1}', '{\"terminal\":1}', 'terminal', 'no_fill', 1702)",
-            params![pending_revision],
-        )
-        .unwrap();
+                params![pending_revision],
+            )
+            .unwrap();
+        })
     }
 
     /// PASS: the version-one seal evidence document renders byte-identical to the pinned golden
@@ -11369,12 +11662,12 @@ mod tests {
             "page_occurrences": [{"receipt": receipt}],
         }))
         .unwrap();
-        db.lock()
+        db.with(|conn| conn
             .execute(
                 "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = 'g2:seal'",
                 params![frozen],
             )
-            .unwrap();
+            .unwrap());
         assert!(matches!(
             db.seal_decision_evidence_for_source_prefix(&[], &[], Some(EventSeq(5))),
             Err(PaperStateError::SealEvidenceSelectionMismatch {
@@ -11401,12 +11694,13 @@ mod tests {
             if version == 7 {
                 frozen["source_authority"] = serde_json::json!("complete_read");
             }
-            db.lock()
-                .execute(
+            db.with(|conn| {
+                conn.execute(
                     "UPDATE decision_pending SET frozen_inputs_json = ?1",
                     [frozen.to_string()],
                 )
-                .unwrap();
+                .unwrap()
+            });
             let original = db.seal_decision_evidence(&keys).unwrap();
             assert_eq!(
                 db.seal_decision_evidence_for_source_prefix(&keys, &keys, Some(EventSeq(3)))
@@ -11460,12 +11754,13 @@ mod tests {
             if let Some(authority) = authority {
                 frozen["source_authority"] = serde_json::json!(authority);
             }
-            db.lock()
-                .execute(
+            db.with(|conn| {
+                conn.execute(
                     "UPDATE decision_pending SET frozen_inputs_json = ?1",
                     [frozen.to_string()],
                 )
-                .unwrap();
+                .unwrap()
+            });
             assert!(matches!(
                 db.seal_decision_evidence_for_source_prefix(&keys, &keys, Some(EventSeq(3))),
                 Err(PaperStateError::SealEvidenceSelectionMismatch { .. })
@@ -11497,12 +11792,13 @@ mod tests {
             })
         };
         let set = |value: serde_json::Value| {
-            db.lock()
-                .execute(
+            db.with(|conn| {
+                conn.execute(
                     "UPDATE decision_pending SET frozen_inputs_json = ?1",
                     [value.to_string()],
                 )
-                .unwrap();
+                .unwrap()
+            });
         };
 
         // A version-1 admission (no identity) and a version-2 admission whose identity receipt
@@ -11747,57 +12043,58 @@ mod tests {
             .unwrap();
         let writer = PaperStateDb::open(&path).unwrap();
 
-        let mut connection = reader.lock();
-        let transaction = connection.transaction().unwrap();
-        let cash = tx_read_bankroll(&transaction).unwrap();
-        let snapshot_start = tx_financial_start(&transaction).unwrap();
-        let last_prepared = tx_financial_last_prepared(&transaction).unwrap();
+        let writer_thread = reader.with(|connection| {
+            let transaction = connection.transaction().unwrap();
+            let cash = tx_read_bankroll(&transaction).unwrap();
+            let snapshot_start = tx_financial_start(&transaction).unwrap();
+            let last_prepared = tx_financial_last_prepared(&transaction).unwrap();
 
-        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
-        let writer_thread = std::thread::spawn(move || {
-            let source = append_receipt(40, 2);
-            let result = writer.apply_financial_resolution(
-                start,
-                Some(EventSeq(11)),
-                EventSeq(12),
-                &market(),
-                "[\"1\",\"0\"]",
-                source,
-                999_999,
-                CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
-                dec!(10.5),
+            let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+            let writer_thread = std::thread::spawn(move || {
+                let source = append_receipt(40, 2);
+                let result = writer.apply_financial_resolution(
+                    start,
+                    Some(EventSeq(11)),
+                    EventSeq(12),
+                    &market(),
+                    "[\"1\",\"0\"]",
+                    source,
+                    999_999,
+                    CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+                    dec!(10.5),
+                );
+                completed_tx.send(result).unwrap();
+            });
+            completed_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(cash, dec!(9.5));
+            assert_eq!(
+                snapshot_start.map(|value| value.sequence),
+                Some(EventSeq(10))
             );
-            completed_tx.send(result).unwrap();
+            assert_eq!(last_prepared, Some(EventSeq(11)));
+            assert_eq!(
+                read_financial_positions(&transaction, true).unwrap().len(),
+                1
+            );
+            assert_eq!(
+                read_settlements_window(&transaction, 0, 1_000_000)
+                    .unwrap()
+                    .len(),
+                0
+            );
+            assert_eq!(
+                read_financial_fills_window(&transaction, 0, 1_000_000)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            transaction.commit().unwrap();
+            writer_thread
         });
-        completed_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(cash, dec!(9.5));
-        assert_eq!(
-            snapshot_start.map(|value| value.sequence),
-            Some(EventSeq(10))
-        );
-        assert_eq!(last_prepared, Some(EventSeq(11)));
-        assert_eq!(
-            read_financial_positions(&transaction, true).unwrap().len(),
-            1
-        );
-        assert_eq!(
-            read_settlements_window(&transaction, 0, 1_000_000)
-                .unwrap()
-                .len(),
-            0
-        );
-        assert_eq!(
-            read_financial_fills_window(&transaction, 0, 1_000_000)
-                .unwrap()
-                .len(),
-            1
-        );
-        transaction.commit().unwrap();
-        drop(connection);
         writer_thread.join().unwrap();
 
         let after = reader.financial_snapshot(1_000_000).unwrap();
@@ -12192,9 +12489,10 @@ mod tests {
         ));
         db.reset_financial_era(predecessor, bankroll, None).unwrap();
         db.set_cursor(&wallet(), 77).unwrap();
-        db.lock()
-            .execute("UPDATE bankroll SET bankroll_str = '25'", [])
-            .unwrap();
+        db.with(|conn| {
+            conn.execute("UPDATE bankroll SET bankroll_str = '25'", [])
+                .unwrap()
+        });
         assert!(matches!(
             db.reset_financial_era(successor, bankroll, Some(append_receipt(9, 6))),
             Err(PaperStateError::FinancialStartConflict)
@@ -12215,9 +12513,10 @@ mod tests {
             db.reset_financial_era(append_receipt(30, 9), bankroll, Some(predecessor)),
             Err(PaperStateError::FinancialStartConflict)
         ));
-        db.lock()
-            .execute("UPDATE bankroll SET bankroll_str = '99'", [])
-            .unwrap();
+        db.with(|conn| {
+            conn.execute("UPDATE bankroll SET bankroll_str = '99'", [])
+                .unwrap()
+        });
         assert!(matches!(
             db.reset_financial_era(successor, bankroll, Some(predecessor)),
             Err(PaperStateError::FinancialConflict(_))
@@ -12448,78 +12747,80 @@ mod tests {
             let mut repaired_identity = None;
             for reopen in 0..3 {
                 let db = PaperStateDb::open(&path).unwrap();
-                let conn = db.lock();
-                let version: i64 = conn
-                    .pragma_query_value(None, "user_version", |row| row.get(0))
-                    .unwrap();
-                assert_eq!(version, SCHEMA_VERSION);
-                let current_ddl = stored_rows(&conn, schema_query);
-                if repair {
-                    let fresh = Connection::open_in_memory().unwrap();
-                    fresh.execute_batch(SCHEMA).unwrap();
-                    assert_eq!(
-                        stored_rows(&conn, "PRAGMA table_info('no_copy_dispositions')"),
-                        stored_rows(&fresh, "PRAGMA table_info('no_copy_dispositions')")
-                    );
-                    let sql: String = conn.query_row(schema_query, [], |row| row.get(0)).unwrap();
-                    assert!(!sql.to_ascii_lowercase().contains("check"));
-                } else {
-                    assert_eq!(current_ddl, ddl);
-                }
-                let current_identity = stored_rows(&conn, identity_query);
-                if reopen == 0 {
-                    assert_eq!(stored_rows(&conn, no_copy_query), no_copy);
-                    if !repair {
+                db.with(|conn| {
+                    let version: i64 = conn
+                        .pragma_query_value(None, "user_version", |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(version, SCHEMA_VERSION);
+                    let current_ddl = stored_rows(conn, schema_query);
+                    if repair {
+                        let fresh = Connection::open_in_memory().unwrap();
+                        fresh.execute_batch(SCHEMA).unwrap();
                         assert_eq!(
-                            current_identity, identity,
-                            "current table must not be rebuilt"
+                            stored_rows(conn, "PRAGMA table_info('no_copy_dispositions')"),
+                            stored_rows(&fresh, "PRAGMA table_info('no_copy_dispositions')")
+                        );
+                        let sql: String =
+                            conn.query_row(schema_query, [], |row| row.get(0)).unwrap();
+                        assert!(!sql.to_ascii_lowercase().contains("check"));
+                    } else {
+                        assert_eq!(current_ddl, ddl);
+                    }
+                    let current_identity = stored_rows(conn, identity_query);
+                    if reopen == 0 {
+                        assert_eq!(stored_rows(conn, no_copy_query), no_copy);
+                        if !repair {
+                            assert_eq!(
+                                current_identity, identity,
+                                "current table must not be rebuilt"
+                            );
+                        }
+                        tx_record_no_copy_disposition(
+                            conn,
+                            &group_id('c'),
+                            &NoCopyDisposition {
+                                provenance: "reconciled_rest".to_owned(),
+                                age_secs: 0,
+                                reason: "not_copy_eligible".to_owned(),
+                                recorded_at_unix: 108,
+                            },
+                        )
+                        .unwrap();
+                        repaired_identity = Some((current_ddl, stored_rows(conn, identity_query)));
+                    } else {
+                        assert_eq!(Some((current_ddl, current_identity)), repaired_identity);
+                    }
+                    for (query, expected) in unchanged_queries.iter().zip(&unrelated) {
+                        assert_eq!(
+                            &stored_rows(conn, query),
+                            expected,
+                            "{query}, reopen {reopen}"
                         );
                     }
-                    tx_record_no_copy_disposition(
-                        &conn,
-                        &group_id('c'),
-                        &NoCopyDisposition {
-                            provenance: "reconciled_rest".to_owned(),
-                            age_secs: 0,
-                            reason: "not_copy_eligible".to_owned(),
-                            recorded_at_unix: 108,
-                        },
-                    )
-                    .unwrap();
-                    repaired_identity = Some((current_ddl, stored_rows(&conn, identity_query)));
-                } else {
-                    assert_eq!(Some((current_ddl, current_identity)), repaired_identity);
-                }
-                for (query, expected) in unchanged_queries.iter().zip(&unrelated) {
                     assert_eq!(
-                        &stored_rows(&conn, query),
-                        expected,
-                        "{query}, reopen {reopen}"
+                        stored_rows(
+                            conn,
+                            "SELECT quantity_str, principal_str, fee_str, prepared_seq FROM fills"
+                        ),
+                        vec![vec![
+                            "3".to_owned().into(),
+                            "0.75".to_owned().into(),
+                            "0".to_owned().into(),
+                            7_i64.into()
+                        ]]
                     );
-                }
-                assert_eq!(
-                    stored_rows(
-                        &conn,
-                        "SELECT quantity_str, principal_str, fee_str, prepared_seq FROM fills"
-                    ),
-                    vec![vec![
-                        "3".to_owned().into(),
-                        "0.75".to_owned().into(),
-                        "0".to_owned().into(),
-                        7_i64.into()
-                    ]]
-                );
-                assert_eq!(
-                    stored_rows(&conn, "SELECT long_str, short_str FROM positions"),
-                    vec![vec!["3".to_owned().into(), "0".to_owned().into()]]
-                );
-                assert!(
-                    stored_rows(
-                        &conn,
-                        "SELECT name FROM sqlite_master WHERE name LIKE '%legacy_provenance%'"
-                    )
-                    .is_empty()
-                );
+                    assert_eq!(
+                        stored_rows(conn, "SELECT long_str, short_str FROM positions"),
+                        vec![vec!["3".to_owned().into(), "0".to_owned().into()]]
+                    );
+                    assert!(
+                        stored_rows(
+                            conn,
+                            "SELECT name FROM sqlite_master WHERE name LIKE '%legacy_provenance%'"
+                        )
+                        .is_empty()
+                    );
+                })
             }
         }
     }
@@ -12541,33 +12842,35 @@ mod tests {
         drop(conn);
 
         let original = PaperStateDb::open_read_only(&path).unwrap();
-        assert_eq!(stored_rows(&original.lock(), rows_query), rows);
-        assert_eq!(stored_rows(&original.lock(), ddl_query), ddl);
+        assert_eq!(original.with(|conn| stored_rows(conn, rows_query)), rows);
+        assert_eq!(original.with(|conn| stored_rows(conn, ddl_query)), ddl);
         assert!(
-            stored_rows(
-                &original.lock(),
-                "SELECT name FROM sqlite_master WHERE name LIKE '%legacy_provenance%'"
-            )
-            .is_empty()
+            original
+                .with(|conn| stored_rows(
+                    conn,
+                    "SELECT name FROM sqlite_master WHERE name LIKE '%legacy_provenance%'"
+                ))
+                .is_empty()
         );
         drop(original);
         let repaired = PaperStateDb::open(&path).unwrap();
-        assert_ne!(stored_rows(&repaired.lock(), ddl_query), ddl);
+        assert_ne!(repaired.with(|conn| stored_rows(conn, ddl_query)), ddl);
         assert_eq!(
-            stored_rows(
-                &repaired.lock(),
+            repaired.with(|conn| stored_rows(
+                conn,
                 "SELECT * FROM no_copy_dispositions ORDER BY source_trade_id"
-            ),
+            )),
             rows.into_iter()
                 .map(|row| row.into_iter().skip(1).collect::<Vec<_>>())
                 .collect::<Vec<_>>()
         );
         assert!(
-            stored_rows(
-                &repaired.lock(),
-                "SELECT name FROM sqlite_master WHERE name LIKE '%legacy_provenance%'"
-            )
-            .is_empty()
+            repaired
+                .with(|conn| stored_rows(
+                    conn,
+                    "SELECT name FROM sqlite_master WHERE name LIKE '%legacy_provenance%'"
+                ))
+                .is_empty()
         );
     }
 
@@ -12595,33 +12898,34 @@ mod tests {
         drop(conn);
 
         let db = PaperStateDb::open(&path).unwrap();
-        let conn = db.lock();
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        let financial_columns: Vec<String> = conn
-            .prepare("SELECT name FROM pragma_table_info('fills')")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert!(financial_columns.iter().any(|name| name == "quantity_str"));
-        assert_eq!(stored_rows(&conn, ddl_query), repaired_ddl);
-        assert_eq!(stored_rows(&conn, rows_query), rows);
-        assert!(
-            stored_rows(
-                &conn,
-                "SELECT name FROM sqlite_master WHERE name LIKE '%legacy_provenance%'"
+        db.with(|conn| {
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+            let financial_columns: Vec<String> = conn
+                .prepare("SELECT name FROM pragma_table_info('fills')")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(financial_columns.iter().any(|name| name == "quantity_str"));
+            assert_eq!(stored_rows(conn, ddl_query), repaired_ddl);
+            assert_eq!(stored_rows(conn, rows_query), rows);
+            assert!(
+                stored_rows(
+                    conn,
+                    "SELECT name FROM sqlite_master WHERE name LIKE '%legacy_provenance%'"
+                )
+                .is_empty()
+            );
+            conn.execute(
+                "INSERT INTO no_copy_dispositions VALUES ('late', 'reconciled_rest', 0, 'r', 1)",
+                [],
             )
-            .is_empty()
-        );
-        conn.execute(
-            "INSERT INTO no_copy_dispositions VALUES ('late', 'reconciled_rest', 0, 'r', 1)",
-            [],
-        )
-        .unwrap();
+            .unwrap();
+        })
     }
 
     #[test]
@@ -12638,14 +12942,14 @@ mod tests {
             let rows = stored_rows(&conn, rows_query);
             drop(conn);
             let state = PaperStateDb::open_read_only_allowing_unmigrated(&path).unwrap();
-            assert_eq!(stored_rows(&state.lock(), ddl_query), ddl);
-            assert_eq!(stored_rows(&state.lock(), rows_query), rows);
+            assert_eq!(state.with(|conn| stored_rows(conn, ddl_query)), ddl);
+            assert_eq!(state.with(|conn| stored_rows(conn, rows_query)), rows);
             drop(state);
             let strict = PaperStateDb::open_read_only(&path);
             if version == SCHEMA_VERSION {
                 let strict = strict.unwrap();
-                assert_eq!(stored_rows(&strict.lock(), ddl_query), ddl);
-                assert_eq!(stored_rows(&strict.lock(), rows_query), rows);
+                assert_eq!(strict.with(|conn| stored_rows(conn, ddl_query)), ddl);
+                assert_eq!(strict.with(|conn| stored_rows(conn, rows_query)), rows);
             } else {
                 assert!(matches!(
                     strict,
@@ -12753,20 +13057,21 @@ mod tests {
         let (_dir, db) = db();
         let staged = seed("generation-five", &["primary", "partner"]);
         let source = SourceTradeId(staged.source_trade_id.clone());
-        db.lock()
-            .execute(
+        db.with(|conn| {
+            conn.execute(
                 "INSERT INTO decision_pending \
                  (source_trade_id, semantic_revision, wallet_hex, source_epoch, \
                   frozen_inputs_json, post_commit_inputs_json, state, updated_at_unix) \
              VALUES (?1, 'revision', ?2, 1, '{}', '[]', 'open', 1)",
                 params![source.0, wallet().to_string()],
             )
-            .unwrap();
+            .unwrap()
+        });
         let checkpoint = DispatchStagingEvidence::PaperOutcomeCheckpoint(PendingTerminalEvidence {
             post_commit_inputs_json: "{\"dispatch_id\":\"generation-five\",\"clocks\":[]}",
             updated_at_unix: 2,
         });
-        db.lock().execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON decision_pending BEGIN SELECT RAISE(FAIL, 'checkpoint failed'); END;").unwrap();
+        db.with(|conn| conn.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON decision_pending BEGIN SELECT RAISE(FAIL, 'checkpoint failed'); END;").unwrap());
         assert!(
             db.stage_dispatch_seed_pending(&staged, Some(checkpoint))
                 .is_err()
@@ -12780,9 +13085,7 @@ mod tests {
                 .post_commit_inputs_json,
             "[]"
         );
-        db.lock()
-            .execute_batch("DROP TRIGGER fail_checkpoint;")
-            .unwrap();
+        db.with(|conn| conn.execute_batch("DROP TRIGGER fail_checkpoint;").unwrap());
         assert!(
             db.stage_dispatch_seed_pending(&staged, Some(checkpoint))
                 .unwrap()
@@ -12877,8 +13180,8 @@ mod tests {
                 proof_json: "{\"bucket_epoch\":10}".to_owned(),
                 fenced_at_unix: 20,
             };
-            db.lock()
-                .execute(
+            db.with(|conn| {
+                conn.execute(
                     "INSERT INTO wallet_fences VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         w.to_string(),
@@ -12888,7 +13191,8 @@ mod tests {
                         fence.fenced_at_unix
                     ],
                 )
-                .unwrap();
+                .unwrap()
+            });
             let mut install = anchor_install(w, Vec::new(), 100, 200, "recovered");
             install.expected_fence = Some(fence.clone());
             install.repaired_history = vec![MarketHistoryRecord {
@@ -12930,8 +13234,8 @@ mod tests {
             proof_json: "{\"bucket_epoch\":10}".to_owned(),
             fenced_at_unix: 20,
         };
-        db.lock()
-            .execute(
+        db.with(|conn| {
+            conn.execute(
                 "INSERT INTO wallet_fences VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     w.to_string(),
@@ -12941,7 +13245,8 @@ mod tests {
                     fence.fenced_at_unix
                 ],
             )
-            .unwrap();
+            .unwrap()
+        });
         for component in 0..4 {
             let mut expected = fence.clone();
             match component {
@@ -13009,3 +13314,7 @@ mod tests {
         assert!(db.recovery_activity_evidence(&w, 99).unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "../../event-log/tests/support/runtime_progress.rs"]
+mod runtime_progress;

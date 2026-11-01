@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use pe_copy_signal_engine::{PositionSnapshot, PositionState};
@@ -1430,70 +1430,78 @@ impl PaperLog {
         })
     }
 
-    fn healthy_state(&self) -> Result<MutexGuard<'_, PaperLogState>, PaperLogScanError> {
-        let state = self.state.lock().map_err(|_| PaperLogScanError::Poisoned)?;
-        if let Some(reason) = state.writer.poisoned() {
-            return Err(pe_event_log::LogError::Poisoned { reason: *reason }.into());
-        }
-        if state.poisoned {
-            return Err(PaperLogScanError::Poisoned);
-        }
-        Ok(state)
+    fn with_healthy_state<T>(
+        &self,
+        f: impl FnOnce(&mut PaperLogState) -> Result<T, PaperLogScanError>,
+    ) -> Result<T, PaperLogScanError> {
+        pe_event_log::run_blocking(|| {
+            let mut state = self.state.lock().map_err(|_| PaperLogScanError::Poisoned)?;
+            if let Some(reason) = state.writer.poisoned() {
+                return Err(pe_event_log::LogError::Poisoned { reason: *reason }.into());
+            }
+            if state.poisoned {
+                return Err(PaperLogScanError::Poisoned);
+            }
+            f(&mut state)
+        })
     }
 
     /// Copy only frame pointers; the guard is dropped before any reader can await.
     pub fn snapshot(&self) -> Result<Vec<Arc<ScannedPaperFrame>>, PaperLogScanError> {
-        Ok(self.healthy_state()?.frames.clone())
+        self.with_healthy_state(|state| Ok(state.frames.clone()))
     }
 
     pub fn append_synced(&self, input: EnvelopeIn) -> Result<AppendReceipt, PaperLogScanError> {
-        let mut state = self.healthy_state()?;
-        let prev_hash = state
-            .frames
-            .last()
-            .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
-                frame.receipt.this_hash
-            });
-        let receipt = state.writer.append_synced(EnvelopeIn {
-            source_id: input.source_id.clone(),
-            schema_version: input.schema_version,
-            parser_version: input.parser_version,
-            observed_at: input.observed_at.clone(),
-            received_at: input.received_at.clone(),
-            content_type: input.content_type.clone(),
-            payload: input.payload.clone(),
-        })?;
-        // Until decoding and the same validators used by a fresh scan succeed, this append
-        // cannot be published. A failure leaves every clone closed until a verified reopen.
-        state.poisoned = true;
-        let frame = decode_paper_frame(EventEnvelope {
-            seq: receipt.sequence,
-            source_id: input.source_id,
-            schema_version: input.schema_version,
-            parser_version: input.parser_version,
-            observed_at: input.observed_at,
-            received_at: input.received_at,
-            content_type: input.content_type,
-            raw_payload_hash: blake3::hash(&input.payload),
-            prev_hash,
-            this_hash: receipt.this_hash,
-            payload: input.payload,
-        })?;
-        state.frames.push(frame);
-        validate_qualification_starts(&state.frames)?;
-        validate_financial_pairs(&state.frames)?;
-        state.poisoned = false;
-        Ok(receipt)
+        self.with_healthy_state(|state| {
+            let prev_hash = state
+                .frames
+                .last()
+                .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
+                    frame.receipt.this_hash
+                });
+            let receipt = state.writer.append_synced(EnvelopeIn {
+                source_id: input.source_id.clone(),
+                schema_version: input.schema_version,
+                parser_version: input.parser_version,
+                observed_at: input.observed_at.clone(),
+                received_at: input.received_at.clone(),
+                content_type: input.content_type.clone(),
+                payload: input.payload.clone(),
+            })?;
+            // Until decoding and the same validators used by a fresh scan succeed, this append
+            // cannot be published. A failure leaves every clone closed until a verified reopen.
+            state.poisoned = true;
+            let frame = decode_paper_frame(EventEnvelope {
+                seq: receipt.sequence,
+                source_id: input.source_id,
+                schema_version: input.schema_version,
+                parser_version: input.parser_version,
+                observed_at: input.observed_at,
+                received_at: input.received_at,
+                content_type: input.content_type,
+                raw_payload_hash: blake3::hash(&input.payload),
+                prev_hash,
+                this_hash: receipt.this_hash,
+                payload: input.payload,
+            })?;
+            state.frames.push(frame);
+            validate_qualification_starts(&state.frames)?;
+            validate_financial_pairs(&state.frames)?;
+            state.poisoned = false;
+            Ok(receipt)
+        })
     }
 
     pub fn verified_tail(&self) -> Result<LogTailBinding, PaperLogScanError> {
-        Ok(self.healthy_state()?.writer.verified_tail()?)
+        self.with_healthy_state(|state| Ok(state.writer.verified_tail()?))
     }
 
     #[cfg(feature = "scenario")]
     pub fn scenario_fail_next_sync(&self) -> Result<(), PaperLogScanError> {
-        self.healthy_state()?.writer.scenario_fail_next_sync();
-        Ok(())
+        self.with_healthy_state(|state| {
+            state.writer.scenario_fail_next_sync();
+            Ok(())
+        })
     }
 }
 
@@ -2249,6 +2257,27 @@ mod paper_log_tests {
                 payload: serde_json::to_vec(value).unwrap(),
             })
             .unwrap()
+    }
+
+    #[test]
+    fn blocking_paper_log_preserves_runtime_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = PaperLog::open(dir.path().join("paper.log")).unwrap();
+        let holder = log.clone();
+        crate::runtime_progress::assert_progress(
+            move |entered, release| {
+                holder
+                    .with_healthy_state(|_| {
+                        entered.send(()).unwrap();
+                        release.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            },
+            move || {
+                assert!(log.snapshot().unwrap().is_empty());
+            },
+        );
     }
 
     fn paper_input<T: Serialize>(schema_version: u32, value: &T) -> EnvelopeIn {

@@ -179,6 +179,13 @@ impl Drop for SourceCheckpointOwner {
 }
 
 impl SourceCheckpointOwner {
+    fn with_retention_authority<T>(
+        &self,
+        f: impl FnOnce(&std::path::Path) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        pe_event_log::run_blocking(|| f(&self.receipts.current_tail_binding()?.path))
+    }
+
     pub(crate) fn new(
         frozen: FrozenCheckpoint,
         receipts: SourceReceiptIndex,
@@ -626,11 +633,10 @@ impl SourceCheckpointOwner {
         if result.is_err() && skip.is_none() {
             skip = Some("retention_failed");
         }
-        let authority = self.receipts.current_tail_binding().ok().and_then(|tail| {
-            pe_event_log::RetentionAuthority::load(&tail.path)
-                .ok()
-                .flatten()
-        });
+        let authority = self
+            .with_retention_authority(|path| Ok(pe_event_log::RetentionAuthority::load(path)?))
+            .ok()
+            .flatten();
         info!(
             epoch = authority.as_ref().map_or(0, |authority| authority.epoch),
             boundary = authority
@@ -750,11 +756,9 @@ impl SourceCheckpointOwner {
                         }) => {
                             self.finishing_retention = true;
                             self.retention_walk_complete = false;
-                            self.retention_tail = Some(
-                                authority
-                                    .retained_tail
-                                    .resolve(&self.receipts.current_tail_binding()?.path)?,
-                            );
+                            self.retention_tail = Some(self.with_retention_authority(|path| {
+                                Ok(authority.retained_tail.resolve(path)?)
+                            })?);
                             self.retention_epoch = authority.epoch;
                             *database_boundary = Some(true);
                             self.pending = None;
@@ -961,8 +965,8 @@ impl SourceCheckpointOwner {
         let Some(database) = &self.database_retention else {
             return Ok(crate::database_retention::DatabaseRetentionReport::default());
         };
-        let path = self.receipts.current_tail_binding()?.path;
-        let authority = pe_event_log::RetentionAuthority::load(&path)?;
+        let authority = self
+            .with_retention_authority(|path| Ok(pe_event_log::RetentionAuthority::load(path)?))?;
         let reducer_pin_wallets = authority.as_ref().map_or_else(HashSet::new, |authority| {
             authority
                 .pins

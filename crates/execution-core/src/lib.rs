@@ -67,3 +67,7 @@ pub use redemption_machine::{
     RedemptionStatusObservation, RedemptionStatusReadError, RedemptionStatusReader, advance,
     reconstruct_redemption_attempts, redemption_posture, run_redemption_pass,
 };
+
+#[cfg(test)]
+#[path = "../../event-log/tests/support/runtime_progress.rs"]
+mod runtime_progress;

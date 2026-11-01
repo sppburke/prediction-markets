@@ -177,7 +177,10 @@ impl CanaryV2Client {
         } else {
             Config::builder().response_observer(observer_trait).build()
         };
-        let client = Client::new(host, config)
+        let host = host.to_owned();
+        let client = tokio::task::spawn_blocking(move || Client::new(&host, config))
+            .await
+            .map_err(|e| CanaryV2Error::Client(e.to_string()))?
             .map_err(|e| CanaryV2Error::Client(e.to_string()))?
             .authentication_builder(&signer)
             .credentials(Credentials::new(

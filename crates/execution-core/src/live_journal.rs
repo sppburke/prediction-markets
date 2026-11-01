@@ -1198,24 +1198,39 @@ impl LiveJournal {
         })
     }
 
-    fn published(&self) -> Result<std::sync::MutexGuard<'_, LiveJournalInner>, LiveJournalError> {
-        let inner = self.inner.lock().map_err(|_| LiveJournalError::Poisoned)?;
-        if let Some(reason) = inner.writer.poisoned() {
-            return Err(pe_event_log::LogError::Poisoned { reason: *reason }.into());
-        }
-        if inner.unpublished {
-            return Err(LiveJournalError::Unpublished);
-        }
-        Ok(inner)
+    fn with_inner<T>(
+        &self,
+        f: impl FnOnce(&mut LiveJournalInner) -> Result<T, LiveJournalError>,
+    ) -> Result<T, LiveJournalError> {
+        pe_event_log::run_blocking(|| {
+            let mut inner = self.inner.lock().map_err(|_| LiveJournalError::Poisoned)?;
+            f(&mut inner)
+        })
+    }
+
+    fn with_published<T>(
+        &self,
+        f: impl FnOnce(&mut LiveJournalInner) -> Result<T, LiveJournalError>,
+    ) -> Result<T, LiveJournalError> {
+        self.with_inner(|inner| {
+            if let Some(reason) = inner.writer.poisoned() {
+                return Err(pe_event_log::LogError::Poisoned { reason: *reason }.into());
+            }
+            if inner.unpublished {
+                return Err(LiveJournalError::Unpublished);
+            }
+            f(inner)
+        })
     }
 
     /// The published records from sequence `next` on, in journal order.
     pub fn records_from(&self, next: u64) -> Result<Vec<Arc<LiveJournalEvent>>, LiveJournalError> {
-        let inner = self.published()?;
-        let start = usize::try_from(next)
-            .map_err(|_| LiveJournalError::SequenceMismatch)?
-            .min(inner.records.len());
-        Ok(inner.records[start..].to_vec())
+        self.with_published(|inner| {
+            let start = usize::try_from(next)
+                .map_err(|_| LiveJournalError::SequenceMismatch)?
+                .min(inner.records.len());
+            Ok(inner.records[start..].to_vec())
+        })
     }
 
     /// The staged dispatch control at `seq` when it names `dispatch_id`. An append followed by a
@@ -1226,18 +1241,19 @@ impl LiveJournal {
         seq: u64,
         dispatch_id: &str,
     ) -> Result<Option<LiveStagedDispatchControlAudit>, LiveJournalError> {
-        let inner = self.published()?;
-        let record = usize::try_from(seq)
-            .ok()
-            .and_then(|index| inner.records.get(index));
-        Ok(record.and_then(|record| match &record.payload {
-            LiveJournalPayload::StagedDispatchControl(audit)
-                if audit.dispatch_id == dispatch_id =>
-            {
-                Some(audit.as_ref().clone())
-            }
-            _ => None,
-        }))
+        self.with_published(|inner| {
+            let record = usize::try_from(seq)
+                .ok()
+                .and_then(|index| inner.records.get(index));
+            Ok(record.and_then(|record| match &record.payload {
+                LiveJournalPayload::StagedDispatchControl(audit)
+                    if audit.dispatch_id == dispatch_id =>
+                {
+                    Some(audit.as_ref().clone())
+                }
+                _ => None,
+            }))
+        })
     }
 
     /// The account's pending-target control records for one dispatch, in journal order.
@@ -1246,11 +1262,12 @@ impl LiveJournal {
         account_id: &AccountId,
         dispatch_id: &str,
     ) -> Result<Vec<LiveTargetControlAudit>, LiveJournalError> {
-        let inner = self.published()?;
-        let index = inner
-            .pending_controls
-            .get(&(account_id.clone(), dispatch_id.to_owned()));
-        Ok(inner.control_audits(index).cloned().collect())
+        self.with_published(|inner| {
+            let index = inner
+                .pending_controls
+                .get(&(account_id.clone(), dispatch_id.to_owned()));
+            Ok(inner.control_audits(index).cloned().collect())
+        })
     }
 
     /// The account's latest approved-recovery control pause for one dispatch.
@@ -1259,17 +1276,20 @@ impl LiveJournal {
         account_id: &AccountId,
         dispatch_id: &str,
     ) -> Result<Option<LiveTargetControlAudit>, LiveJournalError> {
-        let inner = self.published()?;
-        let index = inner
-            .approved_pauses
-            .get(&(account_id.clone(), dispatch_id.to_owned()));
-        Ok(inner.control_audits(index).last().cloned())
+        self.with_published(|inner| {
+            let index = inner
+                .approved_pauses
+                .get(&(account_id.clone(), dispatch_id.to_owned()));
+            Ok(inner.control_audits(index).last().cloned())
+        })
     }
 
     #[cfg(feature = "scenario")]
     pub fn scenario_fail_next_sync(&self) -> Result<(), LiveJournalError> {
-        self.published()?.writer.scenario_fail_next_sync();
-        Ok(())
+        self.with_published(|inner| {
+            inner.writer.scenario_fail_next_sync();
+            Ok(())
+        })
     }
 
     #[must_use]
@@ -1312,14 +1332,15 @@ impl LiveJournal {
     /// Typed writer poison state for service readiness and producer shutdown. A durable append
     /// that was not published is an error: nothing may proceed past it without a verified reopen.
     pub fn poisoned(&self) -> Result<Option<PoisonReason>, LiveJournalError> {
-        let inner = self.inner.lock().map_err(|_| LiveJournalError::Poisoned)?;
-        if let Some(reason) = inner.writer.poisoned() {
-            return Ok(Some(*reason));
-        }
-        if inner.unpublished {
-            return Err(LiveJournalError::Unpublished);
-        }
-        Ok(None)
+        self.with_inner(|inner| {
+            if let Some(reason) = inner.writer.poisoned() {
+                return Ok(Some(*reason));
+            }
+            if inner.unpublished {
+                return Err(LiveJournalError::Unpublished);
+            }
+            Ok(None)
+        })
     }
 
     /// Append and fsync one event, then publish it only after its written frame decodes and
@@ -1330,46 +1351,47 @@ impl LiveJournal {
         timestamp: OffsetDateTime,
         payload: LiveJournalPayload,
     ) -> Result<LiveJournalEvent, LiveJournalError> {
-        let mut inner = self.published()?;
-        let event = LiveJournalEvent {
-            account_id,
-            seq: u64::try_from(inner.records.len())
-                .map_err(|_| LiveJournalError::SequenceMismatch)?,
-            timestamp,
-            payload,
-        };
-        let payload = serde_json::to_vec(&event)?;
-        let source_id = SourceId(LIVE_JOURNAL_SOURCE.to_owned());
-        // Any writer failure or a frame that fails replay decoding leaves this set: every read
-        // then fails until a verified reopen, so no decision passes the unpublished record.
-        inner.unpublished = true;
-        let receipt = inner.writer.append_synced(EnvelopeIn {
-            source_id: source_id.clone(),
-            schema_version: LIVE_JOURNAL_SCHEMA_VERSION,
-            parser_version: LIVE_JOURNAL_PARSER_VERSION,
-            observed_at: SourceTimestamp(timestamp),
-            received_at: ReceivedAt(timestamp),
-            content_type: ContentType::Json,
-            payload: payload.clone(),
-        })?;
-        let written = EventEnvelope {
-            seq: receipt.sequence,
-            source_id,
-            schema_version: LIVE_JOURNAL_SCHEMA_VERSION,
-            parser_version: LIVE_JOURNAL_PARSER_VERSION,
-            observed_at: SourceTimestamp(timestamp),
-            received_at: ReceivedAt(timestamp),
-            content_type: ContentType::Json,
-            raw_payload_hash: blake3::hash(&payload),
-            prev_hash: inner.last_hash,
-            this_hash: receipt.this_hash,
-            payload,
-        };
-        let decoded = decode_record(&written, inner.records.len())?;
-        inner.last_hash = receipt.this_hash;
-        inner.publish(Arc::new(decoded.clone()));
-        inner.unpublished = false;
-        Ok(decoded)
+        self.with_published(|inner| {
+            let event = LiveJournalEvent {
+                account_id,
+                seq: u64::try_from(inner.records.len())
+                    .map_err(|_| LiveJournalError::SequenceMismatch)?,
+                timestamp,
+                payload,
+            };
+            let payload = serde_json::to_vec(&event)?;
+            let source_id = SourceId(LIVE_JOURNAL_SOURCE.to_owned());
+            // Any writer failure or a frame that fails replay decoding leaves this set: every read
+            // then fails until a verified reopen, so no decision passes the unpublished record.
+            inner.unpublished = true;
+            let receipt = inner.writer.append_synced(EnvelopeIn {
+                source_id: source_id.clone(),
+                schema_version: LIVE_JOURNAL_SCHEMA_VERSION,
+                parser_version: LIVE_JOURNAL_PARSER_VERSION,
+                observed_at: SourceTimestamp(timestamp),
+                received_at: ReceivedAt(timestamp),
+                content_type: ContentType::Json,
+                payload: payload.clone(),
+            })?;
+            let written = EventEnvelope {
+                seq: receipt.sequence,
+                source_id,
+                schema_version: LIVE_JOURNAL_SCHEMA_VERSION,
+                parser_version: LIVE_JOURNAL_PARSER_VERSION,
+                observed_at: SourceTimestamp(timestamp),
+                received_at: ReceivedAt(timestamp),
+                content_type: ContentType::Json,
+                raw_payload_hash: blake3::hash(&payload),
+                prev_hash: inner.last_hash,
+                this_hash: receipt.this_hash,
+                payload,
+            };
+            let decoded = decode_record(&written, inner.records.len())?;
+            inner.last_hash = receipt.this_hash;
+            inner.publish(Arc::new(decoded.clone()));
+            inner.unpublished = false;
+            Ok(decoded)
+        })
     }
 }
 
@@ -2960,6 +2982,27 @@ mod tests {
     use time::macros::datetime;
 
     use super::*;
+
+    #[test]
+    fn blocking_live_journal_preserves_runtime_progress() {
+        let dir = tempdir().unwrap();
+        let journal = Arc::new(LiveJournal::open(dir.path().join("journal.log")).unwrap());
+        let holder = Arc::clone(&journal);
+        crate::runtime_progress::assert_progress(
+            move |entered, release| {
+                holder
+                    .with_inner(|_| {
+                        entered.send(()).unwrap();
+                        release.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            },
+            move || {
+                assert!(journal.records_from(0).unwrap().is_empty());
+            },
+        );
+    }
 
     #[test]
     fn recorded_control_outcomes_validate_clock_mode_and_binding() {

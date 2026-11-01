@@ -2274,16 +2274,26 @@ where
                 persist_outcome(state, target, &outcome, final_post_check_at)?;
                 return Ok(false);
             }
-            let guard = state.config.live_accounts.publication_guard();
-            let latest = state.config.live_accounts.snapshot();
-            let latest_at = clock();
-            let latest_account = latest
-                .accounts
-                .iter()
-                .find(|row| row.account_id == *prepared.account_id());
-            let control = latest.control_observation(latest_account, latest_at.unix_timestamp());
+            let (control, latest_at, submitted) =
+                state.config.live_accounts.with_publication(|| {
+                    let latest = state.config.live_accounts.snapshot();
+                    let latest_at = clock();
+                    let latest_account = latest
+                        .accounts
+                        .iter()
+                        .find(|row| row.account_id == *prepared.account_id());
+                    let control =
+                        latest.control_observation(latest_account, latest_at.unix_timestamp());
+                    let submitted = control.permits_mode()
+                        && submit_target_unless_scope_dropped(
+                            state,
+                            target,
+                            &prepared.audit().identity,
+                            latest_at,
+                        )?;
+                    Ok::<_, FanoutError>((control, latest_at, submitted))
+                })?;
             if !control.permits_mode() {
-                drop(guard);
                 let authorization = if control.unavailable() {
                     RecoveryAuthorization::PauseControl(control)
                 } else {
@@ -2302,13 +2312,6 @@ where
                 )?;
                 return Ok(false);
             }
-            let submitted = submit_target_unless_scope_dropped(
-                state,
-                target,
-                &prepared.audit().identity,
-                latest_at,
-            )?;
-            drop(guard);
             if !submitted {
                 let outcome = executor.terminalize_prepared(
                     prepared,
@@ -3077,15 +3080,23 @@ async fn process_target(
             // The short guard orders control publication against the final check and durable
             // submitted transition. It is released before any venue network call.
             let final_at = OffsetDateTime::now_utc();
-            let guard = state.config.live_accounts.publication_guard();
-            let latest = state.config.live_accounts.snapshot();
-            let latest_account = latest
-                .accounts
-                .iter()
-                .find(|row| row.account_id.as_str() == target.account_id);
-            let control = latest.control_observation(latest_account, final_at.unix_timestamp());
+            let (control, submitted) = state.config.live_accounts.with_publication(|| {
+                let latest = state.config.live_accounts.snapshot();
+                let latest_account = latest
+                    .accounts
+                    .iter()
+                    .find(|row| row.account_id.as_str() == target.account_id);
+                let control = latest.control_observation(latest_account, final_at.unix_timestamp());
+                let submitted = control.permits_mode()
+                    && submit_target_unless_scope_dropped(
+                        state,
+                        target,
+                        &prepared.audit().identity,
+                        final_at,
+                    )?;
+                Ok::<_, FanoutError>((control, submitted))
+            })?;
             if !control.permits_mode() {
-                drop(guard);
                 let failure = if control.unavailable() {
                     pe_execution_core::LiveOrderPreparationFailure::PrePostControlUnavailable
                 } else {
@@ -3096,13 +3107,6 @@ async fn process_target(
                 persist_outcome(state, target, &outcome, final_at)?;
                 return Ok(PassControl::Continue);
             }
-            let submitted = submit_target_unless_scope_dropped(
-                state,
-                target,
-                &prepared.audit().identity,
-                final_at,
-            )?;
-            drop(guard);
             if !submitted {
                 let outcome = executor.terminalize_prepared(
                     prepared,
