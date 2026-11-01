@@ -1048,19 +1048,21 @@ fn read_retired_receipt(
     file: &std::fs::File,
     sequence: u64,
 ) -> Result<SourceFrameMetadata, RiskInputsUnavailable> {
-    use std::os::unix::fs::FileExt as _;
-    let position = sequence
-        .checked_mul(pe_event_log::RECEIPT_RECORD_LEN)
-        .ok_or(RiskInputsUnavailable::Overflow)?;
-    let mut bytes = [0; 80];
-    file.read_exact_at(&mut bytes, position)
-        .map_err(|_| RiskInputsUnavailable::PriceMissing)?;
-    let record = pe_event_log::ReceiptRecord::read(&mut bytes.as_slice(), EventSeq(sequence))
-        .map_err(|_| RiskInputsUnavailable::PriceMissing)?;
-    Ok(SourceFrameMetadata {
-        receipt: record.receipt,
-        received_millis: record.received_millis,
-        byte_offset: record.byte_offset,
+    pe_event_log::run_blocking(|| {
+        use std::os::unix::fs::FileExt as _;
+        let position = sequence
+            .checked_mul(pe_event_log::RECEIPT_RECORD_LEN)
+            .ok_or(RiskInputsUnavailable::Overflow)?;
+        let mut bytes = [0; 80];
+        file.read_exact_at(&mut bytes, position)
+            .map_err(|_| RiskInputsUnavailable::PriceMissing)?;
+        let record = pe_event_log::ReceiptRecord::read(&mut bytes.as_slice(), EventSeq(sequence))
+            .map_err(|_| RiskInputsUnavailable::PriceMissing)?;
+        Ok(SourceFrameMetadata {
+            receipt: record.receipt,
+            received_millis: record.received_millis,
+            byte_offset: record.byte_offset,
+        })
     })
 }
 
@@ -1385,16 +1387,36 @@ impl SourceReceiptIndexStaging {
 }
 
 impl SourceReceiptIndex {
+    fn with_read<T>(&self, f: impl FnOnce(&SourceReceiptIndexState) -> T) -> T {
+        pe_event_log::run_blocking(|| {
+            let state = self
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            f(&state)
+        })
+    }
+
+    fn with_write<T>(&self, f: impl FnOnce(&mut SourceReceiptIndexState) -> T) -> T {
+        pe_event_log::run_blocking(|| {
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            f(&mut state)
+        })
+    }
+
     /// Retirement, surviving-obligation and open-continuation authentication counts.
     #[cfg(feature = "scenario")]
     pub fn binding_verification_counts(&self, receipt: AppendReceipt) -> [usize; 3] {
-        self.state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .binding_verification_categories
-            .get(&(receipt.sequence, receipt.this_hash))
-            .copied()
-            .unwrap_or_default()
+        self.with_read(|state| {
+            state
+                .binding_verification_categories
+                .get(&(receipt.sequence, receipt.this_hash))
+                .copied()
+                .unwrap_or_default()
+        })
     }
 
     #[cfg(feature = "scenario")]
@@ -1403,64 +1425,58 @@ impl SourceReceiptIndex {
         receipt: AppendReceipt,
         category: usize,
     ) {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(count) = state
-            .binding_verification_categories
-            .entry((receipt.sequence, receipt.this_hash))
-            .or_default()
-            .get_mut(category)
-        {
-            *count += 1;
-        }
+        self.with_write(|state| {
+            if let Some(count) = state
+                .binding_verification_categories
+                .entry((receipt.sequence, receipt.this_hash))
+                .or_default()
+                .get_mut(category)
+            {
+                *count += 1;
+            }
+        })
     }
 
     #[cfg(feature = "scenario")]
     pub fn read_verification_count(&self, receipt: AppendReceipt) -> usize {
-        self.state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .read_verifications
-            .get(&(receipt.sequence, receipt.this_hash))
-            .copied()
-            .unwrap_or(0)
+        self.with_read(|state| {
+            state
+                .read_verifications
+                .get(&(receipt.sequence, receipt.this_hash))
+                .copied()
+                .unwrap_or(0)
+        })
     }
 
     #[cfg(feature = "scenario")]
     pub(crate) fn record_read_verification(&self, receipt: AppendReceipt) {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state
-            .read_verifications
-            .entry((receipt.sequence, receipt.this_hash))
-            .or_default() += 1;
+        self.with_write(|state| {
+            *state
+                .read_verifications
+                .entry((receipt.sequence, receipt.this_hash))
+                .or_default() += 1;
+        })
     }
 
     #[cfg(feature = "scenario")]
     pub fn frame_verification_count(&self, receipt: AppendReceipt) -> usize {
-        self.state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .frame_verifications
-            .get(&(receipt.sequence, receipt.this_hash))
-            .copied()
-            .unwrap_or(0)
+        self.with_read(|state| {
+            state
+                .frame_verifications
+                .get(&(receipt.sequence, receipt.this_hash))
+                .copied()
+                .unwrap_or(0)
+        })
     }
 
     #[cfg(feature = "scenario")]
     pub(crate) fn record_frame_verification(&self, receipt: AppendReceipt) {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state
-            .frame_verifications
-            .entry((receipt.sequence, receipt.this_hash))
-            .or_default() += 1;
+        self.with_write(|state| {
+            *state
+                .frame_verifications
+                .entry((receipt.sequence, receipt.this_hash))
+                .or_default() += 1;
+        })
     }
 
     pub(crate) fn remember_verified_frontier(
@@ -1468,58 +1484,50 @@ impl SourceReceiptIndex {
         frontier: &crate::frame_admission::FeedHistoryFrontier,
         verified_epoch: u64,
     ) -> Result<(), crate::frame_admission::FrameAdmissionError> {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state
-            .retention
-            .as_ref()
-            .map_or(0, |authority| authority.epoch)
-            != verified_epoch
-        {
-            return Err(crate::frame_admission::FrameAdmissionError::InvalidPrefix(
-                "retention epoch changed during frontier verification",
-            ));
-        }
-        state
-            .verified_feed_frontiers
-            .insert(frontier.wallet, (verified_epoch, frontier.clone()));
-        Ok(())
+        self.with_write(|state| {
+            if state
+                .retention
+                .as_ref()
+                .map_or(0, |authority| authority.epoch)
+                != verified_epoch
+            {
+                return Err(crate::frame_admission::FrameAdmissionError::InvalidPrefix(
+                    "retention epoch changed during frontier verification",
+                ));
+            }
+            state
+                .verified_feed_frontiers
+                .insert(frontier.wallet, (verified_epoch, frontier.clone()));
+            Ok(())
+        })
     }
 
     pub(crate) fn forget_verified_frontier(&self, wallet: pe_core_types::WalletAddress) {
-        self.state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .verified_feed_frontiers
-            .remove(&wallet);
+        self.with_write(|state| {
+            state.verified_feed_frontiers.remove(&wallet);
+        })
     }
 
     pub(crate) fn verify_frame_frontier(
         &self,
         frontier: &crate::frame_admission::FeedHistoryFrontier,
     ) -> Result<(), crate::frame_admission::FrameAdmissionError> {
-        let epoch = {
-            let state = self
-                .state
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (epoch, verified) = self.with_read(|state| {
             let epoch = state
                 .retention
                 .as_ref()
                 .map_or(0, |authority| authority.epoch);
-            if state
+            let verified = state
                 .verified_feed_frontiers
                 .get(&frontier.wallet)
                 .is_some_and(|(verified_epoch, cached)| {
                     *verified_epoch == epoch && cached == frontier
-                })
-            {
-                return Ok(());
-            }
-            epoch
-        };
+                });
+            (epoch, verified)
+        });
+        if verified {
+            return Ok(());
+        }
         #[cfg(feature = "scenario")]
         self.record_read_verification(frontier.commitment);
         frontier.verify(&mut |receipt| {
@@ -1572,11 +1580,7 @@ impl SourceReceiptIndex {
     ) -> Result<Vec<SourceFrameMetadata>, RiskInputsUnavailable> {
         let start = u64::try_from(start).map_err(|_| RiskInputsUnavailable::Overflow)?;
         let count = u64::try_from(count).map_err(|_| RiskInputsUnavailable::Overflow)?;
-        let (base, last, window, sidecar) = {
-            let state = self
-                .state
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (base, last, window, sidecar) = self.with_read(|state| {
             if count > state.len()? || start > count {
                 return Err(RiskInputsUnavailable::PriceConflict);
             }
@@ -1603,8 +1607,8 @@ impl SourceReceiptIndex {
                         .ok_or(RiskInputsUnavailable::PriceMissing)
                 })
                 .transpose()?;
-            (base, last, window, sidecar)
-        };
+            Ok((base, last, window, sidecar))
+        })?;
         #[cfg(feature = "scenario")]
         if let Some(pause) = pause {
             pause();
@@ -1783,37 +1787,35 @@ impl SourceReceiptIndex {
         tail: &LogTailBinding,
         cutoff_millis: i64,
     ) -> Result<BoundaryCandidate, RiskInputsUnavailable> {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = Self::bound_tail_count(&state, tail)?;
-        let base = state.retired.count();
-        if count == 0 {
-            return Ok(BoundaryCandidate::Empty);
-        }
-        if count <= base
-            || state
-                .retired
-                .max_received
-                .is_some_and(|newest| newest >= cutoff_millis)
-        {
-            return Ok(BoundaryCandidate::Retired { base });
-        }
-        let window = state
-            .frames
-            .get(
-                ..usize::try_from(count.saturating_sub(base))
-                    .map_err(|_| RiskInputsUnavailable::Overflow)?,
-            )
-            .ok_or(RiskInputsUnavailable::PriceConflict)?;
-        window
-            .iter()
-            .find(|frame| frame.received_millis >= cutoff_millis)
-            .or_else(|| window.last())
-            .cloned()
-            .map(BoundaryCandidate::Frame)
-            .ok_or(RiskInputsUnavailable::PriceConflict)
+        self.with_read(|state| {
+            let count = Self::bound_tail_count(state, tail)?;
+            let base = state.retired.count();
+            if count == 0 {
+                return Ok(BoundaryCandidate::Empty);
+            }
+            if count <= base
+                || state
+                    .retired
+                    .max_received
+                    .is_some_and(|newest| newest >= cutoff_millis)
+            {
+                return Ok(BoundaryCandidate::Retired { base });
+            }
+            let window = state
+                .frames
+                .get(
+                    ..usize::try_from(count.saturating_sub(base))
+                        .map_err(|_| RiskInputsUnavailable::Overflow)?,
+                )
+                .ok_or(RiskInputsUnavailable::PriceConflict)?;
+            window
+                .iter()
+                .find(|frame| frame.received_millis >= cutoff_millis)
+                .or_else(|| window.last())
+                .cloned()
+                .map(BoundaryCandidate::Frame)
+                .ok_or(RiskInputsUnavailable::PriceConflict)
+        })
     }
 
     /// Inputs for the retention pre-commit audit of receipts `[0, boundary)` (#745): the retired
@@ -1823,50 +1825,37 @@ impl SourceReceiptIndex {
         boundary: EventSeq,
         tail: &LogTailBinding,
     ) -> Result<RetentionAudit, RiskInputsUnavailable> {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = Self::bound_tail_count(&state, tail)?;
-        let base = state.retired.count();
-        if boundary.0 < base || boundary.0 > count {
-            return Err(RiskInputsUnavailable::PriceConflict);
-        }
-        let window = state
-            .frames
-            .get(
-                ..usize::try_from(boundary.0.saturating_sub(base))
-                    .map_err(|_| RiskInputsUnavailable::Overflow)?,
-            )
-            .ok_or(RiskInputsUnavailable::PriceConflict)?
-            .to_vec();
-        Ok(RetentionAudit {
-            commitment: state.retired.commitment.clone(),
-            window,
+        self.with_read(|state| {
+            let count = Self::bound_tail_count(state, tail)?;
+            let base = state.retired.count();
+            if boundary.0 < base || boundary.0 > count {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            let window = state
+                .frames
+                .get(
+                    ..usize::try_from(boundary.0.saturating_sub(base))
+                        .map_err(|_| RiskInputsUnavailable::Overflow)?,
+                )
+                .ok_or(RiskInputsUnavailable::PriceConflict)?
+                .to_vec();
+            Ok(RetentionAudit {
+                commitment: state.retired.commitment.clone(),
+                window,
+            })
         })
     }
 
     /// Number of receipts below the in-memory window: the committed retention boundary, or zero.
     pub(crate) fn retired_count(&self) -> u64 {
-        self.state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retired
-            .count()
+        self.with_read(|state| state.retired.count())
     }
 
     /// The receipt sidecar handle that serves retired receipts: the current one, or a new one
     /// opened for the first retention switch. A retention commit opens it under the checkpoint
     /// lock before its authority can become visible (#745).
     pub(crate) fn retired_reader(&self) -> Result<Arc<std::fs::File>, RiskInputsUnavailable> {
-        if let Some(reader) = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retired
-            .reader
-            .clone()
-        {
+        if let Some(reader) = self.with_read(|state| state.retired.reader.clone()) {
             return Ok(reader);
         }
         let path = self
@@ -1903,11 +1892,7 @@ impl SourceReceiptIndex {
         authority: &RetentionAuthority,
         reader: Option<Arc<std::fs::File>>,
     ) -> Result<RetentionDependencies, RiskInputsUnavailable> {
-        let (base, epoch, current_reader) = {
-            let state = self
-                .state
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (base, epoch, current_reader) = self.with_read(|state| {
             (
                 state.retired.count(),
                 state
@@ -1916,7 +1901,7 @@ impl SourceReceiptIndex {
                     .map_or(0, |authority| authority.epoch),
                 state.retired.reader.clone(),
             )
-        };
+        });
         let reader = current_reader.or(reader);
         // Below the retired cache (the two highest retired receipts) only the sidecar has them.
         let uncached = base.saturating_sub(2);
@@ -2057,12 +2042,12 @@ impl SourceReceiptIndex {
 
     /// Epoch captured by checkpoint verification and publication.
     pub fn retention_epoch(&self) -> u64 {
-        self.state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retention
-            .as_ref()
-            .map_or(0, |authority| authority.epoch)
+        self.with_read(|state| {
+            state
+                .retention
+                .as_ref()
+                .map_or(0, |authority| authority.epoch)
+        })
     }
 
     /// Check every committed pin, including dependencies with no reducer owner.
@@ -2074,12 +2059,7 @@ impl SourceReceiptIndex {
         &self,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(), RiskInputsUnavailable> {
-        let retention = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retention
-            .clone();
+        let retention = self.with_read(|state| state.retention.clone());
         let epoch = retention.as_ref().map_or(0, |authority| authority.epoch);
         if let Some(authority) = retention {
             for pin in &authority.pins {
@@ -2100,11 +2080,7 @@ impl SourceReceiptIndex {
 
     /// Snapshot the synchronized indexed source tail without reading the log (GitHub issue #574).
     pub(crate) fn current_tail_binding(&self) -> Result<LogTailBinding, RiskInputsUnavailable> {
-        let (path, physical_tail, last_sequence, last_hash) = {
-            let state = self
-                .state
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (path, physical_tail, last_sequence, last_hash) = self.with_read(|state| {
             let path = self
                 .source_log_path
                 .as_ref()
@@ -2119,8 +2095,8 @@ impl SourceReceiptIndex {
                 .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
                     frame.receipt.this_hash
                 });
-            (path, physical_tail, last_sequence, last_hash)
-        };
+            Ok::<_, RiskInputsUnavailable>((path, physical_tail, last_sequence, last_hash))
+        })?;
         Ok(LogTailBinding {
             path,
             physical_tail,
@@ -2133,43 +2109,41 @@ impl SourceReceiptIndex {
     pub(crate) fn tail_with_last_frame(
         &self,
     ) -> Result<(LogTailBinding, u64, AppendReceipt, blake3::Hash), RiskInputsUnavailable> {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let path = self
-            .source_log_path
-            .as_ref()
-            .ok_or(RiskInputsUnavailable::PriceMissing)?;
-        let last = state.last().ok_or(RiskInputsUnavailable::PriceMissing)?;
-        let byte_offset = last
-            .byte_offset
-            .ok_or(RiskInputsUnavailable::PriceMissing)?;
-        let physical_tail = state
-            .next_byte_offset
-            .ok_or(RiskInputsUnavailable::PriceMissing)?;
-        // The predecessor is in the window or the retired cache, never only in the sidecar.
-        let previous_hash = match last.receipt.sequence.0.checked_sub(1) {
-            Some(previous) => {
-                state
-                    .memory(previous)
-                    .ok_or(RiskInputsUnavailable::PriceMissing)?
-                    .receipt
-                    .this_hash
-            }
-            None => blake3::Hash::from_bytes([0; 32]),
-        };
-        Ok((
-            LogTailBinding {
-                path: path.as_ref().clone(),
-                physical_tail,
-                last_sequence: Some(last.receipt.sequence),
-                last_hash: last.receipt.this_hash,
-            },
-            byte_offset,
-            last.receipt,
-            previous_hash,
-        ))
+        self.with_read(|state| {
+            let path = self
+                .source_log_path
+                .as_ref()
+                .ok_or(RiskInputsUnavailable::PriceMissing)?;
+            let last = state.last().ok_or(RiskInputsUnavailable::PriceMissing)?;
+            let byte_offset = last
+                .byte_offset
+                .ok_or(RiskInputsUnavailable::PriceMissing)?;
+            let physical_tail = state
+                .next_byte_offset
+                .ok_or(RiskInputsUnavailable::PriceMissing)?;
+            // The predecessor is in the window or the retired cache, never only in the sidecar.
+            let previous_hash = match last.receipt.sequence.0.checked_sub(1) {
+                Some(previous) => {
+                    state
+                        .memory(previous)
+                        .ok_or(RiskInputsUnavailable::PriceMissing)?
+                        .receipt
+                        .this_hash
+                }
+                None => blake3::Hash::from_bytes([0; 32]),
+            };
+            Ok((
+                LogTailBinding {
+                    path: path.as_ref().clone(),
+                    physical_tail,
+                    last_sequence: Some(last.receipt.sequence),
+                    last_hash: last.receipt.this_hash,
+                },
+                byte_offset,
+                last.receipt,
+                previous_hash,
+            ))
+        })
     }
 
     /// Extend the projection with an append that the source-log owner has already synchronized.
@@ -2179,63 +2153,61 @@ impl SourceReceiptIndex {
         envelope: &pe_event_log::EnvelopeIn,
     ) -> Result<(), RiskInputsUnavailable> {
         let received_millis = received_at_millis(&envelope.received_at)?;
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let expected_sequence = EventSeq(state.len()?);
-        if receipt.sequence < expected_sequence {
-            let slot = state.slot(receipt.sequence.0)?;
-            // A retired duplicate is read after releasing the guard; retired receipts never change.
-            drop(state);
+        let duplicate = self.with_write(|state| {
+            let expected_sequence = EventSeq(state.len()?);
+            if receipt.sequence < expected_sequence {
+                return state.slot(receipt.sequence.0).map(Some);
+            }
+            if receipt.sequence != expected_sequence {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            let prev_hash = state
+                .last()
+                .map_or(blake3::Hash::from_bytes([0; 32]), |known| {
+                    known.receipt.this_hash
+                });
+            let (_raw_payload_hash, _, this_hash) =
+                pe_event_log::envelope::compute_hashes(pe_event_log::envelope::HashInput {
+                    seq: receipt.sequence,
+                    source_id: &envelope.source_id,
+                    schema_version: envelope.schema_version,
+                    parser_version: envelope.parser_version,
+                    observed_at: &envelope.observed_at,
+                    received_at: &envelope.received_at,
+                    content_type: &envelope.content_type,
+                    prev_hash: &prev_hash,
+                    payload: &envelope.payload,
+                })
+                .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+            if this_hash != receipt.this_hash {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            let byte_offset = state.next_byte_offset;
+            if let (Some(path), Some(frame_start)) = (&self.source_log_path, byte_offset) {
+                let new_tail = std::fs::metadata(path.as_ref())
+                    .map_err(|_| RiskInputsUnavailable::PriceMissing)?
+                    .len();
+                if new_tail <= frame_start {
+                    return Err(RiskInputsUnavailable::PriceConflict);
+                }
+                state.next_byte_offset = Some(new_tail);
+            }
+            state.frames.push(SourceFrameMetadata {
+                receipt,
+                received_millis,
+                byte_offset,
+            });
+            Ok(None)
+        })?;
+        // Retired receipts never change and are read only after releasing the guard.
+        if let Some(slot) = duplicate {
             let known = slot
                 .resolve(receipt.sequence.0)?
                 .ok_or(RiskInputsUnavailable::PriceConflict)?;
-            return if known.receipt == receipt && known.received_millis == received_millis {
-                Ok(())
-            } else {
-                Err(RiskInputsUnavailable::PriceConflict)
-            };
-        }
-        if receipt.sequence != expected_sequence {
-            return Err(RiskInputsUnavailable::PriceConflict);
-        }
-        let prev_hash = state
-            .last()
-            .map_or(blake3::Hash::from_bytes([0; 32]), |known| {
-                known.receipt.this_hash
-            });
-        let (_raw_payload_hash, _, this_hash) =
-            pe_event_log::envelope::compute_hashes(pe_event_log::envelope::HashInput {
-                seq: receipt.sequence,
-                source_id: &envelope.source_id,
-                schema_version: envelope.schema_version,
-                parser_version: envelope.parser_version,
-                observed_at: &envelope.observed_at,
-                received_at: &envelope.received_at,
-                content_type: &envelope.content_type,
-                prev_hash: &prev_hash,
-                payload: &envelope.payload,
-            })
-            .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
-        if this_hash != receipt.this_hash {
-            return Err(RiskInputsUnavailable::PriceConflict);
-        }
-        let byte_offset = state.next_byte_offset;
-        if let (Some(path), Some(frame_start)) = (&self.source_log_path, byte_offset) {
-            let new_tail = std::fs::metadata(path.as_ref())
-                .map_err(|_| RiskInputsUnavailable::PriceMissing)?
-                .len();
-            if new_tail <= frame_start {
+            if known.receipt != receipt || known.received_millis != received_millis {
                 return Err(RiskInputsUnavailable::PriceConflict);
             }
-            state.next_byte_offset = Some(new_tail);
         }
-        state.frames.push(SourceFrameMetadata {
-            receipt,
-            received_millis,
-            byte_offset,
-        });
         Ok(())
     }
 
@@ -2283,108 +2255,110 @@ impl SourceReceiptIndex {
         observer: &mut dyn FnMut(u64, &EventEnvelope),
         #[cfg(feature = "scenario")] pause: Option<&mut dyn FnMut()>,
     ) -> Result<(), RiskInputsUnavailable> {
-        let Some(path) = self.source_log_path.as_ref() else {
-            return if expected_tail.is_some() {
-                Err(RiskInputsUnavailable::PriceMissing)
-            } else {
-                Ok(())
+        pe_event_log::run_blocking(|| {
+            let Some(path) = self.source_log_path.as_ref() else {
+                return if expected_tail.is_some() {
+                    Err(RiskInputsUnavailable::PriceMissing)
+                } else {
+                    Ok(())
+                };
             };
-        };
-        // Absolute counts survive a retention switch that moves the window during recovery.
-        let (indexed_len, next_byte_offset, indexed_last_hash) = {
-            let state = self
-                .state
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(next_byte_offset) = state.next_byte_offset else {
+            // Absolute counts survive a retention switch that moves the window during recovery.
+            let (indexed_len, next_byte_offset, indexed_last_hash) = {
+                let state = self
+                    .state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(next_byte_offset) = state.next_byte_offset else {
+                    return Err(RiskInputsUnavailable::PriceConflict);
+                };
+                (
+                    state.len()?,
+                    next_byte_offset,
+                    state
+                        .last()
+                        .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
+                            frame.receipt.this_hash
+                        }),
+                )
+            };
+            let current_tail = std::fs::metadata(path.as_ref())
+                .map_err(|_| RiskInputsUnavailable::PriceMissing)?
+                .len();
+            if expected_tail.is_some_and(|expected| current_tail != expected) {
                 return Err(RiskInputsUnavailable::PriceConflict);
-            };
-            (
-                state.len()?,
-                next_byte_offset,
-                state
+            }
+            let verified_tail = expected_tail.unwrap_or(current_tail);
+            if verified_tail < next_byte_offset {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            let mut previous_hash = indexed_last_hash;
+            let mut recovered = Vec::new();
+            let mut byte_offset = next_byte_offset;
+            while byte_offset < verified_tail {
+                let expected_sequence = u64::try_from(recovered.len())
+                    .ok()
+                    .and_then(|recovered| indexed_len.checked_add(recovered))
+                    .map(EventSeq)
+                    .ok_or(RiskInputsUnavailable::Overflow)?;
+                let (envelope, frame_end) =
+                    Reader::read_at(path.as_ref(), byte_offset, expected_sequence, previous_hash)
+                        .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+                if frame_end <= byte_offset || frame_end > verified_tail {
+                    return Err(RiskInputsUnavailable::PriceConflict);
+                }
+                if envelope.seq != expected_sequence || envelope.prev_hash != previous_hash {
+                    return Err(RiskInputsUnavailable::PriceConflict);
+                }
+                observer(byte_offset, &envelope);
+                let receipt = AppendReceipt {
+                    sequence: envelope.seq,
+                    this_hash: envelope.this_hash,
+                };
+                let received_millis = received_at_millis(&envelope.received_at)?;
+                previous_hash = receipt.this_hash;
+                recovered.push(SourceFrameMetadata {
+                    receipt,
+                    received_millis,
+                    byte_offset: Some(byte_offset),
+                });
+                byte_offset = frame_end;
+            }
+            if byte_offset != verified_tail {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            if expected_tail.is_some()
+                && std::fs::metadata(path.as_ref())
+                    .map_err(|_| RiskInputsUnavailable::PriceMissing)?
+                    .len()
+                    != verified_tail
+            {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            #[cfg(feature = "scenario")]
+            if let Some(pause) = pause {
+                pause();
+            }
+
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.len()? != indexed_len
+                || state.next_byte_offset != Some(next_byte_offset)
+                || state
                     .last()
                     .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
                         frame.receipt.this_hash
-                    }),
-            )
-        };
-        let current_tail = std::fs::metadata(path.as_ref())
-            .map_err(|_| RiskInputsUnavailable::PriceMissing)?
-            .len();
-        if expected_tail.is_some_and(|expected| current_tail != expected) {
-            return Err(RiskInputsUnavailable::PriceConflict);
-        }
-        let verified_tail = expected_tail.unwrap_or(current_tail);
-        if verified_tail < next_byte_offset {
-            return Err(RiskInputsUnavailable::PriceConflict);
-        }
-        let mut previous_hash = indexed_last_hash;
-        let mut recovered = Vec::new();
-        let mut byte_offset = next_byte_offset;
-        while byte_offset < verified_tail {
-            let expected_sequence = u64::try_from(recovered.len())
-                .ok()
-                .and_then(|recovered| indexed_len.checked_add(recovered))
-                .map(EventSeq)
-                .ok_or(RiskInputsUnavailable::Overflow)?;
-            let (envelope, frame_end) =
-                Reader::read_at(path.as_ref(), byte_offset, expected_sequence, previous_hash)
-                    .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
-            if frame_end <= byte_offset || frame_end > verified_tail {
+                    })
+                    != indexed_last_hash
+            {
                 return Err(RiskInputsUnavailable::PriceConflict);
             }
-            if envelope.seq != expected_sequence || envelope.prev_hash != previous_hash {
-                return Err(RiskInputsUnavailable::PriceConflict);
-            }
-            observer(byte_offset, &envelope);
-            let receipt = AppendReceipt {
-                sequence: envelope.seq,
-                this_hash: envelope.this_hash,
-            };
-            let received_millis = received_at_millis(&envelope.received_at)?;
-            previous_hash = receipt.this_hash;
-            recovered.push(SourceFrameMetadata {
-                receipt,
-                received_millis,
-                byte_offset: Some(byte_offset),
-            });
-            byte_offset = frame_end;
-        }
-        if byte_offset != verified_tail {
-            return Err(RiskInputsUnavailable::PriceConflict);
-        }
-        if expected_tail.is_some()
-            && std::fs::metadata(path.as_ref())
-                .map_err(|_| RiskInputsUnavailable::PriceMissing)?
-                .len()
-                != verified_tail
-        {
-            return Err(RiskInputsUnavailable::PriceConflict);
-        }
-        #[cfg(feature = "scenario")]
-        if let Some(pause) = pause {
-            pause();
-        }
-
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.len()? != indexed_len
-            || state.next_byte_offset != Some(next_byte_offset)
-            || state
-                .last()
-                .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
-                    frame.receipt.this_hash
-                })
-                != indexed_last_hash
-        {
-            return Err(RiskInputsUnavailable::PriceConflict);
-        }
-        state.frames.extend(recovered);
-        state.next_byte_offset = Some(verified_tail);
-        Ok(())
+            state.frames.extend(recovered);
+            state.next_byte_offset = Some(verified_tail);
+            Ok(())
+        })
     }
 
     /// Return the receipt and receive millisecond stored for `sequence`, when present (#572).
@@ -2394,11 +2368,7 @@ impl SourceReceiptIndex {
         &self,
         sequence: EventSeq,
     ) -> Result<Option<(AppendReceipt, i64)>, RiskInputsUnavailable> {
-        let slot = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .slot(sequence.0)?;
+        let slot = self.with_read(|state| state.slot(sequence.0))?;
         Ok(slot
             .resolve(sequence.0)?
             .map(|metadata| (metadata.receipt, metadata.received_millis)))
@@ -2441,93 +2411,95 @@ impl SourceReceiptIndex {
         receipt: AppendReceipt,
         #[cfg(feature = "scenario")] pause: Option<&mut dyn FnMut()>,
     ) -> Result<EventEnvelope, RiskInputsUnavailable> {
-        let sequence = receipt.sequence.0;
-        let (metadata, previous, successor) = {
+        pe_event_log::run_blocking(|| {
+            let sequence = receipt.sequence.0;
+            let (metadata, previous, successor) = {
+                let state = self
+                    .state
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Self::require_retained(&state, receipt.sequence)?;
+                (
+                    state.slot(sequence)?,
+                    sequence
+                        .checked_sub(1)
+                        .map(|previous| state.slot(previous))
+                        .transpose()?,
+                    sequence
+                        .checked_add(1)
+                        .map(|next| state.slot(next))
+                        .transpose()?,
+                )
+            };
+            // Retired receipts (a pin and its neighbors) are read only after the lock is released.
+            let metadata = metadata
+                .resolve(sequence)?
+                .filter(|metadata| metadata.receipt == receipt)
+                .ok_or(RiskInputsUnavailable::PriceMissing)?;
+            let previous_hash = match previous {
+                Some(slot) => slot
+                    .resolve(sequence.saturating_sub(1))?
+                    .map_or(blake3::Hash::from_bytes([0; 32]), |previous| {
+                        previous.receipt.this_hash
+                    }),
+                None => blake3::Hash::from_bytes([0; 32]),
+            };
+            let successor = successor
+                .map(|slot| slot.resolve(sequence.saturating_add(1)))
+                .transpose()?
+                .flatten();
+            let path = self
+                .source_log_path
+                .as_ref()
+                .ok_or(RiskInputsUnavailable::PriceMissing)?;
+            let byte_offset = metadata
+                .byte_offset
+                .ok_or(RiskInputsUnavailable::PriceMissing)?;
+            #[cfg(feature = "scenario")]
+            if let Some(pause) = pause {
+                pause();
+            }
+            let read = Reader::read_at(path.as_ref(), byte_offset, receipt.sequence, previous_hash);
+            // The commit may have advanced while the index lock was released, even if no
+            // bytes have been punched yet. A physical failure follows the same rule.
             let state = self
                 .state
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             Self::require_retained(&state, receipt.sequence)?;
-            (
-                state.slot(sequence)?,
-                sequence
-                    .checked_sub(1)
-                    .map(|previous| state.slot(previous))
-                    .transpose()?,
-                sequence
+            let (envelope, end) = read.map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+            if state
+                .retention
+                .as_ref()
+                .is_some_and(|authority| authority.pin(receipt.sequence).is_some())
+            {
+                let next = sequence
                     .checked_add(1)
                     .map(|next| state.slot(next))
-                    .transpose()?,
-            )
-        };
-        // Retired receipts (a pin and its neighbors) are read only after the lock is released.
-        let metadata = metadata
-            .resolve(sequence)?
-            .filter(|metadata| metadata.receipt == receipt)
-            .ok_or(RiskInputsUnavailable::PriceMissing)?;
-        let previous_hash = match previous {
-            Some(slot) => slot
-                .resolve(sequence.saturating_sub(1))?
-                .map_or(blake3::Hash::from_bytes([0; 32]), |previous| {
-                    previous.receipt.this_hash
-                }),
-            None => blake3::Hash::from_bytes([0; 32]),
-        };
-        let successor = successor
-            .map(|slot| slot.resolve(sequence.saturating_add(1)))
-            .transpose()?
-            .flatten();
-        let path = self
-            .source_log_path
-            .as_ref()
-            .ok_or(RiskInputsUnavailable::PriceMissing)?;
-        let byte_offset = metadata
-            .byte_offset
-            .ok_or(RiskInputsUnavailable::PriceMissing)?;
-        #[cfg(feature = "scenario")]
-        if let Some(pause) = pause {
-            pause();
-        }
-        let read = Reader::read_at(path.as_ref(), byte_offset, receipt.sequence, previous_hash);
-        // The commit may have advanced while the index lock was released, even if no
-        // bytes have been punched yet. A physical failure follows the same rule.
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Self::require_retained(&state, receipt.sequence)?;
-        let (envelope, end) = read.map_err(|_| RiskInputsUnavailable::PriceConflict)?;
-        if state
-            .retention
-            .as_ref()
-            .is_some_and(|authority| authority.pin(receipt.sequence).is_some())
-        {
-            let next = sequence
-                .checked_add(1)
-                .map(|next| state.slot(next))
-                .transpose()?;
-            let next_byte_offset = state.next_byte_offset;
-            drop(state);
-            // A successor seen before the read never changes; one appended since may already
-            // be retired, so it is read after the guard is released.
-            let successor = match (successor, next) {
-                (Some(frame), _) => Some(frame),
-                (None, Some(slot)) => slot.resolve(sequence.saturating_add(1))?,
-                (None, None) => None,
-            };
-            let expected_end = successor
-                .and_then(|frame| frame.byte_offset)
-                .or(next_byte_offset);
-            if expected_end != Some(end) {
+                    .transpose()?;
+                let next_byte_offset = state.next_byte_offset;
+                drop(state);
+                // A successor seen before the read never changes; one appended since may already
+                // be retired, so it is read after the guard is released.
+                let successor = match (successor, next) {
+                    (Some(frame), _) => Some(frame),
+                    (None, Some(slot)) => slot.resolve(sequence.saturating_add(1))?,
+                    (None, None) => None,
+                };
+                let expected_end = successor
+                    .and_then(|frame| frame.byte_offset)
+                    .or(next_byte_offset);
+                if expected_end != Some(end) {
+                    return Err(RiskInputsUnavailable::PriceConflict);
+                }
+            }
+            if envelope.this_hash != receipt.this_hash
+                || received_at_millis(&envelope.received_at)? != metadata.received_millis
+            {
                 return Err(RiskInputsUnavailable::PriceConflict);
             }
-        }
-        if envelope.this_hash != receipt.this_hash
-            || received_at_millis(&envelope.received_at)? != metadata.received_millis
-        {
-            return Err(RiskInputsUnavailable::PriceConflict);
-        }
-        Ok(envelope)
+            Ok(envelope)
+        })
     }
 
     fn require_retained(
@@ -2545,12 +2517,7 @@ impl SourceReceiptIndex {
     /// Every receipt from sequence zero, reading retired ones from the sidecar.
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> BTreeMap<EventSeq, (AppendReceipt, i64)> {
-        let len = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
-            .unwrap_or(0);
+        let len = self.with_read(|state| state.len().unwrap_or(0));
         (0..len)
             .filter_map(|sequence| self.receipt_at(EventSeq(sequence)).ok().flatten())
             .map(|(receipt, received_millis)| (receipt.sequence, (receipt, received_millis)))
@@ -2561,54 +2528,48 @@ impl SourceReceiptIndex {
     /// that still holds every receipt in memory (#745).
     #[cfg(test)]
     pub(crate) fn write_receipt_sidecar_for_test(&self) -> std::io::Result<()> {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.retired.count() != 0 {
-            return Err(std::io::Error::other("receipts already retired"));
-        }
-        let path = self
-            .source_log_path
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other("index has no source log"))?;
-        let bytes = state
-            .frames
-            .iter()
-            .flat_map(|frame| {
-                pe_event_log::ReceiptRecord {
-                    receipt: frame.receipt,
-                    received_millis: frame.received_millis,
-                    byte_offset: frame.byte_offset,
-                }
-                .encode()
-            })
-            .collect::<Vec<_>>();
-        std::fs::write(crate::source_checkpoint::receipts_path(path), bytes)
+        self.with_read(|state| {
+            if state.retired.count() != 0 {
+                return Err(std::io::Error::other("receipts already retired"));
+            }
+            let path = self
+                .source_log_path
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("index has no source log"))?;
+            let bytes = state
+                .frames
+                .iter()
+                .flat_map(|frame| {
+                    pe_event_log::ReceiptRecord {
+                        receipt: frame.receipt,
+                        received_millis: frame.received_millis,
+                        byte_offset: frame.byte_offset,
+                    }
+                    .encode()
+                })
+                .collect::<Vec<_>>();
+            std::fs::write(crate::source_checkpoint::receipts_path(path), bytes)
+        })
     }
 
     /// Bytes reserved for in-memory receipt metadata: the window's capacity (#745).
     #[cfg(test)]
     pub(crate) fn retained_frame_metadata_bytes(&self) -> usize {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::size_of::<SourceFrameMetadata>().saturating_mul(state.frames.capacity())
+        self.with_read(|state| {
+            std::mem::size_of::<SourceFrameMetadata>().saturating_mul(state.frames.capacity())
+        })
     }
 
     /// Window base, window length and window capacity, for lifecycle scenarios (#745).
     #[cfg(any(test, feature = "scenario"))]
     pub fn receipt_window_for_scenario(&self) -> (u64, usize, usize) {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (
-            state.retired.count(),
-            state.frames.len(),
-            state.frames.capacity(),
-        )
+        self.with_read(|state| {
+            (
+                state.retired.count(),
+                state.frames.len(),
+                state.frames.capacity(),
+            )
+        })
     }
 }
 
@@ -2849,21 +2810,49 @@ mod tests {
         staging
     }
 
+    #[test]
+    fn blocking_receipt_index_write_preserves_runtime_progress() {
+        receipt_index_preserves_runtime_progress(false);
+    }
+
+    #[test]
+    fn blocking_receipt_index_read_preserves_runtime_progress() {
+        receipt_index_preserves_runtime_progress(true);
+    }
+
+    fn receipt_index_preserves_runtime_progress(read: bool) {
+        let index = SourceReceiptIndex::default();
+        let holder = index.clone();
+        crate::runtime_progress::assert_progress(
+            move |entered, release| {
+                holder.with_write(|_| {
+                    entered.send(()).unwrap();
+                    release.recv().unwrap();
+                })
+            },
+            move || {
+                if read {
+                    assert_eq!(index.retention_epoch(), 0);
+                } else {
+                    index.with_write(|state| assert!(state.frames.is_empty()));
+                }
+            },
+        );
+    }
+
     type SourceIndexSnapshot = (Vec<(AppendReceipt, i64, Option<u64>)>, Option<u64>);
 
     fn source_index_snapshot(index: &SourceReceiptIndex) -> SourceIndexSnapshot {
-        let state = index
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (
-            state
-                .frames
-                .iter()
-                .map(|frame| (frame.receipt, frame.received_millis, frame.byte_offset))
-                .collect(),
-            state.next_byte_offset,
-        )
+        index.with_read(|state| {
+            (
+                state
+                    .frames
+                    .iter()
+                    .map(|frame| (frame.receipt, frame.received_millis, frame.byte_offset))
+                    .collect(),
+                state.next_byte_offset,
+            )
+        })
     }
 
     fn frame(sequence: u64, unix: i64, record: PaperLogRecord) -> Arc<ScannedPaperFrame> {
@@ -3764,12 +3753,7 @@ mod tests {
         assert_eq!(from_index, HashSet::from([EventSeq(1)]));
 
         let missing_index = SourceReceiptIndex::replay(&source_path).unwrap();
-        missing_index
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .frames
-            .clear();
+        missing_index.with_write(|state| state.frames.clear());
         assert_eq!(
             completed_prepared_before_boundary_indexed(&era, &missing_index, 10_000, boundary),
             Err(RiskInputsUnavailable::PriceMissing)
@@ -3888,14 +3872,7 @@ mod tests {
                 .unwrap();
             // A verification that started before the commit now attempts to cache its result.
             let _ = index.remember_verified_frontier(&frontier, 0);
-            assert!(
-                index
-                    .state
-                    .read()
-                    .unwrap()
-                    .verified_feed_frontiers
-                    .is_empty()
-            );
+            assert!(index.with_read(|state| state.verified_feed_frontiers.is_empty()));
             assert!(index.verify_frame_frontier(&frontier).is_err());
         }
     }
@@ -4104,13 +4081,9 @@ mod tests {
         writer.append_synced(source_input(10, b"first")).unwrap();
         drop(writer);
         let index = SourceReceiptIndex::replay(&source_path).unwrap();
-        index
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .frames[0]
-            .receipt
-            .this_hash = blake3::Hash::from_bytes([99; 32]);
+        index.with_write(|state| {
+            state.frames[0].receipt.this_hash = blake3::Hash::from_bytes([99; 32])
+        });
         let before = source_index_snapshot(&index);
 
         let mut writer = Writer::open(&source_path).unwrap();
@@ -5449,6 +5422,50 @@ mod tests {
 
             index.install_retention(later).unwrap();
             assert_eq!(index.receipt_window_for_scenario(), (11, 9, 9));
+        }
+
+        #[cfg(feature = "scenario")]
+        #[test]
+        fn blocking_frame_read_preserves_runtime_progress_and_retention_interleaving() {
+            let fixture = WindowFixture::new(10);
+            let index = SourceReceiptIndex::replay(&fixture.path).unwrap();
+            let receipt = fixture.at(9).receipt;
+            let authority = fixture.authority(7, &[3], 1);
+            let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let holder_gate = Arc::clone(&gate);
+            let holder = index.clone();
+            crate::runtime_progress::assert_progress(
+                move |entered, release| {
+                    holder
+                        .source_envelope_with_pause(receipt, &mut || {
+                            // Installation must still acquire the index while the frame read is paused.
+                            holder.install_retention(authority.clone()).unwrap();
+                            entered.send(()).unwrap();
+                            release.recv().unwrap();
+                            let (lock, ready) = &*holder_gate;
+                            *lock.lock().unwrap() = true;
+                            ready.notify_all();
+                        })
+                        .unwrap();
+                },
+                move || {
+                    let read = index
+                        .source_envelope_with_pause(receipt, &mut || {
+                            let (lock, ready) = &*gate;
+                            let open = lock.lock().unwrap();
+                            let (open, _) = ready
+                                .wait_timeout_while(
+                                    open,
+                                    std::time::Duration::from_secs(8),
+                                    |open| !*open,
+                                )
+                                .unwrap();
+                            assert!(*open, "frame-read watchdog did not release");
+                        })
+                        .unwrap();
+                    assert_eq!(read.payload, payload_at(9));
+                },
+            );
         }
 
         /// PASS: a retention switch between catch-up's recovery and its extension moves the

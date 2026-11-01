@@ -9,6 +9,7 @@ All first-party production services, clients, parsers, models, replay tools, CLI
 ## Rust baseline
 
 - **Edition/toolchain:** Rust 2024 Edition, stable Rust 1.95.0 toolchain, `Cargo.lock` committed, reproducible builds.
+- New synchronous database or file work goes through the existing runtime-aware I/O owners (`pe_event_log::run_blocking`), including acquisition and complete use of locks held across I/O.
 - **Async:** `tokio`, `tokio-tungstenite`, `reqwest`/`hyper`, `tower`, `axum`.
 - **Serialization/parsing:** `serde`, `serde_json`, `simd-json` for benchmarked hot paths, `csv`, `quick-xml`, `scraper`, `schemars`.
 - **Numerics:** `rust_decimal` and integer ticks/cents/basis-points. No raw `f64` for venue prices, money, contract counts, or probabilities.

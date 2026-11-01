@@ -16,7 +16,7 @@ use pe_source_polymarket_public::ActivityAggregate;
 use pe_trader_index::WatchlistEntry;
 use tokio::sync::oneshot;
 
-use crate::bucket_commit::{BucketCommitResult, BucketDecisionContext};
+use crate::bucket_commit::{BucketCommitError, BucketCommitResult, BucketDecisionContext};
 use crate::paper_recovery::{HaltState, MembershipChange, RiskHaltOwner};
 use crate::position_seeder::AnchorInstall;
 use crate::watchlist_maintenance::MembershipCommit;
@@ -49,6 +49,13 @@ pub struct AdmissionLedgerCapture {
 
 /// A control-plane update consumed ahead of trade events by the orchestrator's biased select.
 pub enum OrchestratorControl {
+    /// Apply one fully recorded ranking import between decisions and bucket commits.
+    ImportScopeDrops {
+        batch_id: i64,
+        drops: Vec<(pe_paper_state::WalletScopeDrop, AppendReceipt)>,
+        group_ids: std::collections::BTreeSet<String>,
+        acknowledged: oneshot::Sender<Result<(), String>>,
+    },
     /// Commit a retention boundary while dispatch staging is excluded by the single owner.
     RetentionCommit {
         request: Box<crate::source_checkpoint::retention::RetentionCommitRequest>,
@@ -91,7 +98,7 @@ pub enum OrchestratorControl {
     CommitActivityBucket {
         aggregates: Vec<ActivityAggregate>,
         context: Arc<BucketDecisionContext>,
-        committed: oneshot::Sender<Result<BucketCommitResult, String>>,
+        committed: oneshot::Sender<Result<BucketCommitResult, BucketCommitError>>,
     },
     /// CLOB resolution evidence was durably appended by the caller. The orchestrator
     /// serializes its Prepared/authority/local/Final financial transition.

@@ -246,7 +246,7 @@ fn wallet(byte: u8) -> WalletAddress {
 }
 
 fn condition(byte: u8) -> String {
-    format!("0xcondition{byte:02x}")
+    format!("0x{byte:02x}")
 }
 
 fn asset(byte: u8) -> String {
@@ -947,6 +947,9 @@ fn recording_validator(
 fn fresh(wallets: &[WalletAddress]) -> (TempDir, Arc<PaperStateDb>, BucketCommitEngine) {
     let dir = tempfile::tempdir().unwrap();
     let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    for byte in 0..=20 {
+        paper.record_market_group(&condition(byte), "").unwrap();
+    }
     for wallet in wallets {
         paper
             .record_reconciled_history_status(&WalletHistoryStatusRecord {
@@ -1082,11 +1085,8 @@ fn spawn_hooked_control_actor(
                     context,
                     committed,
                 } => {
-                    let _ = committed.send(
-                        engine
-                            .commit(aggregates, context.as_ref(), zero_basis())
-                            .map_err(|error| error.to_string()),
-                    );
+                    let _ =
+                        committed.send(engine.commit(aggregates, context.as_ref(), zero_basis()));
                 }
                 _ => {}
             }
@@ -1123,7 +1123,7 @@ fn canonical_capture_hash_matches_sorted_anchored_balances() {
     let capture = ledger_capture(&ledger, &paper, wallet).unwrap();
     assert_eq!(
         capture.hash,
-        "c08a170362315f92f6ee39615f7db11e308c4a7db8f2b1b044813fe8a67113c4"
+        "0c1103df5cb64a019c388cc8ad90da7873099d145ff08a5465736c44c2a43fe6"
     );
     assert_eq!(capture.cursor, Some(42));
     assert_eq!(capture.anchor_seq, None);
@@ -1298,12 +1298,12 @@ async fn full_history_repairs_all_older_markets_and_preserves_old_records_on_res
                     .unwrap();
                 assert!(result.pending.is_empty());
                 if side == "BUY" {
-                    assert!(
-                        result
-                            .dispositions
-                            .values()
-                            .all(|value| value == "not_first_entry")
-                    );
+                    assert!(result.dispositions.values().all(|value| value
+                        == if matches!(kind, "anchored" | "seeded") {
+                            "scope_dropped"
+                        } else {
+                            "not_first_entry"
+                        }));
                 }
             }
         }
@@ -1353,12 +1353,12 @@ async fn full_history_repairs_all_older_markets_and_preserves_old_records_on_res
                     .unwrap();
                 assert!(result.pending.is_empty());
                 if side == "BUY" {
-                    assert!(
-                        result
-                            .dispositions
-                            .values()
-                            .all(|value| value == "not_first_entry")
-                    );
+                    assert!(result.dispositions.values().all(|value| value
+                        == if matches!(kind, "anchored" | "seeded") {
+                            "scope_dropped"
+                        } else {
+                            "not_first_entry"
+                        }));
                 }
             }
         }
@@ -2719,7 +2719,7 @@ async fn concurrent_shared_corrected_asset_replays_identically_in_both_completio
 }
 
 #[tokio::test]
-async fn concurrent_fenced_and_deferred_wallets_do_not_abort_healthy_install() {
+async fn concurrent_scoped_and_deferred_wallets_do_not_abort_healthy_install() {
     let fenced = wallet(0x15);
     let deferred = wallet(0x16);
     let healthy = wallet(0x17);
@@ -2730,7 +2730,7 @@ async fn concurrent_fenced_and_deferred_wallets_do_not_abort_healthy_install() {
     underflow["type"] = json!("REDEEM");
     responses.insert(
         activity_url(fenced),
-        vec![serde_json::to_vec(&vec![underflow]).unwrap()],
+        vec![serde_json::to_vec(&vec![underflow]).unwrap(); 3],
     );
     responses.insert(
         activity_url(deferred),
@@ -2744,6 +2744,12 @@ async fn concurrent_fenced_and_deferred_wallets_do_not_abort_healthy_install() {
         position_url(deferred, PositionPartition::Redeemable),
         vec![b"[]".to_vec()],
     );
+    for partition in [
+        PositionPartition::NotRedeemable,
+        PositionPartition::Redeemable,
+    ] {
+        responses.insert(position_url(fenced, partition), vec![b"[]".to_vec(); 2]);
+    }
     let fetcher = Arc::new(GatedFetcher::new(
         responses,
         vec![fenced, deferred, healthy],
@@ -2757,10 +2763,10 @@ async fn concurrent_fenced_and_deferred_wallets_do_not_abort_healthy_install() {
         .validate_direct(&[fenced, deferred, healthy], &mut engine, &paper)
         .await
         .unwrap();
-    assert_eq!(accepted.len(), 1);
-    assert_eq!(accepted[0].wallet, healthy);
-    assert!(paper.is_wallet_fenced(&fenced).unwrap());
-    assert!(paper.position_validation(&fenced).unwrap().is_none());
+    assert_eq!(accepted.len(), 2);
+    assert!(accepted.iter().any(|anchor| anchor.wallet == healthy));
+    assert!(!paper.is_wallet_fenced(&fenced).unwrap());
+    assert!(paper.position_validation(&fenced).unwrap().is_some());
     assert!(paper.position_validation(&deferred).unwrap().is_none());
     assert!(paper.position_validation(&healthy).unwrap().is_some());
 }
@@ -2868,7 +2874,7 @@ async fn intervening_once_retries_then_accepts_and_clears_reanchor() {
 }
 
 #[tokio::test]
-async fn changed_activity_revision_fences_and_installs_nothing() {
+async fn changed_activity_revision_drops_scope_and_completes_on_retry() {
     let wallet = wallet(0x31);
     let (_dir, paper, mut engine) = fresh(&[wallet]);
     let first =
@@ -2877,23 +2883,36 @@ async fn changed_activity_revision_fences_and_installs_nothing() {
         serde_json::to_vec(&vec![activity(wallet, 1, "2.000000", "0xrevision", 10)]).unwrap();
     let positions = serde_json::to_vec(&vec![position(wallet, 1, "1.000000")]).unwrap();
     let responses = HashMap::from([
-        (activity_url(wallet), vec![first, changed]),
+        (
+            activity_url(wallet),
+            vec![
+                first,
+                changed.clone(),
+                changed.clone(),
+                changed.clone(),
+                changed,
+            ],
+        ),
         (
             position_url(wallet, PositionPartition::NotRedeemable),
-            vec![positions],
+            vec![positions.clone(), positions.clone(), positions],
         ),
         (
             position_url(wallet, PositionPartition::Redeemable),
-            vec![b"[]".to_vec()],
+            vec![b"[]".to_vec(); 3],
         ),
     ]);
     let accepted = validator(responses)
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
-        .expect("a deterministic durable fence is quarantined, not boot-fatal");
-    assert!(accepted.is_empty());
-    assert!(paper.is_wallet_fenced(&wallet).unwrap());
-    assert!(paper.position_validation(&wallet).unwrap().is_none());
+        .expect("a retained revision retries the bracket");
+    assert_eq!(accepted.len(), 1);
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+    assert!(paper.position_validation(&wallet).unwrap().is_some());
+    assert_eq!(
+        paper.wallet_scope_drops(&wallet, END).unwrap()[0].cause,
+        "revised_applied_aggregate"
+    );
 }
 
 #[tokio::test]
@@ -3611,18 +3630,14 @@ async fn serialized_admission_preparer_runs_the_bracket_before_acknowledgement()
                     context,
                     committed,
                 } => {
-                    let _ = committed.send(
-                        engine
-                            .commit(
-                                aggregates,
-                                context.as_ref(),
-                                pe_service::bucket_commit::FrozenDecisionBasis {
-                                    win_rate_p: pe_core_types::Probability::ZERO,
-                                    bankroll: rust_decimal::Decimal::ZERO,
-                                },
-                            )
-                            .map_err(|error| error.to_string()),
-                    );
+                    let _ = committed.send(engine.commit(
+                        aggregates,
+                        context.as_ref(),
+                        pe_service::bucket_commit::FrozenDecisionBasis {
+                            win_rate_p: pe_core_types::Probability::ZERO,
+                            bankroll: rust_decimal::Decimal::ZERO,
+                        },
+                    ));
                 }
                 _ => {}
             }
@@ -3666,7 +3681,7 @@ async fn periodic_refresh_skips_an_existing_fence_but_genuine_admission_stays_fa
 }
 
 #[tokio::test]
-async fn periodic_refresh_skips_a_wallet_newly_fenced_inside_the_bracket() {
+async fn periodic_refresh_defers_repeated_revisions_without_fencing() {
     let wallet = wallet(0x77);
     let (_dir, paper, mut engine) = fresh(&[wallet]);
     install_empty_anchor(&mut engine, &paper, wallet, 0);
@@ -3698,12 +3713,12 @@ async fn periodic_refresh_skips_a_wallet_newly_fenced_inside_the_bracket() {
     );
     let anchors_before = paper.position_anchors(&wallet).unwrap();
 
-    // A recoverable fence permits one retry; another novel revision defers without installing.
+    // Another novel revision exhausts the bounded retry without installing.
     assert_eq!(
         preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
         AnchorRefreshOutcome::Deferred
     );
-    assert!(paper.is_wallet_fenced(&wallet).unwrap());
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
     assert_eq!(paper.position_anchors(&wallet).unwrap(), anchors_before);
     assert_eq!(
         fetcher
@@ -3747,7 +3762,7 @@ async fn paper_service_rollout_periodic_refresh_recovers_a_stable_revision_on_bo
         validator_from_fetcher(Arc::clone(&fetcher)),
     );
 
-    // The first read retains R1 and fences; the bounded retry sees only that disposed revision.
+    // The first read retains R1; the bounded retry recognizes the exact revision.
     assert_eq!(
         preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
         AnchorRefreshOutcome::Anchored
@@ -3760,8 +3775,11 @@ async fn paper_service_rollout_periodic_refresh_recovers_a_stable_revision_on_bo
     assert_eq!(anchor.activity_cutoff_unix, END);
     assert_full_history_proof(&anchor.proof_json);
     let proof: Value = serde_json::from_str(&anchor.proof_json).unwrap();
-    assert_eq!(proof["cleared_fence"]["cause"], "revised_applied_aggregate");
-    assert_eq!(proof["cleared_fence"]["source_trade_id"], id.0);
+    assert!(proof["cleared_fence"].is_null());
+    assert_eq!(
+        paper.wallet_scope_drops(&wallet, END).unwrap()[0].cause,
+        "revised_applied_aggregate"
+    );
     assert!(paper.position_validation_current(&wallet).unwrap());
     let coverage = paper.wallet_coverage(&wallet).unwrap();
     assert_eq!(coverage.activity_cutoff_unix, Some(END));
@@ -3781,7 +3799,7 @@ async fn paper_service_rollout_periodic_refresh_recovers_a_stable_revision_on_bo
             .unwrap()
             .unwrap()
             .disposition,
-        "revised_applied_aggregate"
+        "scope_dropped"
     );
     assert_eq!(paper.decision_pending_history().unwrap(), pending);
     assert_eq!(
@@ -3987,7 +4005,7 @@ fn cursor_and_anchor_sequence_cas_reject_stale_expectations() {
 }
 
 #[test]
-fn covered_late_generation_change_rejects_an_otherwise_unchanged_anchor() {
+fn covered_late_scope_drop_survives_an_unchanged_anchor() {
     let wallet = wallet(0x67);
     let (_dir, paper, mut engine) = fresh(&[wallet]);
     install_empty_anchor(&mut engine, &paper, wallet, 100);
@@ -4025,16 +4043,17 @@ fn covered_late_generation_change_rejects_an_otherwise_unchanged_anchor() {
         )
         .unwrap();
 
-    assert!(matches!(
-        engine.install_anchors(&[candidate]),
-        Err(pe_service::bucket_commit::AnchorInstallError::CoverageGenerationChanged { .. })
-    ));
+    engine.install_anchors(&[candidate]).unwrap();
     let after = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
     assert_eq!(after.hash, captured.hash);
     assert_eq!(after.cursor, captured.cursor);
-    assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 1);
-    assert!(paper.position_validation(&wallet).unwrap().is_none());
-    assert!(paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+    assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 2);
+    assert!(paper.position_validation(&wallet).unwrap().is_some());
+    assert!(!paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+    assert_eq!(
+        paper.wallet_scope_drops(&wallet, 100).unwrap()[0].scope_id,
+        condition(2)
+    );
 }
 
 #[test]
@@ -4381,11 +4400,7 @@ async fn anchor_install_ledger_race_defers_one_wallet_and_durability_aborts() {
                         committed,
                     } => {
                         committed
-                            .send(
-                                engine
-                                    .commit(aggregates, context.as_ref(), zero_basis())
-                                    .map_err(|error| error.to_string()),
-                            )
+                            .send(engine.commit(aggregates, context.as_ref(), zero_basis()))
                             .unwrap();
                     }
                     OrchestratorControl::InstallAnchors {
@@ -4567,11 +4582,7 @@ async fn each_source_error_variant_aborts_admission_preparation() {
 }
 
 #[tokio::test]
-async fn boot_bracket_quarantines_a_newly_fenced_wallet_and_accepts_the_rest() {
-    // Live shape from the #544 activation rehearsal: one wallet's visible
-    // activity cannot reconstruct its holdings (position_underflow), the
-    // commit fences it durably, and the boot bracket must continue with the
-    // remaining universe instead of aborting the one-shot activation.
+async fn boot_bracket_keeps_a_scoped_problem_wallet_and_accepts_the_rest() {
     let fenced_wallet = wallet(0x71);
     let healthy = wallet(0x72);
     let (_dir, paper, mut engine) = fresh(&[fenced_wallet, healthy]);
@@ -4582,18 +4593,31 @@ async fn boot_bracket_quarantines_a_newly_fenced_wallet_and_accepts_the_rest() {
     underflow_redeem["type"] = json!("REDEEM");
     responses.insert(
         activity_url(fenced_wallet),
-        vec![serde_json::to_vec(&vec![underflow_redeem]).unwrap()],
+        vec![serde_json::to_vec(&vec![underflow_redeem]).unwrap(); 3],
     );
 
+    for partition in [
+        PositionPartition::NotRedeemable,
+        PositionPartition::Redeemable,
+    ] {
+        responses.insert(
+            position_url(fenced_wallet, partition),
+            vec![b"[]".to_vec(); 2],
+        );
+    }
     let accepted = validator(responses)
         .validate_direct(&[fenced_wallet, healthy], &mut engine, &paper)
         .await
-        .expect("a per-wallet fence must not abort the boot bracket");
+        .expect("a scoped problem must not abort the boot bracket");
 
-    assert_eq!(accepted.len(), 1);
-    assert_eq!(accepted[0].wallet, healthy);
-    assert!(paper.is_wallet_fenced(&fenced_wallet).unwrap());
-    assert!(paper.position_validation(&fenced_wallet).unwrap().is_none());
+    assert_eq!(accepted.len(), 2);
+    assert!(accepted.iter().any(|anchor| anchor.wallet == healthy));
+    assert!(!paper.is_wallet_fenced(&fenced_wallet).unwrap());
+    assert!(paper.position_validation(&fenced_wallet).unwrap().is_some());
+    assert_eq!(
+        paper.wallet_scope_drops(&fenced_wallet, END).unwrap().len(),
+        1
+    );
     assert!(paper.position_validation(&healthy).unwrap().is_some());
 }
 
@@ -5497,11 +5521,7 @@ async fn runtime_rejected_brackets_do_not_complete_history() {
                         context,
                         committed,
                     } => {
-                        let _ = committed.send(
-                            engine
-                                .commit(aggregates, &context, zero_basis())
-                                .map_err(|error| error.to_string()),
-                        );
+                        let _ = committed.send(engine.commit(aggregates, &context, zero_basis()));
                     }
                     OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
                         let _ = captured.send(
@@ -5524,15 +5544,13 @@ async fn runtime_rejected_brackets_do_not_complete_history() {
                                     .unwrap();
                             }
                             "cas_fenced" => {
-                                let mut row = activity(wallet, 9, "2", "0xinstall-fence", 110);
-                                row["type"] = json!("REDEEM");
-                                engine
-                                    .commit(
-                                        vec![aggregate(row, wallet)],
-                                        &context(110),
-                                        zero_basis(),
-                                    )
-                                    .unwrap();
+                                rusqlite::Connection::open(&state_path).unwrap().execute(
+                                    "INSERT INTO wallet_fences VALUES (?1, 'legacy', 'position_underflow', '{}', 110)", [wallet.to_string()]).unwrap();
+                                engine = BucketCommitEngine::load(
+                                    actor_paper.clone(),
+                                    engine.ledger().clone(),
+                                )
+                                .unwrap();
                                 assert!(engine.is_fenced(&wallet));
                             }
                             "cas_cursor" => {
@@ -6444,6 +6462,10 @@ fn rollout_record_effect_with_cursor(
 ) {
     paper
         .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+            scope_drops: Vec::new(),
+            observation_retirements: Vec::new(),
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
             wallet: row.group_id.components().wallet,
             source_epoch: row.source_time.0.unix_timestamp(),
             dispositions: vec![pe_paper_state::ActivityDispositionRecord {
@@ -7706,11 +7728,9 @@ async fn reentry_baseline_refuses_previously_raw_only_unknown_effect() {
     actor.await.unwrap();
 }
 
-/// PASS: a live conversion fences its wallet; the fenced re-entry clears that fence, installs the
-/// stable positions, repairs history from the BUY alone, and re-reading the stored conversion
-/// does not fence again. FAIL: the conversion blocks recovery, consumes history, or re-fences.
+/// A conversion drop survives re-entry and history includes only the BUY.
 #[tokio::test]
-async fn live_conversion_fence_recovers_through_reentry_with_buy_only_history() {
+async fn conversion_scope_survives_reentry_with_buy_only_history() {
     let wallet = wallet(0xe6);
     let (dir, paper, mut engine) = fresh(&[wallet]);
     install_empty_anchor(&mut engine, &paper, wallet, 5);
@@ -7725,7 +7745,7 @@ async fn live_conversion_fence_recovers_through_reentry_with_buy_only_history() 
     };
     engine.commit(groups(), &context(10), zero_basis()).unwrap();
     assert_eq!(
-        paper.wallet_fence(&wallet).unwrap().unwrap().cause,
+        paper.wallet_scope_drops(&wallet, END).unwrap()[0].cause,
         "conversion_unknown_conditions"
     );
 
@@ -7760,8 +7780,9 @@ async fn live_conversion_fence_recovers_through_reentry_with_buy_only_history() 
         .max_by_key(|anchor| anchor.anchor_seq)
         .unwrap();
     let proof: Value = serde_json::from_str(&anchor.proof_json).unwrap();
+    assert!(proof["cleared_fence"].is_null());
     assert_eq!(
-        proof["cleared_fence"]["cause"],
+        paper.wallet_scope_drops(&wallet, 4003).unwrap()[0].cause,
         "conversion_unknown_conditions"
     );
     assert!(anchor.balances_json.contains(&condition(1)));
@@ -8164,4 +8185,597 @@ async fn reentry_union_mapping_rejects_baseline_tail_classification_conflict() {
     assert!(!fetcher.urls().iter().any(|url| url.contains("/positions?")));
     drop(tx);
     actor.await.unwrap();
+}
+
+/// AC6: both real bracket entry points reacquire cold evidence through the existing
+/// membership read; the direct form replays its rolled-back activity batch.
+#[tokio::test]
+async fn membership_cold_and_warm_bracket_acknowledgements_classify_identically() {
+    use axum::{Json, Router, extract::Path, http::StatusCode, routing::get};
+    use pe_source_polymarket_public::ReqwestFetcher;
+    for case in [
+        "healthy",
+        "market_drop",
+        "merge",
+        "redemption",
+        "event_trade",
+        "conversion_token",
+        "unknown_token",
+        "ranker_group",
+        "ranker_zero_unknown",
+        "legacy_group",
+        "absent_token",
+        "absent_no_token",
+        "unknown_group",
+        "removed_group",
+        "grouped_market",
+        "ungrouped_market",
+        "revised",
+        "partial",
+        "late_split",
+        "late_merge",
+        "covered",
+        "flat_late_conversion",
+    ] {
+        let mut expected = None;
+        for direct in [false, true] {
+            for warm in [false, true] {
+                let wallet = wallet(0xa1);
+                let (dir, paper, mut engine) = fresh(&[wallet]);
+                install_empty_anchor(
+                    &mut engine,
+                    &paper,
+                    wallet,
+                    if matches!(case, "covered" | "flat_late_conversion") {
+                        25
+                    } else {
+                        5
+                    },
+                );
+                let event = matches!(
+                    case,
+                    "event_trade"
+                        | "conversion_token"
+                        | "unknown_token"
+                        | "ranker_group"
+                        | "ranker_zero_unknown"
+                        | "legacy_group"
+                        | "absent_token"
+                        | "grouped_market"
+                        | "flat_late_conversion"
+                );
+                let memberships = HashMap::from([
+                    (condition(1), "".to_owned()),
+                    (condition(0x21), if event { "0xee" } else { "" }.to_owned()),
+                    ("0xcd".to_owned(), "absent".to_owned()),
+                    ("0xee".to_owned(), "absent".to_owned()),
+                ]);
+                let mut problem = activity(wallet, 0x21, "1", "membership-problem", 20);
+                problem["type"] = json!("MERGE");
+                problem.as_object_mut().unwrap().remove("asset");
+                match case {
+                    "redemption" | "event_trade" => {
+                        problem["type"] = json!(if case == "redemption" {
+                            "REDEEM"
+                        } else {
+                            "TRADE"
+                        });
+                        problem["conditionId"] = json!("0xcd");
+                        problem["asset"] = json!(asset(0x21));
+                    }
+                    "conversion_token" | "unknown_token" => {
+                        problem["type"] = json!(if case == "unknown_token" {
+                            "MYSTERY"
+                        } else {
+                            "CONVERSION"
+                        });
+                        problem["asset"] = json!(asset(0x21));
+                        problem.as_object_mut().unwrap().remove("conditionId");
+                    }
+                    "ranker_group"
+                    | "ranker_zero_unknown"
+                    | "legacy_group"
+                    | "unknown_group"
+                    | "removed_group"
+                    | "flat_late_conversion" => {
+                        problem["type"] = json!(if case == "ranker_zero_unknown" {
+                            "MYSTERY"
+                        } else {
+                            "CONVERSION"
+                        });
+                        problem["conditionId"] = json!("0xee");
+                        if case == "ranker_zero_unknown" {
+                            problem["size"] = json!("0");
+                        }
+                    }
+                    "absent_token" | "absent_no_token" => {
+                        problem["type"] = json!("CONVERSION");
+                        problem["conditionId"] = json!("0xcd");
+                        if case == "absent_token" {
+                            problem["asset"] = json!(asset(0x21));
+                        }
+                    }
+                    "grouped_market" | "ungrouped_market" => {
+                        problem["type"] = json!("CONVERSION");
+                    }
+                    "late_split" => {
+                        problem["type"] = json!("SPLIT");
+                    }
+                    _ => {}
+                }
+                let mut rows = if matches!(case, "healthy" | "market_drop") {
+                    vec![]
+                } else {
+                    vec![problem.clone()]
+                };
+                rows.push(activity(wallet, 1, "1", "healthy", 20));
+                if case == "revised" {
+                    let mut original = problem.clone();
+                    original["size"] = json!("0");
+                    engine
+                        .commit(
+                            vec![aggregate(original, wallet)],
+                            &context(20),
+                            zero_basis(),
+                        )
+                        .unwrap();
+                }
+                if matches!(case, "partial" | "late_split" | "late_merge") {
+                    let mut prior = activity(
+                        wallet,
+                        2,
+                        "1",
+                        "prior",
+                        if case == "partial" { 20 } else { 30 },
+                    );
+                    prior["type"] = json!("REWARD");
+                    engine
+                        .commit(
+                            vec![aggregate(prior.clone(), wallet)],
+                            &context(30),
+                            zero_basis(),
+                        )
+                        .unwrap();
+                    rows.push(prior);
+                }
+                let conn = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+                for (market, membership) in &memberships {
+                    conn.execute(
+                        "DELETE FROM meta WHERE key = ?1",
+                        [format!("neg_risk_group:{market}")],
+                    )
+                    .unwrap();
+                    if warm {
+                        paper.record_market_group(market, membership).unwrap();
+                    }
+                }
+                if case == "legacy_group" {
+                    paper.record_market_group("0xcf", "0xee").unwrap();
+                }
+                let group_set = if matches!(
+                    case,
+                    "ranker_group"
+                        | "ranker_zero_unknown"
+                        | "removed_group"
+                        | "flat_late_conversion"
+                ) {
+                    std::collections::BTreeSet::from(["0xee".to_owned()])
+                } else {
+                    Default::default()
+                };
+                let prior_drop = match case {
+                    "market_drop" => Some(("market", condition(0x21))),
+                    "event_trade" => Some(("event", "0xee".to_owned())),
+                    _ => None,
+                };
+                let drops = prior_drop
+                    .map(|(kind, id)| {
+                        (
+                            pe_paper_state::WalletScopeDrop {
+                                wallet,
+                                scope_kind: kind.to_owned(),
+                                scope_id: id,
+                                cause: "imported".to_owned(),
+                                source_trade_id: None,
+                                dropped_at_epoch: 6,
+                                proof_json: "{}".to_owned(),
+                                recorded_at_unix: 10,
+                            },
+                            pe_event_log::AppendReceipt {
+                                sequence: pe_core_types::EventSeq(0),
+                                this_hash: blake3::hash(b"fixture"),
+                            },
+                        )
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                paper.import_scope_drops(1, &drops, &group_set).unwrap();
+                if case == "removed_group" {
+                    paper
+                        .import_scope_drops(2, &[], &Default::default())
+                        .unwrap();
+                }
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let server_calls = calls.clone();
+                let answers = memberships.clone();
+                let app = Router::new().route("/markets/{market}", get(move |Path(market): Path<String>| {
+                    let calls = server_calls.clone();
+                    let membership = answers[&market].clone();
+                    async move {
+                        calls.lock().unwrap().push(market.clone());
+                        if membership == "absent" { (StatusCode::NOT_FOUND, Json(json!({"error":"market not found"}))) }
+                        else { (StatusCode::OK, Json(json!({"condition_id":market, "neg_risk":!membership.is_empty(), "neg_risk_market_id":membership}))) }
+                    }
+                }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let fetcher = Arc::new(QueueFetcher::new(HashMap::from([
+                    (
+                        activity_url(wallet),
+                        vec![serde_json::to_vec(&rows).unwrap(); 6],
+                    ),
+                    (
+                        position_url(wallet, PositionPartition::NotRedeemable),
+                        vec![serde_json::to_vec(&[position(wallet, 1, "1")]).unwrap(); 4],
+                    ),
+                    (
+                        position_url(wallet, PositionPartition::Redeemable),
+                        vec![b"[]".to_vec(); 4],
+                    ),
+                    (
+                        condition_url(0x21, false),
+                        vec![condition_metadata(0x21, false)],
+                    ),
+                ])));
+                let source_path = dir.path().join("membership.log");
+                let source = pe_service::activity_ingest::SourceLogHandle::boot(Arc::new(
+                    tokio::sync::Mutex::new(SourceEventSink::open(&source_path).unwrap()),
+                ));
+                let validator = validator_from_fetcher(fetcher).with_market_membership(
+                    if matches!(case, "healthy" | "market_drop") {
+                        "http://127.0.0.1:0".to_owned()
+                    } else {
+                        format!("http://{address}")
+                    },
+                    Arc::new(
+                        ReqwestFetcher::new(reqwest::Client::new())
+                            .with_max_retries(0)
+                            .with_min_interval_ms(0),
+                    ),
+                    source,
+                );
+                if direct {
+                    let result = validator
+                        .validate_direct(&[wallet], &mut engine, &paper)
+                        .await;
+                    assert!(result.is_ok(), "{case}/{direct}/{warm}: {result:?}");
+                } else {
+                    let (tx, rx) = mpsc::channel(2);
+                    let actor = spawn_control_actor(rx, engine, paper.clone());
+                    let outcomes = validator
+                        .validate_via_control(
+                            &[wallet],
+                            &tx,
+                            &paper,
+                            pe_service::position_seeder::ValidationPurpose::CatchUp,
+                            None,
+                        )
+                        .await;
+                    assert!(
+                        outcomes.shared.is_none(),
+                        "{case}/{direct}/{warm}: {:?}",
+                        outcomes.shared
+                    );
+                    assert!(
+                        outcomes.deferred.is_empty(),
+                        "{case}/{direct}/{warm}: {:?}",
+                        outcomes.deferred
+                    );
+                    assert_eq!(outcomes.accepted.len(), 1, "{case}/{direct}/{warm}");
+                    let (acknowledged, result) = tokio::sync::oneshot::channel();
+                    tx.send(OrchestratorControl::InstallAnchors {
+                        installs: outcomes.accepted,
+                        acknowledged,
+                    })
+                    .await
+                    .unwrap();
+                    result.await.unwrap().unwrap();
+                    drop(tx);
+                    actor.await.unwrap();
+                }
+                drop(validator);
+                server.abort();
+                assert!(
+                    paper.wallet_fences().unwrap().is_empty(),
+                    "{case}/{direct}/{warm}"
+                );
+                let expected_scope = match case {
+                    "healthy" | "absent_no_token" | "unknown_group" | "removed_group" => None,
+                    "event_trade"
+                    | "conversion_token"
+                    | "unknown_token"
+                    | "ranker_group"
+                    | "ranker_zero_unknown"
+                    | "legacy_group"
+                    | "absent_token"
+                    | "grouped_market"
+                    | "flat_late_conversion" => Some(("event", "0xee".to_owned())),
+                    _ => Some(("market", condition(0x21))),
+                };
+                let actual_scopes = paper
+                    .wallet_scope_drops(&wallet, END)
+                    .unwrap()
+                    .into_iter()
+                    .map(|drop| (drop.scope_kind, drop.scope_id))
+                    .collect::<Vec<_>>();
+                let mut expected_scopes = expected_scope
+                    .into_iter()
+                    .map(|(kind, id)| (kind.to_owned(), id))
+                    .collect::<Vec<_>>();
+                let late = matches!(
+                    case,
+                    "partial" | "late_split" | "late_merge" | "covered" | "flat_late_conversion"
+                );
+                if late {
+                    expected_scopes.push(("market".to_owned(), condition(1)));
+                    expected_scopes.sort();
+                }
+                assert_eq!(actual_scopes, expected_scopes, "{case}/{direct}/{warm}");
+                let healthy_id = aggregate(activity(wallet, 1, "1", "healthy", 20), wallet)
+                    .group_id
+                    .key()
+                    .clone();
+                if !late {
+                    let demoted = !matches!(
+                        case,
+                        "healthy"
+                            | "market_drop"
+                            | "event_trade"
+                            | "absent_no_token"
+                            | "unknown_group"
+                            | "removed_group"
+                    );
+                    assert_eq!(
+                        paper
+                            .entry_gate_result(&healthy_id)
+                            .unwrap()
+                            .unwrap()
+                            .result,
+                        if demoted { "not_an_entry" } else { "admitted" },
+                        "{case}/{direct}/{warm}"
+                    );
+                } else {
+                    assert_eq!(
+                        paper
+                            .activity_group_state(&healthy_id)
+                            .unwrap()
+                            .unwrap()
+                            .disposition,
+                        if matches!(case, "covered" | "flat_late_conversion") {
+                            "anchor_covered_late"
+                        } else {
+                            "scope_dropped"
+                        },
+                        "{case}/{direct}/{warm}"
+                    );
+                    assert!(paper.entry_gate_result(&healthy_id).unwrap().is_none());
+                }
+                if !matches!(case, "healthy" | "market_drop") {
+                    let id = aggregate(problem.clone(), wallet).group_id.key().clone();
+                    let disposition = if matches!(case, "covered" | "flat_late_conversion") {
+                        "anchor_covered_late"
+                    } else if matches!(
+                        case,
+                        "absent_no_token" | "unknown_group" | "removed_group" | "revised"
+                    ) {
+                        "raw_only"
+                    } else {
+                        "scope_dropped"
+                    };
+                    assert_eq!(
+                        paper
+                            .activity_group_state(&id)
+                            .unwrap()
+                            .unwrap()
+                            .disposition,
+                        disposition,
+                        "{case}/{direct}/{warm}"
+                    );
+                    if case == "revised" {
+                        let revision = aggregate(problem.clone(), wallet)
+                            .semantic_revision
+                            .as_str()
+                            .to_owned();
+                        assert_eq!(
+                            paper
+                                .activity_revision_state(&id, &revision)
+                                .unwrap()
+                                .unwrap()
+                                .disposition,
+                            "scope_dropped"
+                        );
+                    }
+                }
+                let result = (
+                    paper
+                        .wallet_scope_drops(&wallet, END)
+                        .unwrap()
+                        .into_iter()
+                        .map(|drop| {
+                            (
+                                drop.scope_kind,
+                                drop.scope_id,
+                                drop.cause,
+                                drop.source_trade_id,
+                                drop.dropped_at_epoch,
+                                drop.proof_json,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    paper.activity_groups_after(&wallet, 0).unwrap(),
+                    paper.leader_positions().unwrap(),
+                    paper.gate_history().unwrap(),
+                );
+                if let Some(expected) = &expected {
+                    assert_eq!(&result, expected, "{case}/{direct}/{warm}");
+                } else {
+                    expected = Some(result);
+                }
+                let calls = calls.lock().unwrap().len();
+                if warm || matches!(case, "healthy" | "market_drop") {
+                    assert_eq!(calls, 0, "{case}/{direct}/{warm}");
+                } else {
+                    assert!(calls > 0, "{case}/{direct}/{warm}");
+                }
+                let recorded = Reader::replay(&source_path)
+                    .unwrap()
+                    .map(|frame| frame.unwrap().1)
+                    .filter(|frame| frame.source_id.0 == "polymarket.clob.market.http")
+                    .count();
+                assert_eq!(recorded, calls);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn membership_acquired_between_boot_batch_replays_survives_a_later_rollback_and_restart() {
+    use axum::{Json, Router, extract::Path, http::StatusCode, routing::get};
+    use pe_source_polymarket_public::ReqwestFetcher;
+    let wallet = wallet(0xa1);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 5);
+    let mut rows = vec![activity(wallet, 1, "1", "before-membership", 10)];
+    for (byte, epoch) in [(0x21, 20), (0x22, 30)] {
+        let mut row = activity(wallet, byte, "1", &format!("merge-{byte}"), epoch);
+        row["type"] = json!("MERGE");
+        row.as_object_mut().unwrap().remove("asset");
+        rows.push(row);
+    }
+    let succeed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_succeed = succeed.clone();
+    let server_paper = paper.clone();
+    let app = Router::new().route(
+        "/markets/{market}",
+        get(move |Path(market): Path<String>| {
+            let succeed = server_succeed.clone();
+            let paper = server_paper.clone();
+            async move {
+                // Each typed rejection has rolled back its entire activity read before HTTP.
+                assert!(paper.activity_groups_after(&wallet, 0).unwrap().is_empty());
+                assert!(paper.wallet_scope_drops(&wallet, END).unwrap().is_empty());
+                assert_eq!(paper.cursor(&wallet).unwrap(), Some(5));
+                paper.record_market_group("independent-writer", "").unwrap();
+                if market == "0x22" && !succeed.load(Ordering::SeqCst) {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error":"retry later"})),
+                    )
+                } else {
+                    (
+                        StatusCode::OK,
+                        Json(json!({"condition_id":market,"neg_risk":false})),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let source_path = dir.path().join("membership.log");
+    let reader = Arc::new(
+        ReqwestFetcher::new(reqwest::Client::new())
+            .with_max_retries(0)
+            .with_min_interval_ms(0),
+    );
+    let make_validator = || {
+        let fetcher = Arc::new(QueueFetcher::new(HashMap::from([
+            (
+                activity_url(wallet),
+                vec![serde_json::to_vec(&rows).unwrap(); 3],
+            ),
+            (
+                position_url(wallet, PositionPartition::NotRedeemable),
+                vec![serde_json::to_vec(&[position(wallet, 1, "1")]).unwrap(); 2],
+            ),
+            (
+                position_url(wallet, PositionPartition::Redeemable),
+                vec![b"[]".to_vec(); 2],
+            ),
+            (
+                condition_url(0x21, false),
+                vec![condition_metadata(0x21, false)],
+            ),
+            (
+                condition_url(0x22, false),
+                vec![condition_metadata(0x22, false)],
+            ),
+            (
+                format!("{BASE}/markets?condition_ids=0x21&condition_ids=0x22&limit=500"),
+                vec![
+                    serde_json::to_vec(&json!([
+                        {"conditionId":"0x21","clobTokenIds":["asset-21","asset-21-no"]},
+                        {"conditionId":"0x22","clobTokenIds":["asset-22","asset-22-no"]}
+                    ]))
+                    .unwrap(),
+                ],
+            ),
+        ])));
+        validator_from_fetcher(fetcher).with_market_membership(
+            format!("http://{address}"),
+            reader.clone(),
+            pe_service::activity_ingest::SourceLogHandle::boot(Arc::new(tokio::sync::Mutex::new(
+                SourceEventSink::open(&source_path).unwrap(),
+            ))),
+        )
+    };
+    let validator = make_validator();
+    let failure = bracket_failure(
+        validator
+            .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
+            .await,
+    );
+    assert_eq!(
+        failure.class(),
+        pe_service::position_seeder::FailureClass::WalletTransient,
+        "{failure:?}"
+    );
+    assert_eq!(failure.kind(), "validation.market_membership");
+    assert_eq!(
+        paper.market_membership("0x21").unwrap(),
+        Some(pe_paper_state::MarketMembership::Ungrouped)
+    );
+    assert_eq!(paper.market_membership("0x22").unwrap(), None);
+    assert!(paper.activity_groups_after(&wallet, 0).unwrap().is_empty());
+    assert!(paper.wallet_scope_drops(&wallet, END).unwrap().is_empty());
+    assert_eq!(paper.cursor(&wallet).unwrap(), Some(5));
+    drop(validator);
+    drop(engine);
+    let reopened = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    let mut restarted =
+        BucketCommitEngine::load(reopened.clone(), build_leader_ledger(&reopened).unwrap())
+            .unwrap();
+    assert_eq!(
+        reopened.market_membership("0x21").unwrap(),
+        Some(pe_paper_state::MarketMembership::Ungrouped)
+    );
+    succeed.store(true, Ordering::SeqCst);
+    make_validator()
+        .validate_direct(&[wallet], &mut restarted, &reopened)
+        .await
+        .unwrap();
+    assert_eq!(reopened.activity_groups_after(&wallet, 0).unwrap().len(), 3);
+    let attempts = Reader::replay(&source_path)
+        .unwrap()
+        .map(|frame| frame.unwrap().1)
+        .filter(|frame| frame.source_id.0 == "polymarket.clob.market.http")
+        .count();
+    assert_eq!(attempts, 3);
+    server.abort();
 }

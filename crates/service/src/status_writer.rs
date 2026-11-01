@@ -342,10 +342,12 @@ pub fn build_snapshot(
 /// Atomically write `snapshot` to `path` (write a sibling temp file, then rename over `path`),
 /// so a concurrent reader always sees a complete JSON document.
 pub fn write_snapshot(path: &Path, snapshot: &StatusSnapshot) -> std::io::Result<()> {
-    let json = serde_json::to_vec_pretty(snapshot).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, path)
+    pe_event_log::run_blocking(|| {
+        let json = serde_json::to_vec_pretty(snapshot).map_err(std::io::Error::other)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, path)
+    })
 }
 
 /// Periodic status-writer task. A write error is a typed owner failure; financial read errors

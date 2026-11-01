@@ -42,6 +42,13 @@ async fn deployed_flow_replays_exactly_and_qualifies() {
 mod rollout;
 mod support;
 
+/// PASS: real-process imports, local scope anomalies and retained revisions preserve healthy
+/// copying and survive restart with identical state; sealed CLI replay reproduces the run.
+#[tokio::test]
+async fn paper_service_scope_drops_restart_and_replay() {
+    rollout::scope_drops().await;
+}
+
 #[tokio::test]
 async fn paper_service_rollout_restarts_settles_and_replays() {
     rollout::run().await;

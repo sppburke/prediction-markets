@@ -1453,7 +1453,8 @@ fn canonical_scope_id(id: &str) -> bool {
     })
 }
 
-fn resolve_problem_scope(
+/// Resolve a problem's market or event scope from the caller's recorded evidence.
+pub fn resolve_problem_scope(
     aggregate: &ActivityAggregate,
     cause: DropCause,
     lookups: &dyn ScopeLookups,

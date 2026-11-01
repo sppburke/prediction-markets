@@ -226,53 +226,64 @@ impl RiskHaltReleaseHandle {
     }
 
     pub async fn apply(&self, release_hash: &str) -> Result<(), String> {
-        let era =
-            paper_era(scan_paper_log(&self.paper_log_path).map_err(|error| error.to_string())?);
-        let active = active_risk_halts(&era);
-        let Some(release) = audited_halt_release(&era, &active, release_hash) else {
+        let evidence = pe_event_log::run_blocking(|| {
+            let era =
+                paper_era(scan_paper_log(&self.paper_log_path).map_err(|error| error.to_string())?);
+            let active = active_risk_halts(&era);
+            let Some(release) = audited_halt_release(&era, &active, release_hash) else {
+                return Ok(None);
+            };
+            let mut live_journal_tail = None;
+            let latest_latency_p95_ms =
+                if release.cause == pe_risk_engine::RiskHaltCause::CopyLatency {
+                    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+                    owner_latest_latency_p95(
+                        &release.owner,
+                        || {
+                            paper_latency_samples(&era, &self.source_receipts, now_unix)
+                                .map(|samples| samples.latest.p95_ms)
+                                .map_err(|error| {
+                                    format!("derive paper release latency evidence: {error}")
+                                })
+                        },
+                        |account_id| {
+                            let (mut events, tail) =
+                                pe_execution_core::live_journal::replay_account_with_tail(
+                                    &self.live_journal_path,
+                                    account_id,
+                                )
+                                .map_err(|error| {
+                                    format!("derive live release latency evidence: {error}")
+                                })?;
+                            live_journal_tail = Some(LiveLatencyJournalTailEvidence::from(tail));
+                            if let Some((_, start)) = &era.start {
+                                events.retain(|event| {
+                                    start
+                                        .live_prefix
+                                        .last_sequence
+                                        .is_none_or(|last| event.seq > last.0)
+                                });
+                            }
+                            live_latency_samples(&events, now_unix)
+                                .map(|samples| samples.latest.p95_ms)
+                                .map_err(|error| {
+                                    format!("derive live release latency evidence: {error}")
+                                })
+                        },
+                    )?
+                } else {
+                    None
+                };
+            if release.cause == pe_risk_engine::RiskHaltCause::CopyLatency
+                && latest_latency_p95_ms.is_some()
+            {
+                return Ok(None);
+            }
+            Ok::<_, String>(Some((release, latest_latency_p95_ms, live_journal_tail)))
+        })?;
+        let Some((release, latest_latency_p95_ms, live_journal_tail)) = evidence else {
             return Ok(());
         };
-        let mut live_journal_tail = None;
-        let latest_latency_p95_ms = if release.cause == pe_risk_engine::RiskHaltCause::CopyLatency {
-            let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
-            owner_latest_latency_p95(
-                &release.owner,
-                || {
-                    paper_latency_samples(&era, &self.source_receipts, now_unix)
-                        .map(|samples| samples.latest.p95_ms)
-                        .map_err(|error| format!("derive paper release latency evidence: {error}"))
-                },
-                |account_id| {
-                    let (mut events, tail) =
-                        pe_execution_core::live_journal::replay_account_with_tail(
-                            &self.live_journal_path,
-                            account_id,
-                        )
-                        .map_err(|error| {
-                            format!("derive live release latency evidence: {error}")
-                        })?;
-                    live_journal_tail = Some(LiveLatencyJournalTailEvidence::from(tail));
-                    if let Some((_, start)) = &era.start {
-                        events.retain(|event| {
-                            start
-                                .live_prefix
-                                .last_sequence
-                                .is_none_or(|last| event.seq > last.0)
-                        });
-                    }
-                    live_latency_samples(&events, now_unix)
-                        .map(|samples| samples.latest.p95_ms)
-                        .map_err(|error| format!("derive live release latency evidence: {error}"))
-                },
-            )?
-        } else {
-            None
-        };
-        if release.cause == pe_risk_engine::RiskHaltCause::CopyLatency
-            && latest_latency_p95_ms.is_some()
-        {
-            return Ok(());
-        }
         let (acknowledged, response) = tokio::sync::oneshot::channel();
         self.control
             .send(OrchestratorControl::RiskHaltChange {

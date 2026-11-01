@@ -434,6 +434,14 @@ Gate order in `orchestrator.rs::handle_trade`, after dedup → watchlist → cla
 | E | Neg-risk group YES hold | before first staging, a grouped neg-risk outcome-0 BUY has no outcome-0 `buy` fill on another market of that group without a `settled_markets` row | admission's recorded CLOB `neg_risk_market_id`; write-once `meta` mapping and paper fills/settlements | [#752](https://github.com/sppburke/prediction-markets/issues/752) E1–E2 estimated that sibling YES copies lost money; the owner chose this any-leader exception for every group, with unchanged ranker scoring. It skips paper and live together; staged decisions retain admission. Same-market YES and all NO legs are unaffected. The gate maps accepted markets before filling; the resolution poll maps unresolved holdings bought before deploy or restored by recovery. Until successfully mapped, a holding does not block siblings. Gate store errors stop intake; poll store errors fail that market's pass and retry next time. A refusal records a `group_yes_gate` clock and `group_yes_held:<group>:<lowest held sibling market>` in the hashed terminal document; structural replay consumes the reason and qualification does not re-evaluate the gate. |
 | D | Signed-price band | current admission and book evidence are usable, and the signed ladder's worst accepted tick is `≥ min_fill_price` and `< max_fill_price` | shared venue ladder/economic-preparation owner | Continuation 7 checks accepted asks once: inclusive floor, exclusive ceiling and impact ceiling; no later VWAP band refusal or decision mid acquisition/refusal. Horizon, admission, book freshness and risk remain mandatory. Accounting retains VWAP; older paper checks and ordinary-live policy remain frozen. The upper boundary skips and the lower boundary fills. |
 
+**Scoped exclusions (#823).** Immediately before staging, after admission supplies the market's
+neg-risk membership, a paper decision whose source second is at or after its wallet's market or
+event drop terminates `no_copy:scope_dropped_before_dispatch`, on either outcome. Staged decisions
+repeat this check on resume. Imports serialize with paper dispatch through `FinancialPrepared`;
+after Prepared, recovery completes the fill. Known dropped frames route `Ignored`; dispatch checks
+unknown membership. The shared classifier, cumulative drops and evidence contract are canonical in
+[_GLOSSARY.md](_GLOSSARY.md#history-format-3-and-classifier-6-739).
+
 **Copy-latency budget (both provenances).** The owner permits copies through 120 s after
 the leader trade while the ranker's Δ stays 2 s. REST poll and activity-websocket observations pass an
 early freshness gate and the shared pre-dispatch gate. In websocket-primary mode, expiry at either
@@ -455,7 +463,7 @@ pending and stops submission.
 
 “History complete” means complete over attributable rows: rows whose asset no configured metadata authority can verify are recorded `raw_only` and cannot contribute a market to first-entry history.
 
-A rejected copy-scope gate logs the typed reason and commits a no-fill. Complete-read routing mirrors the leader ledger; a frame decision creates no leader effect, and its later authenticated REST counterpart applies once without another decision. SELL-only buckets do not consume history. Non-entry BUY consumption aligns with classifier 6 in pe-service release 2, coordinated on [#588](https://github.com/sppburke/prediction-markets/issues/588); its implementation and restart belong to that release. Defaults for the remaining gate config keys (`min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `min_fill_price`, `max_fill_price`) live in `_GLOSSARY.md` "Copy-entry gate".
+A rejected copy-scope gate logs the typed reason and commits a no-fill. Complete-read routing mirrors the leader ledger outside dropped scopes; a frame decision creates no leader effect, and its later authenticated REST counterpart applies once without another decision. SELL-only buckets do not consume history. Every effective BUY, including a non-entry or dropped-scope BUY, consumes history under classifier 6. Defaults for the remaining gate config keys (`min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `min_fill_price`, `max_fill_price`) live in `_GLOSSARY.md` "Copy-entry gate".
 
 **Current economic sizing (#545).** Production and replay consume the same `EconomicPrepared` value:
 market/admission receipts, signed ladder, exact sizing, compact fee and reserve, risk decision,
@@ -608,6 +616,13 @@ be durable, with frozen ordered account targets and credential bindings. The see
 `pending_paper -> ready` atomically with a typed paper outcome. That outcome records sequencing and
 recovery state only: paper fills and paper-only skips never gate an otherwise admitted live target.
 
+Fresh live dispatch and Approved recovery check the wallet's market/event drops inside the
+transaction that records the target `submitted`. Missing target membership is first recorded from
+its admission's CLOB receipt, or acquired through the shared CLOB read; without it submission waits.
+A target at or after the drop's start terminalizes through journaled preparation failure as
+`scope_dropped_before_post`, then projects that result. Submitted and ambiguous orders keep
+reconciling. This check also covers targets staged before the upgrade and both outcomes.
+
 ## Paper qualification measurement
 
 ```
@@ -661,7 +676,11 @@ ranked bench; a shared failure leaves full-rerank and capacity unchanged, while 
 decided knockout evictions may publish without backfill. Every added wallet has a cited immutable
 admission proof, and the writer lock checks the prepared structural set and proof digests.
 Boot replays the initial membership and later structural records before producers, then applies the
-separate wallet fences. Allowlisted causal recovery commits the exact fence clearance with
+separate wallet fences. Before using any ranking batch, it imports that batch's published drops and
+group set; boot includes the first-Start batch and every batch applied by membership replay before
+brackets or decision recovery. Runtime imports serialize with bucket commits and paper dispatch;
+a failed import leaves prior applied state intact. A scope drop never removes a followed wallet.
+Allowlisted legacy causal recovery commits the exact fence clearance with
 first-entry history repair and its authoritative anchor, as defined in
 [`_GLOSSARY.md`](./_GLOSSARY.md#copy-entry-gate-first-ever-buy-entry-issues-290-339).
 Admission shares the maintenance launch deadline and completion-based transient cooldown; retained

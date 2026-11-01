@@ -3738,9 +3738,15 @@ async fn boot_fence_completes_staged_handoff_atomically_in_both_recovery_orders(
             let history = h.paper.gate_history().unwrap();
             assert_eq!(h.prepared_count(), 1);
 
-            // The same source group with a changed semantic revision fences during boot's
-            // first activity read, through the real validator and bucket commit owner. A novel
-            // revision invalidates that attempt before any positions read or anchor install.
+            // A legacy fence remains authoritative during boot reconciliation. Retaining a
+            // changed revision invalidates the bracket, whose retry observes the fence.
+            rusqlite::Connection::open(h.dir.path().join("paper.db"))
+                .unwrap()
+                .execute(
+                    "INSERT INTO wallet_fences VALUES (?1, ?2, 'invalid_mapping', '{}', ?3)",
+                    rusqlite::params![wallet().to_string(), held.id.0, EPOCH],
+                )
+                .unwrap();
             let mut changed: Value = serde_json::from_slice(&held.activity).unwrap();
             changed[0]["size"] = "11".into();
             let validator = pe_service::position_seeder::CausalPositionValidator::new(
@@ -5355,7 +5361,7 @@ async fn frame_final_before_rest_then_reconcile() {
         assert_eq!(
             group.disposition,
             if route == "late" {
-                "reanchor_required_late_group"
+                "scope_dropped"
             } else {
                 "wallet_fenced_applied"
             }
@@ -6021,6 +6027,27 @@ async fn queue_shutdown_crashes() {
         assert_eq!(h.paper.open_decision_pending().unwrap().len(), 1);
         assert!(h.paper.leader_positions().unwrap().is_empty());
         h.stop().await;
+        if boundary == FrameCrashBoundary::Prepared {
+            h.paper
+                .import_scope_drops(
+                    589,
+                    &[(
+                        pe_paper_state::WalletScopeDrop {
+                            wallet: wallet(),
+                            scope_kind: "market".to_owned(),
+                            scope_id: recorded.admission.market.condition_id.0.clone(),
+                            cause: "underflow".to_owned(),
+                            source_trade_id: None,
+                            dropped_at_epoch: recorded.epoch,
+                            proof_json: "{}".to_owned(),
+                            recorded_at_unix: EPOCH,
+                        },
+                        recorded.admission.receipts.clob_long,
+                    )],
+                    &Default::default(),
+                )
+                .unwrap();
+        }
         let writer =
             pe_service::paper_recovery::PaperLog::open(h.dir.path().join("paper.log")).unwrap();
         pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK
@@ -8899,6 +8926,14 @@ async fn ac_b_membership_reference_checks() {
     let server_rows = rows.clone();
     let router = axum::Router::new()
         .route(
+            "/rest/v1/ranking_scope_drops",
+            axum::routing::get(|| async { axum::Json(json!([])) }),
+        )
+        .route(
+            "/rest/v1/ranking_neg_risk_group_spans",
+            axum::routing::get(|| async { axum::Json(json!([])) }),
+        )
+        .route(
             "/rest/v1/ranking_batches",
             axum::routing::get(|| async { axum::Json(json!([{"batch_id": 546}])) }),
         )
@@ -9353,7 +9388,8 @@ open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I",
         "{failed:?}"
     );
     // A capture that lacks a frame received from the window on is refused, whatever its cohort.
-    retain(6, &[0, 1, 2, 3, 4]);
+    let retired = usize::try_from(bad_type.sequence.0).unwrap();
+    retain(retired + 1, &(0..retired).collect::<Vec<_>>());
     let output = ac_b_capture(&h, &log, "retired", *pin_offset, pin_seq.0, None);
     assert!(output.status.success(), "{output:?}");
     let refused = inspection_run(
@@ -10125,4 +10161,287 @@ async fn frame_identity_wait_rechecks_freshness_and_eligibility_before_consuming
         }
         h.stop().await;
     }
+}
+
+/// PASS: post-Start membership restores unread batch B; boot imports B before recovering the
+/// open decision while skipping already-imported Start batch A. B alone blocks both outcomes
+/// from its start second, and a decision before that second still fills.
+#[tokio::test]
+async fn scope_drop_boot_import_blocks_open_decisions_for_both_outcomes_and_keeps_pre_start() {
+    for kind in ["market", "event"] {
+        for outcome in [0, 1] {
+            for start_delta in [-1, 0, 1] {
+                let mut h = Harness::new().await;
+                let recorded = h.record_group_entry(1, wallet(), outcome, "0xee").await;
+                h.paper
+                    .import_scope_drops(588, &[], &Default::default())
+                    .unwrap();
+                h.freeze(&recorded, true).await;
+                let ranking_receipt = h
+                    .append(
+                        "pe-service.watchlist-ranking",
+                        &serde_json::to_vec(&json!({
+                            "batch_id":589,"entries":h.watchlist.snapshot().entries,
+                        }))
+                        .unwrap(),
+                    )
+                    .await;
+                let change = pe_service::paper_recovery::MembershipChange {
+                    reason: pe_service::paper_recovery::MembershipReason::FullRerank,
+                    removed: Vec::new(), added: Vec::new(), capacity: 1, ranking_batch_id: Some(589),
+                    evidence: json!({"kind":"full_rerank","ranking_receipt":ranking_receipt,"admission_receipts":[]}),
+                }.into_record();
+                Writer::open(h.dir.path().join("paper.log"))
+                    .unwrap()
+                    .append_synced(EnvelopeIn {
+                        source_id: SourceId("pe-service.paper".to_owned()),
+                        schema_version: 2,
+                        parser_version: 1,
+                        observed_at: SourceTimestamp(at()),
+                        received_at: ReceivedAt(at()),
+                        content_type: ContentType::Json,
+                        payload: serde_json::to_vec(&change).unwrap(),
+                    })
+                    .unwrap();
+                let era = pe_service::paper_recovery::paper_era(
+                    scan_paper_log(&h.dir.path().join("paper.log")).unwrap(),
+                );
+                let restored = pe_service::paper_recovery::replay_membership(
+                    &era,
+                    (*h.watchlist.snapshot()).clone(),
+                    &h.dir.path().join("source.log"),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    restored.applied_ranking_batch_ids,
+                    std::collections::BTreeSet::from([588, 589])
+                );
+                assert!(!h.paper.scope_drop_batch_imported(589).unwrap());
+                assert_eq!(h.terminal(&recorded).state, DecisionPendingState::Open);
+                let reads = Arc::new(Mutex::new(Vec::new()));
+                let observed_reads = reads.clone();
+                let drop_row = json!({"batch_id":589,"wallet_hex":wallet(),"scope_kind":kind,
+                    "scope_id":if kind == "market" { recorded.admission.market.condition_id.0.as_str() } else { "0xee" },
+                    "cause":"underflow","dropped_at_unix":recorded.epoch + start_delta});
+                let app = axum::Router::new().fallback(axum::routing::get(
+                    move |uri: axum::http::Uri,
+                          axum::extract::Query(query): axum::extract::Query<
+                        HashMap<String, String>,
+                    >| {
+                        let reads = observed_reads.clone();
+                        let drop_row = drop_row.clone();
+                        async move {
+                            let response = match uri.path() {
+                                "/rest/v1/ranking_scope_drops" => {
+                                    assert_eq!(
+                                        query["batch_id"], "eq.589",
+                                        "Start's marked import must not be fetched again"
+                                    );
+                                    reads.lock().unwrap().push(589);
+                                    json!([drop_row])
+                                }
+                                "/rest/v1/ranking_neg_risk_group_spans" => json!([]),
+                                "/rest/v1/ranking_batches" => json!([{"batch_id":589}]),
+                                path => panic!("unexpected boot import request {path}"),
+                            };
+                            axum::Json(response)
+                        }
+                    },
+                ));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                h.coordinator.abort();
+                let _ = (&mut h.coordinator).await;
+                let sink = Arc::new(tokio::sync::Mutex::new(
+                    SourceEventSink::open(h.dir.path().join("source.log")).unwrap(),
+                ));
+                let loader = pe_service::supabase_reader::ScopeDropLoader::boot(
+                    h.paper.clone(),
+                    sink.clone(),
+                );
+                for batch in std::iter::once(588).chain(restored.applied_ranking_batch_ids) {
+                    loader
+                        .import_batch(&reqwest::Client::new(), &base, "anon", "", batch)
+                        .await
+                        .unwrap();
+                }
+                drop(loader);
+                assert_eq!(*reads.lock().unwrap(), vec![589]);
+                assert!(h.paper.scope_drop_batch_imported(589).unwrap());
+                assert!(h.paper.list_fills().unwrap().is_empty());
+                assert_eq!(h.terminal(&recorded).state, DecisionPendingState::Open);
+                h.index = SourceReceiptIndex::replay(&h.dir.path().join("source.log")).unwrap();
+                let (source, receiver) = SourceLogHandle::channel(8);
+                h.source = source;
+                let (trigger, trigger_rx) = mpsc::channel(1);
+                h._trigger_rx = trigger_rx;
+                let sink = Arc::try_unwrap(sink).ok().unwrap().into_inner();
+                h.coordinator = tokio::spawn(
+                    ActivityIngest::poll_only(sink, receiver, trigger, h.health.clone())
+                        .with_source_receipt_index(h.index.clone())
+                        .run(),
+                );
+                server.abort();
+                h.attempt(&recorded, at());
+                h.arm();
+                h.start(false);
+                h.barrier().await;
+                h.stop().await;
+                let terminal = h.terminal(&recorded);
+                assert_eq!(terminal.state, DecisionPendingState::Terminal);
+                let blocked = start_delta <= 0;
+                if blocked {
+                    assert_eq!(
+                        terminal.terminal_disposition.as_deref(),
+                        Some("no_copy:scope_dropped_before_dispatch")
+                    );
+                    assert_eq!(h.prepared_count(), 0);
+                    assert!(h.paper.list_fills().unwrap().is_empty());
+                    assert!(!h.paper.dispatch_seeds_exist().unwrap());
+                } else {
+                    assert_eq!(h.prepared_count(), 1);
+                    assert_eq!(h.paper.list_fills().unwrap().len(), 1);
+                }
+                replay_decision_pending(&terminal).unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn scope_drop_resumed_staged_decision_terminates_before_prepared() {
+    for kind in ["market", "event"] {
+        let mut h = Harness::new().await;
+        let recorded = h.record_group_entry(1, wallet(), 1, "0xee").await;
+        h.arm();
+        *h.hooks.frame_crash_boundary.lock().unwrap() =
+            Some(pe_service::orchestrator::FrameCrashBoundary::Staging);
+        h.attempt(&recorded, at());
+        h.start(true);
+        h.poll_owner_failure(&recorded, None).await;
+        h.stop().await;
+        assert_eq!(h.terminal(&recorded).state, DecisionPendingState::Open);
+        let seed = h.paper.pending_dispatch_seeds().unwrap().remove(0);
+        h.paper
+            .import_scope_drops(
+                589,
+                &[(
+                    pe_paper_state::WalletScopeDrop {
+                        wallet: wallet(),
+                        scope_kind: kind.to_owned(),
+                        scope_id: if kind == "market" {
+                            recorded.admission.market.condition_id.0.clone()
+                        } else {
+                            "0xee".to_owned()
+                        },
+                        cause: "underflow".to_owned(),
+                        source_trade_id: None,
+                        dropped_at_epoch: recorded.epoch,
+                        proof_json: "{}".to_owned(),
+                        recorded_at_unix: EPOCH,
+                    },
+                    recorded.admission.receipts.clob_long,
+                )],
+                &Default::default(),
+            )
+            .unwrap();
+        h.attempt(&recorded, at());
+        h.start(false);
+        h.barrier().await;
+        h.stop().await;
+        let terminal = h.terminal(&recorded);
+        assert_eq!(
+            terminal.terminal_disposition.as_deref(),
+            Some("no_copy:scope_dropped_before_dispatch")
+        );
+        assert_eq!(h.prepared_count(), 0);
+        assert!(h.paper.list_fills().unwrap().is_empty());
+        let seed = h.paper.dispatch_seed(&seed.dispatch_id).unwrap().unwrap();
+        assert_eq!(seed.state, "ready");
+        assert_eq!(
+            seed.paper_outcome.as_deref(),
+            Some("no_fill:scope_dropped_before_dispatch")
+        );
+        replay_decision_pending(&terminal).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn scope_drop_import_waits_for_bucket_dispatch_prepared_then_excludes_later_sibling() {
+    let mut h = Harness::new().await;
+    let held = h.record(1).await;
+    h.attempt(&held, at());
+    h.start_frames();
+    h.poll(&held).await;
+    h.stop().await;
+    let copying = h.record_group_entry(2, wallet(), 0, "0xee").await;
+    h.attempt(&copying, at());
+    *h.prices.gate.market.lock().unwrap() = Some(held.admission.market.condition_id.0.clone());
+    h.prices.gate.blocked.store(true, Ordering::SeqCst);
+    let gate = h.prices.gate.clone();
+    h.start_frames();
+    let control = h.control.as_ref().unwrap().clone();
+    let (acknowledged, mut ack) = tokio::sync::oneshot::channel();
+    {
+        let pending = h.poll(&copying);
+        tokio::pin!(pending);
+        tokio::select! { biased; _ = gate.started.notified() => {}, _ = &mut pending => panic!("copy completed before risk wait") }
+        assert_eq!(h.prepared_count(), 1);
+        control
+            .send(OrchestratorControl::ImportScopeDrops {
+                batch_id: 589,
+                drops: vec![(
+                    pe_paper_state::WalletScopeDrop {
+                        wallet: wallet(),
+                        scope_kind: "event".to_owned(),
+                        scope_id: "0xee".to_owned(),
+                        cause: "underflow".to_owned(),
+                        source_trade_id: None,
+                        dropped_at_epoch: copying.epoch,
+                        proof_json: "{}".to_owned(),
+                        recorded_at_unix: EPOCH,
+                    },
+                    copying.admission.receipts.clob_long,
+                )],
+                group_ids: Default::default(),
+                acknowledged,
+            })
+            .await
+            .unwrap();
+        assert!(ack.try_recv().is_err());
+        assert!(!h.paper.scope_drop_batch_imported(589).unwrap());
+        gate.release.notify_one();
+        pending.await;
+    }
+    ack.await.unwrap().unwrap();
+    assert_eq!(h.prepared_count(), 2);
+    assert_eq!(h.paper.list_fills().unwrap().len(), 2);
+    assert!(h.paper.scope_drop_batch_imported(589).unwrap());
+    let sibling = h.record_group_entry(3, wallet(), 1, "0xee").await;
+    h.paper
+        .record_market_group(&sibling.admission.market.condition_id.0, "0xee")
+        .unwrap();
+    h.poll(&sibling).await;
+    assert_eq!(
+        h.paper
+            .activity_group_state(&sibling.id)
+            .unwrap()
+            .unwrap()
+            .disposition,
+        "scope_dropped"
+    );
+    let healthy = h.record(4).await;
+    h.hooks
+        .financial_clock_unix
+        .store(EPOCH + 1, Ordering::SeqCst);
+    h.attempt(&healthy, at() + time::Duration::seconds(1));
+    h.paper
+        .record_market_group(&healthy.admission.market.condition_id.0, "")
+        .unwrap();
+    h.poll(&healthy).await;
+    h.stop().await;
+    assert_eq!(h.prepared_count(), 3);
+    assert_eq!(h.paper.list_fills().unwrap().len(), 3);
 }

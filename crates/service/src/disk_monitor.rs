@@ -230,48 +230,50 @@ impl DiskMonitor {
         health: &SharedHealth,
         mut available_space: impl FnMut(&Path) -> io::Result<u64>,
     ) -> Result<DiskTransition, TaskFailure> {
-        let mut floor = None;
-        for (directory, low) in self.directories.iter().zip(&mut self.low) {
-            match available_space(directory) {
-                Ok(bytes) => {
-                    *low = bytes < DISK_FREE_WARN_BYTES;
-                    if bytes < DISK_FREE_FLOOR_BYTES {
-                        floor = Some((directory, bytes));
+        pe_event_log::run_blocking(|| {
+            let mut floor = None;
+            for (directory, low) in self.directories.iter().zip(&mut self.low) {
+                match available_space(directory) {
+                    Ok(bytes) => {
+                        *low = bytes < DISK_FREE_WARN_BYTES;
+                        if bytes < DISK_FREE_FLOOR_BYTES {
+                            floor = Some((directory, bytes));
+                        }
+                    }
+                    Err(error) => {
+                        warn!(directory = %directory.display(), error = %error, "disk free-space sample failed; retrying next tick");
                     }
                 }
-                Err(error) => {
-                    warn!(directory = %directory.display(), error = %error, "disk free-space sample failed; retrying next tick");
+            }
+            let low = self.low.iter().any(|low| *low);
+            health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .disk_low = low;
+            let transition = match (self.warned, low) {
+                (false, true) => {
+                    error!(warn_bytes = DISK_FREE_WARN_BYTES, directories = ?self.directories, "disk free space below warning threshold");
+                    DiskTransition::Warning
                 }
+                (true, false) => {
+                    info!(
+                        warn_bytes = DISK_FREE_WARN_BYTES,
+                        "disk free space recovered"
+                    );
+                    DiskTransition::Recovered
+                }
+                _ => DiskTransition::Unchanged,
+            };
+            self.warned = low;
+            if let Some((directory, bytes)) = floor {
+                error!(directory = %directory.display(), available_bytes = bytes, floor_bytes = DISK_FREE_FLOOR_BYTES, "disk free space below floor; requesting coordinated shutdown");
+                return Err(TaskFailure::typed(format!(
+                    "disk free space for {} is {bytes} bytes, below floor {DISK_FREE_FLOOR_BYTES} bytes",
+                    directory.display()
+                )));
             }
-        }
-        let low = self.low.iter().any(|low| *low);
-        health
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .disk_low = low;
-        let transition = match (self.warned, low) {
-            (false, true) => {
-                error!(warn_bytes = DISK_FREE_WARN_BYTES, directories = ?self.directories, "disk free space below warning threshold");
-                DiskTransition::Warning
-            }
-            (true, false) => {
-                info!(
-                    warn_bytes = DISK_FREE_WARN_BYTES,
-                    "disk free space recovered"
-                );
-                DiskTransition::Recovered
-            }
-            _ => DiskTransition::Unchanged,
-        };
-        self.warned = low;
-        if let Some((directory, bytes)) = floor {
-            error!(directory = %directory.display(), available_bytes = bytes, floor_bytes = DISK_FREE_FLOOR_BYTES, "disk free space below floor; requesting coordinated shutdown");
-            return Err(TaskFailure::typed(format!(
-                "disk free space for {} is {bytes} bytes, below floor {DISK_FREE_FLOOR_BYTES} bytes",
-                directory.display()
-            )));
-        }
-        Ok(transition)
+            Ok(transition)
+        })
     }
 }
 

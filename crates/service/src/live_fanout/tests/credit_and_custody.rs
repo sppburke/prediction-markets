@@ -516,7 +516,7 @@ async fn append_reserved_order(
         LiveOrderIdentity::idempotency_key_for(&prepared.identity.dispatch_id, account_id);
     prepared.account_state = account_state;
     bind_empty_live_risk_to_paper_prefix(state, &mut prepared, now);
-    append_economic_sources(state, &mut prepared, account_id, now, None).await;
+    append_economic_sources(state, &mut prepared, account_id, now, None, None).await;
     append_approved_admission(state.config.journal.as_ref(), account_id, &prepared, now);
     state
         .config
@@ -871,7 +871,7 @@ async fn runtime_credit_crosses_fixed_absolute_loss_floor_with_and_without_latch
         )
         .unwrap();
         assert_eq!(prepared.economic.risk.decision, RiskDecisionAudit::Approved);
-        append_economic_sources(&state, &mut prepared, &account.account_id, now, None).await;
+        append_economic_sources(&state, &mut prepared, &account.account_id, now, None, None).await;
         append_approved_admission(&state.config.journal, &account.account_id, &prepared, now);
         let prepared_event = state
             .config
@@ -1093,7 +1093,7 @@ async fn runtime_credit_between_posture_and_mark_reads_allows_next_order() {
         prepared.economic.balance.worst_case_debit,
     );
     assert_eq!(prepared.economic.risk.decision, RiskDecisionAudit::Approved);
-    append_economic_sources(&state, &mut prepared, &account.account_id, now, None).await;
+    append_economic_sources(&state, &mut prepared, &account.account_id, now, None, None).await;
     append_approved_admission(&state.config.journal, &account.account_id, &prepared, now);
     state
         .config

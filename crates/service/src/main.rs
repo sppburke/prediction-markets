@@ -80,6 +80,84 @@ use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
 use pe_service::watchlist_maintenance::{MaintenanceConfig, MembershipMode, run_maintenance_loop};
 use time::OffsetDateTime;
 
+async fn load_boot_membership(
+    cfg: &ServiceConfig,
+    ranking_client: &reqwest::Client,
+    membership_generation: Option<&pe_service::paper_recovery::PaperEra>,
+    source_log_boot: Option<&pe_service::source_log_boot::SourceLogBoot>,
+    boot_scope_drops: &supabase_reader::ScopeDropLoader,
+) -> Result<(Watchlist, HashMap<WalletAddress, i64>, Option<i64>, bool)> {
+    Ok(
+        if let Some(generation) = membership_generation
+            && let Some((_, start)) = &generation.start
+        {
+            let (start_batch, mut start_last_trade) = boot_scope_drops
+                .fetch_batch(
+                    ranking_client,
+                    &cfg.supabase_url,
+                    &cfg.supabase_anon_key,
+                    &cfg.supabase_secret_key,
+                    start.ranking_batch_id,
+                )
+                .await
+                .context("fetch QualificationStarted ranking batch")?;
+            let replayed = match source_log_boot {
+                Some(boot) => boot.replay_membership(generation, start_batch),
+                None => replay_membership(generation, start_batch, &cfg.source_event_log_path),
+            }
+            .context("replay Start-bound structural membership")?
+            .context("QualificationStarted is missing from its membership generation")?;
+            for batch_id in &replayed.applied_ranking_batch_ids {
+                boot_scope_drops
+                    .import_batch(
+                        ranking_client,
+                        &cfg.supabase_url,
+                        &cfg.supabase_anon_key,
+                        &cfg.supabase_secret_key,
+                        *batch_id,
+                    )
+                    .await
+                    .with_context(|| format!("import replay-applied ranking batch {batch_id}"))?;
+            }
+            let restored = replayed
+                .watchlist
+                .entries
+                .iter()
+                .map(|entry| entry.wallet)
+                .collect::<HashSet<_>>();
+            start_last_trade.retain(|wallet, _| restored.contains(wallet));
+            (
+                replayed.watchlist,
+                start_last_trade,
+                Some(replayed.last_ranking_batch_id),
+                replayed.post_start_record_replayed,
+            )
+        } else {
+            // Bind the fresh survivor bench to the marker before loading the active state.
+            let marker = supabase_reader::fetch_latest_batch_id(
+                ranking_client,
+                &cfg.supabase_url,
+                &cfg.supabase_anon_key,
+                &cfg.supabase_secret_key,
+            )
+            .await
+            .context("fetch pre-Start ranking batch")?
+            .context("no pre-Start ranking batch")?;
+            let (watchlist, last_trade) = boot_scope_drops
+                .fetch_batch(
+                    ranking_client,
+                    &cfg.supabase_url,
+                    &cfg.supabase_anon_key,
+                    &cfg.supabase_secret_key,
+                    marker,
+                )
+                .await
+                .context("bootstrap watchlist from Supabase (the sole pre-Start wallet source)")?;
+            (watchlist, last_trade, Some(marker), false)
+        },
+    )
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct BootAnchorSelection {
     reused: Vec<WalletAddress>,
@@ -674,90 +752,7 @@ async fn run() -> Result<()> {
     let runtime_config_status = RuntimeConfigStatus::new(&initial_runtime_config);
     let live_runtime_config = LiveRuntimeConfig::new(initial_runtime_config.clone());
 
-    // A financial Start makes the synchronized paper prefix the structural membership owner.
-    // Its initial entries come from the exact ranking batch named by Start; subsequent replacement
-    // vectors are verified and reconstructed from the source-log artifacts named by each durable
-    // MembershipChanged record. Therefore a newer published batch with no synchronized membership
-    // record remains a transition for the first maintenance tick instead of changing (or
-    // invalidating) the boot generation.
     let initial_watchlist_size = live_runtime_config.snapshot().active_watchlist_size;
-    let ranking_client = reqwest::Client::new();
-    let (initial_watchlist, bootstrap_last_trade, boot_batch_marker, post_start_record_replayed): (
-        Watchlist,
-        HashMap<_, _>,
-        Option<i64>,
-        bool,
-    ) = if let Some(generation) = &membership_generation
-        && let Some((_, start)) = &generation.start
-    {
-        let (start_batch, mut start_last_trade) = supabase_reader::fetch_batch(
-            &ranking_client,
-            &cfg.supabase_url,
-            &cfg.supabase_anon_key,
-            &cfg.supabase_secret_key,
-            start.ranking_batch_id,
-        )
-        .await
-        .context("fetch QualificationStarted ranking batch")?;
-        let replayed = match source_log_boot.as_ref() {
-            Some(boot) => boot.replay_membership(generation, start_batch),
-            None => replay_membership(generation, start_batch, &cfg.source_event_log_path),
-        }
-        .context("replay Start-bound structural membership")?
-        .context("QualificationStarted is missing from its membership generation")?;
-        let restored = replayed
-            .watchlist
-            .entries
-            .iter()
-            .map(|entry| entry.wallet)
-            .collect::<HashSet<_>>();
-        start_last_trade.retain(|wallet, _| restored.contains(wallet));
-        (
-            replayed.watchlist,
-            start_last_trade,
-            Some(replayed.last_ranking_batch_id),
-            replayed.post_start_record_replayed,
-        )
-    } else {
-        // Bind the fresh survivor bench to the marker before loading the active state.
-        let marker = supabase_reader::fetch_latest_batch_id(
-            &ranking_client,
-            &cfg.supabase_url,
-            &cfg.supabase_anon_key,
-            &cfg.supabase_secret_key,
-        )
-        .await
-        .context("fetch pre-Start ranking batch")?
-        .context("no pre-Start ranking batch")?;
-        let (watchlist, last_trade) = supabase_reader::fetch_batch(
-            &ranking_client,
-            &cfg.supabase_url,
-            &cfg.supabase_anon_key,
-            &cfg.supabase_secret_key,
-            marker,
-        )
-        .await
-        .context("bootstrap watchlist from Supabase (the sole pre-Start wallet source)")?;
-        (watchlist, last_trade, Some(marker), false)
-    };
-    info!(
-        active = initial_watchlist.active_count,
-        total = initial_watchlist.entries.len(),
-        batch_id = ?boot_batch_marker,
-        durable = financial_start.is_some(),
-        "watchlist membership rebuilt"
-    );
-
-    // Pre-Start and Start-pinned survivor-filtered reads require a nonempty membership.
-    // A synchronized post-Start record may instead establish an intentionally empty generation.
-    anyhow::ensure!(
-        post_start_record_replayed || !initial_watchlist.entries.is_empty(),
-        "no wallets to copy: the boot membership generation contains no SURVIVING rows"
-    );
-    if initial_watchlist.entries.is_empty() {
-        warn!("replayed post-Start membership is empty; booting with zero live wallets");
-    }
-
     let (projection_dirty, projection_dirty_rx) = projection_dirty_channel();
     let projection_status = WatchlistProjectionStatus::default();
 
@@ -856,7 +851,7 @@ async fn run() -> Result<()> {
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
         );
-        if let Some(start) = financial_start {
+        if financial_start.is_some() {
             // #628: one observation, so the balance and the progress marker cannot straddle a
             // concurrent fill and make a legitimate first fill look like a corrupt balance.
             let authoritative = client
@@ -869,13 +864,6 @@ async fn run() -> Result<()> {
                 authoritative.map(|(bankroll, _)| bankroll),
                 starting_bankroll,
             )?;
-            paper_state
-                .seed_financial_start(start)
-                .context("seed local financial Start")?;
-            client
-                .seed_financial_start(start)
-                .await
-                .context("seed authoritative financial Start")?;
         } else if migration_boot.session.is_some() {
             supabase_authoritative_boot_observed(
                 &client,
@@ -903,6 +891,56 @@ async fn run() -> Result<()> {
     } else {
         None
     };
+
+    let boot_source_log = Arc::new(tokio::sync::Mutex::new(match boot_sink.take() {
+        Some(sink) => sink,
+        None => pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
+            .context("open boot source-log recorder")?,
+    }));
+    let boot_scope_drops =
+        supabase_reader::ScopeDropLoader::boot(paper_state.clone(), boot_source_log.clone());
+    let ranking_client = reqwest::Client::new();
+    let (initial_watchlist, bootstrap_last_trade, boot_batch_marker, post_start_record_replayed) =
+        load_boot_membership(
+            &cfg,
+            &ranking_client,
+            membership_generation.as_ref(),
+            source_log_boot.as_ref(),
+            &boot_scope_drops,
+        )
+        .await?;
+    info!(
+        active = initial_watchlist.active_count,
+        total = initial_watchlist.entries.len(),
+        batch_id = ?boot_batch_marker,
+        durable = financial_start.is_some(),
+        "watchlist membership rebuilt"
+    );
+
+    // Pre-Start and Start-pinned survivor-filtered reads require a nonempty membership.
+    // A synchronized post-Start record may instead establish an intentionally empty generation.
+    anyhow::ensure!(
+        post_start_record_replayed || !initial_watchlist.entries.is_empty(),
+        "no wallets to copy: the boot membership generation contains no SURVIVING rows"
+    );
+    if initial_watchlist.entries.is_empty() {
+        warn!("replayed post-Start membership is empty; booting with zero live wallets");
+    }
+
+    drop(boot_scope_drops);
+
+    if let Some(start) = financial_start {
+        let client = supabase_state.as_ref().context(
+            "active financial era requires the authoritative client before paper writer boot",
+        )?;
+        paper_state
+            .seed_financial_start(start)
+            .context("seed local financial Start")?;
+        client
+            .seed_financial_start(start)
+            .await
+            .context("seed authoritative financial Start")?;
+    }
 
     // Open the sole paper writer and converge the active financial prefix before reading any
     // bankroll used for sizing or API state.
@@ -1002,11 +1040,6 @@ async fn run() -> Result<()> {
             pe_source_polymarket_public::RECONCILIATION_RATE_LIMIT_RETRY_SECS,
         ),
     );
-    let boot_source_log = Arc::new(tokio::sync::Mutex::new(match boot_sink.take() {
-        Some(sink) => sink,
-        None => pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
-            .context("open boot source-log recorder")?,
-    }));
     let identity_generation = MigrationMetadata::read(&migration_boot.active_main)
         .context("read migration metadata for the identity cache")?
         .as_ref()
@@ -1044,7 +1077,12 @@ async fn run() -> Result<()> {
             source_log_generation,
             Arc::clone(&asset_identity),
         )
-    };
+    }
+    .with_market_membership(
+        cfg.polymarket_clob_base_url.clone(),
+        clob_resolution_fetcher.clone(),
+        pe_service::activity_ingest::SourceLogHandle::boot(Arc::clone(&boot_source_log)),
+    );
     let mut boot_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
         .context("load boot activity ledger owner")?;
     let boot_wallets = live_watchlist
@@ -1242,6 +1280,11 @@ async fn run() -> Result<()> {
         cfg.polymarket_base_url.clone(),
         runtime_source_generation,
         Arc::clone(&asset_identity),
+    )
+    .with_market_membership(
+        cfg.polymarket_clob_base_url.clone(),
+        clob_resolution_fetcher.clone(),
+        source_log.clone(),
     );
 
     projection_dirty.mark();
@@ -1483,6 +1526,8 @@ async fn run() -> Result<()> {
     let poller_admission_preparer = admission_preparer.clone();
     let poller_asset_identity = Arc::clone(&asset_identity);
     let poller_source_receipts = source_receipts.clone();
+    let poller_clob_base_url = cfg.polymarket_clob_base_url.clone();
+    let poller_membership_fetcher = clob_resolution_fetcher.clone();
     let public_poll_shutdown = shutdown.subscribe();
     supervisor.spawn(TaskName::PublicActivityPoll, async move {
         if poller_start.wait_for(|started| *started).await.is_err() {
@@ -1508,6 +1553,7 @@ async fn run() -> Result<()> {
             obligations,
             Some(poller_admission_preparer),
         )
+        .with_market_membership(poller_clob_base_url, poller_membership_fetcher)
         .with_source_receipt_index(poller_source_receipts)
         .with_held_obligations(held_obligations_tx)
         .run_until(public_poll_shutdown.wait_for(ShutdownPhase::StopProducers))
@@ -1869,6 +1915,11 @@ async fn run() -> Result<()> {
             .map_err(anyhow::Error::msg)
             .context("synchronize boot risk halt release")?;
     }
+    let scope_drops = supabase_reader::ScopeDropLoader::runtime(
+        paper_state.clone(),
+        orchestrator_source_log.clone(),
+        control_tx.clone(),
+    );
     // Replayed membership can carry a score from an earlier ranking batch, including after a
     // live-only reentry. Refresh every boot-live score before any source producer can read it.
     boot_refresh_scores_and_release(
@@ -1879,6 +1930,7 @@ async fn run() -> Result<()> {
         &cfg.supabase_secret_key,
         &watchlist_writer_lock,
         &producer_start_tx,
+        &scope_drops,
     )
     .await
     .context("establish current boot watchlist scores before releasing producers")?;
@@ -1913,6 +1965,7 @@ async fn run() -> Result<()> {
         watchlist_writer_lock.clone(),
         projection_dirty_rx,
         projection_status.clone(),
+        scope_drops,
     );
     supervisor.spawn(
         TaskName::WatchlistRefresh,
@@ -2685,14 +2738,13 @@ async fn resolve_financial_condition(
         parsed.condition_id.as_deref() == Some(condition.0.as_str()),
         "CLOB resolution condition differs from request"
     );
+    pe_service::record_market_membership(
+        paper_state,
+        &condition.0,
+        parsed.neg_risk_market_id.as_deref(),
+    )
+    .context("record CLOB resolution membership")?;
     let ClobPayoutResolution::Resolved(payout) = parsed.resolution_evidence().payout else {
-        if parsed.neg_risk == Some(true)
-            && let Some(group) = parsed.neg_risk_market_id.as_deref()
-        {
-            paper_state
-                .record_market_group(&condition.0, group)
-                .context("record unresolved neg-risk market group")?;
-        }
         return Ok(());
     };
     let (acknowledged, acknowledgement) = tokio::sync::oneshot::channel();
@@ -2737,6 +2789,148 @@ mod tests {
 
     const NOW: i64 = 10_000;
 
+    #[tokio::test]
+    async fn boot_imports_start_and_replay_applied_batches_before_brackets() {
+        use axum::{Json, extract::Query};
+        use pe_core_types::{BasisPoints, CollateralAmount, ReconstructionQuality};
+        use pe_service::paper_recovery::{
+            MembershipChange, MembershipReason, PAPER_LOG_SCHEMA_VERSION, PaperLogRecord,
+            QualificationStarted, TailBinding,
+        };
+        use pe_trader_index::{WatchlistEntry, WatchlistTier};
+        use std::sync::Mutex;
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.log");
+        let paper_path = temp.path().join("paper.log");
+        let wallet = WalletAddress([42; 20]);
+        let entry = WatchlistEntry {
+            wallet,
+            tier: WatchlistTier::Active,
+            leader_score_bps: BasisPoints(2_000),
+            lcb_5pct_bps: BasisPoints(0),
+            win_rate_bps: BasisPoints(6_000),
+            closed_trades_in_window: 10,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+        };
+        let at = OffsetDateTime::from_unix_timestamp(NOW).unwrap();
+        let envelope = |source: &str, schema_version, payload| EnvelopeIn {
+            source_id: SourceId(source.to_owned()),
+            schema_version,
+            parser_version: 1,
+            observed_at: SourceTimestamp(at),
+            received_at: ReceivedAt(at),
+            content_type: ContentType::Json,
+            payload,
+        };
+        let mut source_writer = pe_event_log::Writer::open(&source_path).unwrap();
+        let ranking_receipt = source_writer
+            .append_synced(envelope(
+                "pe-service.watchlist-ranking",
+                1,
+                serde_json::to_vec(&serde_json::json!({"batch_id":8,"entries":[entry]})).unwrap(),
+            ))
+            .unwrap();
+        drop(source_writer);
+        let empty_tail = TailBinding {
+            physical_tail: 0,
+            last_sequence: None,
+            last_hash: "00".repeat(32),
+        };
+        let start = QualificationStarted {
+            starting_bankroll: CollateralAmount::ZERO,
+            paper_prefix: empty_tail.clone(),
+            source_prefix: empty_tail.clone(),
+            live_prefix: empty_tail,
+            artifact_blake3: "test".to_owned(),
+            static_config_hash: "test".to_owned(),
+            hot_config_hash: "test".to_owned(),
+            generation: "test".to_owned(),
+            activation_id: "test".to_owned(),
+            ranking_batch_id: 7,
+            membership: vec![wallet],
+            membership_proofs_hash: "test".to_owned(),
+            schema_version: 1,
+            parser_version: 1,
+            financial_semantic_version: 1,
+        };
+        let mut paper_writer = pe_event_log::Writer::open(&paper_path).unwrap();
+        paper_writer
+            .append_synced(envelope(
+                "paper-test",
+                PAPER_LOG_SCHEMA_VERSION,
+                serde_json::to_vec(&PaperLogRecord::QualificationStarted(Arc::new(start))).unwrap(),
+            ))
+            .unwrap();
+        let changed = MembershipChange {
+            reason:MembershipReason::FullRerank,removed:Vec::new(),added:Vec::new(),capacity:1,ranking_batch_id:Some(8),
+            evidence:serde_json::json!({"kind":"full_rerank","ranking_receipt":ranking_receipt,"admission_receipts":[]}),
+        }.into_record();
+        paper_writer
+            .append_synced(envelope(
+                "paper-test",
+                PAPER_LOG_SCHEMA_VERSION,
+                serde_json::to_vec(&changed).unwrap(),
+            ))
+            .unwrap();
+        drop(paper_writer);
+        let era =
+            pe_service::paper_recovery::paper_generation(scan_paper_log(&paper_path).unwrap());
+        let read_batches = Arc::new(Mutex::new(Vec::new()));
+        let reads = read_batches.clone();
+        let app = Router::new()
+            .route("/rest/v1/ranking_entries",get(move |Query(query):Query<HashMap<String,String>>| async move {
+                assert_eq!(query["batch_id"],"eq.7", "only Start's ranking rows are fetched at boot");
+                Json(serde_json::json!([{"batch_id":7,"wallet_hex":wallet.to_string(),"last_trade_unix":NOW,"hit_rate_text":"0.6","ls_tstat_text":"1"}]))
+            }))
+            .route("/rest/v1/ranking_scope_drops",get(move |Query(query):Query<HashMap<String,String>>| {
+                let reads = reads.clone();
+                async move {
+                    let batch = query["batch_id"].strip_prefix("eq.").unwrap().parse::<i64>().unwrap();
+                    reads.lock().unwrap().push(batch);
+                    Json(serde_json::json!([{"batch_id":batch,"wallet_hex":wallet.to_string(),"scope_kind":"market","scope_id":format!("scope-{batch}"),"cause":"underflow","dropped_at_unix":NOW}]))
+                }
+            }))
+            .route("/rest/v1/ranking_neg_risk_group_spans",get(||async{Json(serde_json::json!([]))}))
+            .route("/rest/v1/ranking_batches",get(|Query(query):Query<HashMap<String,String>>|async move{
+                let batch = query["batch_id"].strip_prefix("eq.").unwrap().parse::<i64>().unwrap();
+                Json(serde_json::json!([{"batch_id":batch}]))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        let loader = supabase_reader::ScopeDropLoader::boot(
+            state.clone(),
+            Arc::new(tokio::sync::Mutex::new(
+                pe_service::source_event_sink::SourceEventSink::open(&source_path).unwrap(),
+            )),
+        );
+        let cfg = ServiceConfig {
+            supabase_url: base,
+            supabase_anon_key: "anon".to_owned(),
+            source_event_log_path: source_path,
+            ..ServiceConfig::default()
+        };
+        let (watchlist, _, marker, replayed) =
+            load_boot_membership(&cfg, &reqwest::Client::new(), Some(&era), None, &loader)
+                .await
+                .unwrap();
+        assert_eq!(marker, Some(8));
+        assert!(replayed);
+        assert_eq!(watchlist.entries.len(), 1);
+        assert_eq!(watchlist.entries[0].leader_score_bps, BasisPoints(1_000));
+        assert_eq!(*read_batches.lock().unwrap(), vec![7, 8]);
+        let _engine =
+            BucketCommitEngine::load(state.clone(), pe_position_ledger::PositionLedger::new())
+                .unwrap();
+        state.begin_batch().unwrap();
+        assert!(state.scope_drop_batch_imported(7).unwrap());
+        assert!(state.scope_drop_batch_imported(8).unwrap());
+        assert_eq!(state.wallet_scope_drops(&wallet, NOW).unwrap().len(), 2);
+        state.rollback_batch().unwrap();
+        server.abort();
+    }
+
     #[cfg(feature = "scenario")]
     #[tokio::test]
     async fn resolution_poll_records_neg_risk_group() {
@@ -2749,11 +2943,13 @@ mod tests {
         let mut writer = pe_event_log::Writer::open(dir.path().join("source.log")).unwrap();
         let (source, mut source_rx) = pe_service::activity_ingest::SourceLogHandle::channel(1);
         let (control, mut control_rx) = mpsc::channel(1);
-        for (id, grouped, resolved, fails) in [
-            ("grouped", true, false, false),
-            ("ungrouped", false, false, false),
-            ("failed", true, false, true),
-            ("resolved", true, true, false),
+        for (id, flag, group, resolved, fails) in [
+            ("grouped", Some(true), Some("group"), false, false),
+            ("ungrouped", Some(false), None, false, false),
+            ("group_without_flag", None, Some("group"), false, false),
+            ("flag_without_group", Some(true), None, false, false),
+            ("failed", Some(true), Some("group"), false, true),
+            ("resolved", Some(true), Some("group"), true, false),
         ] {
             if fails {
                 connection.execute_batch("CREATE TRIGGER fail_group_insert BEFORE INSERT ON meta WHEN NEW.key LIKE 'neg_risk_group:%' BEGIN SELECT RAISE(FAIL, 'group insert failed'); END;").unwrap();
@@ -2761,8 +2957,8 @@ mod tests {
             let payload = serde_json::to_vec(&serde_json::json!({
                 "condition_id": id,
                 "closed": resolved,
-                "neg_risk": true,
-                "neg_risk_market_id": if grouped { Some("group") } else { None },
+                "neg_risk": flag,
+                "neg_risk_market_id": group,
                 "is_50_50_outcome": false,
                 "tokens": [
                     {"token_id":"11", "outcome":"Yes", "winner":resolved, "price":if resolved { "1" } else { "0.5" }},
@@ -2810,7 +3006,7 @@ mod tests {
             } else {
                 result.unwrap();
             }
-            let group: Option<String> = connection
+            let stored: Option<String> = connection
                 .query_row(
                     "SELECT value FROM meta WHERE key = ?1",
                     params![format!("neg_risk_group:{id}")],
@@ -2819,13 +3015,14 @@ mod tests {
                 .optional()
                 .unwrap();
             assert_eq!(
-                group.as_deref(),
-                if grouped && !resolved && !fails {
-                    Some("group")
-                } else {
-                    None
-                }
+                stored.as_deref(),
+                (!fails).then_some(group.unwrap_or_default())
             );
+            if fails {
+                connection
+                    .execute_batch("DROP TRIGGER fail_group_insert")
+                    .unwrap();
+            }
             assert!(control_rx.try_recv().is_err());
         }
     }

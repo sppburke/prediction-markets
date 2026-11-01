@@ -4,7 +4,8 @@
 //! reaches paper-state in one transaction. Lexical `g2:` order is used only to
 //! make storage/replay output canonical; it never selects a causal winner.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Display;
 use std::sync::Arc;
 
@@ -19,12 +20,14 @@ use pe_execution_core::ObservationEvidence;
 use pe_paper_state::{
     ActivityBucketCommit, ActivityDispositionRecord, ActivityGroupState, AnchorInstallRecord,
     DecisionPendingRecord, DecisionPendingRow, EntryGateResultRecord, LeaderPositionRow,
-    MarketHistoryRecord, NoCopyDisposition, PaperStateDb, ReanchorRecord, WalletFenceRecord,
-    WalletHistoryStatusRecord,
+    MarketHistoryRecord, MarketMembership, NoCopyDisposition, PaperStateDb, ReanchorRecord,
+    WalletFenceRecord, WalletHistoryStatusRecord, WalletScopeDrop,
 };
 use pe_position_ledger::{
-    AppliedEffect, LedgerEffect, LedgerEffectDocumentError, LedgerError, LedgerMutation,
-    PositionLedger, SecondVerdict, TradeDecision, WalletFenceCause, classify_complete_second,
+    AppliedEffect, DropCause, LedgerEffect, LedgerEffectDocumentError, LedgerError, LedgerMutation,
+    MarketLookup, PositionLedger, Scope, ScopeKind, ScopeLookups, SecondRecord, SecondVerdict,
+    TradeDecision, WalletFenceCause, classify_complete_second, classify_scoped_second,
+    resolve_problem_scope,
 };
 use pe_source_polymarket_public::{
     ACTIVITY_MAX_OFFSET, ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate,
@@ -118,7 +121,7 @@ pub struct BucketDecisionContext {
     pub observation_provenance: HashMap<SourceTradeId, TradeProvenance>,
     /// Typed early-gate dispositions supplied by reconciliation (#544).
     pub no_copy_dispositions: HashMap<SourceTradeId, NoCopyDisposition>,
-    /// Venue-metadata corrections keyed by the immutable raw activity group.
+    /// Venue-verified identities keyed by the immutable raw activity group.
     pub identity_overrides: HashMap<SourceTradeId, IdentityOverride>,
     /// Groups whose token identity could not be established by venue metadata.
     pub identity_unresolved: HashSet<SourceTradeId>,
@@ -132,6 +135,23 @@ pub struct BucketDecisionContext {
 pub struct IdentityOverride {
     pub verified: MarketOutcomeId,
     pub evidence_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AmbiguousObservation {
+    pub group_id: SourceTradeId,
+    pub receipt: AppendReceipt,
+    pub source_epoch: i64,
+    pub candidates: Vec<(SourceTradeId, i64)>,
+    pub market_id: Option<String>,
+}
+
+impl AmbiguousObservation {
+    pub fn start_epoch(&self) -> i64 {
+        self.candidates
+            .iter()
+            .fold(self.source_epoch, |start, (_, second)| start.min(*second))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3185,14 +3205,14 @@ pub(crate) mod continuation_validation_tests {
         let payload = serde_json::to_vec(&json!([
             {
                 "proxyWallet": wallet.to_string(), "timestamp": epoch,
-                "conditionId": "0xcondition-a", "type": "TRADE", "size": "2.000000",
+                "conditionId": "0xca", "type": "TRADE", "size": "2.000000",
                 "usdcSize": "1.000000", "transactionHash": "0xtransaction-a", "price": "0.5",
                 "asset": "asset-a", "side": "BUY", "outcomeIndex": 0, "outcome": "Yes",
                 "isCombo": false
             },
             {
                 "proxyWallet": wallet.to_string(), "timestamp": epoch,
-                "conditionId": "0xcondition-b", "type": "TRADE", "size": "4.000000",
+                "conditionId": "0xcb", "type": "TRADE", "size": "4.000000",
                 "usdcSize": "2.000000", "transactionHash": "0xtransaction-b", "price": "0.5",
                 "asset": "asset-b", "side": "BUY", "outcomeIndex": 0, "outcome": "Yes",
                 "isCombo": false
@@ -3433,6 +3453,8 @@ pub enum BucketCommitError {
     Empty,
     #[error("activity bucket mixes wallets or epoch seconds")]
     MixedBucket,
+    #[error("market membership required: {0:?}")]
+    MembershipRequired(Vec<String>),
     #[error("activity bucket is partially durable")]
     PartialDurableBucket,
     #[error("invalid decision input json: {0}")]
@@ -3560,6 +3582,8 @@ pub struct BucketCommitEngine {
     frontier_hints: HashMap<WalletAddress, crate::frame_admission::FeedHistoryFrontier>,
     routed_frame_receipts: HashSet<pe_core_types::EventSeq>,
     frame_source_index: Option<SourceReceiptIndex>,
+    #[cfg(test)]
+    before_apply: Option<fn(&mut PositionLedger)>,
 }
 
 impl BucketCommitEngine {
@@ -3667,6 +3691,8 @@ impl BucketCommitEngine {
                 .collect(),
             routed_frame_receipts: HashSet::new(),
             frame_source_index: None,
+            #[cfg(test)]
+            before_apply: None,
         })
     }
 
@@ -4026,6 +4052,25 @@ impl BucketCommitEngine {
             .as_ref()
             .ok_or_else(|| BucketCommitError::Invariant("frame condition absent".to_owned()))?;
         let market = MarketId(pe_core_types::VenueMarketId(condition.0.clone()));
+        let group = match self.paper_state.market_membership(&market.to_string())? {
+            Some(MarketMembership::Grouped(group)) => Some(group),
+            _ => None,
+        };
+        let source_epoch = observation.source_time.0.unix_timestamp();
+        if self.paper_state.scope_is_dropped(
+            &observation.wallet,
+            &market.to_string(),
+            group.as_deref(),
+            source_epoch,
+        )? || self
+            .paper_state
+            .wallet_scope_drops(&observation.wallet, source_epoch)?
+            .iter()
+            .any(|drop| drop.dropped_at_epoch == source_epoch)
+        {
+            self.routed_frame_receipts.insert(receipt.sequence);
+            return Ok(FrameRoute::Ignored);
+        }
         let candidate_shaped = parts.side == Some(Side::Buy)
             && observation.share_amount != ShareAmount::ZERO
             && !observation.is_combo;
@@ -4797,7 +4842,7 @@ impl BucketCommitEngine {
         // Resolve identity before the coverage branch so covered effects and
         // first-entry history consume the same venue-authoritative mutation as
         // the ordinary apply path.
-        let recordable_mutations = aggregates
+        let mut recordable_mutations = aggregates
             .iter()
             .map(|aggregate| recordable_mutation(aggregate, context))
             .collect::<Vec<_>>();
@@ -4816,7 +4861,10 @@ impl BucketCommitEngine {
             if let Some(original) = state
                 && original.semantic_revision != aggregate.semantic_revision.as_str()
                 && original.transaction_hash == aggregate.group_id.components().transaction_hash
-                && (self.fences.contains(&wallet)
+                && (self.paper_state.activity_revision_retained_without_fence(
+                    aggregate.group_id.key(),
+                    aggregate.semantic_revision.as_str(),
+                )? || self.fences.contains(&wallet)
                     || coverage
                         .activity_cutoff_unix
                         .is_some_and(|cutoff| source_epoch <= cutoff))
@@ -4829,35 +4877,48 @@ impl BucketCommitEngine {
                 *original = revision;
             }
         }
-        let correlation_inputs: Value = serde_json::from_str(&context.decision_inputs_json)?;
-        if let Some(observations) = correlation_inputs.get("invalid_mapping_observations") {
-            let observations: Vec<(SourceTradeId, AppendReceipt)> =
-                serde_json::from_value(observations.clone())?;
-            if !observations.is_empty() {
-                // This is the deterministic bucket fence trigger, not a selected correlation
-                // target. Every ambiguous original receipt stays in the fence proof; no binding
-                // to any candidate is manufactured.
-                let trigger = aggregates
-                    .iter()
-                    .find(|aggregate| {
-                        !context
-                            .identity_unresolved
-                            .contains(aggregate.group_id.key())
-                    })
-                    .or_else(|| aggregates.first())
-                    .ok_or(BucketCommitError::Empty)?
-                    .group_id
-                    .key();
-                return self.commit_changed_bucket_fence(
-                    &aggregates,
-                    &durable,
-                    wallet,
-                    source_epoch,
-                    (WalletFenceCause::InvalidMapping, trigger.clone()),
-                    context,
+        if context.bracket_commit {
+            for ((aggregate, mutation), state) in aggregates
+                .iter()
+                .zip(&mut recordable_mutations)
+                .zip(&durable)
+            {
+                let Some(state) = state else {
+                    continue;
+                };
+                if state.semantic_revision != aggregate.semantic_revision.as_str() {
+                    continue;
+                }
+                let covered = matches!(
+                    state.disposition.as_str(),
+                    "anchor_covered" | "anchor_covered_late"
                 );
+                let raw_buy = state.disposition == "raw_only"
+                    && matches!(
+                        mutation.effect.effective(),
+                        LedgerEffect::Trade {
+                            side: Side::Buy,
+                            ..
+                        }
+                    );
+                if covered || raw_buy {
+                    let raw = matches!(
+                        AppliedEffect::from_document(&state.proof_json)?
+                            .effect
+                            .effective(),
+                        LedgerEffect::RawOnly
+                    );
+                    if (covered && raw) || (raw_buy && !raw) {
+                        mutation.effect = LedgerEffect::RawOnly;
+                    }
+                }
             }
         }
+        let correlation_inputs: Value = serde_json::from_str(&context.decision_inputs_json)?;
+        let AmbiguityEffects {
+            drops: mut scope_drops,
+            retirements: observation_retirements,
+        } = ambiguity_effects(context, wallet)?;
         let changed: Vec<_> = aggregates
             .iter()
             .zip(&durable)
@@ -4870,10 +4931,11 @@ impl BucketCommitEngine {
             })
             .map(|(aggregate, _)| aggregate.group_id.key().clone())
             .collect();
-        if let Some(trigger) = changed
-            .iter()
-            .find(|trigger| !context.identity_unresolved.contains(*trigger))
-            .or_else(|| changed.first())
+        if self.fences.contains(&wallet)
+            && let Some(trigger) = changed
+                .iter()
+                .find(|id| !context.identity_unresolved.contains(*id))
+                .or_else(|| changed.first())
         {
             return self.commit_changed_bucket_fence(
                 &aggregates,
@@ -4884,12 +4946,45 @@ impl BucketCommitEngine {
                 context,
             );
         }
+        let lookups = NotingScopeLookups::new(&self.paper_state, &aggregates, context);
+        let durable_drops = self.paper_state.wallet_scope_drops(&wallet, source_epoch)?;
+        scope_drops.retain(|drop| {
+            !durable_drops.iter().any(|existing| {
+                existing.scope_kind == "market"
+                    && existing.scope_id == drop.scope_id
+                    && existing.dropped_at_epoch <= drop.dropped_at_epoch
+            })
+        });
+        if !scope_drops.is_empty() && durable_drops.iter().any(|drop| drop.scope_kind == "event") {
+            scope_drops.retain(|drop| match lookups.market(&drop.scope_id) {
+                MarketLookup::Grouped(group) => !durable_drops.iter().any(|existing| {
+                    existing.scope_kind == "event"
+                        && existing.scope_id == group
+                        && existing.dropped_at_epoch <= drop.dropped_at_epoch
+                }),
+                _ => true,
+            });
+            lookups.check(true)?;
+        }
         let seen = durable.iter().filter(|state| state.is_some()).count();
-        if seen == aggregates.len() {
+        if seen == aggregates.len() && changed.is_empty() {
             if context.bracket_commit
                 && !self.fences.contains(&wallet)
                 && !self
-                    .covered_history_effects(wallet, source_epoch, &recordable_mutations)
+                    .covered_history_effects(
+                        wallet,
+                        source_epoch,
+                        &recordable_mutations
+                            .iter()
+                            .zip(&durable)
+                            .filter(|(_, state)| {
+                                state.as_ref().is_some_and(|state| {
+                                    history_repair_disposition(&state.disposition)
+                                })
+                            })
+                            .map(|(mutation, _)| mutation.clone())
+                            .collect::<Vec<_>>(),
+                    )
                     .is_empty()
             {
                 // An older bracket may have recorded these groups without consuming
@@ -4902,8 +4997,30 @@ impl BucketCommitEngine {
                     wallet,
                     source_epoch,
                     coverage.anchor_seq.is_some(),
+                    Vec::new(),
                     context,
                 );
+            }
+            if !observation_retirements.is_empty() {
+                let bucket = ActivityBucketCommit {
+                    scope_drops,
+                    observation_retirements,
+                    unfenced_revisions: Vec::new(),
+                    scope_drop_boundary_unix: None,
+                    wallet,
+                    source_epoch,
+                    dispositions: Vec::new(),
+                    leader_positions: Vec::new(),
+                    gate_results: Vec::new(),
+                    history_effects: Vec::new(),
+                    history_status: None,
+                    pending: Vec::new(),
+                    fence: None,
+                    reanchor: None,
+                    advance_cursor: true,
+                };
+                self.paper_state.commit_activity_bucket(&bucket)?;
+                log_scope_drops(&bucket.scope_drops);
             }
             self.paper_state.set_cursor(&wallet, source_epoch)?;
             return Ok(BucketCommitResult {
@@ -4916,11 +5033,13 @@ impl BucketCommitEngine {
                 already_committed: true,
             });
         }
-        if aggregates
-            .iter()
-            .zip(&durable)
-            .filter(|(_, state)| state.is_none())
-            .all(|(aggregate, _)| context.restamp_twins.contains(aggregate.group_id.key()))
+        if observation_retirements.is_empty()
+            && changed.is_empty()
+            && aggregates
+                .iter()
+                .zip(&durable)
+                .filter(|(_, state)| state.is_none())
+                .all(|(aggregate, _)| context.restamp_twins.contains(aggregate.group_id.key()))
         {
             let mut dispositions = BTreeMap::new();
             let records = aggregates
@@ -4940,6 +5059,10 @@ impl BucketCommitEngine {
                 .collect::<Result<Vec<_>, _>>()?;
             self.paper_state
                 .commit_activity_bucket(&ActivityBucketCommit {
+                    scope_drops: Vec::new(),
+                    observation_retirements: Vec::new(),
+                    unfenced_revisions: Vec::new(),
+                    scope_drop_boundary_unix: None,
                     wallet,
                     source_epoch,
                     dispositions: records,
@@ -4962,16 +5085,7 @@ impl BucketCommitEngine {
                 already_committed: false,
             });
         }
-        if seen == 0
-            && (coverage.reanchor_required
-                || (coverage
-                    .activity_cutoff_unix
-                    .is_some_and(|cutoff| source_epoch > cutoff)
-                    && self
-                        .paper_state
-                        .last_activity_group_epoch(&wallet)?
-                        .is_some_and(|last_epoch| last_epoch >= source_epoch)))
-        {
+        if seen == 0 && changed.is_empty() && coverage.reanchor_required {
             return self.commit_late_group_reanchor(
                 &aggregates,
                 &recordable_mutations,
@@ -4980,9 +5094,18 @@ impl BucketCommitEngine {
                 context,
             );
         }
-        if coverage
+        let covered = coverage
             .activity_cutoff_unix
-            .is_none_or(|cutoff| source_epoch <= cutoff)
+            .is_none_or(|cutoff| source_epoch <= cutoff);
+        let late = !covered
+            && self
+                .paper_state
+                .last_activity_group_epoch(&wallet)?
+                .is_some_and(|last| last >= source_epoch);
+        if observation_retirements.is_empty()
+            && covered
+            && coverage.anchor_seq.is_none()
+            && changed.is_empty()
         {
             return self.commit_covered_bucket(
                 &aggregates,
@@ -4990,61 +5113,46 @@ impl BucketCommitEngine {
                 &recordable_mutations,
                 wallet,
                 source_epoch,
-                coverage.anchor_seq.is_some(),
+                false,
+                Vec::new(),
                 context,
             );
         }
-        let unseen = aggregates
-            .iter()
-            .zip(&durable)
-            .filter(|(_, state)| state.is_none())
-            .map(|(aggregate, _)| aggregate.group_id.key())
-            .collect::<Vec<_>>();
-        if seen != 0 {
-            let trigger = aggregates
-                .iter()
-                .zip(&durable)
-                .find(|(_, state)| state.is_none())
-                .map(|(aggregate, _)| aggregate.group_id.key().clone())
-                .ok_or(BucketCommitError::PartialDurableBucket)?;
-            return self.commit_changed_bucket_fence(
-                &aggregates,
-                &durable,
-                wallet,
-                source_epoch,
-                (WalletFenceCause::LateEqualSecondGroup, trigger),
-                context,
-            );
-        }
-        if !unseen.is_empty()
-            && unseen
-                .iter()
-                .all(|source_trade_id| context.identity_unresolved.contains(*source_trade_id))
-        {
-            return self.commit_covered_bucket(
-                &aggregates,
-                &durable,
-                &recordable_mutations,
-                wallet,
-                source_epoch,
-                true,
-                context,
-            );
-        }
-
-        let decision_inputs: Value = serde_json::from_str(&context.decision_inputs_json)?;
-        let mut mutations = Vec::with_capacity(aggregates.len());
-        for (aggregate, recordable) in aggregates.iter().zip(&recordable_mutations) {
-            if context
-                .identity_unresolved
-                .contains(aggregate.group_id.key())
-            {
-                mutations.push(recordable.clone());
-                continue;
+        if self.fences.contains(&wallet) {
+            if covered {
+                return self.commit_covered_bucket(
+                    &aggregates,
+                    &durable,
+                    &recordable_mutations,
+                    wallet,
+                    source_epoch,
+                    coverage.anchor_seq.is_some(),
+                    Vec::new(),
+                    context,
+                );
             }
-            match LedgerMutation::from_activity(aggregate) {
-                Ok(mutation) => mutations.push(resolve_identity(mutation, context)),
-                Err(error) => {
+            if seen != 0 {
+                let trigger = aggregates
+                    .iter()
+                    .zip(&durable)
+                    .find(|(_, state)| state.is_none())
+                    .map(|(aggregate, _)| aggregate.group_id.key().clone())
+                    .ok_or(BucketCommitError::PartialDurableBucket)?;
+                return self.commit_changed_bucket_fence(
+                    &aggregates,
+                    &durable,
+                    wallet,
+                    source_epoch,
+                    (WalletFenceCause::LateEqualSecondGroup, trigger),
+                    context,
+                );
+            }
+            for aggregate in &aggregates {
+                if !context
+                    .identity_unresolved
+                    .contains(aggregate.group_id.key())
+                    && let Err(error) = LedgerMutation::from_activity(aggregate)
+                {
                     return self.commit_fence(
                         &aggregates,
                         wallet,
@@ -5055,59 +5163,151 @@ impl BucketCommitEngine {
                     );
                 }
             }
-        }
-
-        if self.fences.contains(&wallet) {
             return self.commit_fenced_bucket(
                 &aggregates,
-                &mutations,
+                &recordable_mutations,
                 wallet,
                 source_epoch,
                 context,
             );
         }
-        if let Some((trigger, cause)) =
-            mutations
-                .iter()
-                .find_map(|mutation| match mutation.effect.effective() {
-                    LedgerEffect::Conversion => Some((
-                        mutation.source_trade_id.clone(),
-                        WalletFenceCause::Conversion,
-                    )),
-                    LedgerEffect::UnknownEffect => Some((
-                        mutation.source_trade_id.clone(),
-                        WalletFenceCause::UnknownEffect,
-                    )),
-                    _ => None,
+        let mut starts = durable_drops
+            .iter()
+            .map(|drop| {
+                (
+                    Scope {
+                        kind: if drop.scope_kind == "event" {
+                            ScopeKind::Event
+                        } else {
+                            ScopeKind::Market
+                        },
+                        id: drop.scope_id.clone(),
+                    },
+                    drop.dropped_at_epoch,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for drop in &scope_drops {
+            starts
+                .entry(Scope {
+                    kind: ScopeKind::Market,
+                    id: drop.scope_id.clone(),
                 })
-        {
-            return self.commit_fence(&aggregates, wallet, source_epoch, cause, trigger, context);
+                .and_modify(|start| *start = (*start).min(drop.dropped_at_epoch))
+                .or_insert(drop.dropped_at_epoch);
         }
-        let reanchor_trigger =
-            aggregates
-                .iter()
-                .zip(&mutations)
-                .find_map(|(aggregate, mutation)| {
-                    if !context.bracket_commit
-                        && context
-                            .identity_unresolved
-                            .contains(&mutation.source_trade_id)
-                    {
-                        Some((
-                            mutation.source_trade_id.clone(),
-                            "identity_unresolved".to_owned(),
-                        ))
-                    } else if matches!(mutation.effect.effective(), LedgerEffect::RequiresAnchor)
-                        && aggregate.group_id.components().condition_id.is_none()
-                    {
-                        Some((
-                            mutation.source_trade_id.clone(),
-                            "reanchor_required_redemption".to_owned(),
-                        ))
-                    } else {
-                        None
+        let mut certified = starts.values().any(|start| *start == source_epoch);
+        let mut dropped = starts.into_keys().collect::<BTreeSet<_>>();
+        let mut routed = HashMap::new();
+        let mut unfenced_revisions = Vec::new();
+        let mut records = Vec::new();
+        let mut resolving_late = false;
+        for ((aggregate, state), recordable) in
+            aggregates.iter().zip(&durable).zip(&recordable_mutations)
+        {
+            let id = aggregate.group_id.key();
+            let revised = changed.contains(id);
+            if state.is_some() && !revised {
+                continue;
+            }
+            let mut mutation = if context.restamp_twins.contains(id) {
+                Ok(LedgerMutation {
+                    effect: LedgerEffect::RawOnly,
+                    ..recordable.clone()
+                })
+            } else if context.identity_unresolved.contains(id) {
+                Ok(recordable.clone())
+            } else {
+                LedgerMutation::from_activity(aggregate)
+                    .map(|mutation| resolve_identity(mutation, context))
+            };
+            let route_cause = if revised {
+                Some(WalletFenceCause::RevisedAggregate.as_str())
+            } else if covered && coverage.anchor_seq.is_some() {
+                Some("anchor_covered_late")
+            } else if !changed.is_empty() {
+                None
+            } else if !covered && seen != 0 {
+                Some(WalletFenceCause::LateEqualSecondGroup.as_str())
+            } else if late {
+                Some("reanchor_required_late_group")
+            } else {
+                None
+            };
+            if let Some(cause) = route_cause {
+                let mut scopes = BTreeSet::new();
+                if revised
+                    && let Some(original) = self.paper_state.activity_group_state(id)?
+                    && crate::paper_recovery::applied_disposition(id, &original.disposition)
+                        .map_err(|error| BucketCommitError::Invariant(error.to_string()))?
+                {
+                    let effect = AppliedEffect::from_document(&original.proof_json)?;
+                    if let Some(market) = effect_market_id(&effect.effect) {
+                        scopes.insert(Scope {
+                            kind: ScopeKind::Market,
+                            id: market.to_string(),
+                        });
                     }
-                });
+                }
+                if !matches!(&mutation, Ok(mutation) if matches!(mutation.effect.effective(), LedgerEffect::RawOnly)
+                    || (matches!(mutation.effect.effective(), LedgerEffect::RequiresAnchor) && aggregate.group_id.components().condition_id.is_some()))
+                {
+                    resolving_late = true;
+                    if let Some(scope) =
+                        resolve_problem_scope(aggregate, routing_scope_cause(aggregate), &lookups)
+                    {
+                        scopes.insert(scope);
+                    } else {
+                        tracing::warn!(wallet = %wallet, source_trade_id = %id, cause, "wallet scope problem ignored");
+                        mutation = Ok(LedgerMutation {
+                            effect: LedgerEffect::RawOnly,
+                            ..recordable.clone()
+                        });
+                    }
+                }
+                let disposition =
+                    if covered && !revised && !context.identity_unresolved.contains(id) {
+                        "anchor_covered_late"
+                    } else if scopes.is_empty() {
+                        "raw_only"
+                    } else {
+                        "scope_dropped"
+                    };
+                if revised {
+                    unfenced_revisions
+                        .push((id.clone(), aggregate.semantic_revision.as_str().to_owned()));
+                    if scopes.is_empty() {
+                        tracing::warn!(wallet = %wallet, source_trade_id = %id, cause, "wallet scope revision ignored");
+                    }
+                }
+                for scope in scopes {
+                    let covered_by_event = scope.kind == ScopeKind::Market
+                        && match lookups.market(&scope.id) {
+                            MarketLookup::Grouped(group) => dropped.contains(&Scope {
+                                kind: ScopeKind::Event,
+                                id: group,
+                            }),
+                            _ => false,
+                        };
+                    if !covered_by_event && dropped.insert(scope.clone()) {
+                        certified = true;
+                        scope_drops.push(scope_drop_record(
+                            wallet,
+                            source_epoch,
+                            context.recorded_at_unix,
+                            scope,
+                            cause,
+                            id,
+                        )?);
+                    }
+                }
+                routed.insert(id.clone(), disposition);
+            }
+            records.push(SecondRecord {
+                aggregate,
+                mutation,
+            });
+        }
         let history_complete = context
             .history_status
             .as_ref()
@@ -5116,67 +5316,179 @@ impl BucketCommitEngine {
                 || self.complete_history.contains(&wallet),
                 |status| status.complete,
             );
-        let (applied, trade_decisions, first_entries) = match classify_complete_second(
-            complete_read_entry_policy(current_paper_version(complete_read_version(
-                context.read_commitment,
-            ))),
-            &self.ledger,
-            wallet,
-            &mutations,
-            context.reconstruction_quality,
-            &context.signal_config,
-            history_complete,
-            &|market_id| self.entry_gate.has_market(&wallet, market_id),
-        ) {
-            Ok(SecondVerdict::OrderIndependent {
-                applied,
-                decisions,
-                first_entries,
-            }) => (applied, decisions, first_entries),
-            Ok(SecondVerdict::OrderDependent { .. }) => {
-                let trigger = mutations
-                    .iter()
-                    .find(|mutation| {
-                        !context
-                            .identity_unresolved
-                            .contains(&mutation.source_trade_id)
+        let classification_records = records
+            .iter()
+            .filter(|record| !routed.contains_key(record.aggregate.group_id.key()))
+            .map(|record| SecondRecord {
+                aggregate: record.aggregate,
+                mutation: record.mutation.clone(),
+            })
+            .collect::<Vec<_>>();
+        let classify = |drops: &BTreeSet<Scope>, certified| {
+            classify_scoped_second(
+                complete_read_entry_policy(current_paper_version(complete_read_version(
+                    context.read_commitment,
+                ))),
+                &self.ledger,
+                wallet,
+                &classification_records,
+                drops,
+                certified,
+                context.reconstruction_quality,
+                &context.signal_config,
+                history_complete,
+                &|market| self.entry_gate.has_market(&wallet, market),
+                &lookups,
+            )
+        };
+        let scoped = classify(&dropped, certified);
+        let without_drops = (!dropped.is_empty()).then(|| classify(&BTreeSet::new(), false));
+        let without_drops = without_drops.as_ref().unwrap_or(&scoped);
+        let has_problem = |result: &Result<pe_position_ledger::ScopedSecond, LedgerError>| {
+            result.as_ref().is_ok_and(|second| {
+                !second.problems.is_empty()
+                    || second.ignored.iter().any(|(id, kind)| {
+                        *kind != ActivityType::Trade
+                            || aggregates.iter().any(|aggregate| {
+                                aggregate.group_id.key() == id
+                                    && aggregate.group_id.components().asset.is_some()
+                            })
                     })
-                    .map(|mutation| mutation.source_trade_id.clone())
-                    .ok_or(BucketCommitError::Empty)?;
-                return self.commit_fence(
-                    &aggregates,
-                    wallet,
-                    source_epoch,
-                    WalletFenceCause::OrderDependentEqualSecond,
-                    trigger,
-                    context,
-                );
-            }
+            })
+        };
+        lookups.check(
+            resolving_late
+                || dropped.iter().any(|scope| scope.kind == ScopeKind::Event)
+                || has_problem(&scoped)
+                || has_problem(without_drops),
+        )?;
+        if covered && changed.is_empty() {
+            let covered_mutations = recordable_mutations
+                .iter()
+                .map(|mutation| {
+                    records
+                        .iter()
+                        .find(|record| record.aggregate.group_id.key() == &mutation.source_trade_id)
+                        .and_then(|record| record.mutation.as_ref().ok())
+                        .unwrap_or(mutation)
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            return self.commit_covered_bucket(
+                &aggregates,
+                &durable,
+                &covered_mutations,
+                wallet,
+                source_epoch,
+                coverage.anchor_seq.is_some(),
+                scope_drops,
+                context,
+            );
+        }
+        let decision_inputs = correlation_inputs;
+        let scoped = match scoped {
+            Ok(scoped) => scoped,
             Err(error) => {
-                let cause = error.fence_cause();
-                let trigger = mutation_error_id(&error);
+                if seen != 0 {
+                    return self.commit_changed_bucket_fence(
+                        &aggregates,
+                        &durable,
+                        wallet,
+                        source_epoch,
+                        (error.fence_cause(), mutation_error_id(&error)),
+                        context,
+                    );
+                }
                 return self.commit_fence(
                     &aggregates,
                     wallet,
                     source_epoch,
-                    cause,
-                    trigger,
+                    error.fence_cause(),
+                    mutation_error_id(&error),
                     context,
                 );
             }
         };
-
-        let mut candidate = self.ledger.clone();
-        if let Err(error) = candidate.apply_all_or_none(&mutations) {
-            return self.commit_fence(
-                &aggregates,
+        let history_effects = self.buy_history_effects(
+            wallet,
+            source_epoch,
+            scoped_history_buys(
+                &records,
+                &scoped.consumed,
+                &scoped.ignored,
+                &routed,
+                &lookups,
+            ),
+        );
+        let first_entries = history_effects
+            .iter()
+            .map(|history| (history.market_id.clone(), history.source_trade_id.clone()))
+            .collect::<Vec<_>>();
+        lookups.check(false)?;
+        for (id, kind) in &scoped.ignored {
+            tracing::warn!(wallet = %wallet, source_trade_id = %id, activity_type = kind.as_str(), "wallet scope problem ignored");
+        }
+        for problem in &scoped.problems {
+            scope_drops.push(scope_drop_record(
                 wallet,
                 source_epoch,
-                error.fence_cause(),
-                mutation_error_id(&error),
-                context,
-            );
+                context.recorded_at_unix,
+                problem.scope.clone(),
+                drop_cause_string(problem.cause),
+                &problem.trigger,
+            )?);
         }
+        let mutations = scoped.apply;
+        let trade_decisions = scoped.decisions;
+        let mut candidate = self.ledger.clone();
+        #[cfg(test)]
+        if let Some(before_apply) = self.before_apply.take() {
+            before_apply(&mut candidate);
+        }
+        let applied = match candidate.apply_all_or_none(&mutations) {
+            Ok(applied) => applied,
+            Err(error) => {
+                if seen != 0 {
+                    return self.commit_changed_bucket_fence(
+                        &aggregates,
+                        &durable,
+                        wallet,
+                        source_epoch,
+                        (error.fence_cause(), mutation_error_id(&error)),
+                        context,
+                    );
+                }
+                return self.commit_fence(
+                    &aggregates,
+                    wallet,
+                    source_epoch,
+                    error.fence_cause(),
+                    mutation_error_id(&error),
+                    context,
+                );
+            }
+        };
+        let applied_by_id = mutations
+            .iter()
+            .zip(&applied)
+            .map(|(mutation, effect)| (mutation.source_trade_id.clone(), (mutation, effect)))
+            .collect::<HashMap<_, _>>();
+        let ignored = scoped
+            .ignored
+            .iter()
+            .map(|(id, _)| id)
+            .collect::<HashSet<_>>();
+        let reanchor_trigger = (!context.bracket_commit)
+            .then(|| {
+                records.iter().find_map(|record| {
+                    let id = record.aggregate.group_id.key();
+                    context
+                        .identity_unresolved
+                        .contains(id)
+                        .then(|| (id.clone(), "identity_unresolved".to_owned()))
+                })
+            })
+            .flatten();
         let (mut gate_results, history_effects, gate_outcomes) =
             Self::derive_gate_results(wallet, source_epoch, &trade_decisions, &first_entries);
         // IDs omit epochs. Only an already authenticated durable frame gate owns this exception.
@@ -5185,19 +5497,34 @@ impl BucketCommitEngine {
         let mut pending = Vec::new();
         let mut dispositions = BTreeMap::new();
         let mut disposition_records = Vec::with_capacity(aggregates.len());
-        for ((aggregate, mutation), applied_effect) in
-            aggregates.iter().zip(&mutations).zip(&applied)
-        {
+        for (aggregate, state) in aggregates.iter().zip(&durable) {
             let source_trade_id = aggregate.group_id.key().clone();
+            if state.is_some() && !changed.contains(&source_trade_id) {
+                dispositions.insert(source_trade_id.0.clone(), "already_committed".to_owned());
+                continue;
+            }
+            let Some((mutation, applied_effect)) = applied_by_id.get(&source_trade_id) else {
+                let disposition = routed.get(&source_trade_id).copied().unwrap_or_else(|| {
+                    if ignored.contains(&source_trade_id) {
+                        "raw_only"
+                    } else {
+                        "scope_dropped"
+                    }
+                });
+                dispositions.insert(source_trade_id.0.clone(), disposition.to_owned());
+                let mutation = recordable_mutation(aggregate, context);
+                disposition_records.push(activity_record(
+                    aggregate,
+                    disposition.to_owned(),
+                    &mutation.effect,
+                    None,
+                    context.no_copy_dispositions.get(&source_trade_id).cloned(),
+                )?);
+                continue;
+            };
             let disposition = match mutation.effect.effective() {
                 LedgerEffect::RawOnly => "raw_only".to_owned(),
-                LedgerEffect::RequiresAnchor => {
-                    if aggregate.group_id.components().condition_id.is_some() {
-                        "raw_only".to_owned()
-                    } else {
-                        "reanchor_required_redemption".to_owned()
-                    }
-                }
+                LedgerEffect::RequiresAnchor => "raw_only".to_owned(),
                 LedgerEffect::Trade { .. } => {
                     let outcome = gate_outcomes
                         .get(&source_trade_id.0)
@@ -5355,6 +5682,10 @@ impl BucketCommitEngine {
         }
 
         let bucket = ActivityBucketCommit {
+            scope_drops,
+            observation_retirements,
+            unfenced_revisions,
+            scope_drop_boundary_unix: Some(context.recorded_at_unix),
             wallet,
             source_epoch,
             dispositions: disposition_records,
@@ -5373,10 +5704,11 @@ impl BucketCommitEngine {
             advance_cursor: true,
         };
         self.paper_state.commit_activity_bucket(&bucket)?;
+        log_scope_drops(&bucket.scope_drops);
         self.ledger = candidate;
         self.apply_history_projection(wallet, &history_effects, context.history_status.as_ref());
         Ok(BucketCommitResult {
-            retained_revision: false,
+            retained_revision: !bucket.unfenced_revisions.is_empty(),
             wallet,
             source_epoch,
             dispositions,
@@ -5397,6 +5729,10 @@ impl BucketCommitEngine {
         source_epoch: i64,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
+        let AmbiguityEffects {
+            drops: scope_drops,
+            retirements: observation_retirements,
+        } = ambiguity_effects(context, wallet)?;
         const DISPOSITION: &str = "reanchor_required_late_group";
         let trigger = aggregates
             .iter()
@@ -5434,23 +5770,28 @@ impl BucketCommitEngine {
         } else {
             Vec::new()
         };
-        self.paper_state
-            .commit_activity_bucket(&ActivityBucketCommit {
-                wallet,
-                source_epoch,
-                dispositions: records,
-                leader_positions: Vec::new(),
-                gate_results: Vec::new(),
-                history_effects: history_effects.clone(),
-                history_status: context.history_status.clone(),
-                pending: Vec::new(),
-                fence: None,
-                reanchor: Some(ReanchorRecord {
-                    source_trade_id: trigger,
-                    reason: DISPOSITION.to_owned(),
-                }),
-                advance_cursor: false,
-            })?;
+        let bucket = ActivityBucketCommit {
+            scope_drops,
+            observation_retirements,
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
+            wallet,
+            source_epoch,
+            dispositions: records,
+            leader_positions: Vec::new(),
+            gate_results: Vec::new(),
+            history_effects: history_effects.clone(),
+            history_status: context.history_status.clone(),
+            pending: Vec::new(),
+            fence: None,
+            reanchor: Some(ReanchorRecord {
+                source_trade_id: trigger,
+                reason: DISPOSITION.to_owned(),
+            }),
+            advance_cursor: false,
+        };
+        self.paper_state.commit_activity_bucket(&bucket)?;
+        log_scope_drops(&bucket.scope_drops);
         self.apply_history_projection(wallet, &history_effects, None);
         // The groups are durable: deliver past them now, as their all-stored re-read would,
         // so a later re-read never moves the cursor between a bracket's captures.
@@ -5475,6 +5816,7 @@ impl BucketCommitEngine {
         wallet: WalletAddress,
         source_epoch: i64,
         late: bool,
+        scope_drops: Vec<WalletScopeDrop>,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
         let all_stored = durable.iter().all(Option::is_some);
@@ -5494,7 +5836,8 @@ impl BucketCommitEngine {
                     aggregate.group_id.key().0.clone(),
                     "already_committed".to_owned(),
                 );
-                if repair_history {
+                if repair_history && history_repair_disposition(&state.disposition) {
+                    mutations.push(mutation.clone());
                     let original = self
                         .paper_state
                         .activity_group_state(aggregate.group_id.key())?;
@@ -5541,15 +5884,7 @@ impl BucketCommitEngine {
         let history_effects = if context.bracket_commit && self.fences.contains(&wallet) {
             Vec::new()
         } else {
-            self.covered_history_effects(
-                wallet,
-                source_epoch,
-                if repair_history {
-                    resolved_mutations
-                } else {
-                    &mutations
-                },
-            )
+            self.covered_history_effects(wallet, source_epoch, &mutations)
         };
         let unresolved_trigger = (!context.bracket_commit)
             .then(|| {
@@ -5561,18 +5896,12 @@ impl BucketCommitEngine {
                 })
             })
             .flatten();
-        let late_trigger = late
-            .then(|| {
-                mutations.iter().find_map(|mutation| {
-                    (!context
-                        .identity_unresolved
-                        .contains(&mutation.source_trade_id))
-                    .then(|| mutation.source_trade_id.clone())
-                })
-            })
-            .flatten();
         self.paper_state
             .commit_activity_bucket(&ActivityBucketCommit {
+                scope_drops: scope_drops.clone(),
+                observation_retirements: ambiguity_effects(context, wallet)?.retirements,
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet,
                 source_epoch,
                 dispositions: records,
@@ -5582,19 +5911,13 @@ impl BucketCommitEngine {
                 history_status: context.history_status.clone(),
                 pending: Vec::new(),
                 fence: None,
-                reanchor: unresolved_trigger
-                    .map(|source_trade_id| ReanchorRecord {
-                        source_trade_id,
-                        reason: "identity_unresolved".to_owned(),
-                    })
-                    .or_else(|| {
-                        late_trigger.map(|source_trade_id| ReanchorRecord {
-                            source_trade_id,
-                            reason: disposition.to_owned(),
-                        })
-                    }),
+                reanchor: unresolved_trigger.map(|source_trade_id| ReanchorRecord {
+                    source_trade_id,
+                    reason: "identity_unresolved".to_owned(),
+                }),
                 advance_cursor: !all_stored,
             })?;
+        log_scope_drops(&scope_drops);
         // The running projection follows the committed transaction before any
         // later write, so a failed cursor update cannot leave durable history
         // unpublished.
@@ -5619,27 +5942,40 @@ impl BucketCommitEngine {
         source_epoch: i64,
         mutations: &[LedgerMutation],
     ) -> Vec<MarketHistoryRecord> {
+        self.buy_history_effects(
+            wallet,
+            source_epoch,
+            mutations.iter().filter_map(|mutation| {
+                let LedgerEffect::Trade {
+                    market_id,
+                    side: Side::Buy,
+                    ..
+                } = mutation.effect.effective()
+                else {
+                    return None;
+                };
+                (!self.entry_gate.has_market(&wallet, market_id))
+                    .then(|| (market_id.clone(), mutation.source_trade_id.clone()))
+            }),
+        )
+    }
+
+    fn buy_history_effects(
+        &self,
+        wallet: WalletAddress,
+        source_epoch: i64,
+        buys: impl IntoIterator<Item = (MarketId, SourceTradeId)>,
+    ) -> Vec<MarketHistoryRecord> {
         let mut first_buys: BTreeMap<String, (MarketId, SourceTradeId)> = BTreeMap::new();
-        for mutation in mutations {
-            let LedgerEffect::Trade {
-                market_id,
-                side: Side::Buy,
-                ..
-            } = mutation.effect.effective()
-            else {
-                continue;
-            };
-            if self.entry_gate.has_market(&wallet, market_id) {
-                continue;
-            }
+        for (market_id, source_trade_id) in buys {
             first_buys
                 .entry(market_id.to_string())
                 .and_modify(|(_, current)| {
-                    if mutation.source_trade_id.0 < current.0 {
-                        current.clone_from(&mutation.source_trade_id);
+                    if source_trade_id.0 < current.0 {
+                        current.clone_from(&source_trade_id);
                     }
                 })
-                .or_insert_with(|| (market_id.clone(), mutation.source_trade_id.clone()));
+                .or_insert((market_id, source_trade_id));
         }
         first_buys
             .into_values()
@@ -5728,6 +6064,10 @@ impl BucketCommitEngine {
         trigger: SourceTradeId,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
+        let AmbiguityEffects {
+            drops: scope_drops,
+            retirements: observation_retirements,
+        } = ambiguity_effects(context, wallet)?;
         let proof = json!({"bucket_epoch": source_epoch, "cause": cause.as_str()});
         let mut dispositions = BTreeMap::new();
         let mut records = Vec::with_capacity(aggregates.len());
@@ -5763,29 +6103,34 @@ impl BucketCommitEngine {
                     .flatten(),
             )?);
         }
-        self.paper_state
-            .commit_activity_bucket(&ActivityBucketCommit {
+        let bucket = ActivityBucketCommit {
+            scope_drops,
+            observation_retirements,
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
+            wallet,
+            source_epoch,
+            dispositions: records,
+            leader_positions: Vec::new(),
+            gate_results: Vec::new(),
+            history_effects: Vec::new(),
+            history_status: context.history_status.clone(),
+            pending: Vec::new(),
+            fence: Some(WalletFenceRecord {
                 wallet,
-                source_epoch,
-                dispositions: records,
-                leader_positions: Vec::new(),
-                gate_results: Vec::new(),
-                history_effects: Vec::new(),
-                history_status: context.history_status.clone(),
-                pending: Vec::new(),
-                fence: Some(WalletFenceRecord {
-                    wallet,
-                    source_trade_id: trigger,
-                    cause: cause.as_str().to_owned(),
-                    proof_json: serde_json::to_string(&proof)?,
-                    fenced_at_unix: context.recorded_at_unix,
-                }),
-                reanchor: unresolved_trigger.map(|source_trade_id| ReanchorRecord {
-                    source_trade_id,
-                    reason: "identity_unresolved".to_owned(),
-                }),
-                advance_cursor: true,
-            })?;
+                source_trade_id: trigger,
+                cause: cause.as_str().to_owned(),
+                proof_json: serde_json::to_string(&proof)?,
+                fenced_at_unix: context.recorded_at_unix,
+            }),
+            reanchor: unresolved_trigger.map(|source_trade_id| ReanchorRecord {
+                source_trade_id,
+                reason: "identity_unresolved".to_owned(),
+            }),
+            advance_cursor: true,
+        };
+        self.paper_state.commit_activity_bucket(&bucket)?;
+        log_scope_drops(&bucket.scope_drops);
         self.fences.insert(wallet);
         Ok(BucketCommitResult {
             retained_revision: false,
@@ -5807,80 +6152,14 @@ impl BucketCommitEngine {
         fence: (WalletFenceCause, SourceTradeId),
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
+        let AmbiguityEffects {
+            drops: scope_drops,
+            retirements: observation_retirements,
+        } = ambiguity_effects(context, wallet)?;
         let (cause, trigger) = fence;
         let already_fenced = self.fences.contains(&wallet);
-        let mut proof = json!({"bucket_epoch": source_epoch, "cause": cause.as_str()});
-        if cause == WalletFenceCause::InvalidMapping {
-            let inputs: Value = serde_json::from_str(&context.decision_inputs_json)?;
-            if let Some(observations) = inputs.get("invalid_mapping_observations") {
-                proof["invalid_mapping_observations"] = observations.clone();
-            }
-        }
-        let proof_json = serde_json::to_string(&proof)?;
-        if cause == WalletFenceCause::InvalidMapping
-            && !already_fenced
-            && let Some(aggregate) = aggregates
-                .iter()
-                .zip(durable)
-                .find_map(|(aggregate, state)| state.is_some().then_some(aggregate))
-        {
-            // Comparison states may contain a disposed revision; the witness must use
-            // the immutable original even after a recovery cleared the previous fence.
-            let state = self
-                .paper_state
-                .activity_group_state(aggregate.group_id.key())?
-                .ok_or(BucketCommitError::PartialDurableBucket)?;
-            // Preserve the original disposition and its history clock as the fence witness.
-            // Once that fence is durable, the existing bucket owner can retain any revised
-            // candidates without replacing their original economic effects. A crash between
-            // these commits leaves the wallet fenced and the unfinished read replayable.
-            self.paper_state
-                .commit_activity_bucket(&ActivityBucketCommit {
-                    wallet,
-                    source_epoch: state.source_epoch,
-                    dispositions: vec![ActivityDispositionRecord {
-                        source_trade_id: aggregate.group_id.key().clone(),
-                        transaction_hash: state.transaction_hash.clone(),
-                        wallet,
-                        source_epoch: state.source_epoch,
-                        semantic_revision: state.semantic_revision.clone(),
-                        activity_type: aggregate
-                            .group_id
-                            .components()
-                            .activity_type
-                            .as_str()
-                            .to_owned(),
-                        disposition: state.disposition.clone(),
-                        proof_json: state.proof_json.clone(),
-                        no_copy: None,
-                    }],
-                    leader_positions: Vec::new(),
-                    gate_results: Vec::new(),
-                    history_effects: Vec::new(),
-                    history_status: None,
-                    pending: Vec::new(),
-                    fence: Some(WalletFenceRecord {
-                        wallet,
-                        source_trade_id: aggregate.group_id.key().clone(),
-                        cause: cause.as_str().to_owned(),
-                        proof_json,
-                        fenced_at_unix: context.recorded_at_unix,
-                    }),
-                    reanchor: None,
-                    advance_cursor: false,
-                })?;
-            self.fences.insert(wallet);
-            let mut result = self.commit_changed_bucket_fence(
-                aggregates,
-                durable,
-                wallet,
-                source_epoch,
-                (cause, trigger),
-                context,
-            )?;
-            result.newly_fenced = Some(cause);
-            return Ok(result);
-        }
+        let proof_json =
+            serde_json::to_string(&json!({"bucket_epoch": source_epoch, "cause": cause.as_str()}))?;
         let mut dispositions = BTreeMap::new();
         let mut records = Vec::new();
         let mut unresolved_trigger = None;
@@ -5934,29 +6213,34 @@ impl BucketCommitEngine {
                 )?);
             }
         }
-        self.paper_state
-            .commit_activity_bucket(&ActivityBucketCommit {
+        let bucket = ActivityBucketCommit {
+            scope_drops,
+            observation_retirements,
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
+            wallet,
+            source_epoch,
+            dispositions: records,
+            leader_positions: Vec::new(),
+            gate_results: Vec::new(),
+            history_effects: Vec::new(),
+            history_status: context.history_status.clone(),
+            pending: Vec::new(),
+            fence: (!already_fenced).then(|| WalletFenceRecord {
                 wallet,
-                source_epoch,
-                dispositions: records,
-                leader_positions: Vec::new(),
-                gate_results: Vec::new(),
-                history_effects: Vec::new(),
-                history_status: context.history_status.clone(),
-                pending: Vec::new(),
-                fence: (!already_fenced).then(|| WalletFenceRecord {
-                    wallet,
-                    source_trade_id: trigger,
-                    cause: cause.as_str().to_owned(),
-                    proof_json,
-                    fenced_at_unix: context.recorded_at_unix,
-                }),
-                reanchor: unresolved_trigger.map(|source_trade_id| ReanchorRecord {
-                    source_trade_id,
-                    reason: "identity_unresolved".to_owned(),
-                }),
-                advance_cursor: true,
-            })?;
+                source_trade_id: trigger,
+                cause: cause.as_str().to_owned(),
+                proof_json,
+                fenced_at_unix: context.recorded_at_unix,
+            }),
+            reanchor: unresolved_trigger.map(|source_trade_id| ReanchorRecord {
+                source_trade_id,
+                reason: "identity_unresolved".to_owned(),
+            }),
+            advance_cursor: true,
+        };
+        self.paper_state.commit_activity_bucket(&bucket)?;
+        log_scope_drops(&bucket.scope_drops);
         if !already_fenced {
             self.fences.insert(wallet);
         }
@@ -5979,6 +6263,10 @@ impl BucketCommitEngine {
         source_epoch: i64,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
+        let AmbiguityEffects {
+            drops: scope_drops,
+            retirements: observation_retirements,
+        } = ambiguity_effects(context, wallet)?;
         let known: Vec<_> = mutations
             .iter()
             .filter(|mutation| {
@@ -6063,27 +6351,32 @@ impl BucketCommitEngine {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        self.paper_state
-            .commit_activity_bucket(&ActivityBucketCommit {
-                wallet,
-                source_epoch,
-                dispositions: records,
-                leader_positions: if applied {
-                    touched_leader_rows(&candidate, wallet, &known)
-                } else {
-                    Vec::new()
-                },
-                gate_results: Vec::new(),
-                history_effects: Vec::new(),
-                history_status: context.history_status.clone(),
-                pending: Vec::new(),
-                fence: None,
-                reanchor: unresolved_trigger.map(|source_trade_id| ReanchorRecord {
-                    source_trade_id,
-                    reason: "identity_unresolved".to_owned(),
-                }),
-                advance_cursor: true,
-            })?;
+        let bucket = ActivityBucketCommit {
+            scope_drops,
+            observation_retirements,
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
+            wallet,
+            source_epoch,
+            dispositions: records,
+            leader_positions: if applied {
+                touched_leader_rows(&candidate, wallet, &known)
+            } else {
+                Vec::new()
+            },
+            gate_results: Vec::new(),
+            history_effects: Vec::new(),
+            history_status: context.history_status.clone(),
+            pending: Vec::new(),
+            fence: None,
+            reanchor: unresolved_trigger.map(|source_trade_id| ReanchorRecord {
+                source_trade_id,
+                reason: "identity_unresolved".to_owned(),
+            }),
+            advance_cursor: true,
+        };
+        self.paper_state.commit_activity_bucket(&bucket)?;
+        log_scope_drops(&bucket.scope_drops);
         if applied {
             self.ledger = candidate;
         }
@@ -6097,6 +6390,270 @@ impl BucketCommitEngine {
             already_committed: false,
         })
     }
+}
+
+struct NotingScopeLookups<'a> {
+    paper: &'a PaperStateDb,
+    aggregates: &'a [ActivityAggregate],
+    context: &'a BucketDecisionContext,
+    required: RefCell<BTreeMap<String, bool>>,
+    error: RefCell<Option<pe_paper_state::PaperStateError>>,
+}
+
+impl<'a> NotingScopeLookups<'a> {
+    fn new(
+        paper: &'a PaperStateDb,
+        aggregates: &'a [ActivityAggregate],
+        context: &'a BucketDecisionContext,
+    ) -> Self {
+        Self {
+            paper,
+            aggregates,
+            context,
+            required: RefCell::default(),
+            error: RefCell::default(),
+        }
+    }
+
+    fn check(&self, answer_matters: bool) -> Result<(), BucketCommitError> {
+        if let Some(error) = self.error.borrow_mut().take() {
+            return Err(error.into());
+        }
+        if answer_matters {
+            let missing = self
+                .required
+                .borrow()
+                .iter()
+                .filter(|(_, recorded)| !**recorded)
+                .map(|(market, _)| market.clone())
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(BucketCommitError::MembershipRequired(missing));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ScopeLookups for NotingScopeLookups<'_> {
+    fn market(&self, condition_id: &str) -> MarketLookup {
+        let membership = self.paper.market_membership(condition_id);
+        let recorded = matches!(&membership, Ok(Some(_)));
+        self.required
+            .borrow_mut()
+            .entry(condition_id.to_owned())
+            .and_modify(|previous| *previous &= recorded)
+            .or_insert(recorded);
+        match membership {
+            Ok(Some(MarketMembership::Grouped(group))) => MarketLookup::Grouped(group),
+            Ok(Some(MarketMembership::Ungrouped)) => MarketLookup::Ungrouped,
+            Ok(None | Some(MarketMembership::Absent)) => MarketLookup::Unknown,
+            Err(error) => {
+                *self.error.borrow_mut() = Some(error);
+                MarketLookup::Unknown
+            }
+        }
+    }
+
+    fn token_market(&self, token_id: &str) -> Option<String> {
+        self.aggregates.iter().find_map(|aggregate| {
+            let parts = aggregate.group_id.components();
+            if parts.asset.as_ref().is_none_or(|token| token.0 != token_id)
+                || self
+                    .context
+                    .identity_unresolved
+                    .contains(aggregate.group_id.key())
+            {
+                return None;
+            }
+            self.context
+                .identity_overrides
+                .get(aggregate.group_id.key())
+                .map(|identity| identity.verified.market().to_string())
+        })
+    }
+
+    fn is_group(&self, id: &str) -> bool {
+        match self.paper.is_group(id) {
+            Ok(found) => found,
+            Err(error) => {
+                *self.error.borrow_mut() = Some(error);
+                false
+            }
+        }
+    }
+}
+
+fn effect_market_id(effect: &LedgerEffect) -> Option<&MarketId> {
+    match effect.effective() {
+        LedgerEffect::Trade { market_id, .. }
+        | LedgerEffect::Split { market_id, .. }
+        | LedgerEffect::Merge { market_id, .. }
+        | LedgerEffect::Redeem { market_id, .. } => Some(market_id),
+        _ => None,
+    }
+}
+
+fn routing_scope_cause(aggregate: &ActivityAggregate) -> DropCause {
+    match aggregate.group_id.components().activity_type {
+        ActivityType::Conversion => DropCause::Conversion,
+        ActivityType::Unknown(_) => DropCause::UnknownType,
+        _ => DropCause::Unmapped,
+    }
+}
+
+fn drop_cause_string(cause: DropCause) -> &'static str {
+    match cause {
+        DropCause::Conversion => WalletFenceCause::Conversion.as_str(),
+        DropCause::OrderDependent => WalletFenceCause::OrderDependentEqualSecond.as_str(),
+        DropCause::Overflow => WalletFenceCause::Overflow.as_str(),
+        DropCause::Underflow => WalletFenceCause::Underflow.as_str(),
+        DropCause::UnknownCondition => "reanchor_required_redemption",
+        DropCause::UnknownType => WalletFenceCause::UnknownEffect.as_str(),
+        DropCause::Unmapped => WalletFenceCause::InvalidMapping.as_str(),
+    }
+}
+
+struct AmbiguityEffects {
+    drops: Vec<WalletScopeDrop>,
+    retirements: Vec<(AppendReceipt, bool)>,
+}
+
+fn ambiguity_effects(
+    context: &BucketDecisionContext,
+    wallet: WalletAddress,
+) -> Result<AmbiguityEffects, BucketCommitError> {
+    let inputs: Value = serde_json::from_str(&context.decision_inputs_json)?;
+    let observations: Vec<AmbiguousObservation> = inputs
+        .get("ambiguous_observations")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    let mut drops = Vec::new();
+    let mut retirements = Vec::new();
+    for observation in observations {
+        if let Some(market) = &observation.market_id {
+            let mut drop = scope_drop_record(
+                wallet,
+                observation.start_epoch(),
+                context.recorded_at_unix,
+                Scope {
+                    kind: ScopeKind::Market,
+                    id: market.clone(),
+                },
+                WalletFenceCause::InvalidMapping.as_str(),
+                &observation.group_id,
+            )?;
+            drop.proof_json = serde_json::to_string(&observation)?;
+            drops.push(drop);
+        } else {
+            tracing::warn!(%wallet, source_trade_id = %observation.group_id, "wallet scope ambiguity ignored");
+        }
+        retirements.push((observation.receipt, true));
+    }
+    Ok(AmbiguityEffects { drops, retirements })
+}
+
+fn scope_drop_record(
+    wallet: WalletAddress,
+    second: i64,
+    recorded_at_unix: i64,
+    scope: Scope,
+    cause: &str,
+    trigger: &SourceTradeId,
+) -> Result<WalletScopeDrop, serde_json::Error> {
+    Ok(WalletScopeDrop {
+        wallet,
+        scope_kind: match scope.kind {
+            ScopeKind::Market => "market",
+            ScopeKind::Event => "event",
+        }
+        .to_owned(),
+        scope_id: scope.id,
+        cause: cause.to_owned(),
+        source_trade_id: Some(trigger.clone()),
+        dropped_at_epoch: second,
+        proof_json: serde_json::to_string(
+            &json!({"bucket_epoch": second, "cause": cause, "source_trade_id": trigger}),
+        )?,
+        recorded_at_unix,
+    })
+}
+
+fn log_scope_drops(drops: &[WalletScopeDrop]) {
+    for drop in drops {
+        tracing::warn!(wallet = %drop.wallet, scope_kind = %drop.scope_kind, scope_id = %drop.scope_id,
+            cause = %drop.cause, second = drop.dropped_at_epoch, "wallet scope dropped");
+    }
+}
+
+fn history_repair_disposition(disposition: &str) -> bool {
+    matches!(
+        disposition,
+        "raw_only"
+            | "anchor_covered"
+            | "anchor_covered_late"
+            | "reanchor_required_late_group"
+            | "reanchor_required_redemption"
+    )
+}
+
+fn scoped_history_buys(
+    records: &[SecondRecord<'_>],
+    consumed: &[MarketId],
+    ignored: &[(SourceTradeId, ActivityType)],
+    routed: &HashMap<SourceTradeId, &str>,
+    lookups: &dyn ScopeLookups,
+) -> Vec<(MarketId, SourceTradeId)> {
+    let mut buys = Vec::new();
+    for record in records {
+        if ignored
+            .iter()
+            .any(|(id, _)| id == record.aggregate.group_id.key())
+        {
+            continue;
+        }
+        let Ok(mutation) = &record.mutation else {
+            continue;
+        };
+        let LedgerEffect::Trade {
+            market_id,
+            side: Side::Buy,
+            ..
+        } = mutation.effect.effective()
+        else {
+            continue;
+        };
+        let parts = record.aggregate.group_id.components();
+        let canonical = parts.condition_id.as_ref().is_some_and(|condition| {
+            condition.0.strip_prefix("0x").is_some_and(|hex| {
+                !hex.is_empty()
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        });
+        let market = if canonical
+            || routed.get(&mutation.source_trade_id) == Some(&"anchor_covered_late")
+        {
+            market_id.clone()
+        } else {
+            let Some(scope) = resolve_problem_scope(record.aggregate, DropCause::Unmapped, lookups)
+            else {
+                continue;
+            };
+            MarketId(pe_core_types::VenueMarketId(scope.id))
+        };
+        if consumed.contains(&market)
+            || matches!(
+                routed.get(&mutation.source_trade_id),
+                Some(&"scope_dropped" | &"anchor_covered_late")
+            )
+        {
+            buys.push((market, mutation.source_trade_id.clone()));
+        }
+    }
+    buys
 }
 
 fn activity_record(
@@ -7189,9 +7746,9 @@ pub(crate) mod continuation_v3_tests {
         writer: &mut Writer,
     ) -> (DecisionContinuationV3, ActivityAggregate, AppendReceipt) {
         let condition = match case {
-            "recorded_correction" | "shared_recorded_correction" => "stamped",
-            "other_target" | "exact_other_target" => "other",
-            _ => "new",
+            "recorded_correction" | "shared_recorded_correction" => "0xa4",
+            "other_target" | "exact_other_target" => "0xa3",
+            _ => "0xa1",
         };
         let at = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
         let append = |writer: &mut Writer, source: &str, schema, parser, payload: Vec<u8>| {
@@ -7211,8 +7768,8 @@ pub(crate) mod continuation_v3_tests {
         // An exact stream carries its history row's own stamp; an alias carries another one.
         let (stream_condition, stream_outcome) = match case {
             "alias" | "disposed_alias" => ("alias", if disposed { 0 } else { 1 }),
-            "exact" | "exact_digest" | "exact_other_target" => ("new", 0),
-            _ => ("old", if disposed { 0 } else { 1 }),
+            "exact" | "exact_digest" | "exact_other_target" => ("0xa1", 0),
+            _ => ("0xa2", if disposed { 0 } else { 1 }),
         };
         let stream_payload = serde_json::to_vec(
             &json!({"proxyWallet":"0x1111111111111111111111111111111111111111",
@@ -7261,7 +7818,7 @@ pub(crate) mod continuation_v3_tests {
             "ambiguous_history" | "distinct_legs" | "shared_read" | "shared_recorded_correction"
         ) {
             let mut leg = rows[0].clone();
-            leg["conditionId"] = json!("other");
+            leg["conditionId"] = json!("0xa3");
             if case != "ambiguous_history" {
                 leg["asset"] = json!("456");
             }
@@ -7305,7 +7862,7 @@ pub(crate) mod continuation_v3_tests {
         })
         .unwrap();
         let metadata = serde_json::to_vec(&json!([{
-            "conditionId": if matches!(case, "metadata_wrong_condition" | "other_target" | "exact_other_target") { "other" } else { "new" },
+            "conditionId": if matches!(case, "metadata_wrong_condition" | "other_target" | "exact_other_target") { "0xa3" } else { "0xa1" },
             "clobTokenIds": match case {
                 "metadata_unverified" => "[\"456\"]",
                 "metadata_wrong_outcome" => "[\"456\",\"123\"]",
@@ -7377,7 +7934,7 @@ pub(crate) mod continuation_v3_tests {
             vec![binding]
         };
         if let Some(stream_receipt) = second_stream {
-            let metadata = br#"[{"conditionId":"other","clobTokenIds":["123","456"]}]"#.to_vec();
+            let metadata = br#"[{"conditionId":"0xa3","clobTokenIds":["123","456"]}]"#.to_vec();
             let identity_receipt = append(
                 writer,
                 pe_source_polymarket_public::GAMMA_MARKETS_SOURCE_ID,
@@ -7450,9 +8007,9 @@ pub(crate) mod continuation_v3_tests {
         frozen.transaction_hash = "tx".to_owned();
         frozen.market_id = MarketId(pe_core_types::VenueMarketId(
             if matches!(case, "other_target" | "exact_other_target") {
-                "other"
+                "0xa3"
             } else {
-                "new"
+                "0xa1"
             }
             .to_owned(),
         ));
@@ -7667,6 +8224,10 @@ pub(crate) mod continuation_v3_tests {
                 let epoch = observation.source_time.0.unix_timestamp();
                 state
                     .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+                        scope_drops: Vec::new(),
+                        observation_retirements: Vec::new(),
+                        unfenced_revisions: Vec::new(),
+                        scope_drop_boundary_unix: None,
                         wallet: observation.wallet,
                         source_epoch: epoch,
                         dispositions: vec![pe_paper_state::ActivityDispositionRecord {
@@ -8318,7 +8879,7 @@ pub(crate) mod continuation_v3_tests {
         );
         feed_binding.counterpart_basis_receipt = Some(basis);
         let mut second: Value = serde_json::from_slice(&stream_payload).unwrap();
-        second["conditionId"] = json!("other");
+        second["conditionId"] = json!("0xa3");
         second["asset"] = json!("456");
         second["outcomeIndex"] = json!(0);
         second["timestamp"] = json!(100);
@@ -8958,6 +9519,9 @@ mod activity_exemption_tests {
                 expected_fence: None,
             }])
             .unwrap();
+        for market in ["0xa1", "0xa2", "0xa3", "0xa4"] {
+            paper.record_market_group(market, "").unwrap();
+        }
         let engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
         (dir, paper, engine)
     }
@@ -9044,6 +9608,344 @@ mod activity_exemption_tests {
     }
 
     #[test]
+    fn integrity_fence_failure_path_keeps_the_bucket_unapplied() {
+        let (_dir, paper, mut engine) = fixture();
+        let record = group("TRADE", "integrity", 100, 0, false, "0xa1");
+        let wallet = record.group_id.components().wallet;
+        let trigger = record.group_id.key().clone();
+        let result = engine
+            .commit_fence(
+                &[record],
+                wallet,
+                100,
+                WalletFenceCause::Overflow,
+                trigger,
+                &context(),
+            )
+            .unwrap();
+        assert_eq!(result.newly_fenced, Some(WalletFenceCause::Overflow));
+        assert!(paper.is_wallet_fenced(&wallet).unwrap());
+        assert!(engine.is_fenced(&wallet));
+        assert!(engine.ledger().position(&wallet).is_none());
+        assert!(paper.wallet_scope_drops(&wallet, 100).unwrap().is_empty());
+        assert_eq!(paper.scope_drop_boundary_unix().unwrap(), None);
+    }
+
+    #[test]
+    fn integrity_failure_after_classification_fences_through_commit() {
+        let (_dir, paper, mut engine) = fixture();
+        let record = group("TRADE", "integrity", 100, 0, false, "0xa1");
+        let wallet = record.group_id.components().wallet;
+        let id = record.group_id.key().clone();
+        // Break the classified-snapshot invariant; application must catch the real overflow.
+        engine.before_apply = Some(|ledger| {
+            ledger.replace_wallet_snapshot(
+                WalletAddress([0xaa; 20]),
+                HashMap::from([(
+                    MarketOutcomeId::new(MarketId(VenueMarketId("0xa1".to_owned())), OutcomeId(0)),
+                    PositionState {
+                        long_contracts: ShareAmount::from_atomic(u64::MAX),
+                        short_contracts: ShareAmount::ZERO,
+                    },
+                )]),
+            );
+        });
+        let result = engine.commit(vec![record], &context(), basis()).unwrap();
+        assert_eq!(result.newly_fenced, Some(WalletFenceCause::Overflow));
+        assert_eq!(result.dispositions[&id.0], "position_overflow");
+        assert_eq!(
+            paper
+                .wallet_fence(&wallet)
+                .unwrap()
+                .unwrap()
+                .source_trade_id,
+            id
+        );
+        assert!(engine.is_fenced(&wallet));
+        assert!(engine.ledger().position(&wallet).is_none());
+        assert!(paper.leader_positions().unwrap().is_empty());
+        assert!(paper.open_decision_pending().unwrap().is_empty());
+        assert!(paper.gate_history().unwrap().is_empty());
+        assert!(paper.wallet_scope_drops(&wallet, 100).unwrap().is_empty());
+        assert_eq!(paper.scope_drop_boundary_unix().unwrap(), None);
+    }
+
+    #[test]
+    fn conditionless_redemption_uses_only_verified_token_scope() {
+        for verified in [false, true] {
+            let (_dir, paper, mut engine) = fixture();
+            let mut record = group("REDEEM", "redemption", 100, 999, false, "");
+            // This group helper's source row has no token; reconstruct one through the parser.
+            let payload = serde_json::to_vec(&json!([{
+                "proxyWallet": record.group_id.components().wallet.to_string(), "timestamp": 100,
+                "type": "REDEEM", "size": "0", "price": "0", "usdcSize": "0", "transactionHash": "redemption", "asset": "verified-token",
+                "outcomeIndex": 999,
+            }])).unwrap();
+            record = parse_activity_response(
+                &payload,
+                record.group_id.components().wallet,
+                &ActivityParseContext {
+                    source_id: SourceId("fixture".to_owned()),
+                    observed_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+                    received_at: ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+                    transport: ActivityTransport::Rest,
+                },
+            )
+            .unwrap()
+            .aggregates()
+            .unwrap()
+            .remove(0);
+            let wallet = record.group_id.components().wallet;
+            let mut ctx = context();
+            if verified {
+                ctx.identity_overrides.insert(
+                    record.group_id.key().clone(),
+                    IdentityOverride {
+                        verified: MarketOutcomeId::new(
+                            MarketId(VenueMarketId("0xa1".to_owned())),
+                            OutcomeId(0),
+                        ),
+                        evidence_hash: "a".repeat(64),
+                    },
+                );
+            }
+            let result = engine.commit(vec![record], &ctx, basis()).unwrap();
+            assert_eq!(result.newly_fenced, None);
+            assert!(!paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+            assert_eq!(
+                paper.wallet_scope_drops(&wallet, 100).unwrap().len(),
+                usize::from(verified)
+            );
+        }
+    }
+
+    #[test]
+    fn membership_arriving_after_a_cold_lookup_requires_reclassification() {
+        let (_dir, paper, _engine) = fixture();
+        let records = [group("MERGE", "membership", 100, 999, false, "0xc0")];
+        let ctx = context();
+        let lookups = NotingScopeLookups::new(&paper, &records, &ctx);
+        assert_eq!(lookups.market("0xc0"), MarketLookup::Unknown);
+        paper.record_market_group("0xc0", "0xee").unwrap();
+        assert!(
+            matches!(lookups.check(true), Err(BucketCommitError::MembershipRequired(markets)) if markets == ["0xc0"])
+        );
+        let retry = NotingScopeLookups::new(&paper, &records, &ctx);
+        assert_eq!(
+            retry.market("0xc0"),
+            MarketLookup::Grouped("0xee".to_owned())
+        );
+        retry.check(true).unwrap();
+    }
+
+    #[test]
+    fn frames_ignore_known_scopes_and_continue_with_unknown_membership() {
+        use crate::frame_admission::FeedLatchBasis;
+        use pe_event_log::{EnvelopeIn, Writer};
+        for kind in ["market", "event", "unknown"] {
+            for outcome in [0, 1] {
+                let (dir, paper, mut engine) = fixture();
+                let wallet = WalletAddress([0xaa; 20]);
+                let at = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
+                let mut writer = Writer::open(dir.path().join("frame.log")).unwrap();
+                let receipt = writer.append_synced(EnvelopeIn {
+                    source_id: SourceId(crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned()),
+                    schema_version: ACTIVITY_SCHEMA_VERSION, parser_version: ACTIVITY_PARSER_VERSION,
+                    observed_at: SourceTimestamp(at), received_at: ReceivedAt(at), content_type: ContentType::Json,
+                    payload: serde_json::to_vec(&json!({
+                        "proxyWallet": wallet.to_string(), "timestamp": 100, "conditionId": "0xc0",
+                        "type": "TRADE", "size": "2", "usdcSize": "1", "transactionHash": "frame",
+                        "price": "0.5", "asset": "asset", "side": "BUY", "outcomeIndex": outcome,
+                    })).unwrap(),
+                }).unwrap();
+                drop(writer);
+                if kind == "event" {
+                    paper.record_market_group("0xc0", "0xee").unwrap();
+                }
+                paper
+                    .import_scope_drops(
+                        1,
+                        &[(
+                            WalletScopeDrop {
+                                wallet,
+                                scope_kind: if kind == "market" { "market" } else { "event" }
+                                    .to_owned(),
+                                scope_id: if kind == "market" { "0xc0" } else { "0xee" }.to_owned(),
+                                cause: "imported".to_owned(),
+                                source_trade_id: None,
+                                dropped_at_epoch: 99,
+                                proof_json: "{}".to_owned(),
+                                recorded_at_unix: 100,
+                            },
+                            receipt,
+                        )],
+                        &BTreeSet::new(),
+                    )
+                    .unwrap();
+                let index = SourceReceiptIndex::replay(&dir.path().join("frame.log")).unwrap();
+                let route = engine
+                    .prepare_activity_frame(
+                        receipt,
+                        &index,
+                        FrameAdmissionContext {
+                            admitted_at: at,
+                            stale_secs: 90,
+                            quality: ReconstructionQuality::new(100).unwrap(),
+                            signal_config: SignalConfig::default(),
+                            copy_eligible: true,
+                            configuration: synthetic_legacy17_runtime_config(),
+                            basis: basis(),
+                            latch: FeedLatchBasis::default(),
+                            paper_prefix: None,
+                            identity: None,
+                            freshness_policy: PaperFreshnessPolicy {
+                                activity_ws_enabled: true,
+                                copy_latency_budget_secs: 120,
+                            },
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(matches!(route, FrameRoute::Ignored), kind != "unknown");
+                assert!(paper.open_decision_pending().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn frames_in_an_imported_certified_second_wait_for_the_complete_read() {
+        use crate::frame_admission::{FeedHistoryFrontier, FeedLatchBasis, FrameIdentityProof};
+        use pe_event_log::{EnvelopeIn, Writer};
+        let (dir, paper, mut engine) = fixture();
+        let wallet = WalletAddress([0xaa; 20]);
+        paper
+            .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                wallet,
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: 99,
+            })
+            .unwrap();
+        engine.complete_history.insert(wallet);
+        engine.entry_gate = CopyEntryGate::new(CopyEntryGateConfig, paper.gate_history().unwrap());
+        engine
+            .ledger
+            .replace_wallet_snapshot(wallet, HashMap::new());
+        let path = dir.path().join("certified-frames.log");
+        let mut writer = Writer::open(&path).unwrap();
+        let receipts = [(100, "0xa2"), (101, "0xa3")].map(|(epoch, market)| {
+            let at = time::OffsetDateTime::from_unix_timestamp(epoch).unwrap();
+            writer.append_synced(EnvelopeIn {
+                source_id: SourceId(crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned()),
+                schema_version: ACTIVITY_SCHEMA_VERSION, parser_version: ACTIVITY_PARSER_VERSION,
+                observed_at: SourceTimestamp(at), received_at: ReceivedAt(at), content_type: ContentType::Json,
+                payload: serde_json::to_vec(&json!({
+                    "proxyWallet": wallet.to_string(), "timestamp": epoch, "conditionId": market,
+                    "type": "TRADE", "size": "2", "usdcSize": "1", "transactionHash": "frame",
+                    "price": "0.5", "asset": "asset", "side": "BUY", "outcomeIndex": 0, "outcome": "Yes",
+                })).unwrap(),
+            }).unwrap()
+        });
+        drop(writer);
+        paper
+            .import_scope_drops(
+                1,
+                &[(
+                    WalletScopeDrop {
+                        wallet,
+                        scope_kind: "market".to_owned(),
+                        scope_id: "0xa1".to_owned(),
+                        cause: "underflow".to_owned(),
+                        source_trade_id: None,
+                        dropped_at_epoch: 100,
+                        proof_json: "{}".to_owned(),
+                        recorded_at_unix: 100,
+                    },
+                    receipts[0],
+                )],
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        engine.verified_frontiers.insert(
+            wallet,
+            FeedHistoryFrontier {
+                version: 1,
+                wallet,
+                fixed_end: 99,
+                commitment: receipts[0],
+                page_occurrences: Vec::new(),
+                pages: Vec::new(),
+            },
+        );
+        let index = SourceReceiptIndex::replay(&path).unwrap();
+        for (i, epoch) in [100, 101].into_iter().enumerate() {
+            let at = time::OffsetDateTime::from_unix_timestamp(epoch).unwrap();
+            let route = engine
+                .prepare_activity_frame(
+                    receipts[i],
+                    &index,
+                    FrameAdmissionContext {
+                        admitted_at: at,
+                        stale_secs: 90,
+                        quality: ReconstructionQuality::new(100).unwrap(),
+                        signal_config: SignalConfig::default(),
+                        copy_eligible: true,
+                        configuration: synthetic_legacy17_runtime_config(),
+                        basis: basis(),
+                        latch: FeedLatchBasis::default(),
+                        paper_prefix: None,
+                        identity: Some(FrameIdentityProof {
+                            provenance: crate::asset_identity::IdentityProvenance {
+                                asset: pe_core_types::PolymarketTokenId("asset".to_owned()),
+                                source_log_sequence: receipts[i].sequence.0,
+                                canonical_page_hash: receipts[i].this_hash.to_hex().to_string(),
+                            },
+                            receipt: receipts[i],
+                        }),
+                        freshness_policy: PaperFreshnessPolicy {
+                            activity_ws_enabled: true,
+                            copy_latency_budget_secs: 120,
+                        },
+                    },
+                )
+                .unwrap();
+            if epoch == 100 {
+                assert!(
+                    matches!(route, FrameRoute::Ignored),
+                    "certified second must wait for REST"
+                );
+                assert!(paper.open_decision_pending().unwrap().is_empty());
+                let buy = group("TRADE", "frame", epoch, 0, false, "0xa2");
+                let id = buy.group_id.key().clone();
+                let result = engine.commit(vec![buy], &context(), basis()).unwrap();
+                assert_eq!(result.dispositions[&id.0], "not_an_entry");
+                assert!(result.pending.is_empty());
+                assert_eq!(
+                    paper
+                        .market_history_record(&wallet, &MarketId(VenueMarketId("0xa2".to_owned())))
+                        .unwrap()
+                        .unwrap()
+                        .source_trade_id,
+                    id
+                );
+                assert_eq!(
+                    engine.ledger.position(&wallet).unwrap().positions[&MarketOutcomeId::new(
+                        MarketId(VenueMarketId("0xa2".to_owned())),
+                        OutcomeId(0)
+                    )]
+                        .long_contracts
+                        .atomic(),
+                    2_000_000
+                );
+            } else {
+                assert!(
+                    matches!(route, FrameRoute::Admission(_)),
+                    "later second is copyable"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn frame_admission_ignored_lines() {
         use crate::frame_admission::{EarlierFrame, FeedLatchBasis};
         use pe_event_log::{EnvelopeIn, Writer};
@@ -9060,7 +9962,7 @@ mod activity_exemption_tests {
             for shape in ["buy", "sell", "zero", "combo"] {
                 let (dir, paper, mut engine) = fixture();
                 let wallet = WalletAddress([0xaa; 20]);
-                let market = MarketId(VenueMarketId("market".to_owned()));
+                let market = MarketId(VenueMarketId("0xa1".to_owned()));
                 let at = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
                 let live = crate::live_watchlist::LiveWatchlist::new(pe_trader_index::Watchlist {
                     entries: vec![pe_trader_index::WatchlistEntry {
@@ -9077,7 +9979,7 @@ mod activity_exemption_tests {
                     incubator_count: 0,
                 });
                 let raw = json!({
-                    "proxyWallet": wallet.to_string(), "timestamp": 100, "conditionId": "market",
+                    "proxyWallet": wallet.to_string(), "timestamp": 100, "conditionId": "0xa1",
                     "type": "TRADE", "size": if shape == "zero" { "0" } else { "2" },
                     "usdcSize": "1", "transactionHash": "frame", "price": "0.5", "asset": "asset",
                     "side": if shape == "sell" { "SELL" } else { "BUY" }, "outcomeIndex": 0,
@@ -9117,7 +10019,7 @@ mod activity_exemption_tests {
                 ) {
                     let consumed = case == "market_consumed";
                     let durable_id = if consumed {
-                        group("TRADE", "consuming", 100, 0, false, "market")
+                        group("TRADE", "consuming", 100, 0, false, "0xa1")
                             .group_id
                             .key()
                             .clone()
@@ -9127,6 +10029,10 @@ mod activity_exemption_tests {
                     let pending = case.ends_with("continuation") || case == "earlier_receipt";
                     paper
                         .commit_activity_bucket(&ActivityBucketCommit {
+                            scope_drops: Vec::new(),
+                            observation_retirements: Vec::new(),
+                            unfenced_revisions: Vec::new(),
+                            scope_drop_boundary_unix: None,
                             wallet,
                             source_epoch: 100,
                             dispositions: vec![ActivityDispositionRecord {
@@ -9333,14 +10239,14 @@ mod activity_exemption_tests {
                 [(false, false), (true, false), (false, true), (true, true)]
             {
                 let (dir, paper, mut engine) = fixture();
-                let original = group("TRADE", "trade", 100, 999, false, "market");
+                let original = group("TRADE", "trade", 100, 999, false, "0xa1");
                 let wallet = original.group_id.components().wallet;
                 let mut initial = context();
                 initial.identity_overrides.insert(
                     original.group_id.key().clone(),
                     IdentityOverride {
                         verified: MarketOutcomeId::new(
-                            MarketId(VenueMarketId("market".to_owned())),
+                            MarketId(VenueMarketId("0xa1".to_owned())),
                             OutcomeId(0),
                         ),
                         evidence_hash: "gamma".to_owned(),
@@ -9349,11 +10255,15 @@ mod activity_exemption_tests {
                 engine
                     .commit(vec![original.clone()], &initial, basis())
                     .unwrap();
-                let redeem = group("REDEEM", "redeem", 100, 0, false, "other");
-                let redeem_original = group("REDEEM", "redeem", 100, 999, false, "other");
+                let redeem = group("REDEEM", "redeem", 100, 0, false, "0xa2");
+                let redeem_original = group("REDEEM", "redeem", 100, 999, false, "0xa2");
                 // The recorded sibling is raw history evidence, independent of the new twin route.
                 paper
                     .commit_activity_bucket(&ActivityBucketCommit {
+                        scope_drops: Vec::new(),
+                        observation_retirements: Vec::new(),
+                        unfenced_revisions: Vec::new(),
+                        scope_drop_boundary_unix: None,
                         wallet,
                         source_epoch: 100,
                         dispositions: vec![
@@ -9395,7 +10305,7 @@ mod activity_exemption_tests {
                         }])
                         .unwrap();
                 }
-                let twin = group("TRADE", "trade", 100, 0, false, "market");
+                let twin = group("TRADE", "trade", 100, 0, false, "0xa1");
                 let mut context = context();
                 context
                     .restamp_twins
@@ -9439,11 +10349,11 @@ mod activity_exemption_tests {
     }
 
     #[test]
-    fn known_redemptions_and_combos_are_raw_only_only_on_the_ordinary_path() {
+    fn known_redemptions_and_combos_never_reanchor_or_fence() {
         for (kind, combo) in [("REDEEM", false), ("TRADE", true), ("REDEEM", true)] {
             for arrival in ["ordinary", "late", "covered", "partial"] {
                 let (_dir, paper, mut engine) = fixture();
-                let first = group("TRADE", "recorded", 100, 0, false, "first");
+                let first = group("TRADE", "recorded", 100, 0, false, "0xa3");
                 let wallet = first.group_id.components().wallet;
                 if arrival != "ordinary" {
                     engine
@@ -9451,7 +10361,7 @@ mod activity_exemption_tests {
                         .unwrap();
                 }
                 let epoch = if arrival == "ordinary" { 101 } else { 100 };
-                let exemption = group(kind, "new", epoch, 999, combo, "resolved");
+                let exemption = group(kind, "new", epoch, 999, combo, "0xa4");
                 let id = exemption.group_id.key().clone();
                 let mut context = context();
                 if arrival == "covered" {
@@ -9489,17 +10399,17 @@ mod activity_exemption_tests {
                         assert_eq!(paper.cursor(&wallet).unwrap(), Some(epoch));
                     }
                     "late" => {
-                        assert_eq!(result.dispositions[&id.0], "reanchor_required_late_group");
-                        assert!(paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+                        assert_eq!(result.dispositions[&id.0], "raw_only");
+                        assert!(!paper.wallet_coverage(&wallet).unwrap().reanchor_required);
                     }
                     "covered" => {
                         assert_eq!(result.dispositions[&id.0], "anchor_covered_late");
-                        assert!(paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+                        assert!(!paper.wallet_coverage(&wallet).unwrap().reanchor_required);
                     }
-                    "partial" => assert_eq!(
-                        result.newly_fenced,
-                        Some(WalletFenceCause::LateEqualSecondGroup)
-                    ),
+                    "partial" => {
+                        assert_eq!(result.newly_fenced, None);
+                        assert_eq!(result.dispositions[&id.0], "raw_only");
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -9509,7 +10419,7 @@ mod activity_exemption_tests {
         let wallet = unknown.group_id.components().wallet;
         let id = unknown.group_id.key().clone();
         let result = engine.commit(vec![unknown], &context(), basis()).unwrap();
-        assert_eq!(result.dispositions[&id.0], "reanchor_required_redemption");
-        assert!(paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+        assert_eq!(result.dispositions[&id.0], "raw_only");
+        assert!(!paper.wallet_coverage(&wallet).unwrap().reanchor_required);
     }
 }

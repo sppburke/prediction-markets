@@ -99,6 +99,20 @@
 > on 2026-10-06 (Markdown page and OpenAPI `Market` properties); no fresh live-market probe was run.
 > The tracked dates below retain the supplied 2026-10-05 source-pass provenance.
 
+> **CLOB market not-found contract (#823).** Last checked: **2026-10-31**; re-verify by
+> **2026-12-30**. The [official error-codes page](https://docs.polymarket.com/resources/error-codes),
+> read on 10/31 between 2:13 and 2:26 PM CT, documents `GET /markets/{condition_id}` returning
+> HTTP 404 `{"error":"market not found"}` when no market exists and HTTP 400
+> `{"error":"Invalid market"}` for an invalid condition-id format. Its status override maps an
+> error containing `context canceled` to HTTP 400; that is not a terminal no-market answer.
+> The approved #823 probe on 10/31 at 2:11–2:13 PM CT returned that 404 for both a fabricated id
+> and a real neg-risk group id, and 200 with `neg_risk_market_id` for the group's market.
+> A 404 therefore proves only market absence, never group membership. Only the exact terminal
+> status/body pairs above record `absent`; cancellation, other statuses, network/timeout failure
+> and a response naming another market record nothing and retry. These dates retain the plan's
+> evidence provenance. This docs pass also read the official page on 2026-11-01, confirming the
+> error/status contract without a live venue probe.
+
 > **Closed prices, closure clocks and minimum shares (#730 Part 1), Last checked:
 > 2026-10-03; re-verify by 2026-12-02.** The captured official
 > [market details](https://docs.polymarket.com/market-data/market-details) describe `closed`
@@ -339,7 +353,7 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/market-data/market-details | 2026-10-03 | 2026-12-02 |
 | https://docs.polymarket.com/market-data/prices-order-books | 2026-10-03 | 2026-12-02 |
 | https://docs.polymarket.com/trading/place-orders | 2026-10-03 | 2026-12-02 |
-| https://docs.polymarket.com/resources/error-codes | 2026-10-03 | 2026-12-02 |
+| https://docs.polymarket.com/resources/error-codes | 2026-10-31 | 2026-12-30 |
 | https://docs.polymarket.com/api-reference/rate-limits | 2026-09-17 | 2026-11-16 |
 | https://docs.polymarket.com/market-data/websocket/overview | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/market-data/websocket/market-channel | 2026-06-09 | 2026-09-01 |

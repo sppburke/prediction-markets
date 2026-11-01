@@ -194,14 +194,14 @@ fn two_anchors_and_ordered_effect_documents_replay_to_the_restart_mirror() {
         &paper,
         100,
         vec![(
-            market("market-a"),
+            market("0xa"),
             OutcomeId(0),
             ShareAmount::from_atomic(5_000_000),
         )],
     );
     engine
         .commit(
-            vec![aggregate("0xbetween", "market-a", 0, "BUY", "2", 110)],
+            vec![aggregate("0xbetween", "0xa", 0, "BUY", "2", 110)],
             &context(110),
             zero_basis(),
         )
@@ -212,12 +212,12 @@ fn two_anchors_and_ordered_effect_documents_replay_to_the_restart_mirror() {
         120,
         vec![
             (
-                market("market-a"),
+                market("0xa"),
                 OutcomeId(0),
                 ShareAmount::from_atomic(9_000_000),
             ),
             (
-                market("market-b"),
+                market("0xb"),
                 OutcomeId(1),
                 ShareAmount::from_atomic(3_000_000),
             ),
@@ -225,7 +225,7 @@ fn two_anchors_and_ordered_effect_documents_replay_to_the_restart_mirror() {
     );
     engine
         .commit(
-            vec![aggregate("0xafter", "market-a", 0, "SELL", "4", 130)],
+            vec![aggregate("0xafter", "0xa", 0, "SELL", "4", 130)],
             &context(130),
             zero_basis(),
         )
@@ -244,7 +244,7 @@ fn two_anchors_and_ordered_effect_documents_replay_to_the_restart_mirror() {
             .unwrap()
             .hash
     );
-    let key = MarketOutcomeId::new(market("market-a"), OutcomeId(0));
+    let key = MarketOutcomeId::new(market("0xa"), OutcomeId(0));
     assert_eq!(
         replayed.position(&wallet()).unwrap().positions[&key]
             .long_contracts
@@ -260,20 +260,18 @@ fn successful_post_fence_bucket_replays_the_applied_effect() {
     paper.set_cursor(&wallet(), 0).unwrap();
     let mut engine = BucketCommitEngine::load(Arc::clone(&paper), PositionLedger::new()).unwrap();
     install(&mut engine, &paper, 100, Vec::new());
-    engine
-        .commit(
-            vec![non_trade_aggregate(
-                "CONVERSION",
-                "0xfence-success",
-                "market-a",
-                "1",
-                110,
-            )],
-            &context(110),
-            zero_basis(),
+    rusqlite::Connection::open(dir.path().join("paper.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO wallet_fences VALUES (?1, ?2, 'invalid_mapping', '{}', 110)",
+            rusqlite::params![WALLET, "0xfence-success"],
         )
         .unwrap();
-    let buy = aggregate("0xpost-fence-buy", "market-a", 0, "BUY", "2", 120);
+    let mut engine =
+        BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
+    assert!(engine.is_fenced(&wallet()));
+
+    let buy = aggregate("0xpost-fence-buy", "0xa", 0, "BUY", "2", 120);
     let buy_id = buy.group_id.key().clone();
     let result = engine
         .commit(vec![buy], &context(120), zero_basis())
@@ -295,20 +293,18 @@ fn failed_post_fence_bucket_replays_without_the_rejected_effect() {
     paper.set_cursor(&wallet(), 0).unwrap();
     let mut engine = BucketCommitEngine::load(Arc::clone(&paper), PositionLedger::new()).unwrap();
     install(&mut engine, &paper, 100, Vec::new());
-    engine
-        .commit(
-            vec![non_trade_aggregate(
-                "CONVERSION",
-                "0xfence-failed",
-                "market-a",
-                "1",
-                110,
-            )],
-            &context(110),
-            zero_basis(),
+    rusqlite::Connection::open(dir.path().join("paper.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO wallet_fences VALUES (?1, ?2, 'invalid_mapping', '{}', 110)",
+            rusqlite::params![WALLET, "0xfence-failed"],
         )
         .unwrap();
-    let merge = non_trade_aggregate("MERGE", "0xpost-fence-merge", "market-a", "1", 120);
+    let mut engine =
+        BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
+    assert!(engine.is_fenced(&wallet()));
+
+    let merge = non_trade_aggregate("MERGE", "0xpost-fence-merge", "0xa", "1", 120);
     let merge_id = merge.group_id.key().clone();
     let result = engine
         .commit(vec![merge], &context(120), zero_basis())
@@ -331,6 +327,10 @@ fn equal_cutoff_is_covered_and_legacy_prefix_is_skipped() {
     let legacy = aggregate("0xlegacy", "market-legacy", 0, "BUY", "1", 90);
     paper
         .commit_activity_bucket(&ActivityBucketCommit {
+            scope_drops: Vec::new(),
+            observation_retirements: Vec::new(),
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
             wallet: wallet(),
             source_epoch: 90,
             dispositions: vec![ActivityDispositionRecord {
@@ -461,6 +461,10 @@ fn legacy_fences_and_zero_conversion_documents_replay_without_reclassification()
             .collect();
         paper
             .commit_activity_bucket(&ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet: wallet(),
                 source_epoch: 110,
                 dispositions: records,
@@ -495,6 +499,10 @@ fn replay_with_document(document: &str) -> WalletLedgerReplayError {
     let group = aggregate("0xinvalid-document", "market-a", 0, "BUY", "1", 110);
     paper
         .commit_activity_bucket(&ActivityBucketCommit {
+            scope_drops: Vec::new(),
+            observation_retirements: Vec::new(),
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
             wallet: wallet(),
             source_epoch: 110,
             dispositions: vec![ActivityDispositionRecord {
@@ -551,6 +559,10 @@ fn unknown_disposition_version_is_a_typed_replay_failure() {
         let group = aggregate("0xunknown-disposition", "market-a", 0, "BUY", "1", 110);
         paper
             .commit_activity_bucket(&ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet: wallet(),
                 source_epoch: 110,
                 dispositions: vec![ActivityDispositionRecord {
@@ -591,7 +603,7 @@ fn history_only_bracket_disposition_replays_as_applied() {
     paper.set_cursor(&wallet(), 0).unwrap();
     let mut engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
     install(&mut engine, &paper, 0, Vec::new());
-    let first = aggregate("0xbracket", "market-bracket", 0, "BUY", "2", 10);
+    let first = aggregate("0xbracket", "0xc", 0, "BUY", "2", 10);
     let id = first.group_id.key().clone();
     let mut bracket = context(20);
     bracket.bracket_commit = true;
@@ -614,7 +626,7 @@ fn history_only_bracket_disposition_replays_as_applied() {
     assert_eq!(recorded, 20);
     assert_eq!(no_copy.1, 10);
     assert_eq!(no_copy.0, "reconciled_rest");
-    let legacy = aggregate("0xlegacy", "market-legacy", 0, "BUY", "3", 11);
+    let legacy = aggregate("0xlegacy", "0xd", 0, "BUY", "3", 11);
     engine
         .commit(vec![legacy], &context(20), zero_basis())
         .unwrap();
@@ -674,7 +686,7 @@ fn baseline_tail_anchor_survives_restart_and_replays_post_anchor_activity() {
             }),
             wallet: wallet(),
             balances: vec![(
-                market("market-old"),
+                market("0xe"),
                 OutcomeId(0),
                 ShareAmount::from_atomic(5_000_000),
             )],
@@ -696,14 +708,7 @@ fn baseline_tail_anchor_survives_restart_and_replays_post_anchor_activity() {
         .unwrap();
     engine
         .commit(
-            vec![aggregate(
-                "0xpost-tail-anchor",
-                "market-old",
-                0,
-                "BUY",
-                "2",
-                4010,
-            )],
+            vec![aggregate("0xpost-tail-anchor", "0xe", 0, "BUY", "2", 4010)],
             &context(4010),
             zero_basis(),
         )
@@ -741,7 +746,7 @@ fn baseline_tail_anchor_survives_restart_and_replays_post_anchor_activity() {
             .position(&wallet())
             .unwrap()
             .positions
-            .get(&MarketOutcomeId::new(market("market-old"), OutcomeId(0)))
+            .get(&MarketOutcomeId::new(market("0xe"), OutcomeId(0)))
             .unwrap()
             .long_contracts,
         ShareAmount::from_atomic(7_000_000)

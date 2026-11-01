@@ -3713,7 +3713,7 @@ def with_finalized_context(*a,**kw):
     result=real_filter(*a,**kw)
     history=kw.get("publication_history")
     if history is not None:
-        history.update(classifier_version=6,wallets={{wallet:{{"history_through_unix":{self.NOW},"scope_drops":[]}} for wallet in result[2]}})
+        history.update(classifier_version=6,neg_risk_group_ids=[],wallets={{wallet:{{"history_through_unix":{self.NOW},"scope_drops":[]}} for wallet in result[2]}})
     return result
 pub.filter_active_rows=with_finalized_context
 raise SystemExit(pub.main())

@@ -250,18 +250,20 @@ impl LiveAccounts {
     }
 
     pub fn store(&self, snapshot: LiveAccountsSnapshot) {
-        let _guard = self
-            .publication
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.inner.store(Arc::new(snapshot));
+        self.with_publication(|| {
+            self.inner.store(Arc::new(snapshot));
+        })
     }
 
     /// Order control publication against the in-process pre-POST submitted transition.
-    pub fn publication_guard(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.publication
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    pub fn with_publication<T>(&self, f: impl FnOnce() -> T) -> T {
+        pe_event_log::run_blocking(|| {
+            let _guard = self
+                .publication
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            f()
+        })
     }
 
     fn apply_metadata(
@@ -269,35 +271,37 @@ impl LiveAccounts {
         generation: u64,
         result: Result<Vec<CredentialMetaRow>, SupabaseError>,
     ) {
-        let _guard = self.publication_guard();
-        let current = self.snapshot();
-        if current.generation != generation {
-            return;
-        }
-        let mut next = current.as_ref().clone();
-        match result {
-            Ok(rows) => {
-                next.credential_metadata_available = true;
-                for account in &mut next.accounts {
-                    account.credential_binding = rows
-                        .iter()
-                        .find(|row| row.account_id == account.account_id.as_str())
-                        .map(|row| (row.bundle_version, row.key_id.clone()));
+        self.with_publication(|| {
+            let current = self.snapshot();
+            if current.generation != generation {
+                return;
+            }
+            let mut next = current.as_ref().clone();
+            match result {
+                Ok(rows) => {
+                    next.credential_metadata_available = true;
+                    for account in &mut next.accounts {
+                        account.credential_binding = rows
+                            .iter()
+                            .find(|row| row.account_id == account.account_id.as_str())
+                            .map(|row| (row.bundle_version, row.key_id.clone()));
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "live credential metadata unavailable");
+                    next.credential_metadata_available = false;
                 }
             }
-            Err(error) => {
-                warn!(%error, "live credential metadata unavailable");
-                next.credential_metadata_available = false;
-            }
-        }
-        self.inner.store(Arc::new(next));
+            self.inner.store(Arc::new(next));
+        })
     }
 
     fn mark_control_unavailable(&self) {
-        let _guard = self.publication_guard();
-        let mut next = self.snapshot().as_ref().clone();
-        next.control_available = false;
-        self.inner.store(Arc::new(next));
+        self.with_publication(|| {
+            let mut next = self.snapshot().as_ref().clone();
+            next.control_available = false;
+            self.inner.store(Arc::new(next));
+        })
     }
 }
 

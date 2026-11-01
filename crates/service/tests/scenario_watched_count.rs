@@ -113,6 +113,10 @@ fn fence(paper: &PaperStateDb, wallet: WalletAddress) {
     let source_trade_id = SourceTradeId(format!("g2:{}", "a".repeat(64)));
     paper
         .commit_activity_bucket(&ActivityBucketCommit {
+            scope_drops: Vec::new(),
+            observation_retirements: Vec::new(),
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
             wallet,
             source_epoch: 1,
             dispositions: vec![ActivityDispositionRecord {

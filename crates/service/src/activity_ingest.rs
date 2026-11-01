@@ -86,9 +86,15 @@ pub struct ReconciliationTrigger {
 /// acknowledges only after append and synchronization complete (#544).
 #[derive(Clone)]
 pub struct SourceLogHandle {
-    tx: mpsc::Sender<SourceLogRequest>,
+    writer: SourceLogWriter,
     #[cfg(feature = "scenario")]
     append_ack_gate: Option<(Arc<Semaphore>, Arc<tokio::sync::Notify>)>,
+}
+
+#[derive(Clone)]
+enum SourceLogWriter {
+    Boot(crate::asset_identity::BootSourceLog),
+    Runtime(mpsc::Sender<SourceLogRequest>),
 }
 
 struct SourceLogRequest {
@@ -118,12 +124,21 @@ pub enum SourceLogHandleError {
 }
 
 impl SourceLogHandle {
+    /// Use the synchronized source writer before the runtime coordinator starts.
+    pub fn boot(sink: crate::asset_identity::BootSourceLog) -> Self {
+        Self {
+            writer: SourceLogWriter::Boot(sink),
+            #[cfg(feature = "scenario")]
+            append_ack_gate: None,
+        }
+    }
+
     /// Build the bounded external input owned by [`ActivityIngest`].
     pub fn channel(capacity: usize) -> (Self, SourceLogReceiver) {
         let (tx, rx) = mpsc::channel(capacity);
         (
             Self {
-                tx,
+                writer: SourceLogWriter::Runtime(tx),
                 #[cfg(feature = "scenario")]
                 append_ack_gate: None,
             },
@@ -136,9 +151,17 @@ impl SourceLogHandle {
         &self,
         envelope: EnvelopeIn,
     ) -> Result<AppendReceipt, SourceLogHandleError> {
+        let tx = match &self.writer {
+            SourceLogWriter::Boot(sink) => {
+                return sink.lock().await.append_durable(envelope).map_err(|error| {
+                    tracing::error!(%error, "boot source-log append failed");
+                    SourceLogHandleError::Closed
+                });
+            }
+            SourceLogWriter::Runtime(tx) => tx,
+        };
         let (appended, acknowledgement) = oneshot::channel();
-        self.tx
-            .send(SourceLogRequest { envelope, appended })
+        tx.send(SourceLogRequest { envelope, appended })
             .await
             .map_err(|_| SourceLogHandleError::Closed)?;
         let receipt = acknowledgement

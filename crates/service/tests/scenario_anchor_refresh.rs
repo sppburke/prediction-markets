@@ -121,7 +121,7 @@ impl PageFetcher for MapFetcher {
                 .filter_map(|token| {
                     token.strip_prefix("asset-").map(|index| {
                         json!({
-                            "conditionId": format!("condition-{index}"),
+                            "conditionId": format!("0x{index:0>64}"),
                             "clobTokenIds": [token]
                         })
                     })
@@ -169,7 +169,7 @@ fn stable_bracket_responses(wallets: &[WalletAddress]) -> HashMap<String, Vec<Ve
         let activity = serde_json::to_vec(&vec![json!({
             "proxyWallet": wallet,
             "timestamp": 10,
-            "conditionId": format!("condition-{index}"),
+            "conditionId": format!("0x{index:0>64}"),
             "type": "TRADE",
             "size": "1",
             "usdcSize": "0.5",
@@ -185,7 +185,7 @@ fn stable_bracket_responses(wallets: &[WalletAddress]) -> HashMap<String, Vec<Ve
         let positions = serde_json::to_vec(&vec![json!({
             "proxyWallet": wallet,
             "asset": format!("asset-{index}"),
-            "conditionId": format!("condition-{index}"),
+            "conditionId": format!("0x{index:0>64}"),
             "size": "1",
             "outcomeIndex": 0,
             "negativeRisk": false
@@ -364,22 +364,18 @@ fn poller_harness_with_fetcher(
                     context,
                     committed,
                 } => {
-                    let _ = committed.send(
-                        engine
-                            .commit_with_freshness_policy(
-                                aggregates,
-                                context.as_ref(),
-                                FrozenDecisionBasis {
-                                    win_rate_p: pe_core_types::Probability::ZERO,
-                                    bankroll: rust_decimal::Decimal::ZERO,
-                                },
-                                Some(pe_service::bucket_commit::PaperFreshnessPolicy {
-                                    activity_ws_enabled: false,
-                                    copy_latency_budget_secs: 2,
-                                }),
-                            )
-                            .map_err(|error| error.to_string()),
-                    );
+                    let _ = committed.send(engine.commit_with_freshness_policy(
+                        aggregates,
+                        context.as_ref(),
+                        FrozenDecisionBasis {
+                            win_rate_p: pe_core_types::Probability::ZERO,
+                            bankroll: rust_decimal::Decimal::ZERO,
+                        },
+                        Some(pe_service::bucket_commit::PaperFreshnessPolicy {
+                            activity_ws_enabled: false,
+                            copy_latency_budget_secs: 2,
+                        }),
+                    ));
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
                     let capture = ledger_capture(engine.ledger(), &actor_paper, wallet)
@@ -503,18 +499,14 @@ async fn refresh_outcome_for_install_rejection(
                     context,
                     committed,
                 } => {
-                    let _ = committed.send(
-                        engine
-                            .commit(
-                                aggregates,
-                                context.as_ref(),
-                                FrozenDecisionBasis {
-                                    win_rate_p: pe_core_types::Probability::ZERO,
-                                    bankroll: rust_decimal::Decimal::ZERO,
-                                },
-                            )
-                            .map_err(|error| error.to_string()),
-                    );
+                    let _ = committed.send(engine.commit(
+                        aggregates,
+                        context.as_ref(),
+                        FrozenDecisionBasis {
+                            win_rate_p: pe_core_types::Probability::ZERO,
+                            bankroll: rust_decimal::Decimal::ZERO,
+                        },
+                    ));
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
                     let _ = captured.send(

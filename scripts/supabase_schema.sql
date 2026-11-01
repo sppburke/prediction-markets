@@ -64,6 +64,21 @@ create table if not exists ranking_scope_drops (
   primary key (batch_id, wallet_hex, scope_kind, scope_id)
 );
 
+-- Spans outlive pruned batches; their endpoints intentionally have no batch FK.
+create table if not exists ranking_neg_risk_group_spans (
+  group_id      text not null,
+  from_batch_id bigint not null,
+  to_batch_id   bigint,
+  primary key (group_id, from_batch_id),
+  check (to_batch_id is null or to_batch_id > from_batch_id)
+);
+create unique index if not exists idx_ranking_neg_risk_group_spans_open
+  on ranking_neg_risk_group_spans (group_id) where to_batch_id is null;
+create index if not exists idx_ranking_neg_risk_group_spans_from
+  on ranking_neg_risk_group_spans (from_batch_id);
+create index if not exists idx_ranking_neg_risk_group_spans_to
+  on ranking_neg_risk_group_spans (to_batch_id) where to_batch_id is not null;
+
 -- Atomic, idempotent ranking publication. PostgREST executes each RPC request in one
 -- transaction: the new epoch is therefore invisible until all entries exist, and any
 -- validation/insert failure rolls the whole request back. A retry with the same SHA-256
@@ -191,6 +206,7 @@ language plpgsql
 as $$
 declare
   v_batch_id bigint;
+  v_new_batch boolean;
   v_expected integer;
   v_actual   integer;
 begin
@@ -200,6 +216,10 @@ begin
   if p_batch->>'classifier_version' is null then
     raise exception 'batch requires classifier_version';
   end if;
+  -- Serialize publications before the inherited RPC allocates a batch id.
+  perform pg_advisory_xact_lock(823, 1);
+  select not exists (select 1 from ranking_batches where publish_key = p_publish_key)
+    into v_new_batch;
   v_batch_id := publish_ranking_batch(p_publish_key, p_batch, p_entries);
   update ranking_batches
      set classifier_version = (p_batch->>'classifier_version')::integer
@@ -231,6 +251,27 @@ begin
   if v_actual <> v_expected then
     raise exception 'published batch % has % scope drops; expected %',
       v_batch_id, v_actual, v_expected;
+  end if;
+
+  -- Missing key preserves the set while SQL and publisher installs are staggered.
+  if v_new_batch and p_batch ? 'neg_risk_group_ids' then
+    if jsonb_typeof(p_batch->'neg_risk_group_ids') is distinct from 'array' then
+      raise exception 'neg_risk_group_ids must be a JSON array';
+    end if;
+    update ranking_neg_risk_group_spans span
+       set to_batch_id = v_batch_id
+     where span.to_batch_id is null
+       and not exists (
+         select 1 from jsonb_array_elements_text(p_batch->'neg_risk_group_ids') as listed(group_id)
+          where listed.group_id = span.group_id
+       );
+    insert into ranking_neg_risk_group_spans (group_id, from_batch_id)
+    select distinct listed.group_id, v_batch_id
+      from jsonb_array_elements_text(p_batch->'neg_risk_group_ids') as listed(group_id)
+     where not exists (
+       select 1 from ranking_neg_risk_group_spans span
+        where span.group_id = listed.group_id and span.to_batch_id is null
+     );
   end if;
   return v_batch_id;
 end;
@@ -590,6 +631,11 @@ alter table ranking_scope_drops enable row level security;
 drop policy if exists "ranking_scope_drops_anon_read" on ranking_scope_drops;
 create policy "ranking_scope_drops_anon_read" on ranking_scope_drops for select to anon using (true);
 grant select on ranking_scope_drops to anon;
+
+alter table ranking_neg_risk_group_spans enable row level security;
+drop policy if exists "ranking_neg_risk_group_spans_anon_read" on ranking_neg_risk_group_spans;
+create policy "ranking_neg_risk_group_spans_anon_read" on ranking_neg_risk_group_spans for select to anon using (true);
+grant select on ranking_neg_risk_group_spans to anon;
 
 -- `latest_ranking` evaluates `(select max(batch_id) from ranking_batches)`; under
 -- security_invoker the anon caller runs that subquery, so anon needs read access here too.

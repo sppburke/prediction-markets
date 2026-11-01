@@ -346,33 +346,39 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `bracket_identity_chunk_retry` | 4 additional retries; waits of 2, 4, 8 and 16 s | Compiled retry schedule in `service::asset_identity` (`resolve_historical_for_bracket` / `resolve_inner`), not a TOML/env key. An admission bracket retries a chunk whose fetch exhausted the fetcher's transient retries; each retry passes through the shared rate gate. Rate-limited, fatal, parse and recording failures receive no additional chunk retry. The poller's `resolve_live` retains one attempt per chunk, including the fetcher's own retry policy. |
 | `asset_identities` | Installed activation binding | Additive paper-state cache keyed by `(generation, token)`, with a non-unique index on `(generation, condition_id, outcome)`. Generation is canonical JSON of the installed migration activation tails, stable across restarts; first-migration boot stays memory-only. Resolution checks memory, then an indexed lookup for requested misses in this generation, then Gamma (open before closed). One resolver mutex serializes one fetch attempt for a miss chunk of at most `gamma_batch_size` tokens or conditions: recheck memory and the table (or the completed-condition memo for discovery), fetch open before closed leftovers, verify and compare intersecting original pages, save, then release. Transient bracket retry backoff sleeps with the mutex released; each retry reacquires it and rechecks memory and the table before fetching remaining misses. Original pages are authenticated once per distinct receipt within a request. The mutex is first-in, first-out: a waiting live lookup can be preceded by one fetch attempt from each caller already queued, while each caller releases it between attempts and chunks. Rows contain token, condition, outcome, original source-log sequence and canonical page hash; identities and provenance are rebuilt from those columns. Before restore, each original page is read once through the receipt index and authenticated against its envelope hash, source/schema/parser/content-type contract, canonical hash and the existing Gamma identity verifier. Invalid rows are deleted and fetched again; valid rows retain original provenance. Every verified market's tokens are saved, siblings included. Before using fresh identities, the verifier checks fresh pages together with original pages intersecting by token or condition. Synchronized boot pages retain raw bytes, evidence and receipts until `boot.extend` indexes them. A conflict evicts every involved condition's identities, including cached siblings, and commits independent `meta` markers keyed by `rejected_asset_condition:<generation>:<condition_id>`, whose value is the conflict page's receipt sequence. Rows stay available as evidence; all tokens of a marked condition remain unverified across restarts, even when it has no row of its own. Memory hits check the rejected-condition set; table and Gamma identities check the condition marker before entering memory. Non-conflicting progress before a failed chunk is kept while the original error still rejects admission. Missing token identities are never saved. A completed open-and-closed lookup records absent tokens in `meta` under `absent_asset_token:<generation>:<token>`, with the last recorded page's receipt sequence; failed lookups record no absences. Historical bracket and anchor/re-entry lookups return marked tokens as unresolved without Gamma requests, including across restarts. Live frame and decision lookups ignore absence markers and can discover later listings. Authenticated identities take precedence over absence markers. Rejected-condition markers remain authoritative for both lookup purposes. Observed tokens of rejected conditions also retain `rejected_asset_token:<generation>:<token>` markers with a recorded receipt sequence, committed with the condition markers; historical lookups skip these tokens even when ambiguity left no identity row. Foreign generations neither satisfy lookup nor block insertion. Every mutation commits before acknowledgement at boot and runtime. `PaperStateDb` holds its connection mutex across an autocommit check and its own short transaction, with at most `ASSET_IDENTITY_INSERT_LIMIT` rows per statement (matching `gamma_batch_size`). Rejection and absence markers commit with their accompanying row changes. While a bracket batch is open, the resolver releases the connection mutex and retries asynchronously every 10 ms, failing after 30 s without acknowledging identities. No boot buffer, existing-data migration or backfill. |
 | `bracket_concurrency` | 4 | **Module const** `BRACKET_CONCURRENCY` in `service` (not a TOML/env key). Maximum wallet brackets in flight at once during the boot bracket and runtime admission batches (#555 addendum D9). Chosen from the measured per-wallet peak of ~304 MB resident on the largest wallet against the 2 GB production host. Brackets read full history three times except runtime re-entry and the refresh of a wallet that must re-anchor: one full baseline read precedes three stability reads from the baseline's fixed end minus `REENTRY_HISTORY_OVERLAP_SECS`, as defined by the [Copy-entry gate](#copy-entry-gate-first-ever-buy-entry-issues-290-339). |
-| `redeem_residual_limit_atomic` | 100 | **Exclusive module const** `REDEEM_RESIDUAL_LIMIT_ATOMIC` in `position-ledger` (#557). A REDEEM underflow residual of 1..=99 atomic units clamps the position closed and is recorded in the version-3 effect document; 100 or more fences. `ShareAmount` has six decimal places, so 100 atomic units equal one ten-thousandth of a position: the limit is one four-decimal `/positions` reporting quantum and accepts venue-display quantization residue without hiding a full reported quantum. SELL and MERGE remain strict, and the tolerance cannot stack within a bucket. |
+| `redeem_residual_limit_atomic` | 100 | **Exclusive module const** `REDEEM_RESIDUAL_LIMIT_ATOMIC` in `position-ledger` (#557). A REDEEM underflow residual of 1..=99 atomic units clamps the position closed and is recorded in the version-3 effect document; 100 or more drops the resolved market under [classifier 6](#history-format-3-and-classifier-6-739). `ShareAmount` has six decimal places, so 100 atomic units equal one ten-thousandth of a position: the limit is one four-decimal `/positions` reporting quantum and accepts venue-display quantization residue without hiding a full reported quantum. SELL and MERGE remain strict, and the tolerance cannot stack within a bucket. |
 | `rehearsal_quiescence` | production unit policy at run time | The #545 rehearsal reads the production `pe-service` unit's `TimeoutStopSec` as its exact quiescence bound and requires `KillSignal` to be SIGINT, the signal handled by the service. The harness owns no separate numeric shutdown bound (#586). |
 
 ### Causal re-anchor and rehearsal rules (#557)
 
-**Late-group re-anchor.** Previously unseen activity groups arriving for a wallet at or before an
-already-committed source epoch are recorded raw-only as `reanchor_required_late_group`; they do not
-mutate the ledger or produce a decision. The existing `reanchor_required` flag selects the wallet at
-its class's next fair refresh turn for a fresh complete history/positions bracket. An all-twin
-bucket is the exception: outcome restamps whose unattributed member rows reproduce a recorded
+**Late-group scope drops (#823).** A previously unseen effective position mutation arriving at or
+before an already-committed source epoch drops only its wallet's resolved market or neg-risk event
+from its own second. Partially recorded seconds follow the same scoped rule. Raw-only late records
+drop nothing and consume no history; covered late effects retain `anchor_covered_late`, stay unapplied
+and keep anchor balances and history repair. None requests a wallet-wide re-anchor. An all-twin
+bucket remains unchanged: outcome restamps whose unattributed member rows reproduce a recorded
 group's id and semantic revision (and whose outcome agrees with a recorded trade correction) are
 recorded `raw_only`, with no ledger, first-entry history, re-anchor or fence effect, including under
 anchor coverage and beside exact recorded groups. In feed correlation, a twin listed beside its
 recorded original counts with it as one candidate, so an `activity/trades` observation stamped
 like neither binds the original. An observation of either stamp of a pair first seen together
-(neither recorded), or one fitting genuinely distinct candidates, keeps the invalid-mapping fence;
-without a feed observation, such a pair keeps today's routing. Position brackets recognize twins the same way. A routine refresh's preflight permits proven twins; a
+(neither recorded), or one fitting genuinely distinct candidates, drops the observation's effective
+market from the earliest observation/candidate second. Its exact retirement commits with that drop
+before later buckets run; without an effective market it is retired and counted. Without a feed
+observation, such a pair keeps ordinary routing. Position brackets recognize twins the same way. A routine refresh's preflight permits proven twins; a
 twin first recorded in a later stability walk keeps the existing bounded retry. A twin mixed with a genuinely new
-group keeps the existing routing. Revisions still fence; partially recorded non-twin buckets retain their fence,
-and covered non-twin arrivals retain `anchor_covered_late` re-anchoring.
+group follows the scoped rule for its new records. A changed revision drops its original applied
+market, if any, and its revised non-raw-only resolved scope. No-scope revisions stay `raw_only` and
+are counted, without consumption or problem-second demotion. The wallet stays followed.
 
 Known-condition `RequiresAnchor` redemptions and TRADE/REDEEM combos reaching ordinary routing
 record `raw_only` without a wallet re-anchor. An unexpressible redemption leaves that resolved
 condition's balances and first-entry history unchanged until the next successful anchor; routine
-refresh deferrals can postpone replacement. Late, partially recorded and covered non-twin arrivals,
-unknown-condition redemptions and unresolved non-combo identities retain the existing causal rule.
-Conversion and unknown-type effect precedence is unchanged.
+refresh deferrals can postpone replacement. Unknown-condition redemptions, conversions, unknown
+effects, invalid mappings and arithmetic anomalies use [classifier 6](#history-format-3-and-classifier-6-739).
+Only classifier errors or failure to apply its returned mutations fence the wallet as integrity
+failures. Existing fences and their recovery, `identity_unresolved` re-anchors and pre-upgrade
+re-anchor flags retain their behavior.
 
 Missing-group confirmation retries add no interval: the attempt becomes eligible when its read
 completes, and the single urgent slot selects the least recently launched eligible wallet. Control
@@ -475,7 +481,7 @@ Campaign financial limits and eligibility are canonical in
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `paper_state_db_path` | `./paper_state.db` | Path to the crash-safe paper-state SQLite mirror. Schema three stores quantities, principal, and fees as exact decimal strings and binds each financial mutation to its prepared sequence and `QualificationStarted` identity. It also durably owns reconciled activity revisions, first-entry evidence, terminal `decision_pending`, wallet fences with atomic causal clearance, position validations, and machine-owned migration metadata. |
+| `paper_state_db_path` | `./paper_state.db` | Path to the crash-safe paper-state SQLite mirror. Schema three stores quantities, principal, and fees as exact decimal strings and binds each financial mutation to its prepared sequence and `QualificationStarted` identity. It also durably owns reconciled activity revisions, first-entry evidence, terminal `decision_pending`, wallet fences with atomic causal clearance, cumulative `wallet_scope_drops`, position validations, and machine-owned migration metadata. |
 | `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for Polymarket Gamma market metadata and mark-price reads. Resolution payout evidence comes from the CLOB market endpoint. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms`. |
 | `gamma_resolution_poll_interval_secs` | 120 | Legacy-named cadence for the service's CLOB resolution poll. The poll is limited to conditions with open unsettled positions; Gamma is not a payout authority. |
 | `max_resolution_horizon_secs` | 86_400 (24 h) | `ServiceConfig` field. Gate C measures from its decision clock to the **next UTC midnight after the recorded CLOB `scheduled_end_unix` marker**, not to the marker itself. The ceiling is exclusive: remaining seconds `>=` this value reject. `0` disables the upper bound. Paired with the inclusive `min_resolution_horizon_secs` floor; one admission read serves both. Missing or overflowing end evidence fails closed while either bound is enabled. Evidence retains the raw marker for replay. The scoring twin is `ranker_ttr_hours`. Existing `service_config` rows require an explicit deploy update; `on conflict do nothing` does not change them. |
@@ -502,7 +508,7 @@ before the bracket completes.
 During catch-up, verified prior purchases for unfenced wallets consume all missing markets
 through the existing bucket
 transaction and history projection, including while reanchoring is required and when a group was
-already stored without history. Fenced bracket reconciliation defers all covered-history repair to installation. Recovery permits
+already stored without history. Existing fenced bracket reconciliation defers all covered-history repair to installation. Legacy fence recovery permits
 only the existing order-dependent, underflow, overflow, late-group and conversion causes, or a revised
 aggregate with a unique durably dispositioned trigger matching original wallet/source epoch, canonical
 transaction identity and fence recording time. The second activity read's fixed end must be strictly
@@ -521,7 +527,10 @@ after commit. Retained original effects, dispositions, proofs and earlier decisi
 intentional paper-evidence disposal follows the source-retention contract below.
 Known disposed revisions with matching canonical transaction identity are idempotent while any
 fence is active and, after clearance, within anchor coverage; this recognition never widens
-clearance eligibility. Every newly retained non-original revision advances the existing coverage generation once
+clearance eligibility. Exact revisions retained as `scope_dropped` or no-scope `raw_only` are also
+recognized without a fence. Their originals and earlier decisions stay immutable; qualification
+accepts the retained revision as an explanation across reads without replacing a decision's own
+revision. Every newly retained non-original revision advances the existing coverage generation once
 and invalidates the current bracket, including on its first read; exact retries do not advance it.
 Committed clearance is a forward-only recovery boundary.
 Existing complete records and historical membership proof snapshots remain intact; the corrected
@@ -553,9 +562,11 @@ every real aggregate applies once, and history is consumed once. Mixed outcomes 
 the durable ledger/gate/history commit to the later production-only continuation: `open` is
 closed only by a terminal disposition, and replay consumes the recorded transition without
 executing the continuation. Receipt-bearing continuations pair `ActivityWs` provenance with a
-websocket source receipt exactly; REST provenance has no websocket receipt. A changed semantic
-revision, unprovable activity, invalid mapping,
-or ledger arithmetic failure in history reconciliation creates a durable `wallet_fences` row. Fenced wallets are removed
+websocket source receipt exactly; REST provenance has no websocket receipt. Scoped anomalies commit
+their drops, `scope_dropped` dispositions, exact observation retirements, retained revisions, gates
+and consumed BUY history atomically with the bucket. Unresolvable problems are `raw_only` and
+counted, with no application or consumption. Only integrity failures create new durable
+`wallet_fences` rows. Fenced wallets are removed
 from effective membership/projection and cannot copy. Only the atomic anchor recovery described
 above can clear an eligible fence; unsafe or unprovable fences remain quarantined.
 
@@ -611,7 +622,8 @@ Frames create no activity-group/revision rows, leader-balance effects or deliver
 REST applies each matching counterpart once, including aliases, without another decision or
 any change to the frame's pending row, terminal or Prepared inputs. Copy ownership survives
 restart; equal identifiers retain the frame-owned gate and single terminal. Genuine late
-arrivals retain causal re-anchoring.
+arrivals follow the scoped rule above. Frames in known dropped scopes route `Ignored`; unknown
+membership is checked at dispatch and does not block the frame.
 
 The admission capture retains the frame receipt, source/receive/admission clocks, compact
 `AdmissionLedgerCapture`, append-only activity row boundary, frame-market anchor balances and
@@ -1504,10 +1516,10 @@ alongside `--stage-record`, checks the bound export summary, certificates, spool
 then hashes the checkpointed candidate without another history/projection scan. Its stage record
 binds the export manifest's SHA-256 and summary; activation and interrupted restore use that summary.
 
-**Classifier 6.** `position-ledger::classify_scoped_second` owns the scoped-second rule; bootstrap
+**Classifier 6.** `position-ledger::classify_scoped_second` owns the scoped-second rule; pe-service
+applies that shared rule with its recorded evidence and imported batch drops (#823). Bootstrap
 calls `classify_scoped_historical_second`, which owns default signal configuration and complete
-history and selects `SameSecondEntryPolicy::HomogeneousPieces`. pe-service release 2 coordinates
-on [#588](https://github.com/sppburke/prediction-markets/issues/588). The existing historical entry
+history and selects `SameSecondEntryPolicy::HomogeneousPieces`. The existing historical entry
 point retains its behavior. Same-wallet/market/second/outcome homogeneous BUY pieces count once
 (minimum `source_trade_id`), with every piece applied and consuming. Mixed outcomes remain ambiguous.
 
@@ -1559,12 +1571,61 @@ remains a problem second without the trigger. Digest, decoding and chain failure
 integrity failures, not scope drops. The consumed-market lookup remains necessary at zero balance:
 BUY → SELL → BUY cannot reopen first-entry eligibility.
 
-**Publication.** Version-1 request envelopes keep their shape: the batch adds `classifier_version`,
+**Service scope state (#823).** `wallet_scope_drops` keeps one row per wallet/scope, with the earliest
+starting second under the same tie rule. Drops never remove a wallet from membership and survive
+swap-out, return, re-entry and anchor recovery. They pin no source-log input. A later-discovered
+drop changes no recorded decision: restart, replay and qualification use recorded dispositions and
+effects. `scope_dropped` records an excluded, unapplied effect; ignored records remain `raw_only`.
+No continuation version changes.
+
+Membership comes from write-once recorded CLOB evidence in `meta` `neg_risk_group:<market>`: a group id,
+empty for verified ungrouped, or `absent` for a terminal no-market answer. Missing and `absent`
+both mean unknown membership; neither proves a group. Only HTTP 404 `{"error":"market not found"}`
+and HTTP 400 `{"error":"Invalid market"}` record `absent`. A 400 `context canceled`, other failures,
+timeouts or a response naming another market record nothing and retry; see
+[the source contract](15-SOURCES.md#polymarket). Positive group evidence is any recorded membership
+naming that group, including pre-upgrade mappings, or the newest imported batch's exact group set
+in `ranker_group:<id>`. An id omitted by a newer batch loses that batch evidence; local CLOB
+evidence still counts. An unknown id falls back to its verified token's market or is ignored and
+counted under the shared resolver.
+
+Missing membership is acquired only when its answer can affect classification: an event drop is
+in effect, a late/revised record needs scope resolution, or a problem record needs the lookup.
+Healthy seconds without drops or with only market drops require no CLOB read. Acquisition records
+each CLOB response outside engine locks, commits membership independently of boot bracket batches,
+then retries without cursor, retirement, revision or bucket progress. Every admitted market records
+membership; Gate E and resolution polling share the same writer.
+
+Every batch consumer imports all published drops and derives that batch's group set before using
+it. Paged responses are recorded, validated and followed by a batch-existence check; a missing or
+pruned batch fails the import. One transaction upserts earliest-wins drops with batch/receipt proof,
+advances `ranker_group:<id>` to a newer batch's exact set and marks `scope_drop_imported:<batch>`.
+Older imports cannot replace the newest set; committed imports are not read again. Boot imports
+the deduplicated first-Start and applied membership-replay batches (or the pre-Start batch) before
+brackets, pending decisions or live recovery. Runtime imports serialize with buckets, frames and
+paper dispatch through Prepared; a failed import preserves the consumer's prior applied state.
+
+**Scope-drop compatibility boundary.** Paper schema remains three. The first `scope_dropped`
+disposition, revision retained without a fence, or live `PrePostScopeDropped` record crosses a
+forward-only boundary. `meta` `scope_drop_boundary_unix` is first-write-wins, recorded in the same
+savepoint as the disposition/revision or durably before the live journal append. Before that key
+exists the previous binary ignores the additive table, membership values, group keys and import
+markers; afterwards preserve state and fix forward. The
+[rollback check](35-PE-SERVICE-DEPLOY-RUNBOOK.md#rollback) also requires every earlier boundary.
+
+**Publication.** Version-1 request envelopes keep their shape: the batch adds `classifier_version`
+and freezes sorted distinct `neg_risk_group_ids` from its bound CLOB evidence snapshot;
 entries add `history_through_unix` (head receipt's `fixed_end_unix`) and their certificate's
 `scope_drops`. Publication flattens drops to `p_scope_drops` rows with `wallet_hex`, `scope_kind`,
 `scope_id`, `dropped_at_unix`, `cause`, ordered by `(wallet_hex, scope_kind, scope_id)`, and calls
-`publish_ranking_batch_v2(p_publish_key,p_batch,p_entries,p_scope_drops)`. Batch, entries and drops
-commit in one count-checked idempotent transaction. Earlier batches retain NULL classifier/coverage
+`publish_ranking_batch_v2(p_publish_key,p_batch,p_entries,p_scope_drops)`. Batch, entries, drops
+and group spans commit in one count-checked idempotent transaction. The RPC serializes new
+publications before batch-id allocation and changes `ranking_neg_risk_group_spans(group_id,
+from_batch_id,to_batch_id)` only for a new batch with the group list: missing groups close their
+open span and new groups open one. Batch B contains a group iff `from_batch_id <= B < to_batch_id`,
+with NULL as an open end. A request without the list changes no span; an existing-key retry also
+changes none. Saved requests retain their exact set on resume. Spans have no batch foreign key and
+survive pruning. Earlier batches retain NULL classifier/coverage
 fields. The five batch limits come from the validated oracle manifest; integer limits must be finite,
 integral and PostgreSQL-integer-sized (an integral `2.0` becomes JSON integer `2`, never rounded).
 The shared authenticated request loader still supports historical envelopes for retention; publication

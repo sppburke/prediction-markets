@@ -55,3 +55,14 @@ pub use scanner::{IncompleteTail, LogTailBinding, ScanOutcome, Scanner};
 pub use writer::{AppendReceipt, CheckpointPrefix, CheckpointVerification, Writer};
 #[cfg(feature = "scan-metrics")]
 pub mod scan_metrics;
+
+/// Run synchronous I/O and its lock waits outside multi-thread runtime workers.
+pub fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}

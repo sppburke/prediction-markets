@@ -1240,6 +1240,94 @@ fresh REST read to publish a frontier. Verify fallback during that interval, the
 and subsequent feed copying. Economics and financial semantic versions are unchanged, so this
 policy change alone does not seal qualification.
 
+**#823 scope-drop release.** Preserve the current generation, Start, seal and configuration.
+Prerequisites: #754 closed, owner go-ahead and #588 notified; coordinate the publisher install with
+the ranker agent on Forge and sequence with #822. Use the ordinary guarded swap below. Set `$art`
+to an existing retained deployment artifact directory; on resume, read back installed state and
+continue only from verified results. Database checks stay read-only except the explicit additive
+SQL apply.
+
+1. **Census and boot-batch preflight, while serving.** Record the observation start, first/latest
+   Start identities, source-retention epoch, readiness, followed set and legacy fences. Use the
+   installed `paper_state_db_path` (`paper_state.db` under `/home/sean/prediction-markets` in the
+   examples), opened with `sqlite3 -readonly` as elsewhere in this runbook:
+
+   ```bash
+   sqlite3 -readonly -header paper_state.db \
+     "SELECT wallet_hex, source_trade_id, cause, fenced_at_unix FROM wallet_fences ORDER BY wallet_hex;" \
+     > "$art/scope-drop-fences.before.txt"
+   ```
+
+   Record the deduplicated batch ids from the generation's first Start and every membership record
+   replay actually applies; before Start use the pinned boot batch. Check **every** id still exists
+   in Supabase, including restored batches never previously read. Use the read-only `ranking_read`
+   helper from [release-1 step 3](#release-1-deployment-procedure), with the recorded ids in `VALUES`:
+
+   ```sql
+   WITH required(batch_id) AS (VALUES (<start-batch-id>), (<replayed-batch-id>))
+   SELECT required.batch_id AS missing_batch_id
+   FROM required LEFT JOIN ranking_batches USING (batch_id)
+   WHERE ranking_batches.batch_id IS NULL ORDER BY required.batch_id;
+   ```
+
+   Cutover waits if any id is missing; retain and report the exact missing ids. Recheck the complete
+   list before the swap, including membership changes since this census. Do not manufacture an
+   empty import or replace the recorded batch with latest.
+
+2. **Supabase, then Forge publisher.** Apply the reviewed additive schema idempotently from the
+   release checkout on the authorized operator host:
+
+   ```bash
+   psql "$SUPABASE_DB_URL" -X -v ON_ERROR_STOP=1 -f scripts/supabase_schema.sql
+   ```
+
+   Before continuing, use `ranking_read` to verify the table, anon SELECT grant/policy and installed
+   RPC definition against the reviewed SQL:
+
+   ```sql
+   SELECT to_regclass('public.ranking_neg_risk_group_spans'),
+          has_table_privilege('anon', 'public.ranking_neg_risk_group_spans', 'SELECT');
+   SELECT policyname, roles, cmd, qual FROM pg_policies
+   WHERE schemaname = 'public' AND tablename = 'ranking_neg_risk_group_spans';
+   SELECT pg_get_functiondef('public.publish_ranking_batch_v2(text,jsonb,jsonb,jsonb)'::regprocedure);
+   ```
+
+   Install the publisher on Forge with the ranker agent through the
+   [Forge release procedure](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md#forge-release-deployment-and-rollback).
+   Keep frozen requests unchanged: a request without `neg_risk_group_ids` changes no span. Wait for
+   a **new** batch prepared by the updated publisher; record its batch id and saved request hash.
+   Read back that batch and its group set with `ranking_read`:
+
+   ```sql
+   SELECT batch_id, publish_key, classifier_version FROM ranking_batches WHERE batch_id = <new-batch-id>;
+   SELECT group_id FROM ranking_neg_risk_group_spans
+   WHERE from_batch_id <= <new-batch-id>
+     AND (to_batch_id IS NULL OR <new-batch-id> < to_batch_id) ORDER BY group_id;
+   ```
+
+   Compare the full sorted result with the saved request's `neg_risk_group_ids` before proceeding.
+   Span presence alone is insufficient: an unchanged group need not open a new span. Resume from
+   verified SQL/publisher identities and a matching published request; do not republish a different
+   set under an old key. An empty table supplies no published group evidence to the service.
+
+3. **Guarded service swap.** Stage and prepare the checkpoint while the old unit serves; record
+   reviewed revision, desired/staged/installed/running hashes and helper hashes through steps 1–3
+   below. Recheck the boot-batch preflight, then use steps 4–6's lock, disabled/stopped unit, fresh
+   process census, atomic swap and one start. Resume by those hash and ownership checks, keeping
+   the unit disabled and stopped until clearance. Read back committed `scope_drop_imported:<batch>`
+   markers and `ranker_group_batch` from `meta`, and the imported drops from `wallet_scope_drops`,
+   before accepting activation. Check every required batch's marker; the group batch must be the
+   newest imported id. Rollback must pass the [#823 boundary check](#rollback), including on resume.
+
+4. **Observe for 24 hours (#823 AC12).** Compare with the recorded start/retention-epoch baseline.
+   Use read-only fence/drop/import queries, bounded logs and status/readiness checks: only integrity
+   failures may create new fences; no late-group, covered-late or unknown-condition-redemption
+   re-anchors; `wallet scope dropped` logs and import counts present; unresolved conversion and
+   unknown-effect records counted; no anomaly shrinks the followed set. Confirm healthy readiness
+   and copies in unaffected scopes, with legacy fences and recovery unchanged. Attribute membership
+   changes to their recorded reason. Record unobserved cases explicitly; preserve all evidence and
+   fix forward once the boundary exists.
+
 Every step is bound to the embedded full Git revision plus exact binary bytes (#544). The binary
 reports `revision=<40-hex> config_identity=runtime-applied`; `--verify-staged-identity` checks that
 revision and the executable's BLAKE3 digest before staging. Continue to use sha256 for the existing
@@ -1707,6 +1795,27 @@ Credential, venue, financial, resolver, source, risk, and redemption checks appl
 do not change the owner's requested mode.
 
 ## Rollback
+
+**#823 scope drops:** before `meta` `scope_drop_boundary_unix` exists, the previous binary is a
+rollback target subject to every prerequisite below: it ignores the new table, membership values,
+group keys and import markers. The first `scope_dropped` disposition, revision retained without a
+fence or live `PrePostScopeDropped` record records that key atomically with, or before, the write.
+Afterwards preserve state and fix forward. Before reversing the ordinary [Procedure](#procedure)'s
+swap, hold the deploy lock, disable/stop and drain, clear the process census, then run this check
+against the exact installed paper-state path (shown in the working directory as `paper_state.db`):
+
+```bash
+set -euo pipefail
+sqlite3 -readonly paper_state.db "SELECT value FROM meta WHERE key='scope_drop_boundary_unix'"
+if [ "$(sqlite3 -readonly paper_state.db "SELECT EXISTS(SELECT 1 FROM meta WHERE key='scope_drop_boundary_unix')")" != 0 ]; then
+  echo 'rollback refused: scope-drop boundary exists or could not be read; fix forward'
+  exit 1
+fi
+```
+
+Only a successful absent-row check permits the reversed swap and one start, with all existing
+identity, census and compatibility checks. Repeat it on every resumed rollback before replacing
+the executable; a serving-time or earlier receipt grants no clearance.
 
 **#808 ordinary live:** rollback additionally requires a stopped-and-drained service, a verified
 header-only live journal, and every existing rollback prerequisite below. Older binaries cannot

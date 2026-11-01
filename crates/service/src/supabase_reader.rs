@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::str::FromStr as _;
 
+pub use crate::scope_drops::ScopeDropLoader;
+
 use pe_core_types::{
     BasisPoints, RawHttpAttempt, RawHttpResponse, RawTransportFailure, ReconstructionQuality,
     SourceTimestamp, TransportErrorClass, WalletAddress,
@@ -46,6 +48,8 @@ const SUPABASE_RECONSTRUCTION_QUALITY: u8 = 100;
 /// Error surface for a Supabase fetch. The refresh loop logs and continues on any of these.
 #[derive(Debug, thiserror::Error)]
 pub enum SupabaseError {
+    #[error("scope-drop import failed: {0}")]
+    ScopeImport(String),
     /// The HTTP request itself failed (DNS, connect, timeout, …).
     #[error("supabase request failed: {0}")]
     Transport(reqwest::Error),
@@ -57,10 +61,10 @@ pub enum SupabaseError {
     Decode(reqwest::Error),
     #[error("supabase response JSON failed: {0}")]
     Json(serde_json::Error),
-    /// A batch-pinned `ranking_entries` read returned a row from another batch (#542).
-    #[error("ranking_entries returned batch {found:?} while pinned to batch {expected}")]
+    /// A batch-pinned ranking or scope-drop read returned a row from another batch.
+    #[error("batch-pinned read returned batch {found:?} while pinned to batch {expected}")]
     BatchMismatch { expected: i64, found: Option<i64> },
-    #[error("supabase canary observation failed: {reason}")]
+    #[error("supabase observation failed: {reason}")]
     CanaryObserved {
         reason: String,
         attempts: Vec<RawHttpAttempt>,
@@ -150,7 +154,7 @@ fn batch_ranking_url(base_url: &str, batch_id: i64) -> String {
     )
 }
 
-const RANKING_PAGE_SIZE: usize = 1_000;
+pub(crate) const RANKING_PAGE_SIZE: usize = 1_000;
 
 /// Strict canary-only ranking read. Unlike the ordinary paper reader, this rejects malformed,
 /// stale, duplicate, incomplete, or cross-batch rows and raw-captures the owning batch timestamp.
@@ -322,7 +326,7 @@ pub async fn fetch_canary_observed(
     ))
 }
 
-async fn get_observation(
+pub(crate) async fn get_observation(
     client: &reqwest::Client,
     url: &str,
     anon_key: &str,
@@ -605,6 +609,70 @@ async fn get_ranking_rows(
         return Err(SupabaseError::Status(status.as_u16()));
     }
     resp.json().await.map_err(SupabaseError::Decode)
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ScopeDropRow {
+    pub batch_id: i64,
+    pub wallet_hex: WalletAddress,
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub dropped_at_unix: i64,
+    pub cause: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct GroupSpan {
+    pub group_id: String,
+    pub from_batch_id: i64,
+    pub to_batch_id: Option<i64>,
+}
+
+pub(crate) async fn fetch_scope_drops(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    batch_id: i64,
+    offset: usize,
+) -> Result<RawHttpResponse, SupabaseError> {
+    get_observation(client, &format!(
+        "{}/rest/v1/ranking_scope_drops?select=batch_id,wallet_hex,scope_kind,scope_id,dropped_at_unix,cause&batch_id=eq.{batch_id}&order=wallet_hex,scope_kind,scope_id&limit={RANKING_PAGE_SIZE}&offset={offset}",
+        base_url.trim_end_matches('/')
+    ), token).await
+}
+
+pub(crate) async fn fetch_group_spans(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    from_batch: Option<i64>,
+    batch_id: i64,
+    offset: usize,
+) -> Result<RawHttpResponse, SupabaseError> {
+    let changes = from_batch.map(|from| format!(
+        "&or=(and(from_batch_id.gt.{from},from_batch_id.lte.{batch_id}),and(to_batch_id.gt.{from},to_batch_id.lte.{batch_id}))"
+    )).unwrap_or_default();
+    get_observation(client, &format!(
+        "{}/rest/v1/ranking_neg_risk_group_spans?select=group_id,from_batch_id,to_batch_id&order=from_batch_id,group_id{changes}&limit={RANKING_PAGE_SIZE}&offset={offset}",
+        base_url.trim_end_matches('/')
+    ), token).await
+}
+
+pub(crate) async fn fetch_batch_existence(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    batch_id: i64,
+) -> Result<RawHttpResponse, SupabaseError> {
+    get_observation(
+        client,
+        &format!(
+            "{}/rest/v1/ranking_batches?select=batch_id&batch_id=eq.{batch_id}",
+            base_url.trim_end_matches('/')
+        ),
+        token,
+    )
+    .await
 }
 
 /// Fetch one ranking batch's surviving rows, pinned to `batch_id`, and map them exactly as

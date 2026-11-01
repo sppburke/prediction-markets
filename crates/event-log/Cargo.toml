@@ -17,6 +17,7 @@ scan-metrics = []
 workspace = true
 
 [dependencies]
+tokio = { workspace = true }
 pe-core-types = { path = "../core-types", version = "0.1.0" }
 blake3 = { workspace = true }
 crc32fast = { workspace = true }

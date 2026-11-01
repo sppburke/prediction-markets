@@ -2491,6 +2491,7 @@ fn decision_rows_from_sealed_source(
         }
     }
     let mut required = decision_keys_from_source_observations(
+        state,
         start_sequence,
         source,
         &source_universe,
@@ -2894,6 +2895,7 @@ fn fold_source_trade_universe(
 /// Page occurrences retain multiplicity, saturated parent segments contribute no production rows,
 /// and a group's earliest raw receipt decides whether its production aggregate predates Start.
 fn decision_keys_from_source_observations(
+    state: &PaperStateDb,
     start_sequence: Option<EventSeq>,
     source: SealedSource<'_>,
     source_universe: &HashMap<pe_core_types::SourceTradeId, u64>,
@@ -2961,24 +2963,51 @@ fn decision_keys_from_source_observations(
 
     let mut revisions = HashMap::<pe_core_types::SourceTradeId, String>::new();
     for read in complete_reads {
+        for id in read.decisions.keys() {
+            let Some(aggregate) = read
+                .aggregates
+                .iter()
+                .find(|aggregate| aggregate.group_id.key() == id)
+            else {
+                return insufficient(format!(
+                    "decision source trade {id} is absent from its complete activity read"
+                ));
+            };
+            let revision = aggregate.semantic_revision.as_str();
+            if let Some(previous) = revisions.insert(id.clone(), revision.to_owned())
+                && previous != revision
+            {
+                return insufficient(format!(
+                    "source trade {id} has conflicting decision revisions"
+                ));
+            }
+        }
+    }
+    let mut observed = HashMap::<pe_core_types::SourceTradeId, String>::new();
+    for read in complete_reads {
         for aggregate in &read.aggregates {
-            let source_trade_id = aggregate.group_id.key().clone();
+            let id = aggregate.group_id.key();
             if aggregate.group_id.components().activity_type != ActivityType::Trade
-                || !candidates.contains(&source_trade_id)
+                || !candidates.contains(id)
             {
                 continue;
             }
-            let semantic_revision = aggregate.semantic_revision.as_str().to_owned();
-            match revisions.entry(source_trade_id.clone()) {
+            let revision = aggregate.semantic_revision.as_str();
+            match observed.entry(id.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(semantic_revision);
+                    entry.insert(revision.to_owned());
                 }
-                std::collections::hash_map::Entry::Occupied(entry)
-                    if entry.get() != &semantic_revision =>
-                {
-                    return insufficient(format!(
-                        "source trade {source_trade_id} has multiple semantic revisions in the sealed prefix"
-                    ));
+                std::collections::hash_map::Entry::Occupied(entry) if entry.get() != revision => {
+                    let decided = revisions.get(id);
+                    for other in [entry.get().as_str(), revision] {
+                        if decided.is_none_or(|decided| decided != other)
+                            && !state.activity_revision_retained_without_fence(id, other)?
+                        {
+                            return insufficient(format!(
+                                "source trade {id} has multiple semantic revisions in the sealed prefix"
+                            ));
+                        }
+                    }
                 }
                 std::collections::hash_map::Entry::Occupied(_) => {}
             }
@@ -10377,6 +10406,7 @@ mod tests {
 
         let source_universe = source_trade_universe(EventSeq(2), &observations).unwrap();
         let keys = decision_keys_from_source_observations(
+            &PaperStateDb::open(&tempfile::tempdir().unwrap().path().join("paper.db")).unwrap(),
             None,
             SealedSource::Map(&observations),
             &source_universe,
@@ -10440,6 +10470,7 @@ mod tests {
 
         let source_universe = source_trade_universe(EventSeq(3), &observations).unwrap();
         let keys = decision_keys_from_source_observations(
+            &PaperStateDb::open(&tempfile::tempdir().unwrap().path().join("paper.db")).unwrap(),
             None,
             SealedSource::Map(&observations),
             &source_universe,
@@ -10490,6 +10521,7 @@ mod tests {
         let source_universe =
             source_trade_universe(EventSeq(child_sequence), &observations).unwrap();
         let keys = decision_keys_from_source_observations(
+            &PaperStateDb::open(&tempfile::tempdir().unwrap().path().join("paper.db")).unwrap(),
             None,
             SealedSource::Map(&observations),
             &source_universe,
@@ -10499,6 +10531,118 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].2, expected.semantic_revision.as_str());
         assert_eq!(expected.share_sum.to_decimal(), dec!(3));
+    }
+
+    #[test]
+    fn retained_revision_in_later_read_keeps_decided_revision_across_restart() {
+        let first_payload =
+            activity_payload(vec![activity_row("0xca", "a", "1", "0.5", "0xa", 100)]);
+        let second_payload = activity_payload(vec![
+            activity_row("0xca", "a", "2", "1", "0xa", 100),
+            activity_row("0xcb", "b", "1", "0.5", "0xb", 101),
+        ]);
+        let first = activity_observation(1, &first_payload);
+        let second = activity_observation(2, &second_payload);
+        let observations = BTreeMap::from([(1, first.clone()), (2, second.clone())]);
+        let original = parsed_aggregates(&[&first_payload]).remove(0);
+        let revised = parsed_aggregates(&[&second_payload])
+            .into_iter()
+            .find(|aggregate| aggregate.group_id.key() == original.group_id.key())
+            .unwrap();
+        let b = parsed_aggregates(&[&second_payload])
+            .into_iter()
+            .find(|aggregate| aggregate.group_id.key() != original.group_id.key())
+            .unwrap();
+        let reads = vec![
+            read_scope(
+                100,
+                vec![activity_page_pair(&first, &first_payload, None, 100, 0)],
+                [original.group_id.key().clone()],
+                &observations,
+            ),
+            read_scope(
+                101,
+                vec![activity_page_pair(&second, &second_payload, None, 101, 0)],
+                [b.group_id.key().clone()],
+                &observations,
+            ),
+        ];
+        for disposition in ["scope_dropped", "raw_only"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("paper.db");
+            let state = PaperStateDb::open(&path).unwrap();
+            let mut bucket = pe_paper_state::ActivityBucketCommit {
+                wallet: original.group_id.components().wallet,
+                source_epoch: 100,
+                dispositions: vec![pe_paper_state::ActivityDispositionRecord {
+                    source_trade_id: original.group_id.key().clone(),
+                    transaction_hash: original.group_id.components().transaction_hash.clone(),
+                    wallet: original.group_id.components().wallet,
+                    source_epoch: 100,
+                    semantic_revision: original.semantic_revision.as_str().to_owned(),
+                    activity_type: "TRADE".to_owned(),
+                    disposition: "applied".to_owned(),
+                    proof_json: pe_position_ledger::LedgerEffect::RawOnly
+                        .to_document()
+                        .unwrap(),
+                    no_copy: None,
+                }],
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
+                leader_positions: Vec::new(),
+                gate_results: Vec::new(),
+                history_effects: Vec::new(),
+                history_status: None,
+                pending: Vec::new(),
+                fence: None,
+                reanchor: None,
+                advance_cursor: true,
+            };
+            state.commit_activity_bucket(&bucket).unwrap();
+            let universe = source_trade_universe(EventSeq(2), &observations).unwrap();
+            assert!(
+                decision_keys_from_source_observations(
+                    &state,
+                    None,
+                    SealedSource::Map(&observations),
+                    &universe,
+                    &reads
+                )
+                .is_err()
+            );
+            bucket.dispositions[0].semantic_revision =
+                revised.semantic_revision.as_str().to_owned();
+            bucket.dispositions[0].disposition = disposition.to_owned();
+            bucket.unfenced_revisions.push((
+                original.group_id.key().clone(),
+                revised.semantic_revision.as_str().to_owned(),
+            ));
+            bucket.scope_drop_boundary_unix = Some(140);
+            state.commit_activity_bucket(&bucket).unwrap();
+            drop(state);
+            let state = PaperStateDb::open(&path).unwrap();
+            let keys = decision_keys_from_source_observations(
+                &state,
+                None,
+                SealedSource::Map(&observations),
+                &universe,
+                &reads,
+            )
+            .unwrap();
+            assert_eq!(keys.len(), 2);
+            assert!(
+                keys.iter()
+                    .any(|(_, id, revision)| id == original.group_id.key()
+                        && revision == original.semantic_revision.as_str())
+            );
+            assert!(
+                !keys
+                    .iter()
+                    .any(|(_, _, revision)| revision == revised.semantic_revision.as_str())
+            );
+        }
     }
 
     fn split_source_fixture() -> (DecisionContinuationV3, BTreeMap<u64, SourceObservation>) {
@@ -10698,6 +10842,7 @@ mod tests {
 
         let source_universe = source_trade_universe(EventSeq(2), &observations).unwrap();
         let keys = decision_keys_from_source_observations(
+            &PaperStateDb::open(&tempfile::tempdir().unwrap().path().join("paper.db")).unwrap(),
             Some(EventSeq(1)),
             SealedSource::Map(&observations),
             &source_universe,
@@ -10850,6 +10995,7 @@ mod tests {
         let source_universe = source_trade_universe(EventSeq(0), &observations)
             .expect("valid source universe derives from the activity row");
         let keys = decision_keys_from_source_observations(
+            &PaperStateDb::open(&tempfile::tempdir().unwrap().path().join("paper.db")).unwrap(),
             None,
             SealedSource::Map(&observations),
             &source_universe,
@@ -14277,6 +14423,10 @@ mod tests {
         .unwrap();
         state
             .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet: frozen.wallet,
                 source_epoch: frozen.source_epoch,
                 dispositions: vec![pe_paper_state::ActivityDispositionRecord {
@@ -14560,6 +14710,10 @@ mod tests {
         fixture
             .state
             .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet: legacy.wallet,
                 source_epoch: legacy.source_epoch,
                 dispositions: vec![pe_paper_state::ActivityDispositionRecord {
@@ -15512,12 +15666,12 @@ mod tests {
             // Bind the second history leg too; the original fixture's bound leg sorts first.
             let stream_payload = serde_json::to_vec(&serde_json::json!({
                 "proxyWallet": fixture.continuation.facts.wallet.to_string(),
-                "conditionId": "other", "asset": "456", "side": "BUY", "size": 1,
+                "conditionId": "0xa3", "asset": "456", "side": "BUY", "size": 1,
                 "price": 0.5, "timestamp": 99, "transactionHash": "tx", "outcomeIndex": 0
             }))
             .unwrap();
             let stream = parse_activity_trade_observation(&stream_payload).unwrap();
-            let metadata = br#"[{"conditionId":"other","clobTokenIds":["456","789"]}]"#.to_vec();
+            let metadata = br#"[{"conditionId":"0xa3","clobTokenIds":["456","789"]}]"#.to_vec();
             let metadata_hash =
                 pe_source_polymarket_public::canonical_page_hash(&metadata).unwrap();
             let at = OffsetDateTime::from_unix_timestamp(100).unwrap();

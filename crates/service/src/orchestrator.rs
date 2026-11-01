@@ -652,105 +652,107 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         sealed_cutoff_unix: i64,
         candidate: pe_event_log::LogTailBinding,
     ) -> Result<(), String> {
-        let (paper_log_path, _) = self
-            .financial_log_paths
-            .as_ref()
-            .ok_or_else(|| "qualification seal is unavailable before Start".to_owned())?;
-        let frames = self
-            .paper_writer
-            .snapshot()
-            .map_err(|error| error.to_string())?;
-        if crate::paper_recovery::generation_qualification_sealed(&frames) {
-            return Ok(());
-        }
-        let era = crate::paper_recovery::paper_generation(frames);
-        let (start_receipt, started) = era
-            .start
-            .as_ref()
-            .ok_or_else(|| "qualification seal has no verified Start".to_owned())?;
-        if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
-            return Err("qualification seal waits for the oldest unmatched Prepared".to_owned());
-        }
-        let source_receipts = self.source_receipts.as_ref().ok_or_else(|| {
-            "qualification seal is unavailable before the receipt index is installed".to_owned()
-        })?;
-        let seal_started = std::time::Instant::now();
-        info!(
-            reason = ?reason,
-            candidate_sequence = ?candidate.last_sequence,
-            "qualification seal started"
-        );
-        let qualification_error = |error| match error {
-            crate::qualification::QualificationError::EventLog(error) => error.to_string(),
-            other => other.to_string(),
-        };
-        let (sealed_source_prefix, selected) =
-            crate::qualification::indexed_source_prefix_selection(
-                &self.paper_state,
-                source_receipts,
-                &candidate,
-                &started.source_prefix,
-            )
-            .map_err(qualification_error)?;
-        let frames_walked = sealed_source_prefix
-            .last_sequence
-            .map_or(0, |sequence| sequence.0.saturating_add(1));
-        let (decision_evidence, reason) = match (selected, reason) {
-            (Ok(decisions), reason) => {
-                let decision_keys = decisions
-                    .rows
-                    .into_iter()
-                    .map(|row| (row.source_trade_id, row.semantic_revision))
-                    .collect::<Vec<_>>();
-                let evidence = self
-                    .paper_state
-                    .seal_decision_evidence_for_source_prefix(
-                        &decision_keys,
-                        &decisions.in_prefix,
-                        sealed_source_prefix.last_sequence,
-                    )
-                    .map_err(|error| error.to_string())?;
-                (evidence, reason)
+        pe_event_log::run_blocking(|| {
+            let (paper_log_path, _) = self
+                .financial_log_paths
+                .as_ref()
+                .ok_or_else(|| "qualification seal is unavailable before Start".to_owned())?;
+            let frames = self
+                .paper_writer
+                .snapshot()
+                .map_err(|error| error.to_string())?;
+            if crate::paper_recovery::generation_qualification_sealed(&frames) {
+                return Ok(());
             }
-            // An insufficient-evidence seal still closes the verified prefix when its decision
-            // evidence cannot be assembled (a bracket's recorded pages whose install never
-            // committed leave source trades without durable groups): its digest covers no
-            // decisions and its reason says why. A Complete seal still requires the evidence.
-            (
-                Err(crate::qualification::QualificationError::InsufficientEvidence(detail)),
-                SealReason::InsufficientEvidence(why),
-            ) => (
-                Vec::new(),
-                SealReason::InsufficientEvidence(format!(
-                    "{why}; decision evidence unavailable: {detail}"
-                )),
-            ),
-            (Err(error), _) => return Err(qualification_error(error)),
-        };
-        let financial_prefix = self.paper_writer.verified_tail().map_err(|error| {
-            self.intake_stopped = true;
-            error.to_string()
-        })?;
-        let live_prefix = pe_execution_core::LiveJournal::verified_tail(
-            paper_log_path.with_file_name("live_journal.log"),
-        )
-        .map_err(|error| error.to_string())?;
-        self.append_paper_record(&PaperLogRecord::QualificationSealed(Box::new(
-            QualificationSealed {
-                start_receipt: *start_receipt,
-                source_prefix: sealed_source_prefix,
-                financial_prefix: TailBinding::from(&financial_prefix),
-                live_prefix: TailBinding::from(&live_prefix),
-                decision_evidence_digest: blake3::hash(&decision_evidence).to_hex().to_string(),
-                sealed_cutoff_unix,
-                reason,
-            },
-        )))?;
-        info!(
-            elapsed_ms = u64::try_from(seal_started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            frames_walked, "qualification seal completed"
-        );
-        Ok(())
+            let era = crate::paper_recovery::paper_generation(frames);
+            let (start_receipt, started) = era
+                .start
+                .as_ref()
+                .ok_or_else(|| "qualification seal has no verified Start".to_owned())?;
+            if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
+                return Err("qualification seal waits for the oldest unmatched Prepared".to_owned());
+            }
+            let source_receipts = self.source_receipts.as_ref().ok_or_else(|| {
+                "qualification seal is unavailable before the receipt index is installed".to_owned()
+            })?;
+            let seal_started = std::time::Instant::now();
+            info!(
+                reason = ?reason,
+                candidate_sequence = ?candidate.last_sequence,
+                "qualification seal started"
+            );
+            let qualification_error = |error| match error {
+                crate::qualification::QualificationError::EventLog(error) => error.to_string(),
+                other => other.to_string(),
+            };
+            let (sealed_source_prefix, selected) =
+                crate::qualification::indexed_source_prefix_selection(
+                    &self.paper_state,
+                    source_receipts,
+                    &candidate,
+                    &started.source_prefix,
+                )
+                .map_err(qualification_error)?;
+            let frames_walked = sealed_source_prefix
+                .last_sequence
+                .map_or(0, |sequence| sequence.0.saturating_add(1));
+            let (decision_evidence, reason) = match (selected, reason) {
+                (Ok(decisions), reason) => {
+                    let decision_keys = decisions
+                        .rows
+                        .into_iter()
+                        .map(|row| (row.source_trade_id, row.semantic_revision))
+                        .collect::<Vec<_>>();
+                    let evidence = self
+                        .paper_state
+                        .seal_decision_evidence_for_source_prefix(
+                            &decision_keys,
+                            &decisions.in_prefix,
+                            sealed_source_prefix.last_sequence,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    (evidence, reason)
+                }
+                // An insufficient-evidence seal still closes the verified prefix when its decision
+                // evidence cannot be assembled (a bracket's recorded pages whose install never
+                // committed leave source trades without durable groups): its digest covers no
+                // decisions and its reason says why. A Complete seal still requires the evidence.
+                (
+                    Err(crate::qualification::QualificationError::InsufficientEvidence(detail)),
+                    SealReason::InsufficientEvidence(why),
+                ) => (
+                    Vec::new(),
+                    SealReason::InsufficientEvidence(format!(
+                        "{why}; decision evidence unavailable: {detail}"
+                    )),
+                ),
+                (Err(error), _) => return Err(qualification_error(error)),
+            };
+            let financial_prefix = self.paper_writer.verified_tail().map_err(|error| {
+                self.intake_stopped = true;
+                error.to_string()
+            })?;
+            let live_prefix = pe_execution_core::LiveJournal::verified_tail(
+                paper_log_path.with_file_name("live_journal.log"),
+            )
+            .map_err(|error| error.to_string())?;
+            self.append_paper_record(&PaperLogRecord::QualificationSealed(Box::new(
+                QualificationSealed {
+                    start_receipt: *start_receipt,
+                    source_prefix: sealed_source_prefix,
+                    financial_prefix: TailBinding::from(&financial_prefix),
+                    live_prefix: TailBinding::from(&live_prefix),
+                    decision_evidence_digest: blake3::hash(&decision_evidence).to_hex().to_string(),
+                    sealed_cutoff_unix,
+                    reason,
+                },
+            )))?;
+            info!(
+                elapsed_ms = u64::try_from(seal_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                frames_walked, "qualification seal completed"
+            );
+            Ok(())
+        })
     }
 
     fn apply_seal_check(
@@ -1516,26 +1518,27 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         } else {
             cash
         };
-        let (source_tail, byte_offset, last_receipt, previous_hash) = source_receipts
-            .tail_with_last_frame()
+        let source_tail = pe_event_log::run_blocking(|| {
+            let (source_tail, byte_offset, last_receipt, previous_hash) = source_receipts
+                .tail_with_last_frame()
+                .map_err(|error| error.to_string())?;
+            let (last_frame, end_offset) = pe_event_log::Reader::read_at(
+                &source_tail.path,
+                byte_offset,
+                last_receipt.sequence,
+                previous_hash,
+            )
             .map_err(|error| error.to_string())?;
-        let (last_frame, end_offset) = pe_event_log::Reader::read_at(
-            &source_tail.path,
-            byte_offset,
-            last_receipt.sequence,
-            previous_hash,
-        )
-        .map_err(|error| error.to_string())?;
-        if end_offset != source_tail.physical_tail
-            || Some(last_frame.seq) != source_tail.last_sequence
-            || last_frame.this_hash != source_tail.last_hash
-        {
-            return Err(
-                "daily boundary source receipt index tail differs from log frame"
-                    .to_owned()
-                    .into(),
-            );
-        }
+            if end_offset != source_tail.physical_tail
+                || Some(last_frame.seq) != source_tail.last_sequence
+                || last_frame.this_hash != source_tail.last_hash
+            {
+                return Err(
+                    "daily boundary source receipt index tail differs from log frame".to_owned(),
+                );
+            }
+            Ok::<_, String>(source_tail)
+        })?;
         let mark = PortfolioMark {
             boundary_receipt,
             cutoff_unix,
@@ -1786,12 +1789,33 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
     async fn apply_control_message(&mut self, message: OrchestratorControl) {
         match message {
+            OrchestratorControl::ImportScopeDrops {
+                batch_id,
+                drops,
+                group_ids,
+                acknowledged,
+            } => {
+                let result = self
+                    .paper_state
+                    .import_scope_drops(batch_id, &drops, &group_ids)
+                    .map_err(|error| error.to_string());
+                if result.is_ok() {
+                    info!(
+                        batch_id,
+                        drops = drops.len(),
+                        "ranking scope drops imported"
+                    );
+                }
+                let _ = acknowledged.send(result);
+            }
             OrchestratorControl::RetentionCommit {
                 request,
                 acknowledged,
             } => {
-                let result = crate::source_checkpoint::retention::commit(*request)
-                    .map_err(|error| format!("{error:#}"));
+                let result = pe_event_log::run_blocking(|| {
+                    crate::source_checkpoint::retention::commit(*request)
+                })
+                .map_err(|error| format!("{error:#}"));
                 let _ = acknowledged.send(result);
             }
             OrchestratorControl::ActivityFrameDecision { receipt } => {
@@ -1950,10 +1974,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     && let Err(msg) = self.resume_committed_rows(&result.pending).await
                 {
                     self.pending_load_failure = Some(msg.clone());
-                    let _ = committed.send(Err(msg));
+                    let _ = committed
+                        .send(Err(crate::bucket_commit::BucketCommitError::Invariant(msg)));
                     return;
                 }
-                let result = result.map_err(|error| error.to_string());
                 let _ = committed.send(result);
             }
             OrchestratorControl::ResolutionCandidate {
@@ -3928,6 +3952,17 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             }
         }
 
+        let result = crate::market_membership::record_market_membership(
+            &self.paper_state,
+            &condition_id.0,
+            admission.market.neg_risk_market_id.as_deref(),
+        );
+        if let Err(error) = result {
+            error!(%error, trade = %trade.source_trade_id, "record admitted market membership failed");
+            self.intake_stopped = true;
+            return;
+        }
+
         // Gate E (docs/19): a YES copy skips while another market of its neg-risk group holds an open YES.
         if !already_staged
             && admission.market.neg_risk
@@ -3961,14 +3996,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     .await;
                     return;
                 }
-                Ok(None) => {
-                    if let Err(error) = self.paper_state.record_market_group(&condition_id.0, group)
-                    {
-                        error!(%error, trade = %trade.source_trade_id, "record neg-risk market group failed");
-                        self.intake_stopped = true;
-                        return;
-                    }
-                }
+                Ok(None) => {}
                 Err(error) => {
                     error!(%error, trade = %trade.source_trade_id, "read held YES in neg-risk group failed");
                     self.intake_stopped = true;
@@ -4321,6 +4349,52 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             return;
         }
 
+        let dropped = self
+            .paper_state
+            .market_membership(&condition_id.0)
+            .and_then(|membership| {
+                self.paper_state.scope_is_dropped(
+                    &trade.wallet,
+                    &condition_id.0,
+                    match &membership {
+                        Some(pe_paper_state::MarketMembership::Grouped(group)) => {
+                            Some(group.as_str())
+                        }
+                        _ => None,
+                    },
+                    trade.observed_at.unix_timestamp(),
+                )
+            });
+        match dropped {
+            Ok(false) => {}
+            Ok(true) => {
+                let disposition = pe_paper_state::NoCopyDisposition {
+                    provenance: match trade.provenance {
+                        TradeProvenance::RestPoll => "rest_poll",
+                        TradeProvenance::ActivityWs => "activity_ws",
+                    }
+                    .to_owned(),
+                    age_secs: 0,
+                    reason: "scope_dropped_before_dispatch".to_owned(),
+                    recorded_at_unix: dispatch_stale_at.unix_timestamp(),
+                };
+                self.commit_no_copy_or_rollback(
+                    &trade,
+                    &leader_row,
+                    &disposition,
+                    &rb,
+                    Some(&signal.market_id),
+                    decision_evidence.as_ref(),
+                );
+                return;
+            }
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "scope drop dispatch check failed");
+                self.intake_stopped = true;
+                return;
+            }
+        }
+
         let dispatch_id = match self.stage_dispatch_if_targeted(
             &signal,
             &observation,
@@ -4649,7 +4723,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             age_secs = disposition.age_secs,
             budget_secs = self.copy_latency_budget_secs,
             reason = %disposition.reason,
-            "stale observation: admitted with no-copy disposition"
+            "decision terminated with no-copy disposition"
         );
         #[cfg(feature = "scenario")]
         if self.take_scenario_fault(|h| &h.fail_next_no_copy_commit) {
@@ -5150,11 +5224,12 @@ mod tests {
                     crate::paper_recovery::PaperLog::open(fixture.dir.path().join("paper.log"))
                         .unwrap();
                 let base = "https://offline.invalid";
+                let condition = continuation.facts.market_id.to_string();
                 let mids = serde_json::to_vec(&serde_json::json!([{
-                    "conditionId": "new", "outcomePrices": "[\"0.5\",\"0.5\"]", "clobTokenIds": "[\"123\",\"456\"]"
+                    "conditionId": condition, "outcomePrices": "[\"0.5\",\"0.5\"]", "clobTokenIds": "[\"123\",\"456\"]"
                 }])).unwrap();
                 let mid_fetcher = FixtureFetcher::new(HashMap::from([(
-                    format!("{base}/markets?condition_ids=new&limit=500"),
+                    format!("{base}/markets?condition_ids={condition}&limit=500"),
                     mids,
                 )]));
                 let mut owner = Orchestrator::new(
@@ -5209,7 +5284,7 @@ mod tests {
                 let economic =
                     seal_test_economic(fixture.metadata_receipt, fixture.metadata_receipt);
                 let mut market = pe_source_polymarket_public::LiveMarketEvidence {
-                    condition_id: PolymarketConditionId("new".to_owned()),
+                    condition_id: PolymarketConditionId(condition),
                     ordered_outcome_token_ids: [
                         PolymarketTokenId("123".to_owned()),
                         PolymarketTokenId("456".to_owned()),
@@ -5286,7 +5361,7 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
-        async fn group_gate_bypass_and_store_errors() {
+        async fn admission_membership_and_group_gate_fail_closed_on_store_errors() {
             for (neg_risk, group, insert_failure) in [
                 (false, Some("group"), false),
                 (true, None, false),
@@ -5302,8 +5377,8 @@ mod tests {
                 let connection =
                     rusqlite::Connection::open(harness._fixture.dir.path().join("paper.db"))
                         .unwrap();
-                let fails = neg_risk && group.is_some();
-                connection.execute_batch(if insert_failure || !fails {
+                let group_gate = neg_risk && group.is_some();
+                connection.execute_batch(if insert_failure || !group_gate {
                     "CREATE TRIGGER fail_group_insert BEFORE INSERT ON meta WHEN NEW.key LIKE 'neg_risk_group:%' BEGIN SELECT RAISE(FAIL, 'group insert failed'); END;"
                 } else {
                     "ALTER TABLE settled_markets RENAME TO unavailable_settled_markets;"
@@ -5311,29 +5386,15 @@ mod tests {
                 harness.release.take().unwrap().send(()).unwrap();
                 harness.owner.handle_trade_once(harness.trade.clone()).await;
                 assert_eq!(harness.books.started.lock().unwrap().len(), 1);
-                assert_eq!(harness.owner.intake_stopped, fails);
+                assert!(harness.owner.intake_stopped);
                 let row = harness
                     .owner
                     .paper_state
                     .decision_pending_for(&harness.trade.source_trade_id)
                     .unwrap()
                     .unwrap();
-                assert_eq!(
-                    row.state,
-                    if fails {
-                        DecisionPendingState::Open
-                    } else {
-                        DecisionPendingState::Terminal
-                    }
-                );
-                if fails {
-                    assert!(row.terminal_disposition.is_none());
-                } else {
-                    assert_eq!(
-                        harness.evidence().body.book.unwrap().outcome,
-                        "below_minimum"
-                    );
-                }
+                assert_eq!(row.state, DecisionPendingState::Open);
+                assert!(row.terminal_disposition.is_none());
                 let seeds: usize = connection
                     .query_row("SELECT COUNT(*) FROM dispatch_seeds", [], |row| row.get(0))
                     .unwrap();
@@ -5354,7 +5415,7 @@ mod tests {
                         |row| row.get(0),
                     )
                     .unwrap();
-                assert_eq!(mappings, 0);
+                assert_eq!(mappings, usize::from(group_gate && !insert_failure));
             }
         }
 
@@ -5366,7 +5427,7 @@ mod tests {
                 assert!(futures::poll!(&mut decision).is_pending());
                 assert_eq!(
                     *harness.books.started.lock().unwrap(),
-                    [("new".to_owned(), "123".to_owned())]
+                    [(harness.trade.market_id.to_string(), "123".to_owned())]
                 );
                 harness.release.take().unwrap().send(()).unwrap();
                 decision.await;
@@ -5744,6 +5805,78 @@ mod tests {
             paper_writer,
             start,
         }
+    }
+
+    #[tokio::test]
+    async fn scope_drop_imports_apply_in_control_message_order_and_acknowledge_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let (control, rx) = mpsc::channel(3);
+        let owner = build_test_orchestrator(
+            crate::paper_recovery::PaperLog::open(dir.path().join("paper.log")).unwrap(),
+            state.clone(),
+            rx,
+            String::new(),
+            None,
+        );
+        let wallet = pe_core_types::WalletAddress([42; 20]);
+        let mut replies = Vec::new();
+        for (batch_id, kind, cause) in [
+            (10, "market", "underflow"),
+            (11, "invalid", "overflow"),
+            (12, "market", "overflow"),
+        ] {
+            let (acknowledged, reply) = tokio::sync::oneshot::channel();
+            let receipt = AppendReceipt {
+                sequence: pe_core_types::EventSeq(1),
+                this_hash: blake3::hash(b"import-evidence"),
+            };
+            control
+                .send(OrchestratorControl::ImportScopeDrops {
+                    batch_id,
+                    drops: vec![(
+                        pe_paper_state::WalletScopeDrop {
+                            wallet,
+                            scope_kind: kind.to_owned(),
+                            scope_id: "market".to_owned(),
+                            cause: cause.to_owned(),
+                            source_trade_id: None,
+                            dropped_at_epoch: NOW,
+                            proof_json: String::new(),
+                            recorded_at_unix: NOW,
+                        },
+                        receipt,
+                    )],
+                    group_ids: std::collections::BTreeSet::from([format!("group-{batch_id}")]),
+                    acknowledged,
+                })
+                .await
+                .unwrap();
+            replies.push(reply);
+        }
+        assert!(!state.scope_drop_batch_imported(10).unwrap());
+        drop(control);
+        owner.run(std::future::pending()).await;
+        for (index, reply) in replies.into_iter().enumerate() {
+            assert_eq!(reply.await.unwrap().is_ok(), index != 1);
+        }
+        assert!(state.scope_drop_batch_imported(10).unwrap());
+        assert!(!state.scope_drop_batch_imported(11).unwrap());
+        assert!(state.scope_drop_batch_imported(12).unwrap());
+        let drops = state.wallet_scope_drops(&wallet, NOW).unwrap();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].cause, "underflow");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&drops[0].proof_json).unwrap()["batch_id"],
+            10
+        );
+        assert_eq!(
+            state.ranker_group_snapshot().unwrap(),
+            (
+                Some(12),
+                std::collections::BTreeSet::from(["group-12".to_owned()])
+            )
+        );
     }
 
     fn test_orchestrator(

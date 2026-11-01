@@ -255,7 +255,7 @@ fn whole_shares(value: u64) -> u64 {
 
 // ── AC1 ──────────────────────────────────────────────────────────────────────
 
-/// PASS: a trade delivered twice (same source_trade_id, distinct observed_at buckets)
+/// PASS: a trade delivered twice (same source_trade_id, distinct receipt times)
 ///       yields exactly one fill and one leader-ledger ingest.
 /// FAIL: two fills, or leader long-contracts doubled.
 #[tokio::test]
@@ -264,9 +264,10 @@ async fn ac1_duplicate_trade_fills_and_ingests_once() {
     let paper_state = paper_state_at(&dir);
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
 
-    // Same source_trade_id, two distinct observed_at buckets (Open risk #6).
+    // The same venue record arrives again with a later receipt time.
     let t1 = trade("dup-tx", Side::Buy, 100, 1_700_000_000);
-    let t2 = trade("dup-tx", Side::Buy, 100, 1_700_000_010);
+    let mut t2 = t1.clone();
+    t2.received_at = OffsetDateTime::from_unix_timestamp(1_700_000_010).unwrap();
 
     run_trades(
         &dir,
@@ -303,7 +304,8 @@ async fn ac2_no_fill_trade_is_still_deduped() {
     paper_state.init_bankroll(Decimal::from(10_000u32)).unwrap();
 
     let t1 = trade("noedge-tx", Side::Buy, 100, 1_700_000_000);
-    let t2 = trade("noedge-tx", Side::Buy, 100, 1_700_000_010);
+    let mut t2 = t1.clone();
+    t2.received_at = OffsetDateTime::from_unix_timestamp(1_700_000_010).unwrap();
 
     // Shadow mode → evaluate returns ShadowMode → no order produced.
     run_trades(

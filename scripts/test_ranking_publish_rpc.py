@@ -164,7 +164,10 @@ def main() -> int:
 
 
 def test_v2(url, suffix, batch, entries):
-    current = {**batch, "classifier_version": 6, "ttr_floor_secs": 10, "latency_shift_secs": 2}
+    group_a, group_b, shared = ["0x" + hashlib.sha256((suffix + name).encode()).hexdigest()
+                                for name in ("a", "b", "shared")]
+    current = {**batch, "classifier_version": 6, "ttr_floor_secs": 10, "latency_shift_secs": 2,
+               "neg_risk_group_ids": sorted([group_a, shared])}
     entries = [{**entry, "history_through_unix": 1700000010} for entry in entries]
     drops = [{"wallet_hex": "0xaaa", "scope_kind": "event", "scope_id": "0xa",
               "dropped_at_unix": 1700000000, "cause": "conversion"},
@@ -172,11 +175,24 @@ def test_v2(url, suffix, batch, entries):
               "dropped_at_unix": 1700000001, "cause": "underflow"}]
     batch_id = -1
     prefix = "ranking-v2-test-" + suffix
-    keys = [hashlib.sha256((prefix + str(i)).encode()).hexdigest() for i in range(8)]
-    def call(key, scope_drops, entry_rows=entries):
+    keys = [hashlib.sha256((prefix + str(i)).encode()).hexdigest() for i in range(16)]
+    def call(key, scope_drops, entry_rows=entries, batch_row=current):
         return ("select publish_ranking_batch_v2("
-                f"'{key}', '{sql_json(current)}'::jsonb, '{sql_json(entry_rows)}'::jsonb, "
+                f"'{key}', '{sql_json(batch_row)}'::jsonb, '{sql_json(entry_rows)}'::jsonb, "
                 f"'{sql_json(scope_drops)}'::jsonb);")
+
+    def spans():
+        return psql(url, "select group_id, from_batch_id, to_batch_id "
+                    "from ranking_neg_risk_group_spans order by group_id, from_batch_id;").stdout
+
+    def assert_groups(at_batch, expected):
+        stored = psql(url, "select group_id from ranking_neg_risk_group_spans "
+                      f"where from_batch_id <= {at_batch} "
+                      f"and (to_batch_id is null or {at_batch} < to_batch_id) "
+                      "order by group_id;").stdout.split()
+        if stored != sorted(expected):
+            raise AssertionError(f"batch {at_batch} groups {stored!r} != {sorted(expected)!r}")
+
     try:
         legacy_key = keys[-1]
         old_batch = int(psql(url, "select publish_ranking_batch("
@@ -188,6 +204,15 @@ def test_v2(url, suffix, batch, entries):
         if len(set(results)) != 1 or not results[0].isdigit():
             raise AssertionError(f"v2 same-key retry did not converge: {results}")
         batch_id = int(results[0])
+        counts = psql(url, "select "
+                      f"(select count(*) from ranking_batches where publish_key='{keys[0]}'), "
+                      f"(select count(*) from ranking_entries where batch_id={batch_id}), "
+                      f"(select count(*) from ranking_scope_drops where batch_id={batch_id}), "
+                      "(select count(*) from ranking_neg_risk_group_spans);").stdout.strip()
+        if counts != f"1|{len(entries)}|{len(drops)}|2":
+            raise AssertionError(f"v2 concurrent retry left duplicate or partial rows: {counts}")
+        assert_groups(old_batch, [])
+        assert_groups(batch_id, current["neg_risk_group_ids"])
         stored = psql(url, f"select classifier_version, ttr_floor_secs, latency_shift_secs from ranking_batches where batch_id={batch_id};").stdout.strip()
         if stored != "6|10|2":
             raise AssertionError(f"v2 batch metadata mismatch: {stored}")
@@ -197,6 +222,9 @@ def test_v2(url, suffix, batch, entries):
         anon = psql(url, f"set role anon; select count(*) from ranking_scope_drops where batch_id={batch_id};").stdout.splitlines()[-1]
         if anon != "2":
             raise AssertionError("anon cannot read scope drops")
+        anon_groups = psql(url, "set role anon; select count(*) from ranking_neg_risk_group_spans;").stdout.splitlines()[-1]
+        if anon_groups != "2":
+            raise AssertionError("anon cannot read group spans")
         privileges = psql(url, "select has_function_privilege('anon', 'publish_ranking_batch_v2(text,jsonb,jsonb,jsonb)', 'EXECUTE'), "
                          "has_function_privilege('authenticated', 'publish_ranking_batch_v2(text,jsonb,jsonb,jsonb)', 'EXECUTE'), "
                          "has_function_privilege('service_role', 'publish_ranking_batch_v2(text,jsonb,jsonb,jsonb)', 'EXECUTE');").stdout.strip()
@@ -209,12 +237,15 @@ def test_v2(url, suffix, batch, entries):
             [{**drops[0], "scope_kind": "wallet"}],
         )
         for key, bad_drops in zip(keys[1:5], failures, strict=True):
+            before = spans()
             failed = psql(url, call(key, bad_drops), check=False)
             if failed.returncode == 0:
                 raise AssertionError(f"invalid v2 drops accepted: {bad_drops}")
             count = psql(url, f"select count(*) from ranking_batches where publish_key='{key}';").stdout.strip()
             if count != "0":
                 raise AssertionError("failing drop did not roll back batch and entries")
+            if spans() != before:
+                raise AssertionError("failing drop changed group spans")
         # Retry counts remain enforced for both inherited entries and the extension's drops.
         for scope_drops, entry_rows in (([], entries), (drops, entries[:1])):
             if psql(url, call(keys[0], scope_drops, entry_rows), check=False).returncode == 0:
@@ -222,12 +253,81 @@ def test_v2(url, suffix, batch, entries):
         no_end = [{**entry, "history_through_unix": None} for entry in entries]
         if psql(url, call(keys[5], drops, no_end), check=False).returncode == 0:
             raise AssertionError("v2 missing coverage end accepted")
+
+        next_batch = {**current, "neg_risk_group_ids": sorted([group_b, shared])}
+        batch_b = int(psql(url, call(keys[6], drops, batch_row=next_batch)).stdout.strip())
+        if batch_b <= batch_id:
+            raise AssertionError("new publication did not get a newer batch id")
+        assert_groups(batch_id, current["neg_risk_group_ids"])
+        assert_groups(batch_b, next_batch["neg_risk_group_ids"])
+        expected_spans = sorted([(group_a, batch_id, batch_b), (shared, batch_id, None),
+                                 (group_b, batch_b, None)])
+        rendered = "".join(f"{group}|{start}|{'' if end is None else end}\n"
+                           for group, start, end in expected_spans)
+        if spans() != rendered:
+            raise AssertionError("A -> B did not close only the removed group and retain the shared span")
+        before = spans()
+        if psql(url, call(keys[0], drops)).stdout.strip() != str(batch_id) or spans() != before:
+            raise AssertionError("retry of A after B changed group spans or returned a new batch")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            retries = list(executor.map(lambda _: psql(url, call(keys[0], drops)).stdout.strip(), range(2)))
+        if retries != [str(batch_id)] * 2 or spans() != before:
+            raise AssertionError("concurrent retries of A after B changed spans or batch id")
+        assert_groups(batch_id, current["neg_risk_group_ids"])
+        assert_groups(batch_b, next_batch["neg_risk_group_ids"])
+
+        without_groups = dict(current)
+        del without_groups["neg_risk_group_ids"]
+        legacy_id = int(psql(url, call(keys[7], drops, batch_row=without_groups)).stdout.strip())
+        if spans() != before:
+            raise AssertionError("publication without group key changed spans")
+        assert_groups(legacy_id, next_batch["neg_risk_group_ids"])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            publications = [(keys[8], current), (keys[9], next_batch)]
+            ids = list(executor.map(
+                lambda item: int(psql(url, call(item[0], drops, batch_row=item[1])).stdout.strip()),
+                publications,
+            ))
+        if len(set(ids)) != 2 or min(ids) <= legacy_id:
+            raise AssertionError(f"distinct concurrent publications returned unordered/reused ids: {ids}")
+        for published_id, (_, payload) in zip(ids, publications, strict=True):
+            assert_groups(published_id, payload["neg_risk_group_ids"])
+        assert_groups(batch_id, current["neg_risk_group_ids"])
+        assert_groups(batch_b, next_batch["neg_risk_group_ids"])
+        print("PASS: A, B, retry A preserve exact sets; concurrent same-key and distinct publications converge")
+
+        # This failure occurs after closing spans, proving those writes roll back too.
+        for key, groups in ((keys[12], [None]), (keys[13], "not-an-array")):
+            before = spans()
+            failed = psql(url, call(key, drops, batch_row={**current, "neg_risk_group_ids": groups}), check=False)
+            if failed.returncode == 0:
+                raise AssertionError(f"invalid group list accepted: {groups!r}")
+            count = psql(url, f"select count(*) from ranking_batches where publish_key='{key}';").stdout.strip()
+            if count != "0" or spans() != before:
+                raise AssertionError("failing group publication left a batch or changed spans")
+
+        empty_id = int(psql(url, call(keys[10], drops, batch_row={**current, "neg_risk_group_ids": []})).stdout.strip())
+        assert_groups(empty_id, [])
+        reopened_id = int(psql(url, call(keys[11], drops)).stdout.strip())
+        assert_groups(reopened_id, current["neg_risk_group_ids"])
+        assert_groups(empty_id, [])
+        assert_groups(batch_id, current["neg_risk_group_ids"])
+        before = spans()
+        psql(url, f"delete from ranking_batches where batch_id in ({batch_id}, {batch_b});")
+        if spans() != before:
+            raise AssertionError("pruning batches changed their group spans")
+        assert_groups(batch_id, current["neg_risk_group_ids"])
+        assert_groups(batch_b, next_batch["neg_risk_group_ids"])
+        print("PASS: group failures roll back atomically; empty sets, reopening, pruning and anon reads work")
         print("PASS: v2 drops atomic; retries converge; counts checked; old classifier NULL; anon reads drops")
     finally:
         rendered = ",".join("'" + key + "'" for key in keys)
         psql(url, f"delete from ranking_batches where publish_key in ({rendered});", check=False)
         if psql(url, f"select count(*) from ranking_scope_drops where batch_id={batch_id};").stdout.strip() != "0":
             raise AssertionError("batch delete did not cascade to drops")
+        group_ids = ",".join("'" + group + "'" for group in (group_a, group_b, shared))
+        psql(url, f"delete from ranking_neg_risk_group_spans where group_id in ({group_ids});", check=False)
 
 
 if __name__ == "__main__":

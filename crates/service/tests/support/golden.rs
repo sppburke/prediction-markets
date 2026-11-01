@@ -3373,7 +3373,12 @@ impl BracketFinancialHarness {
         &self,
         wallet: WalletAddress,
         epoch: i64,
-    ) -> oneshot::Receiver<Result<pe_service::bucket_commit::BucketCommitResult, String>> {
+    ) -> oneshot::Receiver<
+        Result<
+            pe_service::bucket_commit::BucketCommitResult,
+            pe_service::bucket_commit::BucketCommitError,
+        >,
+    > {
         let bodies = golden_trade_bodies(1, epoch);
         self.record_entry_admission(&bodies, epoch).await;
         let payload = Self::entry_payload(wallet, epoch);
@@ -3971,7 +3976,9 @@ impl BracketFinancialHarness {
 
 /// Composed recorded-policy proof: runtime full-history bracket validation/publication, stream
 /// observation through the real two-slot poller, orchestrator gates, fresh/corrected paper fills,
-/// cold-portfolio expiry with staged-target release, completed-state restart, and sealed CLI replay.
+/// cold-portfolio expiry with staged-target release, retained revisions without a fence,
+/// completed-state restart, anchor installation, and sealed CLI replay. An unexplained revision
+/// fails qualification even though the original admitted continuation remains intact.
 /// Uses the golden corpus's 2030 end dates, disabled min/max resolution horizons, impact cap 300,
 /// and recorded admission artifacts queued through scenario hooks. The poller has no admission
 /// preparer; runtime bracket preparation completes separately before polling. No fanout consumer
@@ -4017,6 +4024,7 @@ pub(crate) async fn deployed_flow_replays_exactly_and_qualifies() {
     let credit = CollateralAmount::from_decimal_exact(dec!(5.04)).unwrap();
     let mut expected = Vec::new();
     let mut expired_id = None;
+    let mut revised_trade = None;
     for day in 0..QUALIFICATION_DAYS {
         for within_day in 0..COPIES_PER_DAY {
             let ordinal = day * COPIES_PER_DAY + within_day;
@@ -4114,7 +4122,32 @@ pub(crate) async fn deployed_flow_replays_exactly_and_qualifies() {
                 // A later fresh observation encounters an aged portfolio cache, then its
                 // held response consumes the copy budget while the first position remains open.
                 let expiry_epoch = epoch + 120;
-                let expired = deployed_trade(PRICE_CONFLICT_DECISION, expiry_epoch, false);
+                let mut expired = deployed_trade(PRICE_CONFLICT_DECISION, expiry_epoch, false);
+                let mut revised: serde_json::Value =
+                    serde_json::from_slice(&bodies.activity).unwrap();
+                revised[0]["size"] = "6".into();
+                revised[0]["usdcSize"] = "3".into();
+                let mut rows: serde_json::Value =
+                    serde_json::from_slice(&expired.activity).unwrap();
+                rows.as_array_mut().unwrap().push(revised[0].clone());
+                expired.activity = serde_json::to_vec(&rows).unwrap();
+                let mut gamma: serde_json::Value = serde_json::from_slice(&expired.gamma).unwrap();
+                gamma.as_array_mut().unwrap().extend(
+                    serde_json::from_slice::<Vec<serde_json::Value>>(&bodies.gamma).unwrap(),
+                );
+                expired.gamma = serde_json::to_vec(&gamma).unwrap();
+                let read = support::producer_shaped_read_v2(
+                    newcomer,
+                    &serde_json::to_vec(&revised).unwrap(),
+                    epoch,
+                    expiry_epoch,
+                    support::scenario_receipt(1),
+                );
+                let revision = &read.aggregates[0];
+                revised_trade = Some((
+                    revision.group_id.key().clone(),
+                    revision.semantic_revision.as_str().to_owned(),
+                ));
                 h.accounts
                     .store(pe_service::live_accounts::LiveAccountsSnapshot {
                         accounts: vec![pe_service::live_accounts::AccountContext {
@@ -4157,6 +4190,13 @@ pub(crate) async fn deployed_flow_replays_exactly_and_qualifies() {
                 eprintln!("deployed flow releasing portfolio price");
                 h.price_gate.release.notify_one();
                 let expired_row = attempt.await;
+                let (id, revision) = revised_trade.as_ref().unwrap();
+                assert!(
+                    paper
+                        .activity_revision_retained_without_fence(id, revision)
+                        .unwrap()
+                );
+                assert!(!paper.is_wallet_fenced(&newcomer).unwrap());
                 let replay = replay_decision_pending(&expired_row).unwrap();
                 assert_eq!(
                     replay.post_boundary.body.terminal.reason,
@@ -4223,6 +4263,41 @@ pub(crate) async fn deployed_flow_replays_exactly_and_qualifies() {
         h.deployed_boundary(cutoff + i64::try_from(day + 1).unwrap() * DAY_SECS)
             .await;
     }
+    let sealed = paper_era(scan_paper_log(&h.paper_path).unwrap());
+    let seal_receipt = sealed
+        .frames
+        .iter()
+        .find(|frame| {
+            matches!(
+                frame.frame,
+                PaperLogFrame::Record(PaperLogRecord::QualificationSealed(_))
+            )
+        })
+        .unwrap()
+        .receipt;
+    let initial_output = dir.path().join("before-restart-qualification.json");
+    let output = run_qualify_cli(
+        &h.paper_path,
+        &h.source_path,
+        &dir.path().join("live_journal.log"),
+        &state_path,
+        seal_receipt,
+        &initial_output,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let initial_report: QualificationReport =
+        serde_json::from_slice(&std::fs::read(initial_output).unwrap()).unwrap();
+    assert_eq!(
+        initial_report.verdict,
+        QualificationVerdict::Pass,
+        "{:?}",
+        initial_report.reasons
+    );
+    assert!(initial_report.replay.exact);
     eprintln!("deployed flow sealed; reopening");
     let paths = (h.paper_path.clone(), h.source_path.clone());
     let initial = h.initial.clone();
@@ -4325,6 +4400,7 @@ pub(crate) async fn deployed_flow_replays_exactly_and_qualifies() {
         report.reasons
     );
     assert!(report.replay.exact);
+    assert_eq!(report.replay, initial_report.replay);
     assert_eq!(report.replay.fills, ORIGINAL_COPIES);
     assert_eq!(report.replay.financial_prepared, ORIGINAL_COPIES * 2);
     assert_eq!(report.replay.financial_final, ORIGINAL_COPIES * 2);
@@ -4341,6 +4417,79 @@ pub(crate) async fn deployed_flow_replays_exactly_and_qualifies() {
         expected
             .iter()
             .all(|(id, _, _, _)| Some(id) != expired_id.as_ref())
+    );
+    let mut engine = engine;
+    let capture = ledger_capture(engine.ledger(), &paper, newcomer).unwrap();
+    let balances = engine
+        .ledger()
+        .position(&newcomer)
+        .unwrap()
+        .positions
+        .iter()
+        .map(|(key, position)| {
+            assert_eq!(position.short_contracts, ShareAmount::ZERO);
+            (key.market().clone(), key.outcome(), position.long_contracts)
+        })
+        .collect();
+    engine
+        .install_anchors(&[AnchorInstall {
+            wallet: newcomer,
+            balances,
+            cutoff: cutoff + i64::try_from(QUALIFICATION_DAYS).unwrap() * DAY_SECS,
+            newest_activity_unix: None,
+            fresh_history: Vec::new(),
+            expected_fence: None,
+            history_status: None,
+            expected: AnchorExpectation {
+                ledger_hash: capture.hash,
+                cursor: capture.cursor,
+                anchor_seq: capture.anchor_seq,
+                coverage_generation: capture.coverage_generation,
+            },
+            proof: AnchorProof {
+                positions_proof_hash: "qualification-anchor".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                document: "{}".to_owned(),
+                recorded_at_unix: cutoff + i64::try_from(QUALIFICATION_DAYS).unwrap() * DAY_SECS,
+            },
+        }])
+        .unwrap();
+    let output_path = dir.path().join("anchored-qualification.json");
+    let output = run_qualify_cli(
+        &paths.0,
+        &paths.1,
+        &dir.path().join("live_journal.log"),
+        &state_path,
+        seal.receipt,
+        &output_path,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let anchored: QualificationReport =
+        serde_json::from_slice(&std::fs::read(output_path).unwrap()).unwrap();
+    assert_eq!(
+        anchored.verdict,
+        QualificationVerdict::Pass,
+        "{:?}",
+        anchored.reasons
+    );
+    assert!(anchored.replay.exact);
+    assert_eq!(anchored.replay, report.replay);
+    let (id, revision) = revised_trade.unwrap();
+    let connection = rusqlite::Connection::open(&state_path).unwrap();
+    assert_eq!(connection.execute("DELETE FROM activity_group_revisions WHERE source_trade_id=?1 AND semantic_revision=?2", rusqlite::params![id.0, revision]).unwrap(), 1);
+    assert_qualify_insufficient(
+        &paths.0,
+        &paths.1,
+        &dir.path().join("live_journal.log"),
+        &state_path,
+        seal.receipt,
+        &dir.path().join("unexplained-revision.json"),
+        &format!("source trade {id} has multiple semantic revisions in the sealed prefix"),
     );
 }
 

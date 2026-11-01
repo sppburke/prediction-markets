@@ -13,6 +13,7 @@
 //!
 //! See `docs/_GLOSSARY.md` "JSONL observability sidecar schema" for the per-kind field tables.
 
+use std::io::{self, Write};
 use std::path::Path;
 
 use tracing_appender::non_blocking::WorkerGuard;
@@ -21,6 +22,22 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{
     EnvFilter, Layer as _, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _,
 };
+
+struct BlockingWriter<F>(F);
+
+impl<W: Write, F: Fn() -> W> Write for BlockingWriter<F> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        pe_event_log::run_blocking(|| (self.0)().write(buf))
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        pe_event_log::run_blocking(|| (self.0)().write_all(buf))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        pe_event_log::run_blocking(|| (self.0)().flush())
+    }
+}
 
 /// Initialise the global tracing subscriber.
 ///
@@ -71,7 +88,7 @@ pub fn setup(
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
     let stderr_layer = fmt::layer()
-        .with_writer(std::io::stderr)
+        .with_writer(|| BlockingWriter(std::io::stderr))
         .json()
         .flatten_event(true)
         .with_filter(env());
@@ -94,4 +111,64 @@ pub fn setup(
         .map_err(|e| anyhow::anyhow!("tracing init: {e}"))?;
 
     Ok(vec![full_guard, err_guard])
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct InjectedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for InjectedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+
+    #[test]
+    fn blocking_stderr_write_preserves_runtime_progress() {
+        stderr_preserves_runtime_progress(0);
+    }
+
+    #[test]
+    fn blocking_stderr_write_all_preserves_runtime_progress() {
+        stderr_preserves_runtime_progress(1);
+    }
+
+    #[test]
+    fn blocking_stderr_flush_preserves_runtime_progress() {
+        stderr_preserves_runtime_progress(2);
+    }
+
+    fn stderr_preserves_runtime_progress(operation: u8) {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let holder = Arc::clone(&bytes);
+        crate::runtime_progress::assert_progress(
+            move |entered, release| {
+                let _guard = holder.lock().unwrap();
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            },
+            move || {
+                let mut writer = BlockingWriter(|| InjectedWriter(Arc::clone(&bytes)));
+                match operation {
+                    0 => {
+                        assert_eq!(writer.write(b"line").unwrap(), 4);
+                    }
+                    1 => {
+                        writer.write_all(b"line").unwrap();
+                    }
+                    _ => {
+                        writer.flush().unwrap();
+                    }
+                }
+            },
+        );
+    }
 }

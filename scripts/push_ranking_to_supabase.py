@@ -227,6 +227,10 @@ def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, 
                     if wallet in current and current[wallet]["newest_trade_unix"] is not None}
             if publication_history is not None:
                 publication_history["classifier_version"] = certificates["classifier_version"]
+                publication_history["neg_risk_group_ids"] = [row[0] for row in con.execute(
+                    "SELECT DISTINCT neg_risk_market_id FROM clob_payout_evidence_v2 "
+                    "WHERE neg_risk_market_id IS NOT NULL ORDER BY neg_risk_market_id"
+                )]
                 publication_history["wallets"] = {}
                 for wallet in wallets_lower:
                     if wallet not in last:
@@ -723,6 +727,7 @@ def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
     entries = build_entries(top, last_trade_map)
     if publication_history:
         batch["classifier_version"] = publication_history["classifier_version"]
+        batch["neg_risk_group_ids"] = publication_history["neg_risk_group_ids"]
         for entry in entries:
             entry.update(publication_history["wallets"][entry["wallet_hex"].lower()])
     activation_args = (

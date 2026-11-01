@@ -259,10 +259,7 @@ pub fn post_snapshot_invalid_continuation(
     let snapshot_source = source_path.with_file_name("snapshot-source.log");
     let connection = rusqlite::Connection::open(state_path).unwrap();
     let mut newer_id = None;
-    for (epoch, market, size, price) in [
-        (910, "0xcondition-a", "2", "0.4"),
-        (911, "0xcondition-b", "3", "0.6"),
-    ] {
+    for (epoch, market, size, price) in [(910, "0xca", "2", "0.4"), (911, "0xcb", "3", "0.6")] {
         let payload = serde_json::to_vec(&serde_json::json!([{
             "proxyWallet": wallet, "timestamp": epoch, "conditionId": market,
             "type": "TRADE", "size": size, "usdcSize": "999999.000000",

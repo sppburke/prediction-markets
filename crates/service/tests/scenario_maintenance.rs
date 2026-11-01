@@ -1346,18 +1346,19 @@ async fn full_structural_set_backfills_vacancy_from_stale_survivors_in_rank_orde
                 if !starts.contains(&user) {
                     starts.push(user.clone());
                 }
-                json!([{"proxyWallet":user,"timestamp":NOW-10,"conditionId":"stale-survivor-market",
+                json!([{"proxyWallet":user,"timestamp":NOW-10,"conditionId":"0xca",
                     "type":"TRADE","size":"1","usdcSize":"0.5","transactionHash":"0xsurvivor",
                     "price":"0.5","asset":"123","side":"BUY","outcomeIndex":0}])
             }
             "/positions" => json!([]),
             "/markets" => {
-                json!([{"conditionId":"stale-survivor-market","clobTokenIds":["123","456"]}])
+                json!([{"conditionId":"0xca","clobTokenIds":["123","456"]}])
             }
             _ => json!([]),
         })
     }
     let (dir, paper) = temp_db();
+    paper.record_market_group("0xca", "").unwrap();
     // Every installed member's activity clock already reflects its acquired history.
     for n in 1..=100 {
         install_anchor(
@@ -1427,23 +1428,31 @@ async fn full_structural_set_backfills_vacancy_from_stale_survivors_in_rank_orde
             BucketCommitEngine::load(actor_paper.clone(), PositionLedger::new()).unwrap();
         while let Some(command) = commands.recv().await {
             match command {
+                OrchestratorControl::ImportScopeDrops {
+                    batch_id,
+                    drops,
+                    group_ids,
+                    acknowledged,
+                } => {
+                    let _ = acknowledged.send(
+                        actor_paper
+                            .import_scope_drops(batch_id, &drops, &group_ids)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
                 OrchestratorControl::CommitActivityBucket {
                     aggregates,
                     context,
                     committed,
                 } => {
-                    let _ = committed.send(
-                        engine
-                            .commit(
-                                aggregates,
-                                &context,
-                                FrozenDecisionBasis {
-                                    win_rate_p: pe_core_types::Probability::ZERO,
-                                    bankroll: Decimal::ZERO,
-                                },
-                            )
-                            .map_err(|error| error.to_string()),
-                    );
+                    let _ = committed.send(engine.commit(
+                        aggregates,
+                        &context,
+                        FrozenDecisionBasis {
+                            win_rate_p: pe_core_types::Probability::ZERO,
+                            bankroll: Decimal::ZERO,
+                        },
+                    ));
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
                     let _ = captured.send(
@@ -1540,8 +1549,13 @@ async fn full_structural_set_backfills_vacancy_from_stale_survivors_in_rank_orde
 /// PASS: 95 proved members plus five ranked newcomers reach 100 across two ticks. The first
 /// tick's launch deadline expires with four brackets in flight; their accepted proofs publish,
 /// the untouched fifth remains in the pinned batch, and the next tick backfills its slot.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn budgeted_admission_reaches_100_across_ticks() {
+    let io = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
     use axum::{
         Json, Router,
         extract::{Query, State},
@@ -1577,10 +1591,10 @@ async fn budgeted_admission_reaches_100_across_ticks() {
                 let user = query["user"].clone();
                 let first = state.first.lock().unwrap().insert(user.clone());
                 if first { state.started.send(user.clone()).unwrap(); state.release.acquire().await.unwrap().forget(); }
-                json!([{"proxyWallet":user,"timestamp":NOW-10,"conditionId":"population-market","type":"TRADE","size":"1","usdcSize":"0.5","transactionHash":"0xpopulation","price":"0.5","asset":"123","side":"BUY","outcomeIndex":0}])
+                json!([{"proxyWallet":user,"timestamp":NOW-10,"conditionId":"0xcb","type":"TRADE","size":"1","usdcSize":"0.5","transactionHash":"0xpopulation","price":"0.5","asset":"123","side":"BUY","outcomeIndex":0}])
             },
             "/positions" => json!([]),
-            "/markets" => json!([{"conditionId":"population-market","clobTokenIds":["123","456"]}]),
+            "/markets" => json!([{"conditionId":"0xcb","clobTokenIds":["123","456"]}]),
             _ => json!([]),
         })
     }
@@ -1629,7 +1643,7 @@ async fn budgeted_admission_reaches_100_across_ticks() {
         )
         .run(),
     );
-    let fetcher = Arc::new(ReqwestFetcher::new(reqwest::Client::new()));
+    let fetcher = Arc::new(ReqwestFetcher::new(reqwest::Client::new()).with_min_interval_ms(0));
     let identity = Arc::new(AssetIdentityResolver::new_runtime(
         fetcher.clone(),
         base.clone(),
@@ -1647,23 +1661,31 @@ async fn budgeted_admission_reaches_100_across_ticks() {
             BucketCommitEngine::load(actor_paper.clone(), PositionLedger::new()).unwrap();
         while let Some(command) = commands.recv().await {
             match command {
+                OrchestratorControl::ImportScopeDrops {
+                    batch_id,
+                    drops,
+                    group_ids,
+                    acknowledged,
+                } => {
+                    let _ = acknowledged.send(
+                        actor_paper
+                            .import_scope_drops(batch_id, &drops, &group_ids)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
                 OrchestratorControl::CommitActivityBucket {
                     aggregates,
                     context,
                     committed,
                 } => {
-                    let _ = committed.send(
-                        engine
-                            .commit(
-                                aggregates,
-                                &context,
-                                FrozenDecisionBasis {
-                                    win_rate_p: pe_core_types::Probability::ZERO,
-                                    bankroll: Decimal::ZERO,
-                                },
-                            )
-                            .map_err(|e| e.to_string()),
-                    );
+                    let _ = committed.send(engine.commit(
+                        aggregates,
+                        &context,
+                        FrozenDecisionBasis {
+                            win_rate_p: pe_core_types::Probability::ZERO,
+                            bankroll: Decimal::ZERO,
+                        },
+                    ));
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
                     let _ = captured.send(
@@ -1747,7 +1769,7 @@ async fn budgeted_admission_reaches_100_across_ticks() {
         );
     }
     assert_eq!(launched, (96..=99).map(|n| wallet(n).to_string()).collect());
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    tokio::time::advance(std::time::Duration::from_millis(1100)).await;
     release.add_permits(4);
     let state = tokio::time::timeout(std::time::Duration::from_secs(20), task)
         .await
@@ -1782,4 +1804,5 @@ async fn budgeted_admission_reaches_100_across_ticks() {
     actor.await.unwrap();
     source_task.await.unwrap();
     server.abort();
+    io.abort();
 }

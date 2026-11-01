@@ -94,12 +94,18 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Hosted runners now start with ~86 GiB free, and a fresh full workspace test build peaks at
-      # ~36 GiB (measured 10/11), so the preinstalled-SDK reclaim (53-160 s per Rust job) is gone. A
-      # full disk shows up as `ld ... signal 7 [Bus error]` while linking; if that returns, restore
-      # the reclaim from this step's history. df -h stays so disk headroom is visible in the log.
+      # Hosted runners usually start with ~86 GiB free, and a fresh full workspace test build peaks at
+      # ~36 GiB (measured 10/11). Some still start smaller (11/1: 19 GiB free, a nextest shard hit
+      # `No space left on device`), so the preinstalled-SDK reclaim (53-160 s) runs only below 45 GiB.
+      # df -h stays so disk headroom is visible in the log.
       - name: Disk space
-        run: df -h /
+        run: |
+          df -h /
+          if [ "$(df --output=avail -BG / | tail -1 | tr -dc 0-9)" -lt 45 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+              /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell || true
+            df -h /
+          fi
 
       - name: Install pinned toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -159,7 +165,13 @@ jobs:
           python-version: "3.11"
 
       - name: Disk space
-        run: df -h /
+        run: |
+          df -h /
+          if [ "$(df --output=avail -BG / | tail -1 | tr -dc 0-9)" -lt 45 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+              /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell || true
+            df -h /
+          fi
 
       - name: Install pinned toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -211,7 +223,13 @@ jobs:
           fetch-depth: 0
 
       - name: Disk space
-        run: df -h /
+        run: |
+          df -h /
+          if [ "$(df --output=avail -BG / | tail -1 | tr -dc 0-9)" -lt 45 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+              /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell || true
+            df -h /
+          fi
 
       - name: Install pinned toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -337,7 +355,13 @@ jobs:
           python-version: "3.11"
 
       - name: Disk space
-        run: df -h /
+        run: |
+          df -h /
+          if [ "$(df --output=avail -BG / | tail -1 | tr -dc 0-9)" -lt 45 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+              /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell || true
+            df -h /
+          fi
 
       - name: Install pinned toolchain
         uses: dtolnay/rust-toolchain@stable
