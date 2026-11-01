@@ -15500,6 +15500,10 @@ mod tests {
             .config
             .paper_state
             .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet: continuation.facts.wallet,
                 source_epoch: continuation.facts.source_epoch,
                 dispositions: vec![pe_paper_state::ActivityDispositionRecord {

@@ -528,6 +528,10 @@ async fn acknowledged_pre_cutoff_websocket_fill_survives_late_final_and_replay()
     let observation = parse_activity_trade_observation(WS_PAYLOAD).unwrap();
     state
         .commit_activity_bucket(&ActivityBucketCommit {
+            scope_drops: Vec::new(),
+            observation_retirements: Vec::new(),
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
             wallet: observation.wallet,
             source_epoch: observation.source_time.0.unix_timestamp(),
             dispositions: vec![ActivityDispositionRecord {

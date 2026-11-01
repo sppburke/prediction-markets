@@ -3355,6 +3355,10 @@ mod tests {
             .effect;
         state
             .commit_activity_bucket(&ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet: components.wallet,
                 source_epoch: aggregate.source_time.0.unix_timestamp(),
                 dispositions: vec![ActivityDispositionRecord {
@@ -3696,6 +3700,10 @@ mod tests {
         let activity = parse_activity_trade_observation(payload).unwrap();
         paper_state
             .commit_activity_bucket(&ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet: activity.wallet,
                 source_epoch: activity.source_time.0.unix_timestamp(),
                 dispositions: vec![ActivityDispositionRecord {

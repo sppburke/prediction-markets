@@ -71,6 +71,10 @@ struct ActivityObservationRetirement {
     unbound: bool,
 }
 
+const IS_GROUP_SQL: &str = "SELECT EXISTS(SELECT 1 FROM meta \
+    WHERE key GLOB 'neg_risk_group:*' AND value <> '' AND value <> 'absent' AND value = ?1) \
+    OR EXISTS(SELECT 1 FROM meta WHERE key = 'ranker_group:' || ?1)";
+
 /// Errors from the paper-state store.
 #[derive(Debug, thiserror::Error)]
 pub enum PaperStateError {
@@ -91,6 +95,9 @@ pub enum PaperStateError {
     /// Identity mutations must wait for the caller-owned activity batch to end.
     #[error("identity mutation requires an autocommit connection")]
     IdentityBatchOpen,
+    /// Membership evidence must commit independently of an activity batch.
+    #[error("market membership mutation requires an autocommit connection")]
+    MembershipBatchOpen,
     /// Retention must not join a caller-owned reconciliation batch.
     #[error("retention requires an autocommit connection")]
     RetentionBatchOpen,
@@ -585,12 +592,41 @@ pub struct ReanchorRecord {
     pub reason: String,
 }
 
+/// One cumulative market or event exclusion, with caller-owned replay evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletScopeDrop {
+    pub wallet: WalletAddress,
+    /// The scope wire name: `market` or `event`.
+    pub scope_kind: String,
+    pub scope_id: String,
+    pub cause: String,
+    pub source_trade_id: Option<SourceTradeId>,
+    pub dropped_at_epoch: i64,
+    pub proof_json: String,
+    pub recorded_at_unix: i64,
+}
+
+/// Acquired CLOB evidence. Missing rows and `Absent` both mean unknown membership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarketMembership {
+    Absent,
+    Ungrouped,
+    Grouped(String),
+}
+
 /// Complete atomic wallet-second commit assembled by the service bucket engine.
 #[derive(Debug, Clone)]
 pub struct ActivityBucketCommit {
     pub wallet: WalletAddress,
     pub source_epoch: i64,
     pub dispositions: Vec<ActivityDispositionRecord>,
+    pub scope_drops: Vec<WalletScopeDrop>,
+    /// Exact source observations and their existing unbound-retirement flag.
+    pub observation_retirements: Vec<(AppendReceipt, bool)>,
+    /// Exact revisions this bucket may retain without a wallet fence.
+    pub unfenced_revisions: Vec<(SourceTradeId, String)>,
+    /// Required when this bucket first writes a forward-only disposition or revision.
+    pub scope_drop_boundary_unix: Option<i64>,
     pub leader_positions: Vec<LeaderPositionRow>,
     pub gate_results: Vec<EntryGateResultRecord>,
     pub history_effects: Vec<MarketHistoryRecord>,
@@ -1818,6 +1854,21 @@ impl PaperStateDb {
             .map_err(PaperStateError::from)
     }
 
+    /// Recognize an exact revision retained as a scoped exclusion or a no-scope record.
+    pub fn activity_revision_retained_without_fence(
+        &self,
+        id: &SourceTradeId,
+        revision: &str,
+    ) -> Result<bool, PaperStateError> {
+        Ok(self.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM activity_group_revisions \
+             WHERE source_trade_id = ?1 AND semantic_revision = ?2 \
+             AND disposition IN ('scope_dropped', 'raw_only'))",
+            params![id.0, revision],
+            |row| row.get(0),
+        )?)
+    }
+
     /// All original effects and all retained revisions through an accepted source cutoff.
     pub fn recovery_activity_evidence(
         &self,
@@ -2161,18 +2212,183 @@ impl PaperStateDb {
         Ok(())
     }
 
-    /// Record a market's neg-risk group once.
+    /// Record membership once: a group id, empty for ungrouped, or `absent`.
     pub fn record_market_group(
         &self,
         market_id: &str,
         group_id: &str,
     ) -> Result<(), PaperStateError> {
-        self.lock().execute(
+        let conn = self.lock();
+        if !conn.is_autocommit() {
+            return Err(PaperStateError::MembershipBatchOpen);
+        }
+        conn.execute(
             "INSERT INTO meta (key, value) VALUES ('neg_risk_group:' || ?1, ?2) \
              ON CONFLICT(key) DO NOTHING",
             params![market_id, group_id],
         )?;
         Ok(())
+    }
+
+    /// Read acquired evidence distinctly from a market that has never been looked up.
+    pub fn market_membership(
+        &self,
+        market_id: &str,
+    ) -> Result<Option<MarketMembership>, PaperStateError> {
+        let value: Option<String> = self
+            .lock()
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'neg_risk_group:' || ?1",
+                [market_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.map(|value| match value.as_str() {
+            "absent" => MarketMembership::Absent,
+            "" => MarketMembership::Ungrouped,
+            _ => MarketMembership::Grouped(value),
+        }))
+    }
+
+    /// Positive group evidence from recorded memberships or the newest imported batch.
+    pub fn is_group(&self, id: &str) -> Result<bool, PaperStateError> {
+        Ok(self
+            .lock()
+            .query_row(IS_GROUP_SQL, [id], |row| row.get(0))?)
+    }
+
+    /// Test a market and its known group against this wallet's cumulative drops.
+    pub fn scope_is_dropped(
+        &self,
+        wallet: &WalletAddress,
+        market_id: &str,
+        group_id: Option<&str>,
+        source_epoch: i64,
+    ) -> Result<bool, PaperStateError> {
+        scope_is_dropped(&self.lock(), wallet, market_id, group_id, source_epoch)
+    }
+
+    /// Read exclusions in effect at this second, including their certification seconds.
+    pub fn wallet_scope_drops(
+        &self,
+        wallet: &WalletAddress,
+        source_epoch: i64,
+    ) -> Result<Vec<WalletScopeDrop>, PaperStateError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT scope_kind, scope_id, cause, source_trade_id, dropped_at_epoch, \
+                    proof_json, recorded_at_unix FROM wallet_scope_drops \
+             WHERE wallet_hex = ?1 AND dropped_at_epoch <= ?2 ORDER BY scope_kind, scope_id",
+        )?;
+        Ok(statement
+            .query_map(params![wallet.to_string(), source_epoch], |row| {
+                Ok(WalletScopeDrop {
+                    wallet: *wallet,
+                    scope_kind: row.get(0)?,
+                    scope_id: row.get(1)?,
+                    cause: row.get(2)?,
+                    source_trade_id: row.get::<_, Option<String>>(3)?.map(SourceTradeId),
+                    dropped_at_epoch: row.get(4)?,
+                    proof_json: row.get(5)?,
+                    recorded_at_unix: row.get(6)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Atomically import drops and advance only the newest batch's exact group set.
+    pub fn import_scope_drops(
+        &self,
+        batch_id: i64,
+        drops: &[(WalletScopeDrop, AppendReceipt)],
+        group_ids: &BTreeSet<String>,
+    ) -> Result<(), PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        for (drop, receipt) in drops {
+            let mut imported = drop.clone();
+            imported.source_trade_id = None;
+            imported.proof_json = serde_json::to_string(&serde_json::json!({
+                "batch_id": batch_id,
+                "receipt": receipt,
+            }))?;
+            tx_upsert_scope_drop(&tx, &imported)?;
+        }
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'ranker_group_batch'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.is_none_or(|current| batch_id > current) {
+            let groups_json = serde_json::to_string(group_ids)?;
+            tx.execute(
+                "DELETE FROM meta WHERE key GLOB 'ranker_group:*' \
+                 AND key NOT IN (SELECT 'ranker_group:' || value FROM json_each(?1))",
+                [&groups_json],
+            )?;
+            tx.execute(
+                "INSERT INTO meta(key, value) \
+                 SELECT 'ranker_group:' || value, 1 FROM json_each(?1) WHERE true \
+                 ON CONFLICT(key) DO NOTHING",
+                [&groups_json],
+            )?;
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES ('ranker_group_batch', ?1) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [batch_id],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES ('scope_drop_imported:' || ?1, 1) \
+             ON CONFLICT(key) DO NOTHING",
+            [batch_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether this batch's full import committed.
+    pub fn scope_drop_batch_imported(&self, batch_id: i64) -> Result<bool, PaperStateError> {
+        Ok(self.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key = 'scope_drop_imported:' || ?1)",
+            [batch_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Batch whose exact published group set is currently recorded.
+    pub fn ranker_group_batch(&self) -> Result<Option<i64>, PaperStateError> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'ranker_group_batch'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Persist the rollback boundary before a live scope-drop journal append.
+    pub fn record_scope_drop_boundary(&self, recorded_at_unix: i64) -> Result<(), PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx_record_scope_drop_boundary(&tx, recorded_at_unix)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// First forward-only scope-drop write, or no boundary yet.
+    pub fn scope_drop_boundary_unix(&self) -> Result<Option<i64>, PaperStateError> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'scope_drop_boundary_unix'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// Find the lowest sibling market holding an unsettled YES buy.
@@ -2202,19 +2418,7 @@ impl PaperStateDb {
         receipt: AppendReceipt,
         unbound: bool,
     ) -> Result<(), PaperStateError> {
-        self.lock().execute(
-            "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
-            params![
-                format!("retired_activity_observation:{}", receipt.sequence.0),
-                serde_json::to_string(&ActivityObservationRetirement {
-                    version: 1,
-                    receipt,
-                    unbound,
-                })?
-            ],
-        )?;
-        self.activity_observation_retired(receipt)?;
-        Ok(())
+        tx_retire_activity_observation(&self.lock(), receipt, unbound)
     }
 
     pub fn activity_observation_retired(
@@ -2237,29 +2441,7 @@ impl PaperStateDb {
         &self,
         receipt: AppendReceipt,
     ) -> Result<Option<ActivityObservationRetirement>, PaperStateError> {
-        let encoded: Option<String> = self
-            .lock()
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                params![format!(
-                    "retired_activity_observation:{}",
-                    receipt.sequence.0
-                )],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let retirement = encoded
-            .map(|encoded| serde_json::from_str::<ActivityObservationRetirement>(&encoded))
-            .transpose()?;
-        if retirement
-            .as_ref()
-            .is_some_and(|retirement| retirement.version != 1 || retirement.receipt != receipt)
-        {
-            return Err(PaperStateError::Internal(
-                "retired observation receipt or version differs".to_owned(),
-            ));
-        }
-        Ok(retirement)
+        read_activity_observation_retirement(&self.lock(), receipt)
     }
 
     /// One versioned collection, stored in the existing metadata owner.
@@ -2317,8 +2499,44 @@ impl PaperStateDb {
         let mut retains_novel_revision = false;
         let mut inserts_group = false;
 
+        for drop in &bucket.scope_drops {
+            tx_upsert_scope_drop(&tx, drop)?;
+        }
+        for (receipt, unbound) in &bucket.observation_retirements {
+            tx_retire_activity_observation(&tx, *receipt, *unbound)?;
+        }
         for record in &bucket.dispositions {
             let mut non_original = false;
+            let durable_revision: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT transaction_hash, disposition, proof_json \
+                     FROM activity_group_revisions \
+                     WHERE source_trade_id = ?1 AND semantic_revision = ?2",
+                    params![record.source_trade_id.0, record.semantic_revision],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let requested_revision = (
+                record.transaction_hash.clone(),
+                record.disposition.clone(),
+                record.proof_json.clone(),
+            );
+            if durable_revision
+                .as_ref()
+                .is_some_and(|stored| stored != &requested_revision)
+            {
+                return Err(PaperStateError::ActivityRevisionConflict(
+                    record.source_trade_id.0.clone(),
+                ));
+            }
+            let authorized = bucket.unfenced_revisions.iter().any(|(id, revision)| {
+                id == &record.source_trade_id && revision == &record.semantic_revision
+            });
+            let known_scoped_revision = durable_revision.is_some()
+                && matches!(record.disposition.as_str(), "scope_dropped" | "raw_only");
+            if durable_revision.is_none() && record.disposition == "scope_dropped" {
+                tx_record_bucket_scope_drop_boundary(&tx, bucket)?;
+            }
             let existing: Option<(String, String, String, String, i64, String, String)> = tx
                 .query_row(
                     "SELECT transaction_hash, semantic_revision, disposition, wallet_hex, \
@@ -2357,14 +2575,25 @@ impl PaperStateDb {
                     && proof_json == record.proof_json;
                 let retained_revision = transaction_hash == record.transaction_hash
                     && revision != record.semantic_revision
-                    && (is_revision_fence || wallet_already_fenced);
+                    && (is_revision_fence
+                        || wallet_already_fenced
+                        || ((authorized || known_scoped_revision)
+                            && wallet_hex == record.wallet.to_string()
+                            && source_epoch == record.source_epoch
+                            && activity_type == record.activity_type));
                 if !exact_retry && !retained_revision {
                     return Err(PaperStateError::ActivityRevisionConflict(
                         record.source_trade_id.0.clone(),
                     ));
                 }
-                invalidates_position_validation |= retained_revision;
                 non_original = revision != record.semantic_revision;
+                if non_original
+                    && durable_revision.is_none()
+                    && bucket.fence.is_none()
+                    && !wallet_already_fenced
+                {
+                    tx_record_bucket_scope_drop_boundary(&tx, bucket)?;
+                }
             } else {
                 invalidates_position_validation = true;
                 inserts_group |= record.disposition != "raw_only";
@@ -2389,28 +2618,9 @@ impl PaperStateDb {
                     ],
                 )?;
             }
-            let durable_revision: Option<(String, String, String)> = tx
-                .query_row(
-                    "SELECT transaction_hash, disposition, proof_json \
-                     FROM activity_group_revisions \
-                     WHERE source_trade_id = ?1 AND semantic_revision = ?2",
-                    params![record.source_trade_id.0, record.semantic_revision],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?;
-            let requested_revision = (
-                record.transaction_hash.clone(),
-                record.disposition.clone(),
-                record.proof_json.clone(),
-            );
-            if let Some(durable_revision) = durable_revision {
-                if durable_revision != requested_revision {
-                    return Err(PaperStateError::ActivityRevisionConflict(
-                        record.source_trade_id.0.clone(),
-                    ));
-                }
-            } else {
+            if durable_revision.is_none() {
                 retains_novel_revision |= non_original;
+                invalidates_position_validation |= non_original;
                 tx.execute(
                     "INSERT INTO activity_group_revisions \
                          (source_trade_id, semantic_revision, transaction_hash, disposition, \
@@ -2422,10 +2632,12 @@ impl PaperStateDb {
                         requested_revision.0,
                         requested_revision.1,
                         requested_revision.2,
-                        bucket
-                            .fence
-                            .as_ref()
-                            .map_or(record.source_epoch, |fence| fence.fenced_at_unix),
+                        bucket.fence.as_ref().map_or(
+                            bucket
+                                .scope_drop_boundary_unix
+                                .unwrap_or(record.source_epoch),
+                            |fence| fence.fenced_at_unix,
+                        ),
                     ],
                 )?;
             }
@@ -5748,7 +5960,135 @@ fn tx_upsert_position_validation(
     Ok(())
 }
 
+/// Match a drop on a standalone connection or inside the caller's transaction/savepoint.
+pub fn scope_is_dropped(
+    conn: &Connection,
+    wallet: &WalletAddress,
+    market_id: &str,
+    group_id: Option<&str>,
+    source_epoch: i64,
+) -> Result<bool, PaperStateError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM wallet_scope_drops \
+         WHERE wallet_hex = ?1 AND scope_kind = 'market' AND scope_id = ?2 \
+         AND dropped_at_epoch <= ?4) \
+         OR EXISTS(SELECT 1 FROM wallet_scope_drops \
+         WHERE wallet_hex = ?1 AND scope_kind = 'event' AND scope_id = ?3 \
+         AND dropped_at_epoch <= ?4)",
+        params![wallet.to_string(), market_id, group_id, source_epoch],
+        |row| row.get(0),
+    )?)
+}
+
+fn tx_upsert_scope_drop(conn: &Connection, drop: &WalletScopeDrop) -> Result<(), PaperStateError> {
+    conn.execute(
+        "INSERT INTO wallet_scope_drops \
+         (wallet_hex, scope_kind, scope_id, cause, source_trade_id, dropped_at_epoch, \
+          proof_json, recorded_at_unix) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(wallet_hex, scope_kind, scope_id) DO UPDATE SET \
+         cause = excluded.cause, source_trade_id = excluded.source_trade_id, \
+         dropped_at_epoch = excluded.dropped_at_epoch, proof_json = excluded.proof_json, \
+         recorded_at_unix = excluded.recorded_at_unix \
+         WHERE excluded.dropped_at_epoch < wallet_scope_drops.dropped_at_epoch",
+        params![
+            drop.wallet.to_string(),
+            drop.scope_kind,
+            drop.scope_id,
+            drop.cause,
+            drop.source_trade_id.as_ref().map(|id| &id.0),
+            drop.dropped_at_epoch,
+            drop.proof_json,
+            drop.recorded_at_unix,
+        ],
+    )?;
+    Ok(())
+}
+
+fn tx_record_scope_drop_boundary(
+    conn: &Connection,
+    recorded_at_unix: i64,
+) -> Result<(), PaperStateError> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES ('scope_drop_boundary_unix', ?1) \
+         ON CONFLICT(key) DO NOTHING",
+        [recorded_at_unix],
+    )?;
+    Ok(())
+}
+
+fn tx_record_bucket_scope_drop_boundary(
+    conn: &Connection,
+    bucket: &ActivityBucketCommit,
+) -> Result<(), PaperStateError> {
+    let recorded_at_unix = bucket.scope_drop_boundary_unix.ok_or_else(|| {
+        PaperStateError::Internal("scope-drop boundary time is missing".to_owned())
+    })?;
+    tx_record_scope_drop_boundary(conn, recorded_at_unix)
+}
+
+fn tx_retire_activity_observation(
+    conn: &Connection,
+    receipt: AppendReceipt,
+    unbound: bool,
+) -> Result<(), PaperStateError> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+        params![
+            format!("retired_activity_observation:{}", receipt.sequence.0),
+            serde_json::to_string(&ActivityObservationRetirement {
+                version: 1,
+                receipt,
+                unbound
+            })?,
+        ],
+    )?;
+    read_activity_observation_retirement(conn, receipt)?;
+    Ok(())
+}
+
+fn read_activity_observation_retirement(
+    conn: &Connection,
+    receipt: AppendReceipt,
+) -> Result<Option<ActivityObservationRetirement>, PaperStateError> {
+    let encoded: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [format!(
+                "retired_activity_observation:{}",
+                receipt.sequence.0
+            )],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let retirement = encoded
+        .map(|encoded| serde_json::from_str::<ActivityObservationRetirement>(&encoded))
+        .transpose()?;
+    if retirement
+        .as_ref()
+        .is_some_and(|retirement| retirement.version != 1 || retirement.receipt != receipt)
+    {
+        return Err(PaperStateError::Internal(
+            "retired observation receipt or version differs".to_owned(),
+        ));
+    }
+    Ok(retirement)
+}
+
 fn validate_activity_bucket(bucket: &ActivityBucketCommit) -> Result<(), PaperStateError> {
+    for drop in &bucket.scope_drops {
+        if drop.wallet != bucket.wallet {
+            return Err(PaperStateError::ActivityBucketMismatch);
+        }
+    }
+    for (id, revision) in &bucket.unfenced_revisions {
+        if !bucket.dispositions.iter().any(|record| {
+            record.source_trade_id == *id
+                && record.semantic_revision == *revision
+                && matches!(record.disposition.as_str(), "scope_dropped" | "raw_only")
+        }) {
+            return Err(PaperStateError::ActivityRevisionConflict(id.0.clone()));
+        }
+    }
     let mut group_ids = BTreeSet::new();
     for record in &bucket.dispositions {
         if record.wallet != bucket.wallet || record.source_epoch != bucket.source_epoch {
@@ -8083,6 +8423,10 @@ mod tests {
         proof_json: &str,
     ) {
         db.commit_activity_bucket(&ActivityBucketCommit {
+            scope_drops: Vec::new(),
+            observation_retirements: Vec::new(),
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
             wallet,
             source_epoch,
             dispositions: vec![ActivityDispositionRecord {
@@ -8132,6 +8476,10 @@ mod tests {
         suffixes: &[char],
     ) -> ActivityBucketCommit {
         ActivityBucketCommit {
+            scope_drops: Vec::new(),
+            observation_retirements: Vec::new(),
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
             wallet,
             source_epoch,
             dispositions: suffixes
@@ -8147,6 +8495,560 @@ mod tests {
             reanchor: None,
             advance_cursor: false,
         }
+    }
+
+    fn scope_drop(kind: &str, id: &str, second: i64) -> WalletScopeDrop {
+        WalletScopeDrop {
+            wallet: wallet(),
+            scope_kind: kind.to_owned(),
+            scope_id: id.to_owned(),
+            cause: "underflow".to_owned(),
+            source_trade_id: Some(group_id('a')),
+            dropped_at_epoch: second,
+            proof_json: "{\"source\":\"bucket\"}".to_owned(),
+            recorded_at_unix: 1000,
+        }
+    }
+
+    fn scope_drop_receipt() -> AppendReceipt {
+        AppendReceipt {
+            sequence: EventSeq(7),
+            this_hash: blake3::hash(b"scope-drop-source"),
+        }
+    }
+
+    #[test]
+    fn scope_drops_earliest_second_wins_and_ties_keep_certified_evidence() {
+        let (_dir, db) = db();
+        let first = scope_drop("market", "market-a", 100);
+        let mut bucket = activity_bucket(wallet(), 100, &[]);
+        bucket.scope_drops.push(first.clone());
+        db.commit_activity_bucket(&bucket).unwrap();
+        for second in [101, 100, 99] {
+            let mut next = first.clone();
+            next.dropped_at_epoch = second;
+            next.cause = "conversion".to_owned();
+            next.source_trade_id = Some(group_id('b'));
+            next.proof_json = "{\"source\":\"earlier\"}".to_owned();
+            next.recorded_at_unix = 2000;
+            bucket.scope_drops = vec![next.clone()];
+            db.commit_activity_bucket(&bucket).unwrap();
+            assert_eq!(
+                db.wallet_scope_drops(&wallet(), 200).unwrap(),
+                vec![if second < 100 { next } else { first.clone() }],
+            );
+        }
+        db.import_scope_drops(
+            1,
+            &[(scope_drop("market", "market-a", 98), scope_drop_receipt())],
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let imported = db.wallet_scope_drops(&wallet(), 200).unwrap();
+        assert_eq!(imported[0].dropped_at_epoch, 98);
+        assert_eq!(imported[0].source_trade_id, None);
+        bucket.scope_drops[0].dropped_at_epoch = 98;
+        db.commit_activity_bucket(&bucket).unwrap();
+        assert_eq!(db.wallet_scope_drops(&wallet(), 200).unwrap(), imported);
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
+    }
+
+    #[test]
+    fn scope_drops_predicate_matches_wallet_kind_group_and_inclusive_start() {
+        let (dir, db) = db();
+        let mut bucket = activity_bucket(wallet(), 100, &[]);
+        bucket.scope_drops = vec![
+            scope_drop("market", "market-a", 100),
+            scope_drop("event", "group-b", 110),
+        ];
+        db.begin_batch().unwrap();
+        db.commit_activity_bucket(&bucket).unwrap();
+        assert!(
+            db.scope_is_dropped(&wallet(), "market-a", None, 100)
+                .unwrap()
+        );
+        {
+            let mut conn = db.lock();
+            let savepoint = conn.savepoint().unwrap();
+            assert!(
+                scope_is_dropped(&savepoint, &wallet(), "market-b", Some("group-b"), 110).unwrap()
+            );
+        }
+        db.commit_batch().unwrap();
+        for (market, group, second, expected) in [
+            ("market-a", None, 99, false),
+            ("market-a", None, 100, true),
+            ("market-a", None, 101, true),
+            ("market-b", Some("group-b"), 109, false),
+            ("market-b", Some("group-b"), 110, true),
+            ("market-c", Some("group-b"), 111, true),
+            ("market-b", None, 111, false),
+            ("market-b", Some("other"), 111, false),
+            ("group-b", None, 111, false),
+        ] {
+            assert_eq!(
+                db.scope_is_dropped(&wallet(), market, group, second)
+                    .unwrap(),
+                expected
+            );
+            assert!(
+                !db.scope_is_dropped(&other_wallet(), market, group, second)
+                    .unwrap()
+            );
+        }
+        assert!(db.wallet_scope_drops(&wallet(), 99).unwrap().is_empty());
+        assert_eq!(db.wallet_scope_drops(&wallet(), 100).unwrap().len(), 1);
+        assert_eq!(db.wallet_scope_drops(&wallet(), 110).unwrap().len(), 2);
+        assert_eq!(db.retire_wallet(wallet(), 200, None).unwrap().result, None);
+        assert!(
+            db.drain_retired_wallet(wallet(), 10)
+                .unwrap()
+                .result
+                .finished
+        );
+        drop(db);
+        let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
+        db.seed_cursor_if_absent(&wallet(), 200).unwrap();
+        db.install_anchors(&[anchor_install(wallet(), vec![], 200, 300, "returned")])
+            .unwrap();
+        assert_eq!(db.wallet_scope_drops(&wallet(), 300).unwrap().len(), 2);
+        assert!(
+            db.scope_is_dropped(&wallet(), "market-c", Some("group-b"), 300)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn scope_drops_membership_is_write_once_typed_and_independent_of_batches() {
+        let (dir, db) = db();
+        assert_eq!(db.market_membership("never").unwrap(), None);
+        db.begin_batch().unwrap();
+        for value in ["group", "", "absent"] {
+            assert!(matches!(
+                db.record_market_group("blocked", value),
+                Err(PaperStateError::MembershipBatchOpen)
+            ));
+        }
+        db.rollback_batch().unwrap();
+        assert_eq!(db.market_membership("blocked").unwrap(), None);
+        db.record_market_group("blocked", "group").unwrap();
+        for (market, value, expected) in [
+            (
+                "grouped",
+                "group",
+                MarketMembership::Grouped("group".to_owned()),
+            ),
+            ("ungrouped", "", MarketMembership::Ungrouped),
+            ("missing", "absent", MarketMembership::Absent),
+        ] {
+            db.record_market_group(market, value).unwrap();
+            db.record_market_group(market, "replacement").unwrap();
+            assert_eq!(db.market_membership(market).unwrap(), Some(expected));
+        }
+        db.begin_batch().unwrap();
+        db.rollback_batch().unwrap();
+        drop(db);
+        let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
+        assert_eq!(
+            db.market_membership("grouped").unwrap(),
+            Some(MarketMembership::Grouped("group".to_owned()))
+        );
+        assert_eq!(
+            db.market_membership("missing").unwrap(),
+            Some(MarketMembership::Absent)
+        );
+        assert_eq!(
+            db.market_membership("ungrouped").unwrap(),
+            Some(MarketMembership::Ungrouped)
+        );
+        assert!(!db.is_group("").unwrap());
+        assert!(!db.is_group("absent").unwrap());
+        assert!(!db.is_group("missing").unwrap());
+        assert!(!db.is_group("replacement").unwrap());
+    }
+
+    #[test]
+    fn scope_drops_group_lookup_uses_partial_index_and_pre_upgrade_rows() {
+        let (dir, db) = db();
+        {
+            let conn = db.lock();
+            conn.execute_batch(
+                "DROP INDEX idx_meta_neg_risk_group;
+                INSERT INTO meta(key, value) VALUES ('neg_risk_group:old-market', 'old-group');
+                INSERT INTO meta(key, value) VALUES ('unrelated', 'fabricated');",
+            )
+            .unwrap();
+        }
+        drop(db);
+        let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
+        assert!(db.is_group("old-group").unwrap());
+        assert!(!db.is_group("fabricated").unwrap());
+        let conn = db.lock();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {IS_GROUP_SQL}"))
+            .unwrap()
+            .query_map(["old-group"], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_meta_neg_risk_group (value=?)")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|detail| detail == "SCAN meta"), "{plan:?}");
+    }
+
+    #[test]
+    fn scope_drops_import_is_atomic_and_newest_groups_change_only_differences() {
+        let (dir, db) = db();
+        let receipt = scope_drop_receipt();
+        let groups = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(db.ranker_group_batch().unwrap(), None);
+        assert!(!db.scope_drop_batch_imported(10).unwrap());
+        db.import_scope_drops(
+            10,
+            &[(scope_drop("event", "a", 100), receipt)],
+            &groups(&["a", "b"]),
+        )
+        .unwrap();
+        db.record_market_group("local-market", "a").unwrap();
+        db.lock().execute_batch(
+            "CREATE TABLE group_changes(key TEXT);
+             CREATE TEMP TRIGGER note_group_insert AFTER INSERT ON meta WHEN NEW.key GLOB 'ranker_group:*'
+             BEGIN INSERT INTO group_changes VALUES (NEW.key); END;
+             CREATE TEMP TRIGGER note_group_delete AFTER DELETE ON meta WHEN OLD.key GLOB 'ranker_group:*'
+             BEGIN INSERT INTO group_changes VALUES (OLD.key); END;
+             CREATE TEMP TRIGGER fail_import_marker BEFORE INSERT ON meta WHEN NEW.key = 'scope_drop_imported:11'
+             BEGIN SELECT RAISE(ABORT, 'injected import failure'); END;",
+        ).unwrap();
+        assert!(
+            db.import_scope_drops(
+                11,
+                &[(scope_drop("market", "failed", 90), receipt)],
+                &groups(&["b", "c"])
+            )
+            .is_err()
+        );
+        assert_eq!(db.ranker_group_batch().unwrap(), Some(10));
+        assert!(!db.scope_drop_batch_imported(11).unwrap());
+        assert!(db.is_group("a").unwrap());
+        assert!(db.is_group("b").unwrap());
+        assert!(!db.is_group("c").unwrap());
+        assert!(!db.scope_is_dropped(&wallet(), "failed", None, 100).unwrap());
+        assert!(stored_rows(&db.lock(), "SELECT * FROM group_changes").is_empty());
+        db.lock()
+            .execute_batch("DROP TRIGGER fail_import_marker;")
+            .unwrap();
+        db.import_scope_drops(
+            11,
+            &[(scope_drop("market", "imported", 90), receipt)],
+            &groups(&["b", "c"]),
+        )
+        .unwrap();
+        assert_eq!(db.ranker_group_batch().unwrap(), Some(11));
+        assert!(db.scope_drop_batch_imported(11).unwrap());
+        assert!(db.is_group("a").unwrap()); // Local CLOB evidence outlives the batch's set.
+        assert!(db.is_group("c").unwrap());
+        assert_eq!(
+            stored_rows(&db.lock(), "SELECT * FROM group_changes ORDER BY key"),
+            vec![
+                vec![rusqlite::types::Value::Text("ranker_group:a".to_owned())],
+                vec![rusqlite::types::Value::Text("ranker_group:c".to_owned())]
+            ]
+        );
+        db.import_scope_drops(
+            10,
+            &[(scope_drop("event", "a", 101), receipt)],
+            &groups(&["a", "b"]),
+        )
+        .unwrap();
+        db.import_scope_drops(9, &[], &groups(&["old-only"]))
+            .unwrap();
+        assert_eq!(db.ranker_group_batch().unwrap(), Some(11));
+        assert!(db.scope_drop_batch_imported(9).unwrap());
+        assert!(!db.is_group("old-only").unwrap());
+        assert!(db.is_group("c").unwrap());
+        let rows = db.wallet_scope_drops(&wallet(), 200).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|drop| drop.source_trade_id.is_none()));
+        for drop in &rows {
+            let proof: serde_json::Value = serde_json::from_str(&drop.proof_json).unwrap();
+            assert_eq!(proof["receipt"], serde_json::to_value(receipt).unwrap());
+            assert_eq!(
+                proof["batch_id"],
+                if drop.scope_id == "a" { 10 } else { 11 }
+            );
+        }
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
+        drop(db);
+        let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
+        assert_eq!(db.ranker_group_batch().unwrap(), Some(11));
+        assert!(db.is_group("c").unwrap());
+        assert!(db.scope_drop_batch_imported(10).unwrap());
+        db.import_scope_drops(12, &[], &BTreeSet::new()).unwrap();
+        assert!(db.is_group("a").unwrap());
+        assert!(!db.is_group("b").unwrap());
+        assert!(!db.is_group("c").unwrap());
+    }
+
+    #[test]
+    fn scope_drops_boundary_and_retirements_share_the_bucket_savepoint() {
+        let (dir, db) = db();
+        let receipt = scope_drop_receipt();
+        let mut bucket = activity_bucket(wallet(), 100, &['a']);
+        bucket.scope_drops.push(scope_drop("market", "a", 100));
+        bucket.observation_retirements.push((receipt, true));
+        bucket.scope_drop_boundary_unix = Some(1000);
+        bucket.dispositions[0].disposition = "scope_dropped".to_owned();
+        db.lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER require_scope_drop_boundary BEFORE INSERT ON activity_groups
+             WHEN NEW.disposition = 'scope_dropped' AND NOT EXISTS
+               (SELECT 1 FROM meta WHERE key = 'scope_drop_boundary_unix')
+             BEGIN SELECT RAISE(ABORT, 'missing boundary'); END;
+             CREATE TEMP TRIGGER fail_scope_drop_boundary BEFORE INSERT ON meta
+             WHEN NEW.key = 'scope_drop_boundary_unix'
+             BEGIN SELECT RAISE(ABORT, 'boundary failure'); END;",
+            )
+            .unwrap();
+        assert!(db.commit_activity_bucket(&bucket).is_err());
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
+        assert!(db.wallet_scope_drops(&wallet(), 200).unwrap().is_empty());
+        assert!(!db.activity_observation_retired(receipt).unwrap());
+        assert!(db.activity_group_state(&group_id('a')).unwrap().is_none());
+        db.lock()
+            .execute_batch(
+                "DROP TRIGGER fail_scope_drop_boundary;
+             CREATE TEMP TRIGGER fail_bucket_seen BEFORE INSERT ON seen_trades_v2
+             BEGIN SELECT RAISE(ABORT, 'after-boundary failure'); END;",
+            )
+            .unwrap();
+        assert!(db.commit_activity_bucket(&bucket).is_err());
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
+        assert!(db.wallet_scope_drops(&wallet(), 200).unwrap().is_empty());
+        assert!(!db.activity_observation_retired(receipt).unwrap());
+        assert!(db.activity_group_state(&group_id('a')).unwrap().is_none());
+        db.lock()
+            .execute_batch("DROP TRIGGER fail_bucket_seen;")
+            .unwrap();
+        db.begin_batch().unwrap();
+        db.commit_activity_bucket(&bucket).unwrap();
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), Some(1000));
+        let observer = Connection::open(dir.path().join("paper_state.db")).unwrap();
+        assert_eq!(
+            observer
+                .query_row(
+                    "SELECT COUNT(*) FROM meta WHERE key = 'scope_drop_boundary_unix'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        db.rollback_batch().unwrap();
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
+        db.commit_activity_bucket(&bucket).unwrap();
+        assert!(db.activity_observation_unbound_retired(receipt).unwrap());
+        let mut conflict = bucket.clone();
+        conflict.scope_drops[0].dropped_at_epoch = 90;
+        conflict.observation_retirements[0].0.this_hash = blake3::hash(b"different");
+        assert!(db.commit_activity_bucket(&conflict).is_err());
+        assert_eq!(
+            db.wallet_scope_drops(&wallet(), 200).unwrap()[0].dropped_at_epoch,
+            100
+        );
+        bucket.scope_drop_boundary_unix = Some(900);
+        db.commit_activity_bucket(&bucket).unwrap();
+        drop(db);
+        let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), Some(1000));
+        assert!(db.activity_observation_unbound_retired(receipt).unwrap());
+        assert_eq!(
+            db.activity_group_state(&group_id('a'))
+                .unwrap()
+                .unwrap()
+                .disposition,
+            "scope_dropped"
+        );
+    }
+
+    #[test]
+    fn scope_drops_live_boundary_is_first_write_wins_and_never_joins_a_batch() {
+        let (dir, db) = db();
+        db.lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_boundary BEFORE INSERT ON meta
+             WHEN NEW.key = 'scope_drop_boundary_unix'
+             BEGIN SELECT RAISE(ABORT, 'boundary failure'); END;",
+            )
+            .unwrap();
+        assert!(db.record_scope_drop_boundary(1000).is_err());
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
+        db.lock()
+            .execute_batch("DROP TRIGGER fail_boundary;")
+            .unwrap();
+        db.begin_batch().unwrap();
+        assert!(db.record_scope_drop_boundary(1000).is_err());
+        db.rollback_batch().unwrap();
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
+        db.record_scope_drop_boundary(1000).unwrap();
+        db.record_scope_drop_boundary(900).unwrap();
+        drop(db);
+        let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), Some(1000));
+    }
+
+    #[test]
+    fn scope_drops_unfenced_revisions_require_exact_authority_and_invalidate_once() {
+        for disposition in ["scope_dropped", "raw_only"] {
+            let (dir, db) = db();
+            db.seed_cursor_if_absent(&wallet(), 10).unwrap();
+            let original = activity_bucket(wallet(), 100, &['a']);
+            db.commit_activity_bucket(&original).unwrap();
+            let original_state = db.activity_group_state(&group_id('a')).unwrap();
+            db.install_anchors(&[anchor_install(wallet(), vec![], 100, 200, "baseline")])
+                .unwrap();
+            let before = db.wallet_coverage(&wallet()).unwrap().coverage_generation;
+            let mut revised = original.clone();
+            revised.dispositions[0].semantic_revision = "r2".to_owned();
+            revised.dispositions[0].disposition = disposition.to_owned();
+            revised.scope_drop_boundary_unix = Some(1000);
+            assert!(matches!(
+                db.commit_activity_bucket(&revised),
+                Err(PaperStateError::ActivityRevisionConflict(_))
+            ));
+            assert!(db.position_validation(&wallet()).unwrap().is_some());
+            assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
+            revised
+                .unfenced_revisions
+                .push((group_id('a'), "r3".to_owned()));
+            assert!(db.commit_activity_bucket(&revised).is_err());
+            revised.unfenced_revisions = vec![(group_id('a'), "r2".to_owned())];
+            revised.scope_drop_boundary_unix = None;
+            assert!(db.commit_activity_bucket(&revised).is_err());
+            revised.scope_drop_boundary_unix = Some(1000);
+            db.lock().execute_batch(
+                "CREATE TEMP TRIGGER require_revision_boundary BEFORE INSERT ON activity_group_revisions
+                 WHEN NEW.semantic_revision = 'r2' AND NOT EXISTS
+                   (SELECT 1 FROM meta WHERE key = 'scope_drop_boundary_unix')
+                 BEGIN SELECT RAISE(ABORT, 'missing boundary'); END;
+                 CREATE TEMP TRIGGER fail_revision_seen BEFORE INSERT ON seen_trades_v2
+                 BEGIN SELECT RAISE(ABORT, 'revision rollback'); END;",
+            ).unwrap();
+            assert!(db.commit_activity_bucket(&revised).is_err());
+            assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
+            assert!(
+                !db.activity_revision_retained_without_fence(&group_id('a'), "r2")
+                    .unwrap()
+            );
+            assert_eq!(
+                db.wallet_coverage(&wallet()).unwrap().coverage_generation,
+                before
+            );
+            assert!(db.position_validation(&wallet()).unwrap().is_some());
+            db.lock()
+                .execute_batch("DROP TRIGGER fail_revision_seen;")
+                .unwrap();
+            db.commit_activity_bucket(&revised).unwrap();
+            assert!(db.position_validation(&wallet()).unwrap().is_none());
+            assert_eq!(
+                db.wallet_coverage(&wallet()).unwrap().coverage_generation,
+                before + 1
+            );
+            assert_eq!(db.scope_drop_boundary_unix().unwrap(), Some(1000));
+            assert_eq!(
+                db.activity_group_state(&group_id('a')).unwrap(),
+                original_state
+            );
+            assert!(
+                db.activity_revision_retained_without_fence(&group_id('a'), "r2")
+                    .unwrap()
+            );
+            assert!(
+                !db.activity_revision_retained_without_fence(&group_id('a'), "revision-a")
+                    .unwrap()
+            );
+            assert!(
+                !db.activity_revision_retained_without_fence(&group_id('b'), "r2")
+                    .unwrap()
+            );
+            assert!(!db.is_wallet_fenced(&wallet()).unwrap());
+            db.install_anchors(&[anchor_install(wallet(), vec![], 110, 300, "after-revision")])
+                .unwrap();
+            revised.unfenced_revisions.clear();
+            revised.scope_drop_boundary_unix = None;
+            drop(db);
+            let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
+            db.commit_activity_bucket(&revised).unwrap();
+            assert!(db.position_validation(&wallet()).unwrap().is_some());
+            assert_eq!(
+                db.wallet_coverage(&wallet()).unwrap().coverage_generation,
+                before + 1
+            );
+            assert!(
+                db.activity_revision_retained_without_fence(&group_id('a'), "r2")
+                    .unwrap()
+            );
+            revised.dispositions[0].proof_json = "{\"changed\":true}".to_owned();
+            assert!(db.commit_activity_bucket(&revised).is_err());
+            revised.dispositions[0].proof_json = original.dispositions[0].proof_json.clone();
+            revised.dispositions[0].semantic_revision = "r3".to_owned();
+            assert!(db.commit_activity_bucket(&revised).is_err());
+            revised.unfenced_revisions = vec![(group_id('a'), "r3".to_owned())];
+            revised.dispositions[0].disposition = "applied".to_owned();
+            assert!(db.commit_activity_bucket(&revised).is_err());
+        }
+    }
+
+    #[test]
+    fn scope_drops_pre_boundary_additions_pass_the_previous_schema_version_check() {
+        let (dir, db) = db();
+        db.record_market_group("missing", "absent").unwrap();
+        db.record_market_group("ungrouped", "").unwrap();
+        db.import_scope_drops(
+            1,
+            &[(scope_drop("market", "a", 100), scope_drop_receipt())],
+            &BTreeSet::from(["group".to_owned()]),
+        )
+        .unwrap();
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
+        drop(db);
+        let conn = Connection::open(dir.path().join("paper_state.db")).unwrap();
+        let found: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        // a9155b7's open check accepts exactly 0, 2, or 3.
+        assert!(found == 0 || found == 2 || found == 3);
+        assert_eq!(SCHEMA_VERSION, 3);
+        assert_eq!(found, 3);
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('wallet_scope_drops')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "wallet_hex",
+                "scope_kind",
+                "scope_id",
+                "cause",
+                "source_trade_id",
+                "dropped_at_epoch",
+                "proof_json",
+                "recorded_at_unix"
+            ]
+        );
+        let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
+        assert!(db.scope_drop_batch_imported(1).unwrap());
     }
 
     fn leader(long: u64, short: u64) -> LeaderPositionRow {
@@ -8782,6 +9684,10 @@ mod tests {
         assert!(db.position_validation(&wallet).unwrap().is_some());
 
         let bucket = ActivityBucketCommit {
+            scope_drops: Vec::new(),
+            observation_retirements: Vec::new(),
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
             wallet,
             source_epoch: 101,
             dispositions: vec![ActivityDispositionRecord {

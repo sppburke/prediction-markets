@@ -224,6 +224,19 @@ CREATE TABLE IF NOT EXISTS wallet_fences (
     fenced_at_unix   INTEGER NOT NULL
 );
 
+-- Cumulative wallet-scoped exclusions survive wallet removal and anchor recovery.
+CREATE TABLE IF NOT EXISTS wallet_scope_drops (
+    wallet_hex       TEXT    NOT NULL,
+    scope_kind       TEXT    NOT NULL CHECK(scope_kind IN ('market', 'event')),
+    scope_id         TEXT    NOT NULL,
+    cause            TEXT    NOT NULL,
+    source_trade_id  TEXT,
+    dropped_at_epoch INTEGER NOT NULL,
+    proof_json       TEXT    NOT NULL,
+    recorded_at_unix INTEGER NOT NULL,
+    PRIMARY KEY (wallet_hex, scope_kind, scope_id)
+);
+
 -- Accepted causal activity/positions brackets. A position-changing activity
 -- commit invalidates the row before a later membership publication can use it.
 CREATE TABLE IF NOT EXISTS position_validations (
@@ -279,6 +292,8 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT    PRIMARY KEY NOT NULL,
     value BLOB    NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_meta_neg_risk_group ON meta(value)
+WHERE key GLOB 'neg_risk_group:*' AND value <> '' AND value <> 'absent';
 
 -- Hash-bound activation census captured after remote-authority reload and the
 -- causal activity/position bracket, before final tails and rename (#544).

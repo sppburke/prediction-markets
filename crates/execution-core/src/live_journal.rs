@@ -453,6 +453,7 @@ pub enum LiveOrderPreparationFailure {
     PrePostRiskPriceExpired,
     PrePostLadderExpired,
     PrePostCopyExpired,
+    PrePostScopeDropped,
     PrePostAdmissionExpired,
     PrePostMarkUnavailable,
     PrePostNotArmed,
@@ -473,6 +474,7 @@ impl LiveOrderPreparationFailure {
             }
             Self::PrePostLadderExpired => "recovery_ladder_expired",
             Self::PrePostCopyExpired => "copy_expired_before_post",
+            Self::PrePostScopeDropped => "scope_dropped_before_post",
             Self::PrePostNotArmed => "not_armed",
             Self::PrePostControlUnavailable => "control_unavailable",
             Self::Venue
@@ -3712,6 +3714,66 @@ mod tests {
                     if audit.failure == LiveOrderPreparationFailure::RecoveryAdmissionExpired
             ));
         }
+    }
+
+    #[test]
+    fn scope_dropped_preparation_failure_round_trips_and_terminalizes_approved_recovery() {
+        let failure = LiveOrderPreparationFailure::PrePostScopeDropped;
+        assert_eq!(
+            serde_json::to_string(&failure).unwrap(),
+            "\"pre_post_scope_dropped\""
+        );
+        assert_eq!(
+            serde_json::from_str::<LiveOrderPreparationFailure>("\"pre_post_scope_dropped\"")
+                .unwrap(),
+            failure
+        );
+        for has_control in [false, true] {
+            assert_eq!(
+                failure.terminal_reason(has_control),
+                "scope_dropped_before_post"
+            );
+        }
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("scope-dropped.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account_id = AccountId::new("scope-dropped").unwrap();
+        let at = datetime!(2026-08-11 12:00 UTC);
+        let prepared = current_prepared(&account_id, "scope-dropped");
+        journal
+            .append(account_id.clone(), at, baseline_for(&account_id, &prepared))
+            .unwrap();
+        journal
+            .append(account_id.clone(), at, approved_admission_for(&prepared))
+            .unwrap();
+        let audit = LiveOrderPreparationFailedAudit {
+            identity: prepared.identity.clone(),
+            failure,
+            control: None,
+        };
+        assert_eq!(
+            serde_json::from_slice::<LiveOrderPreparationFailedAudit>(
+                &serde_json::to_vec(&audit).unwrap()
+            )
+            .unwrap(),
+            audit,
+        );
+        journal
+            .append(
+                account_id,
+                at,
+                LiveJournalPayload::OrderPreparationFailed(Box::new(audit.clone())),
+            )
+            .unwrap();
+        drop(journal);
+        let recovered = recovery_inventory(&path, None).unwrap();
+        assert!(recovered.approved_admissions.is_empty());
+        assert!(recovered.open_orders.is_empty());
+        assert_eq!(recovered.terminal_admissions.len(), 1);
+        assert!(matches!(
+            &recovered.terminal_admissions[0].outcome,
+            TerminalAdmissionRecoveryOutcome::PreparationFailed(stored) if stored.as_ref() == &audit
+        ));
     }
 
     /// PASS: a verified financial-era prefix excludes every earlier Approved admission, while a

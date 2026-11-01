@@ -331,6 +331,10 @@ fn equal_cutoff_is_covered_and_legacy_prefix_is_skipped() {
     let legacy = aggregate("0xlegacy", "market-legacy", 0, "BUY", "1", 90);
     paper
         .commit_activity_bucket(&ActivityBucketCommit {
+            scope_drops: Vec::new(),
+            observation_retirements: Vec::new(),
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
             wallet: wallet(),
             source_epoch: 90,
             dispositions: vec![ActivityDispositionRecord {
@@ -461,6 +465,10 @@ fn legacy_fences_and_zero_conversion_documents_replay_without_reclassification()
             .collect();
         paper
             .commit_activity_bucket(&ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet: wallet(),
                 source_epoch: 110,
                 dispositions: records,
@@ -495,6 +503,10 @@ fn replay_with_document(document: &str) -> WalletLedgerReplayError {
     let group = aggregate("0xinvalid-document", "market-a", 0, "BUY", "1", 110);
     paper
         .commit_activity_bucket(&ActivityBucketCommit {
+            scope_drops: Vec::new(),
+            observation_retirements: Vec::new(),
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
             wallet: wallet(),
             source_epoch: 110,
             dispositions: vec![ActivityDispositionRecord {
@@ -551,6 +563,10 @@ fn unknown_disposition_version_is_a_typed_replay_failure() {
         let group = aggregate("0xunknown-disposition", "market-a", 0, "BUY", "1", 110);
         paper
             .commit_activity_bucket(&ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet: wallet(),
                 source_epoch: 110,
                 dispositions: vec![ActivityDispositionRecord {

@@ -5211,6 +5211,10 @@ async fn runtime_checkpoint_prunes_only_after_successful_disposition_barrier() {
         .unwrap();
         paper
             .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet: observation.wallet,
                 source_epoch: NOW_UNIX + 2,
                 dispositions: vec![pe_paper_state::ActivityDispositionRecord {
@@ -6729,6 +6733,10 @@ fn record_failed_catch_up_group(
 ) {
     state
         .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+            scope_drops: Vec::new(),
+            observation_retirements: Vec::new(),
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
             wallet: observation.wallet,
             source_epoch: observation.source_time.0.unix_timestamp(),
             dispositions: vec![pe_paper_state::ActivityDispositionRecord {

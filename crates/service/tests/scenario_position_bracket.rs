@@ -6444,6 +6444,10 @@ fn rollout_record_effect_with_cursor(
 ) {
     paper
         .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+            scope_drops: Vec::new(),
+            observation_retirements: Vec::new(),
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
             wallet: row.group_id.components().wallet,
             source_epoch: row.source_time.0.unix_timestamp(),
             dispositions: vec![pe_paper_state::ActivityDispositionRecord {

@@ -14277,6 +14277,10 @@ mod tests {
         .unwrap();
         state
             .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet: frozen.wallet,
                 source_epoch: frozen.source_epoch,
                 dispositions: vec![pe_paper_state::ActivityDispositionRecord {
@@ -14560,6 +14564,10 @@ mod tests {
         fixture
             .state
             .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet: legacy.wallet,
                 source_epoch: legacy.source_epoch,
                 dispositions: vec![pe_paper_state::ActivityDispositionRecord {

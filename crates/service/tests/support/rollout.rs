@@ -808,6 +808,10 @@ async fn run_case(boot_waves: bool) {
         };
         paper
             .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet: wallet(n),
                 source_epoch: now - 20,
                 dispositions: vec![pe_paper_state::ActivityDispositionRecord {

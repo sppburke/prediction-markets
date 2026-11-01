@@ -4940,6 +4940,10 @@ impl BucketCommitEngine {
                 .collect::<Result<Vec<_>, _>>()?;
             self.paper_state
                 .commit_activity_bucket(&ActivityBucketCommit {
+                    scope_drops: Vec::new(),
+                    observation_retirements: Vec::new(),
+                    unfenced_revisions: Vec::new(),
+                    scope_drop_boundary_unix: None,
                     wallet,
                     source_epoch,
                     dispositions: records,
@@ -5355,6 +5359,10 @@ impl BucketCommitEngine {
         }
 
         let bucket = ActivityBucketCommit {
+            scope_drops: Vec::new(),
+            observation_retirements: Vec::new(),
+            unfenced_revisions: Vec::new(),
+            scope_drop_boundary_unix: None,
             wallet,
             source_epoch,
             dispositions: disposition_records,
@@ -5436,6 +5444,10 @@ impl BucketCommitEngine {
         };
         self.paper_state
             .commit_activity_bucket(&ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet,
                 source_epoch,
                 dispositions: records,
@@ -5573,6 +5585,10 @@ impl BucketCommitEngine {
             .flatten();
         self.paper_state
             .commit_activity_bucket(&ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet,
                 source_epoch,
                 dispositions: records,
@@ -5765,6 +5781,10 @@ impl BucketCommitEngine {
         }
         self.paper_state
             .commit_activity_bucket(&ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet,
                 source_epoch,
                 dispositions: records,
@@ -5836,6 +5856,10 @@ impl BucketCommitEngine {
             // these commits leaves the wallet fenced and the unfinished read replayable.
             self.paper_state
                 .commit_activity_bucket(&ActivityBucketCommit {
+                    scope_drops: Vec::new(),
+                    observation_retirements: Vec::new(),
+                    unfenced_revisions: Vec::new(),
+                    scope_drop_boundary_unix: None,
                     wallet,
                     source_epoch: state.source_epoch,
                     dispositions: vec![ActivityDispositionRecord {
@@ -5936,6 +5960,10 @@ impl BucketCommitEngine {
         }
         self.paper_state
             .commit_activity_bucket(&ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet,
                 source_epoch,
                 dispositions: records,
@@ -6065,6 +6093,10 @@ impl BucketCommitEngine {
             .collect::<Result<Vec<_>, _>>()?;
         self.paper_state
             .commit_activity_bucket(&ActivityBucketCommit {
+                scope_drops: Vec::new(),
+                observation_retirements: Vec::new(),
+                unfenced_revisions: Vec::new(),
+                scope_drop_boundary_unix: None,
                 wallet,
                 source_epoch,
                 dispositions: records,
@@ -7667,6 +7699,10 @@ pub(crate) mod continuation_v3_tests {
                 let epoch = observation.source_time.0.unix_timestamp();
                 state
                     .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+                        scope_drops: Vec::new(),
+                        observation_retirements: Vec::new(),
+                        unfenced_revisions: Vec::new(),
+                        scope_drop_boundary_unix: None,
                         wallet: observation.wallet,
                         source_epoch: epoch,
                         dispositions: vec![pe_paper_state::ActivityDispositionRecord {
@@ -9127,6 +9163,10 @@ mod activity_exemption_tests {
                     let pending = case.ends_with("continuation") || case == "earlier_receipt";
                     paper
                         .commit_activity_bucket(&ActivityBucketCommit {
+                            scope_drops: Vec::new(),
+                            observation_retirements: Vec::new(),
+                            unfenced_revisions: Vec::new(),
+                            scope_drop_boundary_unix: None,
                             wallet,
                             source_epoch: 100,
                             dispositions: vec![ActivityDispositionRecord {
@@ -9354,6 +9394,10 @@ mod activity_exemption_tests {
                 // The recorded sibling is raw history evidence, independent of the new twin route.
                 paper
                     .commit_activity_bucket(&ActivityBucketCommit {
+                        scope_drops: Vec::new(),
+                        observation_retirements: Vec::new(),
+                        unfenced_revisions: Vec::new(),
+                        scope_drop_boundary_unix: None,
                         wallet,
                         source_epoch: 100,
                         dispositions: vec![
