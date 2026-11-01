@@ -2865,6 +2865,11 @@ struct ActivityAcquisition {
 }
 
 impl ActivityWalletReceiptProof {
+    /// An infra exclusion (#826) never replaces retained history, not even for a frozen repair.
+    fn infra_excluded(&self) -> bool {
+        self.exclusion_reason.as_deref() == Some(INFRA_EXCLUSION_REASON)
+    }
+
     fn partial(&self) -> bool {
         self.acquisition.as_ref().is_some_and(|acquisition| {
             acquisition.version == 3
@@ -7446,6 +7451,57 @@ mod quiet_identity_tests {
         let (pending, digest) = copy_to_pending(&source, &target).unwrap();
         adopt_pending(&pending, &target, Some(&digest)).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), bytes);
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "a broken fixture must fail its test")]
+mod ever_infra_tests {
+    use super::*;
+
+    // PASS (#826): the embedded supplement parses; only `\n` and `\r\n` end a line (the Python
+    // reader splits the same way); a malformed or repeated line refuses; and the set is the supplement
+    // plus the cache's infra tombstones and live flags, nothing else.
+    // FAIL: a malformed supplement is accepted, or the set gains or loses a wallet.
+    #[test]
+    fn supplement_parses_strictly_and_joins_the_cache_marks() {
+        let embedded = parse_ever_infra_supplement(EVER_INFRA_SUPPLEMENT).unwrap();
+        assert!(embedded.len() >= 78);
+        let [a, b] = ["ab", "cd"].map(|byte| format!("0x{}", byte.repeat(20)));
+        assert_eq!(
+            parse_ever_infra_supplement(&format!("# note\r\n\r\n{a}\r\n")).unwrap(),
+            BTreeSet::from([a.clone()])
+        );
+        assert_eq!(
+            parse_ever_infra_supplement(&format!("# note\r{a}\n{b}\n")).unwrap(),
+            BTreeSet::from([b.clone()])
+        );
+        for text in [
+            format!("{a}\n{a}\n"),
+            a.to_uppercase().replacen("0X", "0x", 1),
+            a.trim_start_matches("0x").to_owned(),
+            format!("{a}0"),
+            format!(" {a}"),
+            format!("{a}\u{c}"),
+            format!("{a}\u{2028}"),
+            format!("{a}\r"),
+        ] {
+            assert!(parse_ever_infra_supplement(&text).is_err(), "{text:?}");
+        }
+        let [tombstone, loser, flag, plain] =
+            ["01", "02", "03", "04"].map(|byte| format!("0x{}", byte.repeat(20)));
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE purged_wallets (wallet_hex TEXT, reason TEXT, purged_at_unix INTEGER);
+                 CREATE TABLE wallets (wallet_hex TEXT, is_infra INTEGER);
+                 INSERT INTO purged_wallets VALUES ('{tombstone}', 'infra', 1), ('{loser}', 'proven_loser', 1);
+                 INSERT INTO wallets VALUES ('{flag}', 1), ('{plain}', 0);"
+            ))
+            .unwrap();
+        let mut expected = embedded;
+        expected.extend([tombstone, flag]);
+        assert_eq!(ever_infra_wallets(&connection).unwrap(), expected);
     }
 }
 

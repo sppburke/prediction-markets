@@ -238,6 +238,12 @@ class EverInfraUniverseTest(unittest.TestCase):
         for bad in ("0xabc", WA.upper(), WA + " ", " " + WA, WA + "\n" + WA):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 infra.parse_supplement(bad + "\n")
+        # The binary's `str::lines`: only `\n` and `\r\n` end a line; a bare final `\r` stays.
+        self.assertEqual(infra.parse_supplement(f"# note\r\n\r\n{WA}\r\n"), {WA})
+        self.assertEqual(infra.parse_supplement(f"# note\r{WA}\n{WB}\n"), {WB})
+        for bad in (WA + "\x0c", WA + "\u2028", WA + "\r"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                infra.parse_supplement(bad)
 
 
 class QuarantineSnapshotTest(unittest.TestCase):

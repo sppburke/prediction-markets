@@ -247,8 +247,9 @@ stands, and #824 (importing the May breadth accounts later) is closed as not pla
   command or method removes an infra tombstone or flag.
 - **Collection:** an ever-infra wallet stays in the identity union but gets the excluded receipt
   `infra exclusion (owner 2026-10-31)` with no request; the writer neither repairs nor rescans its
-  history, and new identities leave it out of `repair_wallets`. Its retained rows, certificates and
-  drops are unchanged. The excluded head receipt keeps it out of finalize, so out of export, both
+  history, and new identities leave it out of `repair_wallets` (the receipt is never a repair, even
+  in an identity frozen earlier with the wallet as one). Its retained rows, certificates and drops
+  are unchanged. The excluded head receipt keeps it out of finalize, so out of export, both
   ranking passes and publication; its trades no longer serve as reference prints in newly finalized
   projections. Pass 1 also drops ever-infra wallets from its candidates, which covers research
   reruns over older caches (those keep their archived print tape).

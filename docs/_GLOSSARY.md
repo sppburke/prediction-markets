@@ -1588,7 +1588,8 @@ current acquisition candidates, all retained-history wallets (including inactive
 wallets or wallets absent from the pile/projection), and predecessor exclusions. An ever-infra
 wallet stays in the union but reads nothing: it gets the excluded receipt `infra exclusion (owner
 2026-10-31)`, the writer neither repairs nor rescans its history, and admission leaves it out of
-`repair_wallets` (#826). A missing or corrupt established-wallet proof is fatal. New wallets, genuine previous exclusions and explicit
+`repair_wallets` (#826); that receipt is never a repair, even in an identity frozen earlier with the
+wallet as one. A missing or corrupt established-wallet proof is fatal. New wallets, genuine previous exclusions and explicit
 `--full-read-wallets wallet1,wallet2` selections read `(0,E2]` (wire `start=1`); ordinary wallets read
 `(E1,E2]` (wire `start=E1+1`). A root has null base fields, E1=0 and every wallet full-read. Resume
 keeps the authentic recorded identity and skips all valid receipts, including exclusions.

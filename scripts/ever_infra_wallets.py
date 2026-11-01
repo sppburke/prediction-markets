@@ -15,9 +15,14 @@ _WALLET = re.compile(r"0x[0-9a-f]{40}")
 
 
 def parse_supplement(text: str) -> set[str]:
-    """One lowercase 0x-prefixed 40-hex wallet per line; '#' comment lines. Anything else refuses."""
+    """One lowercase 0x-prefixed 40-hex wallet per line; '#' comment lines. Anything else refuses.
+
+    Lines split like Rust's `str::lines` (at `\n`, dropping one `\r` before it), so this reader and
+    the binary's embedded copy accept exactly the same file.
+    """
     wallets: set[str] = set()
-    for line in text.splitlines():
+    lines = text.split("\n")
+    for line in [line.removesuffix("\r") for line in lines[:-1]] + lines[-1:]:
         if not line or line.startswith("#"):
             continue
         if not _WALLET.fullmatch(line) or line in wallets:
@@ -27,7 +32,7 @@ def parse_supplement(text: str) -> set[str]:
 
 
 def ever_infra_wallets(connection: sqlite3.Connection) -> set[str]:
-    wallets = parse_supplement(SUPPLEMENT.read_text(encoding="utf-8"))
+    wallets = parse_supplement(SUPPLEMENT.read_bytes().decode("utf-8"))
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     if "purged_wallets" in tables:
         wallets |= {str(row[0]).lower() for row in connection.execute(

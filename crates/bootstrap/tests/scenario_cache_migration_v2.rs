@@ -12982,8 +12982,9 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
 }
 
 // PASS (#826): infra tombstones pass unchanged through every staged copy and activation; discovery's
-// bulk upsert and the controlled activation batch never re-admit them, collection never requests them,
-// and staging leaves the installed bytes untouched. FAIL: a tombstone is lifted, rewritten or read.
+// bulk upsert and the controlled activation batch never re-admit them; a tombstoned wallet whose row is
+// still active stays in the collection union yet is never requested; and staging leaves the installed
+// bytes untouched. FAIL: a tombstone is lifted, rewritten or read.
 #[tokio::test]
 async fn two_file_infra_tombstones_stay_permanent_across_cycles() {
     use pe_bootstrap::cache_migration::{cache_stage_evidence_path, stage_cache_cycle_v2};
@@ -12992,8 +12993,13 @@ async fn two_file_infra_tombstones_stay_permanent_across_cycles() {
     let dir = TempDir::new().unwrap();
     std::fs::create_dir(dir.path().join("eval-results")).unwrap();
     let fixed = dir.path().join("wallet_cache.db");
-    let cache = seed_v1(&fixed, FRESH_END);
-    for wallet in [WALLET_B, WALLET_C] {
+    let mut cache = seed_v1(&fixed, FRESH_END);
+    // WALLET_D keeps an active row, so `active_tradeable_wallets` still admits it to the union.
+    cache
+        .upsert_wallets_bulk(&[(WALLET_D.to_owned(), SRC_TRADES, false, None, None, None, 0)])
+        .unwrap();
+    cache.conn_for_test_set_active(WALLET_D, 1);
+    for wallet in [WALLET_B, WALLET_C, WALLET_D] {
         cache
             .raw_conn_for_test()
             .execute(
@@ -13082,7 +13088,17 @@ async fn two_file_infra_tombstones_stay_permanent_across_cycles() {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|(wallet, _, _)| wallet == WALLET_B || wallet == WALLET_C)
+                .any(|(wallet, _, _)| [WALLET_B, WALLET_C, WALLET_D].contains(&wallet.as_str()))
+        );
+        assert!(
+            fresh_record(&side)["wallets"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::from(WALLET_D))
+        );
+        assert_eq!(
+            collection_proof(&side, u64::try_from(cycle).unwrap(), WALLET_D)["exclusion_reason"],
+            "infra exclusion (owner 2026-10-31)"
         );
         let stage_path = dir.path().join(format!("final-{cycle}.json"));
         let finalized = finalize_cache_v2(&side, Some(&stage_path), FRESH_END + cycle + 2)
@@ -14798,6 +14814,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         assert!(out.join("cache_stage.json").exists());
     }
     let mut cycles = Vec::new();
+    let mut infra_certificate = None;
     let total_cycles = if recovery {
         6
     } else if bulk_root {
@@ -15121,6 +15138,17 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 assert!(!projected.iter().any(|row| row["wallet_hex"] == wallet));
             }
             assert_eq!(query_values(&fixed, &infra_history), retained_infra);
+            // The format transition certified its retained history once; no later cycle changes it.
+            let certificate = query_values(
+                &fixed,
+                &format!(
+                    "SELECT * FROM activity_wallet_history_v3 WHERE wallet_hex = '{PUBLICATION_INFRA_WALLET}'"
+                ),
+            );
+            assert_eq!(certificate.len(), 1);
+            if let Some(previous) = infra_certificate.replace(certificate.clone()) {
+                assert_eq!(certificate, previous);
+            }
         }
         for market in ["0xfb", "0xfc", "0xfd", "0xfe"] {
             assert!(
@@ -15904,74 +15932,179 @@ async fn history_v3_every_failed_full_read_rechecks_retained_history_and_failed_
     assert_eq!(history_v3_wallet_count(&side), 1);
 }
 
-// PASS (#826): a wallet that ever carried an infra mark keeps its certified history and is never read
-// again: no request, no repair when selected for a full read, no rescan even of damaged rows, and a
-// receipt naming the infra exclusion; unmarked in a copy, the next full read verifies the same history.
-// FAIL: the wallet is requested, repaired, rescanned or loses rows.
+// PASS (#826): a wallet that ever carried an infra mark (a live flag or an infra tombstone) keeps its
+// certified history and is never read again: no request, no repair when selected for a full read, no
+// rescan even of damaged rows, a receipt naming the infra exclusion, and its rows, certificate and
+// nonempty drops unchanged; unmarked in a copy, the next full read verifies the same history.
+// FAIL: the wallet is requested, repaired or rescanned, or loses rows, certificate or drops.
 #[tokio::test]
 async fn history_v3_ever_infra_wallet_is_never_read_rescanned_or_repaired() {
+    for (mark, unmark) in [
+        (
+            "UPDATE wallets SET is_infra = 1 WHERE wallet_hex = ?1",
+            "UPDATE wallets SET is_infra = 0 WHERE wallet_hex = ?1",
+        ),
+        (
+            "INSERT INTO purged_wallets (wallet_hex, reason, purged_at_unix) VALUES (?1, 'infra', 1)",
+            "DELETE FROM purged_wallets WHERE wallet_hex = ?1",
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        // A conversion in the neg-risk event of market 0xa drops that market: nonempty drops.
+        let mut conversion = projection_v3_row("\\xe", "conversion", FRESH_END - 2);
+        conversion["type"] = Value::from("CONVERSION");
+        let (side, source) = history_v3_legacy_seed(
+            &dir,
+            vec![
+                projection_v3_row("0xa", "before-drop", FRESH_END - 3),
+                conversion,
+                projection_v3_row("0xb", "beside-drop", FRESH_END - 2),
+            ],
+        )
+        .await;
+        history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+            .await
+            .unwrap();
+        projection_v3_payouts(&side);
+        finalize_cache_v2_unbound(&side, None, FRESH_END + 2).unwrap();
+        let history = format!("SELECT * FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}'");
+        let retained = query_values(&side, &history);
+        let certificate = certificate_row(&side, WALLET);
+        assert_ne!(
+            certificate[6],
+            rusqlite::types::Value::Text("[]".to_owned())
+        );
+        history_v3_damage_connection(&side)
+            .execute(mark, [WALLET])
+            .unwrap();
+        // Damaged rows fail any rescan of the infra wallet's history.
+        let damaged = dir.path().join("damaged.db");
+        std::fs::copy(&side, &damaged).unwrap();
+        history_v3_damage_connection(&damaged)
+            .execute(
+                "UPDATE activity_groups_v2 SET share_amount_str = '2.250001'",
+                [],
+            )
+            .unwrap();
+        source.calls.lock().unwrap().clear();
+        for candidate in [&damaged, &side] {
+            history_v3_collect(candidate, &source, 3, FRESH_END + 3, &[WALLET.to_owned()])
+                .await
+                .unwrap();
+            let identity = fresh_record(candidate);
+            assert!(
+                identity["wallets"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&Value::from(WALLET))
+            );
+            assert!(
+                !identity["repair_wallets"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&Value::from(WALLET))
+            );
+            let reason: String = Connection::open(candidate)
+                .unwrap()
+                .query_row(
+                    "SELECT exclusion_reason FROM activity_wallet_coverage_staging_v2
+                     WHERE generation = 3 AND wallet_hex = ?1",
+                    [WALLET],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(reason, "infra exclusion (owner 2026-10-31)");
+        }
+        assert!(
+            source.calls.lock().unwrap().is_empty(),
+            "the infra wallet was requested"
+        );
+        assert_eq!(query_values(&side, &history), retained);
+        assert_eq!(certificate_row(&side, WALLET), certificate);
+        // The excluded receipt left the certified history valid: unmarked, the next read verifies it.
+        let unmarked = dir.path().join("unmarked.db");
+        std::fs::copy(&side, &unmarked).unwrap();
+        history_v3_damage_connection(&unmarked)
+            .execute(unmark, [WALLET])
+            .unwrap();
+        history_v3_collect(&unmarked, &source, 4, FRESH_END + 4, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt(&unmarked, 4, WALLET).map(|receipt| receipt.0),
+            Some(i64::try_from(retained.len()).unwrap())
+        );
+        assert_eq!(query_values(&unmarked, &history), retained);
+    }
+}
+
+// PASS (#826): an identity frozen with the wallet as an explicit repair, marked infra before its read,
+// resumes without requesting it or deleting its history; rows, certificate and drops stay, and the
+// chain still proves them: unmarked in a copy, the next full read verifies the same history.
+// FAIL: the resumed repair requests, deletes or rewrites the infra wallet's history.
+#[tokio::test]
+async fn history_v3_frozen_repair_of_a_later_infra_wallet_keeps_its_history() {
     let dir = TempDir::new().unwrap();
+    let mut conversion = projection_v3_row("\\xe", "conversion", FRESH_END - 2);
+    conversion["type"] = Value::from("CONVERSION");
     let (side, source) = history_v3_legacy_seed(
         &dir,
-        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+        vec![
+            projection_v3_row("0xa", "before-drop", FRESH_END - 3),
+            conversion,
+            projection_v3_row("0xb", "beside-drop", FRESH_END - 2),
+        ],
     )
     .await;
     history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
         .await
         .unwrap();
+    projection_v3_payouts(&side);
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 2).unwrap();
     let history = format!("SELECT * FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}'");
     let retained = query_values(&side, &history);
-    assert_eq!(retained.len(), 1);
+    let certificate = certificate_row(&side, WALLET);
+    // The repair is frozen while the wallet is unmarked; its read stops before the wallet commits.
+    let stopped = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+        &BootstrapConfig {
+            cache_path: side.clone(),
+            ..Default::default()
+        },
+        &HistoryV3StopFetcher,
+        "https://data.example",
+        3,
+        &[WALLET.to_owned()],
+        || Ok(FRESH_END + 3),
+        FRESH_END + 4,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stopped.exit_code(), 75);
+    assert_eq!(
+        fresh_record(&side)["repair_wallets"],
+        serde_json::json!([WALLET])
+    );
     history_v3_damage_connection(&side)
         .execute(
             "UPDATE wallets SET is_infra = 1 WHERE wallet_hex = ?1",
             [WALLET],
         )
         .unwrap();
-    // Damaged rows fail any rescan of the infra wallet's history.
-    let damaged = dir.path().join("damaged.db");
-    std::fs::copy(&side, &damaged).unwrap();
-    history_v3_damage_connection(&damaged)
-        .execute(
-            "UPDATE activity_groups_v2 SET share_amount_str = '2.250001'",
-            [],
-        )
-        .unwrap();
     source.calls.lock().unwrap().clear();
-    for candidate in [&damaged, &side] {
-        history_v3_collect(candidate, &source, 3, FRESH_END + 2, &[WALLET.to_owned()])
-            .await
-            .unwrap();
-        let identity = fresh_record(candidate);
-        assert!(
-            identity["wallets"]
-                .as_array()
-                .unwrap()
-                .contains(&Value::from(WALLET))
-        );
-        assert!(
-            !identity["repair_wallets"]
-                .as_array()
-                .unwrap()
-                .contains(&Value::from(WALLET))
-        );
-        let reason: String = Connection::open(candidate)
-            .unwrap()
-            .query_row(
-                "SELECT exclusion_reason FROM activity_wallet_coverage_staging_v2
-                 WHERE generation = 3 AND wallet_hex = ?1",
-                [WALLET],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(reason, "infra exclusion (owner 2026-10-31)");
-    }
+    history_v3_collect(&side, &source, 3, FRESH_END + 3, &[])
+        .await
+        .unwrap();
     assert!(
         source.calls.lock().unwrap().is_empty(),
         "the infra wallet was requested"
     );
+    assert_eq!(
+        collection_proof(&side, 3, WALLET)["exclusion_reason"],
+        "infra exclusion (owner 2026-10-31)"
+    );
     assert_eq!(query_values(&side, &history), retained);
-    // The excluded receipt left the certified history valid: unmarked, the next read verifies it.
+    assert_eq!(certificate_row(&side, WALLET), certificate);
     let unmarked = dir.path().join("unmarked.db");
     std::fs::copy(&side, &unmarked).unwrap();
     history_v3_damage_connection(&unmarked)
@@ -15980,12 +16113,12 @@ async fn history_v3_ever_infra_wallet_is_never_read_rescanned_or_repaired() {
             [WALLET],
         )
         .unwrap();
-    history_v3_collect(&unmarked, &source, 4, FRESH_END + 3, &[])
+    history_v3_collect(&unmarked, &source, 4, FRESH_END + 4, &[])
         .await
         .unwrap();
     assert_eq!(
         receipt(&unmarked, 4, WALLET).map(|receipt| receipt.0),
-        Some(1)
+        Some(i64::try_from(retained.len()).unwrap())
     );
     assert_eq!(query_values(&unmarked, &history), retained);
 }

@@ -131,7 +131,7 @@ impl HistoryChain {
             let repair = identity.repair_wallets.as_ref().is_some_and(|repairs| {
                 repairs.binary_search_by(|w| w.as_str().cmp(wallet)).is_ok()
             });
-            if repair && receipt.excluded() && !receipt.partial() {
+            if repair && receipt.excluded() && !receipt.partial() && !receipt.infra_excluded() {
                 chain.parts.clear();
                 chain.parts.push(HistoryPart {
                     start: 0,
@@ -728,7 +728,7 @@ impl CollectionProof {
                 let repaired = identity.repair_wallets.as_ref().is_some_and(|repairs| {
                     repairs.binary_search_by(|w| w.as_str().cmp(wallet)).is_ok()
                 });
-                if repaired
+                if (repaired && !receipt.infra_excluded())
                     || receipt.partial()
                     || (!receipt.excluded()
                         && receipt
@@ -1856,10 +1856,12 @@ fn commit_history_wallet(
             return invalid("unexpected receipt before wallet commit".to_owned());
         }
         let mode = proof.mode(wallet);
+        // A frozen repair of a wallet later marked infra keeps its history (#826).
         let repair = identity
             .repair_wallets
             .as_ref()
-            .is_some_and(|repairs| repairs.binary_search(wallet).is_ok());
+            .is_some_and(|repairs| repairs.binary_search(wallet).is_ok())
+            && completion.exclusion_reason.as_deref() != Some(super::INFRA_EXCLUSION_REASON);
         let collision = check_collisions(&transaction, proof, completion)?;
         let incomplete = completion.aggregation_status != AggregationStatus::Complete;
         let partial =
