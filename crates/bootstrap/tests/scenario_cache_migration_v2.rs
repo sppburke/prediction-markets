@@ -788,6 +788,17 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
     )
     .unwrap();
     std::fs::copy(
+        repository.join("scripts/ever_infra_wallets.py"),
+        scripts.join("ever_infra_wallets.py"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("deploy/forge")).unwrap();
+    std::fs::copy(
+        repository.join("deploy/forge/ever-infra-wallets.txt"),
+        dir.path().join("deploy/forge/ever-infra-wallets.txt"),
+    )
+    .unwrap();
+    std::fs::copy(
         repository.join("scripts/rank_cycle_manifest.py"),
         scripts.join("rank_cycle_manifest.py"),
     )
@@ -4252,9 +4263,10 @@ fn count(path: &std::path::Path, sql: &str) -> i64 {
 /// trades and an active wallet without any history.
 fn seed_initial_candidate(side: &std::path::Path) {
     let mut cache = seed_v1(side, FRESH_END - 10);
+    // An ever-infra wallet is never read (#826); its own scenarios cover that.
     for (wallet, active, infra, trade) in [
         (WALLET_B, 0, false, true),
-        (WALLET_C, 1, true, true),
+        (WALLET_C, 1, false, true),
         (WALLET_D, 1, false, false),
     ] {
         cache
@@ -5523,7 +5535,8 @@ async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only
 
     // Current acquisition changes on the candidate: a new active wallet, the
     // original wallet now infrastructure-flagged, one retained history whose
-    // wallet row is gone. Every retained history must stay in the union.
+    // wallet row is gone. Every retained history must stay in the union; the
+    // flagged wallet stays in it unread, behind an infra exclusion (#826).
     let mut cache = WalletCache::open(&side).unwrap();
     cache
         .upsert_wallets_bulk(&[(WALLET_E.to_owned(), SRC_TRADES, false, None, None, None, 0)])
@@ -5586,7 +5599,21 @@ async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only
             &side,
             "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2"
         ),
-        5
+        6,
+        "#826: the flagged wallet's exclusion commits beside B's receipt without a read"
+    );
+    let reason: Option<String> = Connection::open(&side)
+        .unwrap()
+        .query_row(
+            "SELECT exclusion_reason FROM activity_wallet_coverage_staging_v2
+             WHERE generation = 2 AND wallet_hex = ?1",
+            [WALLET],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reason.as_deref(),
+        Some("infra exclusion (owner 2026-10-31)")
     );
     assert_eq!(sha256_file(&prior).unwrap(), prior_sha256);
     assert_eq!(generation_rows(&prior, 1), 9);
@@ -5625,7 +5652,7 @@ async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only
     calls.sort();
     assert_eq!(
         calls,
-        [WALLET, WALLET_C, WALLET_D, WALLET_E]
+        [WALLET_C, WALLET_D, WALLET_E]
             .map(|wallet| if wallet == WALLET_E {
                 activity_url(wallet, next_end)
             } else {
@@ -12954,264 +12981,161 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
     }
 }
 
+// PASS (#826): infra tombstones pass unchanged through every staged copy and activation; discovery's
+// bulk upsert and the controlled activation batch never re-admit them; a tombstoned wallet whose row is
+// still active stays in the collection union yet is never requested; and staging leaves the installed
+// bytes untouched. FAIL: a tombstone is lifted, rewritten or read.
 #[tokio::test]
-async fn two_file_reviewed_clears_preserve_installed_bytes_and_later_exclusions() {
+async fn two_file_infra_tombstones_stay_permanent_across_cycles() {
     use pe_bootstrap::cache_migration::{cache_stage_evidence_path, stage_cache_cycle_v2};
     use pe_bootstrap::pile::{PILE_ACTIVATION_MIN_TRADES, SRC_LEADERBOARD};
 
-    for exclude_again in [false, true] {
-        let dir = TempDir::new().unwrap();
-        std::fs::create_dir(dir.path().join("eval-results")).unwrap();
-        let fixed = dir.path().join("wallet_cache.db");
-        let cache = seed_v1(&fixed, FRESH_END);
-        let purged_at = FRESH_END - 100;
-        for wallet in [WALLET_B, WALLET_C] {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join("eval-results")).unwrap();
+    let fixed = dir.path().join("wallet_cache.db");
+    let mut cache = seed_v1(&fixed, FRESH_END);
+    // WALLET_D keeps an active row, so `active_tradeable_wallets` still admits it to the union.
+    cache
+        .upsert_wallets_bulk(&[(WALLET_D.to_owned(), SRC_TRADES, false, None, None, None, 0)])
+        .unwrap();
+    cache.conn_for_test_set_active(WALLET_D, 1);
+    for wallet in [WALLET_B, WALLET_C, WALLET_D] {
+        cache
+            .raw_conn_for_test()
+            .execute(
+                "INSERT INTO purged_wallets (wallet_hex, reason, purged_at_unix)
+                 VALUES (?1, 'infra', ?2)",
+                params![wallet, FRESH_END - 100],
+            )
+            .unwrap();
+    }
+    drop(cache);
+    let tombstones = "SELECT * FROM purged_wallets ORDER BY wallet_hex";
+    let original = query_values(&fixed, tombstones);
+    let marked_rows =
+        format!("SELECT COUNT(*) FROM wallets WHERE wallet_hex IN ('{WALLET_B}', '{WALLET_C}')");
+    let log = CheckLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let mut installed_request = None;
+    for cycle in 1..=3 {
+        let cycle_id = format!("cron-20261012T00000{cycle}Z");
+        let side = dir.path().join(format!("wallet_cache.{cycle_id}.side.db"));
+        let prior = dir.path().join(format!("wallet_cache.{cycle_id}.prior.db"));
+        let displaced = dir
+            .path()
+            .join(format!("wallet_cache.{cycle_id}.displaced.db"));
+        let build = dir.path().join(format!("build-{cycle}.json"));
+        let installed_bytes = std::fs::read(&fixed).unwrap();
+        let staged = stage_cache_cycle_v2(
+            &fixed,
+            &prior,
+            &side,
+            Some(&build),
+            installed_request.as_deref(),
+        )
+        .unwrap();
+        assert!(!staged.resumed);
+        let skipped = log.take_named(
+            "staging_fixed quick_check skipped: an accepted activation installed these bytes",
+        );
+        assert_eq!(skipped.len(), usize::from(cycle > 1));
+        if cycle == 1 {
+            migrate_cache_v2(&side, &build).unwrap();
+            install_payout_manifest(&side);
+        } else {
+            // Use discovery's bulk-upsert owner, then the real controlled batch owner.
+            let mut cache = WalletCache::open(&side).unwrap();
             cache
-                .raw_conn_for_test()
-                .execute(
-                    "INSERT INTO purged_wallets (wallet_hex, reason, purged_at_unix)
-                     VALUES (?1, 'infra', ?2)",
-                    params![wallet, purged_at],
-                )
+                .upsert_wallets_bulk(&[(
+                    WALLET_B.to_owned(),
+                    SRC_LEADERBOARD,
+                    false,
+                    None,
+                    None,
+                    None,
+                    0,
+                )])
                 .unwrap();
+            let batch = cache
+                .activate_next_batch(&cycle_id, 1, PILE_ACTIVATION_MIN_TRADES, FRESH_END + cycle)
+                .unwrap();
+            assert!(batch.wallet_hexes.is_empty(), "{:?}", batch.wallet_hexes);
+            drop(cache);
+            assert_eq!(std::fs::read(&fixed).unwrap(), installed_bytes);
         }
-        drop(cache);
-        let clear = |side: &std::path::Path, wallet: &str| {
-            let output = Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"))
-                .arg("clear-infra-exclusion")
-                .arg("--db")
-                .arg(side)
-                .arg("--wallet")
-                .arg(wallet)
-                .arg("--purged-at")
-                .arg(purged_at.to_string())
-                .arg("--confirm")
-                .env("PE_BOOTSTRAP_OUTPUT", dir.path().join("watchlist.json"))
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        let assert_later_exclusion = |path: &std::path::Path| {
-            assert_eq!(
-                count(
-                    path,
-                    &format!(
-                        "SELECT purged_at_unix FROM purged_wallets
-                         WHERE wallet_hex = '{WALLET_B}' AND reason = 'infra'"
-                    ),
-                ),
-                purged_at + 1
-            );
-            assert_eq!(
-                count(
-                    path,
-                    &format!("SELECT is_infra FROM wallets WHERE wallet_hex = '{WALLET_B}'"),
-                ),
-                1
-            );
-        };
-        let log = CheckLog::default();
-        let writer = log.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let mut installed_request = None;
-        for cycle in 1..=3 {
-            let cycle_id = format!("cron-20261012T00000{cycle}Z");
-            let side = dir.path().join(format!("wallet_cache.{cycle_id}.side.db"));
-            let prior = dir.path().join(format!("wallet_cache.{cycle_id}.prior.db"));
-            let displaced = dir
-                .path()
-                .join(format!("wallet_cache.{cycle_id}.displaced.db"));
-            let build = dir.path().join(format!("build-{cycle}.json"));
-            let installed_bytes = std::fs::read(&fixed).unwrap();
-            let staged = stage_cache_cycle_v2(
-                &fixed,
-                &prior,
-                &side,
-                Some(&build),
-                installed_request.as_deref(),
-            )
-            .unwrap();
-            assert!(!staged.resumed);
-            let skipped = log.take_named(
-                "staging_fixed quick_check skipped: an accepted activation installed these bytes",
-            );
-            assert_eq!(skipped.len(), usize::from(cycle > 1));
-            if cycle == 1 {
-                migrate_cache_v2(&side, &build).unwrap();
-                install_payout_manifest(&side);
-            } else {
-                for wallet in [WALLET_B, WALLET_C] {
-                    clear(&side, wallet);
-                    assert_eq!(std::fs::read(&fixed).unwrap(), installed_bytes);
-                    assert_eq!(
-                        count(
-                            &side,
-                            &format!(
-                                "SELECT COUNT(*) FROM purged_wallets WHERE wallet_hex = '{wallet}'
-                                 AND reason = 'infra' AND purged_at_unix = {purged_at}"
-                            ),
-                        ),
-                        0
-                    );
-                }
-                assert_eq!(
-                    count(
-                        &side,
-                        &format!("SELECT COUNT(*) FROM wallets WHERE wallet_hex = '{WALLET_C}'"),
-                    ),
-                    0
-                );
-                if cycle == 2 {
-                    // Use discovery's bulk-upsert owner, then the real controlled batch owner.
-                    let mut cache = WalletCache::open(&side).unwrap();
-                    cache
-                        .upsert_wallets_bulk(&[(
-                            WALLET_B.to_owned(),
-                            SRC_LEADERBOARD,
-                            false,
-                            None,
-                            None,
-                            None,
-                            0,
-                        )])
-                        .unwrap();
-                    let batch = cache
-                        .activate_next_batch(
-                            &cycle_id,
-                            1,
-                            PILE_ACTIVATION_MIN_TRADES,
-                            FRESH_END + cycle,
-                        )
-                        .unwrap();
-                    assert_eq!(batch.wallet_hexes, [WALLET_B]);
-                    drop(cache);
-                    if exclude_again {
-                        Connection::open(&side)
-                            .unwrap()
-                            .execute(
-                                "INSERT INTO purged_wallets (wallet_hex, reason, purged_at_unix)
-                                 VALUES (?1, 'infra', ?2)",
-                                params![WALLET_B, purged_at + 1],
-                            )
-                            .unwrap();
-                        Connection::open(&side)
-                            .unwrap()
-                            .execute(
-                                "UPDATE wallets SET is_infra = 1 WHERE wallet_hex = ?1",
-                                [WALLET_B],
-                            )
-                            .unwrap();
-                        let resumed = stage_cache_cycle_v2(
-                            &fixed,
-                            &prior,
-                            &side,
-                            Some(&build),
-                            installed_request.as_deref(),
-                        )
-                        .unwrap();
-                        // A retained cycle reports `resumed`, so the wrapper applies no clear.
-                        assert!(resumed.resumed);
-                    }
-                }
-                if exclude_again {
-                    assert_later_exclusion(&side);
-                }
-            }
-            let source = DatasetFetcher::default();
-            populate_activity_fresh_v2(
-                &side,
-                &source,
-                "https://data.example",
-                u64::try_from(cycle).unwrap(),
-                FRESH_END + cycle,
-                FRESH_END + cycle + 1,
-            )
-            .await
-            .unwrap();
-            if cycle == 2 && !exclude_again {
-                assert!(
-                    source
-                        .calls
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .any(|(wallet, _, _)| wallet == WALLET_B)
-                );
-                assert_eq!(
-                    count(
-                        &side,
-                        &format!("SELECT is_active FROM wallets WHERE wallet_hex = '{WALLET_B}'"),
-                    ),
-                    1
-                );
-            }
-            let stage_path = dir.path().join(format!("final-{cycle}.json"));
-            let finalized = finalize_cache_v2(&side, Some(&stage_path), FRESH_END + cycle + 2)
+        assert_eq!(query_values(&side, tombstones), original);
+        assert_eq!(count(&side, &marked_rows), 0);
+        let source = DatasetFetcher::default();
+        populate_activity_fresh_v2(
+            &side,
+            &source,
+            "https://data.example",
+            u64::try_from(cycle).unwrap(),
+            FRESH_END + cycle,
+            FRESH_END + cycle + 1,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !source
+                .calls
+                .lock()
                 .unwrap()
-                .unwrap();
-            let request = CacheActivationRequest {
-                fixed_path: fixed.clone(),
-                side_path: side.clone(),
-                prior_cache_backup_path: displaced.clone(),
-                expected_side_sha256: finalized.cache_sha256.clone(),
-                stage_evidence_sha256: Some(
-                    sha256_file(&cache_stage_evidence_path(&side)).unwrap(),
-                ),
-            };
-            activate_cache_v2_with_handoff(
-                &request,
-                None,
-                Some(&stage_path),
-                installed_request.as_deref(),
-            )
+                .iter()
+                .any(|(wallet, _, _)| [WALLET_B, WALLET_C, WALLET_D].contains(&wallet.as_str()))
+        );
+        assert!(
+            fresh_record(&side)["wallets"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::from(WALLET_D))
+        );
+        assert_eq!(
+            collection_proof(&side, u64::try_from(cycle).unwrap(), WALLET_D)["exclusion_reason"],
+            "infra exclusion (owner 2026-10-31)"
+        );
+        let stage_path = dir.path().join(format!("final-{cycle}.json"));
+        let finalized = finalize_cache_v2(&side, Some(&stage_path), FRESH_END + cycle + 2)
+            .unwrap()
             .unwrap();
-            assert_eq!(sha256_file(&fixed).unwrap(), finalized.cache_sha256);
-            if cycle > 1 {
-                assert_eq!(
-                    count(
-                        &fixed,
-                        &format!(
-                            "SELECT COUNT(*) FROM purged_wallets WHERE wallet_hex = '{WALLET_C}'"
-                        ),
-                    ),
-                    0
-                );
-                assert_eq!(
-                    count(
-                        &fixed,
-                        &format!("SELECT COUNT(*) FROM wallets WHERE wallet_hex = '{WALLET_C}'"),
-                    ),
-                    0
-                );
-                if exclude_again {
-                    assert_later_exclusion(&fixed);
-                }
-            }
-            let accepted = dir.path().join(&cycle_id);
-            std::fs::create_dir(&accepted).unwrap();
-            let publication = accepted.join("ranking_publish_request.json");
-            std::fs::write(
-                &publication,
-                serde_json::json!({"cache_activation": {
-                    "fixed_path": fixed, "side_path": side,
-                    "expected_sha256": finalized.cache_sha256,
-                }})
-                .to_string(),
-            )
-            .unwrap();
-            std::fs::write(accepted.join("accepted_cycle_manifest.json"), "{}").unwrap();
-            installed_request = Some(publication);
-            std::fs::remove_file(displaced).unwrap();
-        }
+        let request = CacheActivationRequest {
+            fixed_path: fixed.clone(),
+            side_path: side.clone(),
+            prior_cache_backup_path: displaced.clone(),
+            expected_side_sha256: finalized.cache_sha256.clone(),
+            stage_evidence_sha256: Some(sha256_file(&cache_stage_evidence_path(&side)).unwrap()),
+        };
+        activate_cache_v2_with_handoff(
+            &request,
+            None,
+            Some(&stage_path),
+            installed_request.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(sha256_file(&fixed).unwrap(), finalized.cache_sha256);
+        assert_eq!(query_values(&fixed, tombstones), original);
+        assert_eq!(count(&fixed, &marked_rows), 0);
+        let accepted = dir.path().join(&cycle_id);
+        std::fs::create_dir(&accepted).unwrap();
+        let publication = accepted.join("ranking_publish_request.json");
+        std::fs::write(
+            &publication,
+            serde_json::json!({"cache_activation": {
+                "fixed_path": fixed, "side_path": side,
+                "expected_sha256": finalized.cache_sha256,
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(accepted.join("accepted_cycle_manifest.json"), "{}").unwrap();
+        installed_request = Some(publication);
+        std::fs::remove_file(displaced).unwrap();
     }
 }
 
@@ -13999,6 +13923,8 @@ async fn staging_interruption_refuses_source_drift_and_checks_before_copying() {
     }
 }
 const PUBLICATION_PRINT_WALLET: &str = "0x5555555555555555555555555555555555555555";
+/// Flagged after its history is collected: an ever-infra wallet with retained history (#826).
+const PUBLICATION_INFRA_WALLET: &str = "0x6666666666666666666666666666666666666666";
 
 fn publication_dataset(now: i64, quiet: &str) -> (Vec<Value>, Vec<Value>) {
     let mut rows = Vec::new();
@@ -14105,8 +14031,11 @@ fn publication_payouts(path: &std::path::Path, markets: &[Value], now: i64) {
 }
 
 // PASS: real transition and bulk-root publications carry the AC8 mapping, raw-only and scoped-drop cases;
-// the successor reads quiet history and a token_conditions edit changes no published scope.
-// FAIL: a wallet is excluded for the accepted defects, a dropped market scores, or raw-only BUYs consume.
+// the successor reads quiet history and a token_conditions edit changes no published scope. Across the
+// transition's two cycles, a flagged wallet with retained history and a supplement wallet (#826) are
+// never requested, never hold or take a successor, and never reach the projection or publication.
+// FAIL: a wallet is excluded for the accepted defects, a dropped market scores, raw-only BUYs consume,
+// or an ever-infra wallet is requested, waited for, projected or published.
 #[tokio::test]
 async fn real_wrapper_two_cycles_publish_and_read_quiet_wallet() {
     real_wrapper_publications(PublicationScenario::Transition).await;
@@ -14152,8 +14081,9 @@ async fn real_wrapper_frozen_deferred_generation_resumes_with_full_successor() {
     real_wrapper_publications(PublicationScenario::Deferred).await;
 }
 
-// PASS: inactive, flagged and tombstoned participants hold before activity,
-// payout and request creation, also on rerun. FAIL: any omitted wallet proceeds.
+// PASS: inactive and tombstoned participants hold before activity, payout and
+// request creation, also on rerun; a flagged participant is reported as infra-excluded
+// and never holds (#826). FAIL: any omitted wallet proceeds or the flagged one holds.
 #[tokio::test]
 async fn real_wrapper_participant_holds_precede_collection_and_payout() {
     real_wrapper_publications(PublicationScenario::ParticipantHold).await;
@@ -14191,6 +14121,35 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         (-(now + 3 * 86_400)).rem_euclid(604_800)
     );
     let (mut rows, mut markets) = publication_dataset(now, &quiet);
+    // AC5 (#826): the transition's two cycles carry a wallet flagged after its history was
+    // collected and an active wallet of the committed supplement. Each prints at 0.95 two seconds
+    // after one of WALLET's entries, where the print wallet's print sets the reference price.
+    let infra_case = scenario == PublicationScenario::Transition;
+    let supplement_wallet = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/forge/ever-infra-wallets.txt"),
+    )
+    .unwrap()
+    .lines()
+    .find(|line| line.starts_with("0x"))
+    .unwrap()
+    .to_owned();
+    let infra_wallets = [PUBLICATION_INFRA_WALLET, supplement_wallet.as_str()];
+    if infra_case {
+        for (index, wallet) in infra_wallets.into_iter().enumerate() {
+            let mut print = rows
+                .iter()
+                .find(|row| row["transactionHash"] == format!("{WALLET}-entry-{index}"))
+                .unwrap()
+                .clone();
+            print["proxyWallet"] = Value::from(wallet);
+            print["transactionHash"] = Value::from(format!("{wallet}-infra-print"));
+            print["timestamp"] = Value::from(print["timestamp"].as_i64().unwrap() + 2);
+            print["price"] = Value::from("0.95");
+            print["usdcSize"] = Value::from("9.51");
+            rows.push(print);
+        }
+    }
     let mut conversion = dataset_row(WALLET, "0xe", "wrapper-conversion", "BUY", now - 220);
     conversion["type"] = Value::from("CONVERSION");
     conversion["asset"] = Value::from("8000");
@@ -14228,6 +14187,14 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         .unwrap();
     cache.conn_for_test_set_active(&quiet, 1);
     cache.conn_for_test_set_active(PUBLICATION_PRINT_WALLET, 1);
+    if infra_case {
+        for wallet in infra_wallets {
+            cache
+                .upsert_wallets_bulk(&[(wallet.to_owned(), SRC_TRADES, false, None, None, None, 0)])
+                .unwrap();
+            cache.conn_for_test_set_active(wallet, 1);
+        }
+    }
     drop(cache);
     fixture_participant_coverage(&fixed, now);
     if !bulk_root {
@@ -14239,12 +14206,11 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         std::fs::write(&build, serde_json::to_vec(&manifest).unwrap()).unwrap();
         migrate_cache_v2(&fixed, &build).unwrap();
         // AC5 / Change 2: a historical format-two head transitions in the first real cycle.
-        history_v3_freeze_legacy_root_at(
-            &fixed,
-            &[WALLET, &quiet, PUBLICATION_PRINT_WALLET],
-            1,
-            now - 240,
-        );
+        let mut frozen = vec![WALLET, quiet.as_str(), PUBLICATION_PRINT_WALLET];
+        if infra_case {
+            frozen.push(PUBLICATION_INFRA_WALLET);
+        }
+        history_v3_freeze_legacy_root_at(&fixed, &frozen, 1, now - 240);
         populate_activity_fresh_v2(
             &fixed,
             &DatasetFetcher {
@@ -14269,8 +14235,25 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
             1
         );
         assert!(finalize_cache_v2_unbound(&fixed, None, now - 237).is_ok());
-        assert_eq!(classifier_projection_rows(&fixed).len(), 60);
+        assert_eq!(
+            classifier_projection_rows(&fixed).len(),
+            60 + usize::from(infra_case)
+        );
     }
+    // A flag written after collection, as `classify-infra` does, leaves the retained history in place.
+    let infra_history = format!(
+        "SELECT * FROM activity_groups_v2 WHERE wallet_hex = '{PUBLICATION_INFRA_WALLET}' ORDER BY 1"
+    );
+    let retained_infra = if infra_case {
+        let mut cache = WalletCache::open(&fixed).unwrap();
+        cache.mark_infra(PUBLICATION_INFRA_WALLET).unwrap();
+        drop(cache);
+        let retained = query_values(&fixed, &infra_history);
+        assert_eq!(retained.len(), 1);
+        retained
+    } else {
+        Vec::new()
+    };
     // AC8 / Decision 1: these defects are acquired only under acquisition three, beside valid BUYs.
     let scoped_row = |market: &str, token: &str, id: &str, epoch: i64| {
         let mut row = dataset_row(WALLET, market, id, "BUY", epoch);
@@ -14373,7 +14356,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         Arc::clone(&venue.batches),
     );
     let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    // The production reviewed-clears list runs through the real command on each fresh copy.
+    // The real scripts read the committed ever-infra supplement under deploy (#826).
     for tree in ["scripts", "deploy"] {
         assert!(
             Command::new("cp")
@@ -14506,6 +14489,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
             "SELECT COUNT(*) FROM clob_payout_coverage_manifests_v2",
         );
         let hold = |reasons: &[&str]| {
+            let mut stderr = String::new();
             for _ in 0..2 {
                 let before = requests.lock().unwrap().len();
                 let output = run_wrapper();
@@ -14517,6 +14501,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 for reason in reasons {
                     assert!(error.contains(reason), "{output:?}");
                 }
+                stderr = error.into_owned();
                 assert!(
                     !request.exists() && !data.join("eval-results/rank_and_push.pending").exists()
                 );
@@ -14535,6 +14520,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 assert_eq!(sha256_file(&fixed).unwrap(), fixed_hash);
                 assert!(batches.lock().unwrap().is_empty());
             }
+            stderr
         };
         if scenario == PublicationScenario::ParticipantHold {
             let mut cache = WalletCache::open(&side).unwrap();
@@ -14559,14 +14545,17 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                  INSERT INTO purged_wallets(wallet_hex, reason, purged_at_unix) VALUES ('{WALLET_D}', 'proven_loser', 1)"
             )).unwrap();
             let before = requests.lock().unwrap().len();
-            hold(&[
+            let stderr = hold(&[
                 WALLET_B,
                 "inactive participant",
-                WALLET_C,
-                "flagged participant",
                 WALLET_D,
                 "tombstoned participant",
+                &format!("[infra-excluded] {WALLET_C}: participant"),
             ]);
+            assert!(
+                !stderr.lines().any(|line| line.starts_with(WALLET_C)),
+                "{stderr}"
+            );
             assert!(
                 !requests.lock().unwrap()[before..]
                     .iter()
@@ -14825,7 +14814,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         assert!(out.join("cache_stage.json").exists());
     }
     let mut cycles = Vec::new();
-    let mut clears_run = 0;
+    let mut infra_certificate = None;
     let total_cycles = if recovery {
         6
     } else if bulk_root {
@@ -15008,32 +14997,8 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
             .find_map(|line| line.strip_prefix("RANK_AND_PUSH_RUN_DIR="))
             .unwrap();
         let out = dir.path().join(run);
-        // The production reviewed-clears list runs through the real command only when this run
-        // staged a fresh copy; the fixture holds none of its tombstones, so each clear logs "absent".
-        let reviewed =
-            std::fs::read_to_string(repository.join("deploy/forge/reviewed-infra-clears.txt"))
-                .unwrap()
-                .lines()
-                .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
-                .count();
-        let staged: Value =
-            serde_json::from_slice(&std::fs::read(out.join("cache_stage.json")).unwrap()).unwrap();
-        let clears = if stdout.contains("[cache-stage] ok") && staged["resumed"] == false {
-            reviewed
-        } else {
-            0
-        };
-        assert_eq!(
-            stdout.matches("[infra-clear] ok").count(),
-            clears,
-            "{stdout}"
-        );
-        assert_eq!(
-            stderr.matches("reviewed infra tombstone absent").count(),
-            clears,
-            "{stderr}"
-        );
-        clears_run += clears;
+        // #826: infra marks are permanent, so no cycle clears one.
+        assert!(!stdout.contains("[infra-clear]"), "{stdout}");
         assert!(out.join("accepted_cycle_manifest.json").is_file());
         assert!(out.join("cache_stage_record.json").is_file());
         assert!(out.join("ranking_publish_request.json").is_file());
@@ -15137,7 +15102,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 batches.lock().unwrap()[0]["p_scope_drops"]
             );
         }
-        let projection = Command::new("python3").args(["-c", "import duckdb,json,sys; c=duckdb.connect(); r=c.execute('SELECT condition_id, source_time_unix, outcome_id FROM read_parquet(?)', [sys.argv[1]]); print(json.dumps([dict(zip([d[0] for d in r.description], row)) for row in r.fetchall()]))"])
+        let projection = Command::new("python3").args(["-c", "import duckdb,json,sys; c=duckdb.connect(); r=c.execute('SELECT condition_id, source_time_unix, outcome_id, wallet_hex FROM read_parquet(?)', [sys.argv[1]]); print(json.dumps([dict(zip([d[0] for d in r.description], row)) for row in r.fetchall()]))"])
             .arg(data.join("parquet/projection.parquet")).output().unwrap();
         assert!(
             projection.status.success(),
@@ -15145,6 +15110,46 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
             String::from_utf8_lossy(&projection.stderr)
         );
         let projected: Vec<Value> = serde_json::from_slice(&projection.stdout).unwrap();
+        if infra_case {
+            // AC5 (#826): neither ever-infra wallet is requested, holds or takes a successor (the
+            // generation and publication checks above), or keeps a row in the finalized projection,
+            // which is pass 1's universe and the print tape: its print sets no reference price.
+            for wallet in infra_wallets {
+                assert!(
+                    !new_requests
+                        .iter()
+                        .any(|request| request.contains("/activity?") && request.contains(wallet)),
+                    "{wallet} was requested: {new_requests:?}"
+                );
+                assert!(
+                    stderr.contains(&format!("[infra-excluded] {wallet}:")),
+                    "{stderr}"
+                );
+                let proof = proofs
+                    .iter()
+                    .find(|proof| proof["wallet_hex"] == wallet)
+                    .unwrap();
+                assert_eq!(
+                    proof["exclusion_reason"],
+                    "infra exclusion (owner 2026-10-31)"
+                );
+                assert_eq!(proof["acquisition"]["disposition"], "excluded");
+                assert_eq!(proof["acquisition"]["aggregation_status"], "not_attempted");
+                assert!(!projected.iter().any(|row| row["wallet_hex"] == wallet));
+            }
+            assert_eq!(query_values(&fixed, &infra_history), retained_infra);
+            // The format transition certified its retained history once; no later cycle changes it.
+            let certificate = query_values(
+                &fixed,
+                &format!(
+                    "SELECT * FROM activity_wallet_history_v3 WHERE wallet_hex = '{PUBLICATION_INFRA_WALLET}'"
+                ),
+            );
+            assert_eq!(certificate.len(), 1);
+            if let Some(previous) = infra_certificate.replace(certificate.clone()) {
+                assert_eq!(certificate, previous);
+            }
+        }
         for market in ["0xfb", "0xfc", "0xfd", "0xfe"] {
             assert!(
                 !projected.iter().any(|row| row["condition_id"] == market),
@@ -15253,8 +15258,6 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         );
         assert_eq!(before.stdout, after.stdout);
     }
-    // A bulk-root resume skips setup; every other scenario stages at least one fresh copy.
-    assert!(bulk_root || clears_run > 0);
     venue.stop();
 }
 
@@ -15927,6 +15930,207 @@ async fn history_v3_every_failed_full_read_rechecks_retained_history_and_failed_
         .await
         .unwrap();
     assert_eq!(history_v3_wallet_count(&side), 1);
+}
+
+// PASS (#826): a wallet that ever carried an infra mark (a live flag or an infra tombstone) keeps its
+// certified history and is never read again: no request, no repair when selected for a full read, no
+// rescan even of damaged rows, a receipt naming the infra exclusion, and its rows, certificate and
+// nonempty drops unchanged; unmarked in a copy, the next full read verifies the same history.
+// FAIL: the wallet is requested, repaired or rescanned, or loses rows, certificate or drops.
+#[tokio::test]
+async fn history_v3_ever_infra_wallet_is_never_read_rescanned_or_repaired() {
+    for (mark, unmark) in [
+        (
+            "UPDATE wallets SET is_infra = 1 WHERE wallet_hex = ?1",
+            "UPDATE wallets SET is_infra = 0 WHERE wallet_hex = ?1",
+        ),
+        (
+            "INSERT INTO purged_wallets (wallet_hex, reason, purged_at_unix) VALUES (?1, 'infra', 1)",
+            "DELETE FROM purged_wallets WHERE wallet_hex = ?1",
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        // A conversion in the neg-risk event of market 0xa drops that market: nonempty drops.
+        let mut conversion = projection_v3_row("\\xe", "conversion", FRESH_END - 2);
+        conversion["type"] = Value::from("CONVERSION");
+        let (side, source) = history_v3_legacy_seed(
+            &dir,
+            vec![
+                projection_v3_row("0xa", "before-drop", FRESH_END - 3),
+                conversion,
+                projection_v3_row("0xb", "beside-drop", FRESH_END - 2),
+            ],
+        )
+        .await;
+        history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+            .await
+            .unwrap();
+        projection_v3_payouts(&side);
+        finalize_cache_v2_unbound(&side, None, FRESH_END + 2).unwrap();
+        let history = format!("SELECT * FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}'");
+        let retained = query_values(&side, &history);
+        let certificate = certificate_row(&side, WALLET);
+        assert_ne!(
+            certificate[6],
+            rusqlite::types::Value::Text("[]".to_owned())
+        );
+        history_v3_damage_connection(&side)
+            .execute(mark, [WALLET])
+            .unwrap();
+        // Damaged rows fail any rescan of the infra wallet's history.
+        let damaged = dir.path().join("damaged.db");
+        std::fs::copy(&side, &damaged).unwrap();
+        history_v3_damage_connection(&damaged)
+            .execute(
+                "UPDATE activity_groups_v2 SET share_amount_str = '2.250001'",
+                [],
+            )
+            .unwrap();
+        source.calls.lock().unwrap().clear();
+        for candidate in [&damaged, &side] {
+            history_v3_collect(candidate, &source, 3, FRESH_END + 3, &[WALLET.to_owned()])
+                .await
+                .unwrap();
+            let identity = fresh_record(candidate);
+            assert!(
+                identity["wallets"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&Value::from(WALLET))
+            );
+            assert!(
+                !identity["repair_wallets"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&Value::from(WALLET))
+            );
+            let reason: String = Connection::open(candidate)
+                .unwrap()
+                .query_row(
+                    "SELECT exclusion_reason FROM activity_wallet_coverage_staging_v2
+                     WHERE generation = 3 AND wallet_hex = ?1",
+                    [WALLET],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(reason, "infra exclusion (owner 2026-10-31)");
+        }
+        assert!(
+            source.calls.lock().unwrap().is_empty(),
+            "the infra wallet was requested"
+        );
+        assert_eq!(query_values(&side, &history), retained);
+        assert_eq!(certificate_row(&side, WALLET), certificate);
+        // The excluded receipt left the certified history valid: unmarked, the next read verifies it.
+        let unmarked = dir.path().join("unmarked.db");
+        std::fs::copy(&side, &unmarked).unwrap();
+        history_v3_damage_connection(&unmarked)
+            .execute(unmark, [WALLET])
+            .unwrap();
+        history_v3_collect(&unmarked, &source, 4, FRESH_END + 4, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            receipt(&unmarked, 4, WALLET).map(|receipt| receipt.0),
+            Some(i64::try_from(retained.len()).unwrap())
+        );
+        // Finalizing scans the stored history against its chain and certifies it again, drops kept.
+        finalize_cache_v2_unbound(&unmarked, None, FRESH_END + 5).unwrap();
+        let recertified = certificate_row(&unmarked, WALLET);
+        assert_eq!(recertified[0], rusqlite::types::Value::Integer(4));
+        assert_eq!(recertified[3..], certificate[3..]);
+        assert_eq!(query_values(&unmarked, &history), retained);
+    }
+}
+
+// PASS (#826): an identity frozen with the wallet as an explicit repair, marked infra before its read,
+// resumes without requesting it or deleting its history; rows, certificate and drops stay, and the
+// chain still proves them: unmarked in a copy, the next full read verifies the same history.
+// FAIL: the resumed repair requests, deletes or rewrites the infra wallet's history.
+#[tokio::test]
+async fn history_v3_frozen_repair_of_a_later_infra_wallet_keeps_its_history() {
+    let dir = TempDir::new().unwrap();
+    let mut conversion = projection_v3_row("\\xe", "conversion", FRESH_END - 2);
+    conversion["type"] = Value::from("CONVERSION");
+    let (side, source) = history_v3_legacy_seed(
+        &dir,
+        vec![
+            projection_v3_row("0xa", "before-drop", FRESH_END - 3),
+            conversion,
+            projection_v3_row("0xb", "beside-drop", FRESH_END - 2),
+        ],
+    )
+    .await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&side);
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 2).unwrap();
+    let history = format!("SELECT * FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}'");
+    let retained = query_values(&side, &history);
+    let certificate = certificate_row(&side, WALLET);
+    // The repair is frozen while the wallet is unmarked; its read stops before the wallet commits.
+    let stopped = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+        &BootstrapConfig {
+            cache_path: side.clone(),
+            ..Default::default()
+        },
+        &HistoryV3StopFetcher,
+        "https://data.example",
+        3,
+        &[WALLET.to_owned()],
+        || Ok(FRESH_END + 3),
+        FRESH_END + 4,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(stopped.exit_code(), 75);
+    assert_eq!(
+        fresh_record(&side)["repair_wallets"],
+        serde_json::json!([WALLET])
+    );
+    history_v3_damage_connection(&side)
+        .execute(
+            "UPDATE wallets SET is_infra = 1 WHERE wallet_hex = ?1",
+            [WALLET],
+        )
+        .unwrap();
+    source.calls.lock().unwrap().clear();
+    history_v3_collect(&side, &source, 3, FRESH_END + 3, &[])
+        .await
+        .unwrap();
+    assert!(
+        source.calls.lock().unwrap().is_empty(),
+        "the infra wallet was requested"
+    );
+    assert_eq!(
+        collection_proof(&side, 3, WALLET)["exclusion_reason"],
+        "infra exclusion (owner 2026-10-31)"
+    );
+    assert_eq!(query_values(&side, &history), retained);
+    assert_eq!(certificate_row(&side, WALLET), certificate);
+    let unmarked = dir.path().join("unmarked.db");
+    std::fs::copy(&side, &unmarked).unwrap();
+    history_v3_damage_connection(&unmarked)
+        .execute(
+            "UPDATE wallets SET is_infra = 0 WHERE wallet_hex = ?1",
+            [WALLET],
+        )
+        .unwrap();
+    history_v3_collect(&unmarked, &source, 4, FRESH_END + 4, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt(&unmarked, 4, WALLET).map(|receipt| receipt.0),
+        Some(i64::try_from(retained.len()).unwrap())
+    );
+    // Finalizing scans the stored history against its chain and certifies it again, drops kept.
+    finalize_cache_v2_unbound(&unmarked, None, FRESH_END + 5).unwrap();
+    let recertified = certificate_row(&unmarked, WALLET);
+    assert_eq!(recertified[0], rusqlite::types::Value::Integer(4));
+    assert_eq!(recertified[3..], certificate[3..]);
+    assert_eq!(query_values(&unmarked, &history), retained);
 }
 
 #[tokio::test]
@@ -21210,7 +21414,7 @@ async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
         error.to_string().contains("infrastructure-flagged"),
         "{error}"
     );
-    // Participant discovery lifts the inherited loser tombstone and flag.
+    // Participant discovery lifts the inherited loser tombstone; the inherited flag stays (#826).
     let mut cache = WalletCache::open(&fresh).unwrap();
     cache
         .upsert_wallets_bulk(&[
@@ -21224,11 +21428,20 @@ async fn seeded_cache_carries_certified_drops_into_its_first_finalize() {
         count(
             &fresh,
             &format!(
-                "SELECT COUNT(*) FROM wallets WHERE wallet_hex IN ('{WALLET_C}', '{WALLET_D}')
-                 AND is_active = 1"
+                "SELECT COUNT(*) FROM wallets WHERE wallet_hex = '{WALLET_D}' AND is_active = 1"
             )
         ),
-        2
+        1
+    );
+    assert_eq!(
+        count(
+            &fresh,
+            &format!(
+                "SELECT COUNT(*) FROM wallets WHERE wallet_hex = '{WALLET_C}'
+                 AND is_infra = 1 AND is_active = 0"
+            )
+        ),
+        1
     );
 
     let tampered = dir.path().join("tampered.db");

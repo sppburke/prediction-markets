@@ -539,21 +539,75 @@ class CandidateObligationsTest(unittest.TestCase):
         self.assertEqual(self.targets()[0], 3)
 
     def test_participants_hold_before_collection_but_exchange_contracts_are_exempt(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
         from rank_cycle_manifest import EXCHANGE_CONTRACTS
         participants = [("0x" + digit * 40, active, infra, 256)
                         for digit, active, infra in (("1", 0, 0), ("2", 1, 1), ("3", 1, 0))]
         with sqlite3.connect(self.side) as c:
             c.executemany("INSERT INTO wallets VALUES (?, ?, ?, ?)", participants)
             c.execute("INSERT INTO purged_wallets VALUES (?, 'proven_loser')", (participants[2][0],))
-        with self.assertRaises(ValueError) as held:
+        output = StringIO()
+        with redirect_stderr(output), self.assertRaises(ValueError) as held:
             self.targets(after_collection=False)
-        for row, reason in zip(participants, ("inactive", "flagged", "tombstoned")):
+        for row, reason in zip(participants[::2], ("inactive", "tombstoned")):
             self.assertIn(row[0] + ": " + reason, str(held.exception))
+        # A flagged participant is excluded, not held (#826).
+        self.assertNotIn(participants[1][0], str(held.exception))
+        self.assertIn(f"[infra-excluded] {participants[1][0]}: participant", output.getvalue())
         with sqlite3.connect(self.side) as c:
             c.execute("DELETE FROM wallets")
             c.execute("DELETE FROM purged_wallets")
             c.executemany("INSERT INTO wallets VALUES (?, 0, 1, 256)", ((wallet,) for wallet in EXCHANGE_CONTRACTS))
         self.assertEqual(self.targets(after_collection=False)[0], 1)
+
+    def test_ever_infra_wallets_never_hold_or_take_successors(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from ever_infra_wallets import SUPPLEMENT, parse_supplement
+        listed = min(parse_supplement(SUPPLEMENT.read_text(encoding="utf-8")))
+        flagged, tombstoned, control = ("0x" + digit * 40 for digit in "234")
+        # Rule 1: an inactive flagged participant, an inactive list-only one and an infra tombstone that kept its row
+        # are excluded whatever else they fail; the inactive control still holds.
+        with sqlite3.connect(self.side) as c:
+            c.executemany("INSERT INTO wallets VALUES (?, 0, ?, 256)",
+                          ((flagged, 1), (listed, 0), (tombstoned, 0), (control, 0)))
+            c.execute("INSERT INTO purged_wallets VALUES (?, 'infra')", (tombstoned,))
+        output = StringIO()
+        with redirect_stderr(output), self.assertRaises(ValueError) as held:
+            self.targets(after_collection=False)
+        self.assertEqual(str(held.exception), "candidate HOLD:\n" + control
+                         + ": inactive participant, participant absent from active_tradeable_wallets")
+        for wallet in (flagged, listed, tombstoned):
+            self.assertIn(f"[infra-excluded] {wallet}: participant", output.getvalue())
+        with sqlite3.connect(self.side) as c:
+            c.execute("DELETE FROM wallets")
+            c.execute("DELETE FROM purged_wallets")
+        # Rule 3: no excluded receipt of an ever-infra wallet holds or takes a successor.
+        head_wallets = sorted([self.wallet, listed])
+        self.head(wallets=head_wallets, full_read_wallets=head_wallets)
+        for reason, changes in (("infra exclusion (owner 2026-10-31)", {}),
+                                ("acquisition budget exhausted", {}),
+                                ("held-row limit reached", dict(aggregation_status="complete", fixed_end_unix=100)),
+                                ("aggregation failed", dict(exclusion_reason="aggregation_failure"))):
+            with self.subTest(reason=reason):
+                with sqlite3.connect(self.side) as c:
+                    c.execute("DELETE FROM activity_wallet_coverage_staging_v2")
+                self.receipt(reason, wallet=listed, **changes)
+                output = StringIO()
+                with redirect_stderr(output):
+                    self.assertEqual(self.targets()[0], 1)
+                self.assertIn(f"[infra-excluded] {listed}: {reason}", output.getvalue())
+        # Rule 4: an active list-only wallet outside the head takes no successor; the active control does.
+        with sqlite3.connect(self.side) as c:
+            c.execute("DELETE FROM activity_wallet_coverage_staging_v2")
+            c.execute("INSERT INTO wallets VALUES (?, 1, 0, 256)", (listed,))
+        self.head()
+        with redirect_stderr(StringIO()):
+            self.assertEqual(self.targets()[0], 1)
+            with sqlite3.connect(self.side) as c:
+                c.execute("INSERT INTO wallets VALUES (?, 1, 0, 256)", (control,))
+            self.assertEqual(self.targets()[0], 2)
 
     def test_newly_admitted_wallet_requires_a_head_that_includes_it(self):
         self.head()

@@ -475,6 +475,7 @@ fn infra_purge_honors_shared_enable_flag_and_invalidates_wallet_derived_data() {
     // PASS: purge-infra is report-only with purge_enabled=false, then an armed
     // call deletes only infra wallet-keyed rows, writes a non-liftable
     // exclusion, clears the first-mover cache, and preserves activation audit.
+    // No source, a market participant included, removes an infra mark (#826).
     let dir = TempDir::new().unwrap();
     let mut cache = open_cache(&dir);
     let infra = wallet_hex(0x31);
@@ -578,11 +579,8 @@ fn infra_purge_honors_shared_enable_flag_and_invalidates_wallet_derived_data() {
                 |row| row.get(0)
             )
             .unwrap(),
-        0
+        1
     );
-    assert!(cache.clear_infra_exclusion(&infra).unwrap());
-    upsert(&mut cache, &infra, SRC_LEADERBOARD);
-    assert!(cache.conn_for_test_wallet_exists(&infra));
 
     let archive = rusqlite::Connection::open(dir.path().join("cache.purge-archive.db")).unwrap();
     let reason: String = archive

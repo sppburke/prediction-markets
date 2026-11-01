@@ -38,6 +38,7 @@ from unittest import mock
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ever_infra_wallets as infra  # noqa: E402
 import rank_72hr_buyandhold as rk  # noqa: E402
 from test_ranker_duck_parity import all_markets_scope, write_market_scope  # noqa: E402
 
@@ -196,6 +197,53 @@ class PartialBackfillUniverseTest(unittest.TestCase):
             conn.executemany("INSERT INTO wallets VALUES (?,?)", [(WA, 1), (WB, 2)])
             self.assertEqual(rk.exclude_partial_backfills(conn, [WA, WB], 1), [WB])
             self.assertEqual(rk.exclude_partial_backfills(conn, [WA, WB], 2), [WA, WB])
+
+
+class EverInfraUniverseTest(unittest.TestCase):
+    """#826: a wallet that ever carried an infra mark is never a pass-one candidate."""
+
+    def test_each_mark_kind_leaves_the_candidates_and_is_logged(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        for mark in ("flag", "tombstone", "supplement"):
+            with self.subTest(mark=mark), tempfile.TemporaryDirectory() as tmp:
+                db = str(Path(tmp) / "cache.db")
+                out = str(Path(tmp) / "out")
+                build_core_cache(db)
+                supplement = Path(tmp) / "supplement.txt"
+                supplement.write_text("# fixture\n" + (WA + "\n" if mark == "supplement" else ""))
+                with sqlite3.connect(db) as conn:
+                    conn.execute("CREATE TABLE wallets (wallet_hex TEXT PRIMARY KEY, is_active INTEGER DEFAULT 1, "
+                                 "is_infra INTEGER DEFAULT 0)")
+                    conn.execute("CREATE TABLE purged_wallets (wallet_hex TEXT PRIMARY KEY, purged_at_unix INTEGER, "
+                                 "reason TEXT)")
+                    if mark == "flag":
+                        conn.execute("INSERT INTO wallets(wallet_hex, is_infra) VALUES (?, 1)", (WA,))
+                    if mark == "tombstone":
+                        conn.execute("INSERT INTO purged_wallets VALUES (?, 1, 'infra')", (WA,))
+                output = StringIO()
+                with mock.patch.object(infra, "SUPPLEMENT", supplement), redirect_stdout(output):
+                    self.assertEqual(run_ranker(db, out, "--universe-from-trades", "--floor-tstat", "0.1"), 0)
+                rows = read_csv_rows(str(Path(out) / "ranked_72hr_buyandhold.csv"))
+                self.assertEqual([r["wallet"] for r in rows], [WB])
+                self.assertIn(f"[infra-excluded] 1 wallet(s) that ever carried an infra mark: {WA}",
+                              output.getvalue())
+
+    def test_reader_without_exclusion_tables_and_malformed_supplements(self):
+        committed = infra.parse_supplement(infra.SUPPLEMENT.read_text(encoding="utf-8"))
+        self.assertGreaterEqual(len(committed), 78)
+        with sqlite3.connect(":memory:") as conn:
+            conn.execute("CREATE TABLE trades (wallet_hex TEXT)")
+            self.assertEqual(infra.ever_infra_wallets(conn), committed)
+        for bad in ("0xabc", WA.upper(), WA + " ", " " + WA, WA + "\n" + WA):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                infra.parse_supplement(bad + "\n")
+        # The binary's `str::lines`: only `\n` and `\r\n` end a line; a bare final `\r` stays.
+        self.assertEqual(infra.parse_supplement(f"# note\r\n\r\n{WA}\r\n"), {WA})
+        self.assertEqual(infra.parse_supplement(f"# note\r{WA}\n{WB}\n"), {WB})
+        for bad in (WA + "\x0c", WA + "\u2028", WA + "\r"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                infra.parse_supplement(bad)
 
 
 class QuarantineSnapshotTest(unittest.TestCase):

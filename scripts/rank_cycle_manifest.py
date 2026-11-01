@@ -14,6 +14,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from ever_infra_wallets import ever_infra_wallets
 from partial_backfill_wallets import partial_backfill_wallets
 
 MANIFEST_VERSION = 1
@@ -709,18 +710,21 @@ def _candidate_obligations(side: sqlite3.Connection, head: dict | None, *, compl
                            window_start: int | None, window_end: int | None,
                            market_floor: int | None, fill_window: int, scope: dict) -> bool:
     holds = []
+    # A wallet that ever carried an infra mark is excluded, never a hold or successor (#826).
+    ever_infra = ever_infra_wallets(side)
     # Rules 1 and 2 also apply before the initial collection and on frozen resumes.
-    for wallet, active, infra, tombstoned, tradeable in side.execute("""SELECT w.wallet_hex, w.is_active, w.is_infra,
+    for wallet, active, tombstoned, tradeable in side.execute("""SELECT w.wallet_hex, w.is_active,
             EXISTS(SELECT 1 FROM purged_wallets p WHERE p.wallet_hex = w.wallet_hex),
             EXISTS(SELECT 1 FROM active_tradeable_wallets a WHERE a.wallet_hex = w.wallet_hex)
             FROM wallets w WHERE (w.source_bits & 256) != 0 ORDER BY w.wallet_hex"""):
         if wallet in EXCHANGE_CONTRACTS:
             continue
+        if wallet in ever_infra:
+            print(f"   [infra-excluded] {wallet}: participant", file=sys.stderr)
+            continue
         reasons = []
         if not active:
             reasons.append("inactive participant")
-        if infra:
-            reasons.append("flagged participant")
         if tombstoned:
             reasons.append("tombstoned participant")
         if not tradeable:
@@ -733,7 +737,7 @@ def _candidate_obligations(side: sqlite3.Connection, head: dict | None, *, compl
             holds.append(reason)
     successor = False
     if head is not None:
-        # Rule 3: mirror ActivityWalletReceiptProof::partial(), after the E11 exceptions.
+        # Rule 3: mirror ActivityWalletReceiptProof::partial(), after the infra (#826) and E11 exceptions.
         for wallet, raw, reason, count, pages in side.execute("""SELECT wallet_hex, acquisition_json,
                 exclusion_reason, aggregate_count, page_evidence_json
                 FROM activity_wallet_coverage_staging_v2 WHERE generation = ? ORDER BY wallet_hex""",
@@ -745,7 +749,9 @@ def _candidate_obligations(side: sqlite3.Connection, head: dict | None, *, compl
                 continue
             kind = acquisition.get("exclusion_reason") if acquisition is not None else None
             text = reason or kind or "excluded activity receipt without a reason"
-            if (UNREPRESENTABLE_PRICE in text or UNREPRESENTABLE_MAPPING in text
+            if wallet in ever_infra:
+                print(f"   [infra-excluded] {wallet}: {text}", file=sys.stderr)
+            elif (UNREPRESENTABLE_PRICE in text or UNREPRESENTABLE_MAPPING in text
                     or (ACTIVITY_RESPONSE_JSON in text and UNREPRESENTABLE_DECIMAL in text)):
                 print(f"   [unrepresentable-row] {wallet}: {text}", file=sys.stderr)
             elif ACTIVITY_PAGE_PARSE_FAILURE in text or ACTIVITY_RESPONSE_JSON in text:
@@ -762,7 +768,7 @@ def _candidate_obligations(side: sqlite3.Connection, head: dict | None, *, compl
     if completed:
         # Rule 4: finalize uses the head's frozen wallet list and inclusive end.
         active = {row[0] for row in side.execute("SELECT wallet_hex FROM active_tradeable_wallets")}
-        successor |= bool(active - set(head["wallets"]))
+        successor |= bool(active - ever_infra - set(head["wallets"]))
         successor |= window_end is not None and head["fixed_end_unix"] < window_end - 1 + fill_window
     return successor
 

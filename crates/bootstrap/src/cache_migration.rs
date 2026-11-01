@@ -88,6 +88,46 @@ const FRESH_COLLECTION_VERSION: u32 = 1;
 const MAX_ACTIVITY_WALLET_FETCHES: usize = 32;
 /// Shared proved walk rows held through wallet commit (`docs/_GLOSSARY.md`).
 const ACTIVITY_WALK_HELD_ROWS: u64 = 2_000_000;
+/// Wallets whose infra mark no cache still holds (#826); the binary carries the file it was built with.
+const EVER_INFRA_SUPPLEMENT: &str = include_str!("../../../deploy/forge/ever-infra-wallets.txt");
+/// Receipt reason of a wallet excluded because it ever carried an infra mark (#826).
+const INFRA_EXCLUSION_REASON: &str = "infra exclusion (owner 2026-10-31)";
+
+/// The supplement's wallets: one lowercase `0x` + 40 hex per line, `#` comment lines.
+fn parse_ever_infra_supplement(text: &str) -> Result<BTreeSet<String>, BootstrapError> {
+    let mut wallets = BTreeSet::new();
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let canonical = line.strip_prefix("0x").is_some_and(|hex| {
+            hex.len() == 40
+                && hex
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        });
+        if !canonical || !wallets.insert(line.to_owned()) {
+            return invalid(format!(
+                "ever-infra supplement line is not a new canonical wallet: {line}"
+            ));
+        }
+    }
+    Ok(wallets)
+}
+
+/// Every wallet that ever carried an infra mark (#826): the cache's infra tombstones and live
+/// flags plus the supplement. Collection never reads, repairs or rescans one.
+fn ever_infra_wallets(connection: &Connection) -> Result<BTreeSet<String>, BootstrapError> {
+    let mut wallets = parse_ever_infra_supplement(EVER_INFRA_SUPPLEMENT)?;
+    let mut statement = connection.prepare(
+        "SELECT wallet_hex FROM purged_wallets WHERE reason = 'infra'
+         UNION SELECT wallet_hex FROM wallets WHERE is_infra = 1",
+    )?;
+    for wallet in statement.query_map([], |row| row.get::<_, String>(0))? {
+        wallets.insert(wallet?);
+    }
+    Ok(wallets)
+}
 
 struct ActivityCollectionLimits {
     wallet_budget: Option<Duration>,
@@ -1675,7 +1715,13 @@ fn begin_or_resume_fresh_collection(
             certificate.write(&transaction)?;
         }
     }
-    let mut repairs = selected_full_reads.to_vec();
+    // An infra wallet is never repaired: its retained history stays as certified (#826).
+    let infra = ever_infra_wallets(&transaction)?;
+    let mut repairs = selected_full_reads
+        .iter()
+        .filter(|wallet| !infra.contains(wallet.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
     repairs.sort();
     repairs.dedup();
     let record = FreshCollectionIdentity::new(
@@ -2098,6 +2144,9 @@ async fn collect_activity_v2(
     let reads = stream::iter(missing.into_iter().map(|wallet_hex| async move {
         if proof_ref.is_some_and(|proof| proof.deferred(&wallet_hex)) {
             return Ok(excluded_completion(wallet_hex, "dormant_deferred".to_owned(), fixed_end_unix));
+        }
+        if proof_ref.is_some_and(|proof| proof.infra_excluded(&wallet_hex)) {
+            return Ok(excluded_completion(wallet_hex, INFRA_EXCLUSION_REASON.to_owned(), fixed_end_unix));
         }
         let wallet =
             WalletAddress::from_hex(&wallet_hex).map_err(|error| BootstrapError::Invalid {
@@ -2816,6 +2865,11 @@ struct ActivityAcquisition {
 }
 
 impl ActivityWalletReceiptProof {
+    /// An infra exclusion (#826) never replaces retained history, not even for a frozen repair.
+    fn infra_excluded(&self) -> bool {
+        self.exclusion_reason.as_deref() == Some(INFRA_EXCLUSION_REASON)
+    }
+
     fn partial(&self) -> bool {
         self.acquisition.as_ref().is_some_and(|acquisition| {
             acquisition.version == 3
@@ -7397,6 +7451,57 @@ mod quiet_identity_tests {
         let (pending, digest) = copy_to_pending(&source, &target).unwrap();
         adopt_pending(&pending, &target, Some(&digest)).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), bytes);
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "a broken fixture must fail its test")]
+mod ever_infra_tests {
+    use super::*;
+
+    // PASS (#826): the embedded supplement parses; only `\n` and `\r\n` end a line (the Python
+    // reader splits the same way); a malformed or repeated line refuses; and the set is the supplement
+    // plus the cache's infra tombstones and live flags, nothing else.
+    // FAIL: a malformed supplement is accepted, or the set gains or loses a wallet.
+    #[test]
+    fn supplement_parses_strictly_and_joins_the_cache_marks() {
+        let embedded = parse_ever_infra_supplement(EVER_INFRA_SUPPLEMENT).unwrap();
+        assert!(embedded.len() >= 78);
+        let [a, b] = ["ab", "cd"].map(|byte| format!("0x{}", byte.repeat(20)));
+        assert_eq!(
+            parse_ever_infra_supplement(&format!("# note\r\n\r\n{a}\r\n")).unwrap(),
+            BTreeSet::from([a.clone()])
+        );
+        assert_eq!(
+            parse_ever_infra_supplement(&format!("# note\r{a}\n{b}\n")).unwrap(),
+            BTreeSet::from([b.clone()])
+        );
+        for text in [
+            format!("{a}\n{a}\n"),
+            a.to_uppercase().replacen("0X", "0x", 1),
+            a.trim_start_matches("0x").to_owned(),
+            format!("{a}0"),
+            format!(" {a}"),
+            format!("{a}\u{c}"),
+            format!("{a}\u{2028}"),
+            format!("{a}\r"),
+        ] {
+            assert!(parse_ever_infra_supplement(&text).is_err(), "{text:?}");
+        }
+        let [tombstone, loser, flag, plain] =
+            ["01", "02", "03", "04"].map(|byte| format!("0x{}", byte.repeat(20)));
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE purged_wallets (wallet_hex TEXT, reason TEXT, purged_at_unix INTEGER);
+                 CREATE TABLE wallets (wallet_hex TEXT, is_infra INTEGER);
+                 INSERT INTO purged_wallets VALUES ('{tombstone}', 'infra', 1), ('{loser}', 'proven_loser', 1);
+                 INSERT INTO wallets VALUES ('{flag}', 1), ('{plain}', 0);"
+            ))
+            .unwrap();
+        let mut expected = embedded;
+        expected.extend([tombstone, flag]);
+        assert_eq!(ever_infra_wallets(&connection).unwrap(), expected);
     }
 }
 

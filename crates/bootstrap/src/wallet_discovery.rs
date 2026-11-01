@@ -1664,6 +1664,7 @@ mod tests {
         assert!(!cache.is_purged(&wallet(1)).unwrap());
         assert!(cache.is_purged(&wallet(3)).unwrap());
         assert_eq!(cache.wallet_pile_size().unwrap(), 2);
+        // An inherited infra flag is permanent, participants included (#826).
         assert_eq!(
             cache
                 .raw_conn_for_test()
@@ -1673,7 +1674,7 @@ mod tests {
                     |row| row.get(0)
                 )
                 .unwrap(),
-            0
+            1
         );
         cache
             .raw_conn_for_test()

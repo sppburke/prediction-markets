@@ -81,7 +81,7 @@ With a $10k paper bankroll and per-trade Kelly fraction of 0.25, a 10-wallet coh
 ### When a wallet should be dropped without waiting for re-evaluation
 
 - No trades in 30 days (wallet inactive).
-- Wallet identified as infrastructure / market-maker (check `is_infra` in wallet_cache).
+- Wallet that ever carried an infra mark: an infra tombstone or `is_infra` flag in wallet_cache, or a line of `deploy/forge/ever-infra-wallets.txt` (#826; the ranking already excludes these).
 - Wallet's recent on-chain activity shows large withdrawals (operator exiting).
 
 In these cases, remove the wallet from `watchlist-production-n<N>.json` manually and restart the service. File a note in the issue tracker so the next monthly re-evaluation accounts for the slot.

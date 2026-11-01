@@ -582,7 +582,8 @@ count) →
 The production wrapper performs no infrastructure or ordinary purge; exclusions gate
 acquisition (discovery, activation, and backfill), and production rank/export applies
 trade-recency, current-eligibility and schema-one completeness filters without deleting history
-(`docs/37`).
+(`docs/37`). Every wallet that ever carried an infra mark gets an excluded receipt with no read in
+fresh collection and never reaches finalize, ranking or publication (#826, `docs/37` §6).
 `resolutions` performs a full CLOB closed-market re-walk, backfills missing
 schedule `end_date`s, then audits and repairs every traded, scheduled past-end
 market still missing a terminal row. The subcommand runs the full
@@ -927,9 +928,6 @@ no frozen reference narrows it. Classifier 6 never finalizes a format-2 head.
 pe-bootstrap cache-stage-v2 --db "$FIXED_PHYSICAL" --prior "$PRIOR" --side "$SIDE" \
   --manifest "$CACHE_BUILD_MANIFEST"
 pe-bootstrap cache-migrate-v2 --db "$SIDE" --manifest "$CACHE_BUILD_MANIFEST"   # unsealed candidate only
-# Fresh copy only (cache_stage.json "resumed": false), once per line of
-# deploy/forge/reviewed-infra-clears.txt, in file order (docs/37 §7):
-pe-bootstrap clear-infra-exclusion --db "$SIDE" --wallet "$WALLET" --purged-at "$PURGED_AT" --confirm
 # Skipped on a retried cycle whose candidate already records $BATCH in wallet_activation_batches
 # (rank_cycle_manifest.py activation-batch; an unreadable probe exits 2) (#788):
 pe-bootstrap winner-discovery --db "$SIDE" --defer-activation \
@@ -1187,14 +1185,17 @@ where inputs exist, and always after collection before payout or request creatio
 `candidate-targets` applies these ordered obligations (#821):
 
 1. Hold on every participant-tagged wallet outside `active_tradeable_wallets` or carrying a
-   tombstone, naming each wallet's inactive/flagged/tombstoned reason. The four exchange contracts
-   stay blocked. Participants skipped for kept `infra` tombstones receive no new participant row
+   tombstone, naming each wallet's inactive/tombstoned reason, except an ever-infra wallet (an infra
+   tombstone or flag, or a line of `deploy/forge/ever-infra-wallets.txt`): it is named as
+   `[infra-excluded]` and never held (#826). The four exchange contracts stay blocked. Participants skipped for kept `infra` tombstones receive no new participant row
    and are reported separately, not silently admitted.
 2. Hold unless persisted participant coverage matches the cycle's recurrences and pin, has a
    market floor at or before the cycle's, starts at or before its window start and reaches the
    exclusive end `win_end + FILL_WINDOW_SECS`. A recorded activation batch never waives this:
    print wallets can first appear after the entry window ends.
-3. Classify each head exclusion once from its recorded receipt. First, unrepresentable price,
+3. Classify each head exclusion once from its recorded receipt. First, any exclusion of an
+   ever-infra wallet is named as `[infra-excluded]`, with no hold and no successor (#826). Next,
+   unrepresentable price,
    condition/outcome mapping and decimal tokens rejected by the exact-decimal parser are the
    owner's parser exception: name the wallet and reason every cycle, but neither hold nor take a
    successor for it, even when it has proved windows. Other parse failures (including a response
@@ -1202,7 +1203,7 @@ where inputs exist, and always after collection before payout or request creatio
    require a successor; no-progress failures, aggregation failures and collisions hold. Name every
    held wallet and reason.
 4. Take linked successors while a proved partial or historical deferral remains, an active
-   tradeable wallet is absent from the head's frozen wallet list, or the head's inclusive fixed
+   tradeable wallet other than an ever-infra one is absent from the head's frozen wallet list, or the head's inclusive fixed
    end precedes `win_end − 1 + FILL_WINDOW_SECS`. This covers participants admitted after the head
    froze and the final print second. Each successor resumes or completes under its recorded proof.
 5. After those obligations clear, apply the unchanged maximum-age policy. Only the initial head
@@ -1863,10 +1864,10 @@ many with long histories. Measure their certified sizes in the old cache first.
 
 **2026-10-31 participant gate (#821).** Before installing or superseding the retained first
 request, accept and archive the read-only full-window sweep and its hashes (`docs/27`), then
-size the complete participant cohort and unfinished histories against available capacity. Keep
-the May `infra` tombstones under the owner's 11:49 CT amendment (`docs/37`); name their skipped
-participants and all unrepresentable-row exclusions in every cycle's report until their separate
-capacity/parser fixes ship. If the preview no longer fits, hold for the owner. This release
+size the complete participant cohort and unfinished histories against available capacity. Infra
+marks are permanent (owner, 2026-10-31 ~10 PM CT, #826; `docs/37` §6); name skipped and excluded
+infra wallets in every cycle's report, and all unrepresentable-row exclusions until the parser fix
+ships. If the preview no longer fits, hold for the owner. This release
 changes no pe-service state or already-published batch.
 
 **Checkout** (no downtime; the old loop keeps running), with this release:
@@ -1965,8 +1966,8 @@ below; a recorded batch of zero stays unchanged and cannot waive participant/cov
    /mnt/storage/prediction-markets/data/eval-results --since <gen 26's cycle> --candidate <the prepared
    cycle>` and explain every wallet it lists (an exclusion record is not coverage): a wallet missing
    because of the cache change (not seeded, excluded only by the new cache, or its history read
-   differently) holds the switch for the owner, while one that only left the ranking window does not
-   (whole universes churn between cycles; the frozen tools compare chosen wallets, with their
+   differently) holds the switch for the owner, while one that only left the ranking window, or that
+   ever carried an infra mark (#826), does not (whole universes churn between cycles; the frozen tools compare chosen wallets, with their
    registered fallback, and decide research coverage); record pe-service's mode. Then set `PE_RANK_SCHEMA_TWO_CUTOVER=1` in the new `.env` and
    run `--resume-pending` (a prepared request resumes only under `1`).
 7. After pe-service applies the batch and research accepts the linked cycle, qualify nonzero
@@ -2074,7 +2075,8 @@ fit, hold the revert and report the shortfall: every retained cache role stays a
 of it needs the owner's yes. Record the old loop's admission setting and run its first cycle
 under `prepare` with `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0`; until 11/30 01:00 UTC pass the frozen
 merger check and `research-coverage` against it (the root holds the new loop's linked cycles; a wallet
-missing because of the switch back holds the publication for the owner); always run
+missing because of the switch back holds the publication for the owner; one that ever carried an infra
+mark is explained by #826 and does not); always run
 `scripts/rank_cycle_manifest.py drops-cover --source
 /mnt/t7/cache-15m5m/wallet_cache.db --target <the old loop's prepared candidate>`: any drop the
 candidate does not keep as early holds the publication for the owner with both loops stopped (drops
