@@ -60,7 +60,8 @@ pairing: both discovery and backfill defer the global rule, and one
 `bootstrap_pipeline_activation_batch_wallets`, records the exact batch in
 SQLite, and exports `activated_wallets.csv` into the run directory. Empty or
 partially depleted candidate piles warn. In the private-candidate lane, any participant still
-inactive, flagged or tombstoned holds before collection; the batch cap cannot silently omit it.
+inactive or tombstoned holds before collection, except an ever-infra one, which is excluded and named
+(#826); the batch cap cannot silently omit it.
 
 The [one-time classifier-6 catch-up](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md#classifier-6-catch-up-and-coordinated-release-739)
 records an activation batch of zero. Before the first ordinary cycle, the owner selects the
@@ -123,10 +124,10 @@ the read's start as its floor. Bounds and request spacing are canonical in
 Valid `proxyWallet` addresses are canonicalized to lowercase and deduplicated before tagging with
 `SRC_MARKET_PARTICIPANT`. A row without a valid wallet makes the chunk incomplete; its page hash
 is logged, and no participant from that run is upserted. Preferred activation eligibility is the
-same as datadash, including already-known inactive wallets. Under the owner's 2026-10-31 decision,
-participant upserts lift `proven_loser` tombstones and clear inherited live infra flags, while
-`infra` tombstones and the four exchange contracts stay blocked (`docs/37` §6–7). Each skipped
-infra-tombstoned participant is logged by wallet and counted. Normal history acquisition,
+same as datadash, including already-known inactive wallets. Under the owner's 2026-10-31 decisions,
+participant upserts lift `proven_loser` tombstones, while infra marks are permanent (#826): `infra`
+tombstones stay blocked, a live `is_infra` flag is kept, and the four exchange contracts stay blocked
+(`docs/37` §6). Each skipped infra-tombstoned participant is logged by wallet and counted. Normal history acquisition,
 eligibility, ranking and sizing still apply.
 
 Completed coverage lives in the dedicated `meta` key
@@ -195,8 +196,8 @@ Then ordinary discovery reads only the recent tail from the imported coverage.
 
 Disabling discovery with `PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS=0` leaves coverage and previously
 admitted wallets intact. It cannot waive coverage or admission holds; a disabled run supplies no
-new proof. Every cycle's report names unrepresentable-row exclusions and kept `infra` participants
-until their separate fixes ship. Build the latter list from the archived accepted union's
+new proof. Every cycle's report names infra participants (skipped or excluded, #826) and, until the
+parser fix ships, unrepresentable-row exclusions. Build the latter list from the archived accepted union's
 infra-tombstoned members plus all later discovery skip logs kept with the reports; a resumed
 cycle can skip discovery, so one invocation's log is insufficient.
 
@@ -229,20 +230,14 @@ cycle can skip discovery, so one invocation's log is insufficient.
 - **Infrastructure exclusions do not require deletion.** Ordinary publication is
   purge-free. A cold-probe flag (`is_infra = 1`, no tombstone) and a historical
   `reason='infra'` tombstone are both enforced at acquisition time: discovery skips an
-  infra-tombstoned wallet, while participant rediscovery clears inherited live flags and lifts
+  infra-tombstoned wallet, and participant rediscovery keeps live flags while lifting
   `proven_loser` tombstones; activation requires `is_infra = 0` and no tombstone, and backfill selects
-  through `active_tradeable_wallets`, so an excluded wallet accrues no trades.
-  Ranking/export/publisher filters do not consult either (`docs/37`); the private-candidate
-  wrapper separately holds on participant flags/tombstones. Direct `purge-infra` is
-  report-only while `PE_BOOTSTRAP_PURGE_ENABLED=false`. Outside the participant exception,
-  reclassification requires
-  the explicit operator-only `clear-infra-exclusion --wallet <hex> --confirm` command; it
-  removes the infra tombstone and clears a live flag, and does not recreate or activate the
-  wallet. With `--purged-at <unix>` it removes only the tombstone stamped at that second and no
-  flag; the wrapper runs that form for each line of `deploy/forge/reviewed-infra-clears.txt`
-  on each fresh cycle's private copy (`docs/37` §7). A cleared active wallet with no fetch stamp (the cold-probe shape) becomes due for
-  backfill at once and is probed again on its newest page; a wallet flagged after ingestion
-  resumes incremental backfill once its stamp is stale, without a new probe.
+  through `active_tradeable_wallets`, so an excluded wallet accrues no trades. Fresh collection
+  gives every ever-infra wallet (marks plus `deploy/forge/ever-infra-wallets.txt`) an excluded
+  receipt with no read, pass 1 drops it from its candidates, and the completion rules never hold
+  or wait for it (#826, `docs/37` §6). Direct `purge-infra` is report-only while
+  `PE_BOOTSTRAP_PURGE_ENABLED=false`. Infra marks are permanent: no command clears one
+  (`clear-infra-exclusion` and the reviewed-clear list are retired).
 - **`CacheMutationLock`** is a persistent-inode, kernel-held lock acquired before
   every read-write wallet-cache open. Production coordination follows the sole
   loop → one-shot run → cache order; true read-only probes use

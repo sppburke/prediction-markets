@@ -56,6 +56,7 @@ import csv
 import math
 import os
 import sqlite3
+from ever_infra_wallets import ever_infra_wallets
 from partial_backfill_wallets import partial_backfill_wallets
 import sys
 import time
@@ -519,6 +520,11 @@ def main() -> int:
         log(f"universe: {len(wallets)} wallets ({universe_label})")
 
     wallets = exclude_partial_backfills(conn, wallets, schema_version)
+    # Never a candidate (#826); an archived projection keeps their prints in the tape.
+    infra = ever_infra_wallets(conn)
+    if excluded := [wallet for wallet in wallets if wallet in infra]:
+        log(f"[infra-excluded] {len(excluded)} wallet(s) that ever carried an infra mark: {' '.join(excluded)}")
+        wallets = [wallet for wallet in wallets if wallet not in infra]
     if prm.limit_wallets > 0:
         wallets = wallets[:prm.limit_wallets]
     log(f"universe after completeness filter and limit: {len(wallets)} wallets")

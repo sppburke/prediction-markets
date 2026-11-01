@@ -88,6 +88,46 @@ const FRESH_COLLECTION_VERSION: u32 = 1;
 const MAX_ACTIVITY_WALLET_FETCHES: usize = 32;
 /// Shared proved walk rows held through wallet commit (`docs/_GLOSSARY.md`).
 const ACTIVITY_WALK_HELD_ROWS: u64 = 2_000_000;
+/// Wallets whose infra mark no cache still holds (#826); the binary carries the file it was built with.
+const EVER_INFRA_SUPPLEMENT: &str = include_str!("../../../deploy/forge/ever-infra-wallets.txt");
+/// Receipt reason of a wallet excluded because it ever carried an infra mark (#826).
+const INFRA_EXCLUSION_REASON: &str = "infra exclusion (owner 2026-10-31)";
+
+/// The supplement's wallets: one lowercase `0x` + 40 hex per line, `#` comment lines.
+fn parse_ever_infra_supplement(text: &str) -> Result<BTreeSet<String>, BootstrapError> {
+    let mut wallets = BTreeSet::new();
+    for line in text.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let canonical = line.strip_prefix("0x").is_some_and(|hex| {
+            hex.len() == 40
+                && hex
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        });
+        if !canonical || !wallets.insert(line.to_owned()) {
+            return invalid(format!(
+                "ever-infra supplement line is not a new canonical wallet: {line}"
+            ));
+        }
+    }
+    Ok(wallets)
+}
+
+/// Every wallet that ever carried an infra mark (#826): the cache's infra tombstones and live
+/// flags plus the supplement. Collection never reads, repairs or rescans one.
+fn ever_infra_wallets(connection: &Connection) -> Result<BTreeSet<String>, BootstrapError> {
+    let mut wallets = parse_ever_infra_supplement(EVER_INFRA_SUPPLEMENT)?;
+    let mut statement = connection.prepare(
+        "SELECT wallet_hex FROM purged_wallets WHERE reason = 'infra'
+         UNION SELECT wallet_hex FROM wallets WHERE is_infra = 1",
+    )?;
+    for wallet in statement.query_map([], |row| row.get::<_, String>(0))? {
+        wallets.insert(wallet?);
+    }
+    Ok(wallets)
+}
 
 struct ActivityCollectionLimits {
     wallet_budget: Option<Duration>,
@@ -1675,7 +1715,13 @@ fn begin_or_resume_fresh_collection(
             certificate.write(&transaction)?;
         }
     }
-    let mut repairs = selected_full_reads.to_vec();
+    // An infra wallet is never repaired: its retained history stays as certified (#826).
+    let infra = ever_infra_wallets(&transaction)?;
+    let mut repairs = selected_full_reads
+        .iter()
+        .filter(|wallet| !infra.contains(wallet.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
     repairs.sort();
     repairs.dedup();
     let record = FreshCollectionIdentity::new(
@@ -2098,6 +2144,9 @@ async fn collect_activity_v2(
     let reads = stream::iter(missing.into_iter().map(|wallet_hex| async move {
         if proof_ref.is_some_and(|proof| proof.deferred(&wallet_hex)) {
             return Ok(excluded_completion(wallet_hex, "dormant_deferred".to_owned(), fixed_end_unix));
+        }
+        if proof_ref.is_some_and(|proof| proof.infra_excluded(&wallet_hex)) {
+            return Ok(excluded_completion(wallet_hex, INFRA_EXCLUSION_REASON.to_owned(), fixed_end_unix));
         }
         let wallet =
             WalletAddress::from_hex(&wallet_hex).map_err(|error| BootstrapError::Invalid {

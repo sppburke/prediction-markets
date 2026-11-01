@@ -509,6 +509,7 @@ pub(super) struct CollectionProof {
     pub(super) history: Option<Arc<HistoryProof>>,
     data_version: i64,
     large_certified_wallets: BTreeSet<String>,
+    infra: BTreeSet<String>,
 }
 
 impl CollectionProof {
@@ -580,6 +581,7 @@ impl CollectionProof {
             .as_ref()
             .map(|(manifest, identity)| manifest_link(manifest, identity))
             .transpose()?;
+        let infra = super::ever_infra_wallets(connection)?;
         let after: i64 = connection.pragma_query_value(None, "data_version", |row| row.get(0))?;
         if after != data_version {
             return invalid("collection changed externally while loading proof".to_owned());
@@ -592,6 +594,7 @@ impl CollectionProof {
             history,
             data_version,
             large_certified_wallets,
+            infra,
         }))
     }
 
@@ -626,6 +629,11 @@ impl CollectionProof {
                     .binary_search_by(|w| w.as_str().cmp(wallet))
                     .is_ok()
             })
+    }
+
+    /// A wallet that ever carried an infra mark (#826): nothing is read and its history stays as certified.
+    pub(super) fn infra_excluded(&self, wallet: &str) -> bool {
+        self.infra.contains(wallet)
     }
 
     pub(super) fn start(&self, wallet: &str) -> i64 {
@@ -1960,7 +1968,8 @@ fn commit_history_wallet(
             )?)
             .map_err(|_| BootstrapError::Internal)?;
         } else if excluded && !partial {
-            if !proof.deferred(wallet) && chain.has_history_proof() {
+            if !proof.deferred(wallet) && !proof.infra_excluded(wallet) && chain.has_history_proof()
+            {
                 chain.verify_stored(
                     scan,
                     &transaction,

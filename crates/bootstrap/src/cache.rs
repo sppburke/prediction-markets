@@ -3269,8 +3269,8 @@ impl WalletCache {
     /// pass `0` when V1/V2 attribution is unavailable; the enumeration path
     /// passes the bit from `topic_to_contract_version_bit`.
     pub fn upsert_wallets_bulk(&mut self, rows: &[WalletUpsertRow]) -> Result<(), BootstrapError> {
-        // Participants lift proven-loser exclusions and inherited flags; infra
-        // tombstones remain subject to explicit operator clearance.
+        // Participants lift proven-loser exclusions; infra tombstones and flags
+        // are permanent (#826).
         let mut purged = self.load_purged_reasons()?;
         let tx = self.conn.transaction()?;
         let mut skipped_infra = HashSet::new();
@@ -3283,7 +3283,7 @@ impl WalletCache {
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(wallet_hex) DO UPDATE SET \
                     source_bits = source_bits | excluded.source_bits, \
-                    is_infra = CASE WHEN (excluded.source_bits & ", crate::pile::SRC_MARKET_PARTICIPANT, ") != 0 THEN excluded.is_infra ELSE MAX(is_infra, excluded.is_infra) END, \
+                    is_infra = MAX(is_infra, excluded.is_infra), \
                     dune_first_seen_unix = COALESCE(excluded.dune_first_seen_unix, dune_first_seen_unix), \
                     dune_closed_markets = COALESCE(excluded.dune_closed_markets, dune_closed_markets), \
                     dune_win_rate_bps = COALESCE(excluded.dune_win_rate_bps, dune_win_rate_bps), \
@@ -3306,9 +3306,7 @@ impl WalletCache {
                     continue;
                 }
                 if let Some(reason) = purged.get(wallet) {
-                    // Infrastructure exclusions are permanent under ordinary
-                    // discovery. Only the explicit operator clearance command
-                    // may remove them.
+                    // Infrastructure exclusions are permanent (#826).
                     if reason != "infra"
                         && ((bits & crate::pile::TOMBSTONE_OVERRIDE_SOURCES) != 0
                             || (participant && reason == "proven_loser"))
@@ -3362,43 +3360,6 @@ impl WalletCache {
             .prepare("SELECT wallet_hex, reason FROM purged_wallets")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         Ok(rows.collect::<Result<std::collections::HashMap<_, _>, _>>()?)
-    }
-
-    /// Remove one infrastructure exclusion in both shapes it takes: the durable
-    /// `purged_wallets(reason='infra')` tombstone left by a historical
-    /// `purge-infra`, and a live `wallets.is_infra = 1` flag (the only shape the
-    /// cold probe writes since purge retirement, #544). Returns `true` when
-    /// either existed. This does not recreate or activate the wallet: a
-    /// tombstone-only wallet needs a later discovery to re-admit it, and a
-    /// flagged wallet keeps its `is_active`; an active one with no fetch stamp
-    /// becomes due for backfill at once, where the cold probe classifies it
-    /// again on its newest page (`docs/37`).
-    pub fn clear_infra_exclusion(&mut self, wallet_hex: &str) -> Result<bool, BootstrapError> {
-        let tx = self.conn.transaction()?;
-        let tombstones = tx.execute(
-            "DELETE FROM purged_wallets WHERE wallet_hex = ?1 AND reason = 'infra'",
-            params![wallet_hex],
-        )?;
-        let flags = tx.execute(
-            "UPDATE wallets SET is_infra = 0 WHERE wallet_hex = ?1 AND is_infra = 1",
-            params![wallet_hex],
-        )?;
-        tx.commit()?;
-        Ok(tombstones == 1 || flags == 1)
-    }
-
-    /// Clear only the reviewed infra tombstone at this exact second, preserving
-    /// any later tombstone and live `is_infra` flag.
-    pub fn clear_infra_exclusion_at(
-        &self,
-        wallet_hex: &str,
-        purged_at_unix: i64,
-    ) -> Result<bool, BootstrapError> {
-        let deleted = self.conn.execute(
-            "DELETE FROM purged_wallets WHERE wallet_hex = ?1 AND reason = 'infra' AND purged_at_unix = ?2",
-            params![wallet_hex, purged_at_unix],
-        )?;
-        Ok(deleted == 1)
     }
 
     /// Whether a wallet is currently tombstoned (issue #385).

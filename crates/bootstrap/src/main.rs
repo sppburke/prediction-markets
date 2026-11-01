@@ -39,6 +39,12 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let first_arg = args.get(1).map(|s| s.as_str());
+    // Infra marks are permanent (#826). The removed command must not fall through to the
+    // positional-config default below, which would run `all` on the configured cache.
+    if first_arg == Some("clear-infra-exclusion") {
+        tracing::error!("clear-infra-exclusion was removed: infra marks are permanent (#826)");
+        std::process::exit(1);
+    }
 
     // ── Subcommand dispatch ──────────────────────────────────────────────────
     // Precedence: named subcommands > flag-style args > positional TOML path.
@@ -72,7 +78,6 @@ async fn main() {
                 | "purge"
                 | "activate-next"
                 | "purge-infra"
-                | "clear-infra-exclusion"
                 | "recover-reclamation"
                 | "reclamation-evidence"
                 | "cache-init"
@@ -116,11 +121,8 @@ async fn main() {
         let mut stage: Option<&str> = None;
         let mut reset_clob_cursor = false;
         let mut defer_activation = false;
-        let mut confirm = false;
         let mut batch_id: Option<&str> = None;
         let mut audit_csv: Option<std::path::PathBuf> = None;
-        let mut wallet_arg: Option<&str> = None;
-        let mut purged_at_arg: Option<&str> = None;
         let mut db_arg: Option<std::path::PathBuf> = None;
         let mut wallets_file_arg: Option<std::path::PathBuf> = None;
         let mut drops_from_arg: Option<std::path::PathBuf> = None;
@@ -170,8 +172,6 @@ async fn main() {
                 dry_run = true;
             } else if a == "--defer-activation" {
                 defer_activation = true;
-            } else if a == "--confirm" {
-                confirm = true;
             } else if a == "--held-loop-lock-fd" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -200,18 +200,6 @@ async fn main() {
                 audit_csv = Some(std::path::PathBuf::from(rest[i]));
             } else if let Some(v) = a.strip_prefix("--audit-csv=") {
                 audit_csv = Some(std::path::PathBuf::from(v));
-            } else if a == "--wallet" && i + 1 < rest.len() {
-                i += 1;
-                flag_values.insert(rest[i]);
-                wallet_arg = Some(rest[i]);
-            } else if let Some(v) = a.strip_prefix("--wallet=") {
-                wallet_arg = Some(v);
-            } else if a == "--purged-at" && i + 1 < rest.len() {
-                i += 1;
-                flag_values.insert(rest[i]);
-                purged_at_arg = Some(rest[i]);
-            } else if let Some(v) = a.strip_prefix("--purged-at=") {
-                purged_at_arg = Some(v);
             } else if a == "--dump-ledgers" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -416,29 +404,6 @@ async fn main() {
             tracing::error!("bootstrap: --create-cache is only supported by all");
             std::process::exit(1);
         }
-
-        let purged_at_unix = if rest
-            .iter()
-            .any(|a| *a == "--purged-at" || a.starts_with("--purged-at="))
-        {
-            if sub != "clear-infra-exclusion" {
-                tracing::error!(
-                    "bootstrap: --purged-at is only supported by clear-infra-exclusion"
-                );
-                std::process::exit(1);
-            }
-            match purged_at_arg.and_then(|value| value.parse::<i64>().ok()) {
-                Some(value) if value >= 0 => Some(value),
-                _ => {
-                    tracing::error!(
-                        "clear-infra-exclusion: --purged-at requires a nonnegative integer value"
-                    );
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            None
-        };
 
         // TOML path: last non-flag positional not consumed as a flag value.
         let toml_arg: Option<std::path::PathBuf> = rest
@@ -1398,69 +1363,6 @@ async fn main() {
                     1
                 }
             },
-
-            "clear-infra-exclusion" => {
-                if !confirm {
-                    tracing::error!("clear-infra-exclusion: --confirm is required");
-                    std::process::exit(1);
-                }
-                let Some(wallet) = wallet_arg else {
-                    tracing::error!("clear-infra-exclusion: --wallet <hex> is required");
-                    std::process::exit(1);
-                };
-                let normalized = match pe_core_types::WalletAddress::from_hex(wallet) {
-                    Ok(address) => address.to_string(),
-                    Err(e) => {
-                        tracing::error!(error = %e, "clear-infra-exclusion: invalid wallet");
-                        std::process::exit(1);
-                    }
-                };
-                if let Some(purged_at_unix) = purged_at_unix {
-                    match cache.clear_infra_exclusion_at(&normalized, purged_at_unix) {
-                        Ok(true) => {
-                            tracing::warn!(
-                                wallet = normalized,
-                                purged_at_unix,
-                                "clear-infra-exclusion: reviewed infra tombstone cleared"
-                            );
-                            0
-                        }
-                        Ok(false) => {
-                            tracing::info!(
-                                wallet = normalized,
-                                purged_at_unix,
-                                "clear-infra-exclusion: reviewed infra tombstone absent"
-                            );
-                            0
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, wallet = normalized, purged_at_unix, "clear-infra-exclusion: fatal");
-                            1
-                        }
-                    }
-                } else {
-                    match cache.clear_infra_exclusion(&normalized) {
-                        Ok(true) => {
-                            tracing::warn!(
-                                wallet = normalized,
-                                "clear-infra-exclusion: exclusion cleared (infra tombstone and/or live is_infra flag)"
-                            );
-                            0
-                        }
-                        Ok(false) => {
-                            tracing::error!(
-                                wallet = normalized,
-                                "clear-infra-exclusion: no infra tombstone or live is_infra flag for wallet"
-                            );
-                            1
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, wallet = normalized, "clear-infra-exclusion: fatal");
-                            1
-                        }
-                    }
-                }
-            }
 
             _ => unreachable!("known_sub filter restricts to known subcommand names"),
         };
