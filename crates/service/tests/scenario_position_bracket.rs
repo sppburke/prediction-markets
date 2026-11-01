@@ -8492,6 +8492,113 @@ async fn membership_cold_and_warm_bracket_acknowledgements_classify_identically(
                     paper.wallet_fences().unwrap().is_empty(),
                     "{case}/{direct}/{warm}"
                 );
+                let expected_scope = match case {
+                    "healthy" | "absent_no_token" | "unknown_group" | "removed_group" => None,
+                    "event_trade"
+                    | "conversion_token"
+                    | "unknown_token"
+                    | "ranker_group"
+                    | "ranker_zero_unknown"
+                    | "legacy_group"
+                    | "absent_token"
+                    | "grouped_market"
+                    | "flat_late_conversion" => Some(("event", "0xee".to_owned())),
+                    _ => Some(("market", condition(0x21))),
+                };
+                let actual_scopes = paper
+                    .wallet_scope_drops(&wallet, END)
+                    .unwrap()
+                    .into_iter()
+                    .map(|drop| (drop.scope_kind, drop.scope_id))
+                    .collect::<Vec<_>>();
+                let mut expected_scopes = expected_scope
+                    .into_iter()
+                    .map(|(kind, id)| (kind.to_owned(), id))
+                    .collect::<Vec<_>>();
+                let late = matches!(
+                    case,
+                    "partial" | "late_split" | "late_merge" | "covered" | "flat_late_conversion"
+                );
+                if late {
+                    expected_scopes.push(("market".to_owned(), condition(1)));
+                    expected_scopes.sort();
+                }
+                assert_eq!(actual_scopes, expected_scopes, "{case}/{direct}/{warm}");
+                let healthy_id = aggregate(activity(wallet, 1, "1", "healthy", 20), wallet)
+                    .group_id
+                    .key()
+                    .clone();
+                if !late {
+                    let demoted = !matches!(
+                        case,
+                        "healthy"
+                            | "market_drop"
+                            | "event_trade"
+                            | "absent_no_token"
+                            | "unknown_group"
+                            | "removed_group"
+                    );
+                    assert_eq!(
+                        paper
+                            .entry_gate_result(&healthy_id)
+                            .unwrap()
+                            .unwrap()
+                            .result,
+                        if demoted { "not_an_entry" } else { "admitted" },
+                        "{case}/{direct}/{warm}"
+                    );
+                } else {
+                    assert_eq!(
+                        paper
+                            .activity_group_state(&healthy_id)
+                            .unwrap()
+                            .unwrap()
+                            .disposition,
+                        if matches!(case, "covered" | "flat_late_conversion") {
+                            "anchor_covered_late"
+                        } else {
+                            "scope_dropped"
+                        },
+                        "{case}/{direct}/{warm}"
+                    );
+                    assert!(paper.entry_gate_result(&healthy_id).unwrap().is_none());
+                }
+                if !matches!(case, "healthy" | "market_drop") {
+                    let id = aggregate(problem.clone(), wallet).group_id.key().clone();
+                    let disposition = if matches!(case, "covered" | "flat_late_conversion") {
+                        "anchor_covered_late"
+                    } else if matches!(
+                        case,
+                        "absent_no_token" | "unknown_group" | "removed_group" | "revised"
+                    ) {
+                        "raw_only"
+                    } else {
+                        "scope_dropped"
+                    };
+                    assert_eq!(
+                        paper
+                            .activity_group_state(&id)
+                            .unwrap()
+                            .unwrap()
+                            .disposition,
+                        disposition,
+                        "{case}/{direct}/{warm}"
+                    );
+                    if case == "revised" {
+                        let revision = aggregate(problem.clone(), wallet)
+                            .semantic_revision
+                            .as_str()
+                            .to_owned();
+                        assert_eq!(
+                            paper
+                                .activity_revision_state(&id, &revision)
+                                .unwrap()
+                                .unwrap()
+                                .disposition,
+                            "scope_dropped"
+                        );
+                    }
+                }
                 let result = (
                     paper
                         .wallet_scope_drops(&wallet, END)

@@ -2358,18 +2358,6 @@ impl PaperStateDb {
         )?)
     }
 
-    /// Batch whose exact published group set is currently recorded.
-    pub fn ranker_group_batch(&self) -> Result<Option<i64>, PaperStateError> {
-        Ok(self
-            .lock()
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'ranker_group_batch'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?)
-    }
-
     /// Read the published batch and its exact group set under one connection lock.
     pub fn ranker_group_snapshot(
         &self,
@@ -2397,7 +2385,8 @@ impl PaperStateDb {
         let tx = conn.transaction()?;
         tx_record_scope_drop_boundary(&tx, recorded_at_unix)?;
         tx.commit()?;
-        Ok(())
+        drop(conn);
+        self.sync_checkpoint_dispositions()
     }
 
     /// First forward-only scope-drop write, or no boundary yet.
@@ -8760,7 +8749,7 @@ mod tests {
                 .map(|value| (*value).to_owned())
                 .collect::<BTreeSet<_>>()
         };
-        assert_eq!(db.ranker_group_batch().unwrap(), None);
+        assert_eq!(db.ranker_group_snapshot().unwrap().0, None);
         assert!(!db.scope_drop_batch_imported(10).unwrap());
         db.import_scope_drops(
             10,
@@ -8786,7 +8775,7 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(db.ranker_group_batch().unwrap(), Some(10));
+        assert_eq!(db.ranker_group_snapshot().unwrap().0, Some(10));
         assert!(!db.scope_drop_batch_imported(11).unwrap());
         assert!(db.is_group("a").unwrap());
         assert!(db.is_group("b").unwrap());
@@ -8802,7 +8791,7 @@ mod tests {
             &groups(&["b", "c"]),
         )
         .unwrap();
-        assert_eq!(db.ranker_group_batch().unwrap(), Some(11));
+        assert_eq!(db.ranker_group_snapshot().unwrap().0, Some(11));
         assert!(db.scope_drop_batch_imported(11).unwrap());
         assert!(db.is_group("a").unwrap()); // Local CLOB evidence outlives the batch's set.
         assert!(db.is_group("c").unwrap());
@@ -8821,7 +8810,7 @@ mod tests {
         .unwrap();
         db.import_scope_drops(9, &[], &groups(&["old-only"]))
             .unwrap();
-        assert_eq!(db.ranker_group_batch().unwrap(), Some(11));
+        assert_eq!(db.ranker_group_snapshot().unwrap().0, Some(11));
         assert!(db.scope_drop_batch_imported(9).unwrap());
         assert!(!db.is_group("old-only").unwrap());
         assert!(db.is_group("c").unwrap());
@@ -8839,7 +8828,7 @@ mod tests {
         assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
         drop(db);
         let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
-        assert_eq!(db.ranker_group_batch().unwrap(), Some(11));
+        assert_eq!(db.ranker_group_snapshot().unwrap().0, Some(11));
         assert!(db.is_group("c").unwrap());
         assert!(db.scope_drop_batch_imported(10).unwrap());
         db.import_scope_drops(12, &[], &BTreeSet::new()).unwrap();
@@ -8948,11 +8937,37 @@ mod tests {
         assert!(db.record_scope_drop_boundary(1000).is_err());
         db.rollback_batch().unwrap();
         assert_eq!(db.scope_drop_boundary_unix().unwrap(), None);
+        db.sync_checkpoint_dispositions().unwrap();
         db.record_scope_drop_boundary(1000).unwrap();
+        let copy = dir.path().join("main-only.db");
+        std::fs::copy(dir.path().join("paper_state.db"), &copy).unwrap();
+        assert_eq!(
+            PaperStateDb::open_read_only(&copy)
+                .unwrap()
+                .scope_drop_boundary_unix()
+                .unwrap(),
+            Some(1000)
+        );
         db.record_scope_drop_boundary(900).unwrap();
         drop(db);
         let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
         assert_eq!(db.scope_drop_boundary_unix().unwrap(), Some(1000));
+    }
+
+    #[test]
+    fn scope_drops_live_boundary_propagates_an_incomplete_checkpoint() {
+        let (dir, db) = db();
+        db.sync_checkpoint_dispositions().unwrap();
+        let reader = Connection::open(dir.path().join("paper_state.db")).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM meta;")
+            .unwrap();
+        assert!(matches!(
+            db.record_scope_drop_boundary(1000),
+            Err(PaperStateError::MigrationCheckpointIncomplete { .. })
+        ));
+        reader.execute_batch("ROLLBACK").unwrap();
+        db.record_scope_drop_boundary(1000).unwrap();
     }
 
     #[test]

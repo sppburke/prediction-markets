@@ -3582,6 +3582,8 @@ pub struct BucketCommitEngine {
     frontier_hints: HashMap<WalletAddress, crate::frame_admission::FeedHistoryFrontier>,
     routed_frame_receipts: HashSet<pe_core_types::EventSeq>,
     frame_source_index: Option<SourceReceiptIndex>,
+    #[cfg(test)]
+    before_apply: Option<fn(&mut PositionLedger)>,
 }
 
 impl BucketCommitEngine {
@@ -3689,6 +3691,8 @@ impl BucketCommitEngine {
                 .collect(),
             routed_frame_receipts: HashSet::new(),
             frame_source_index: None,
+            #[cfg(test)]
+            before_apply: None,
         })
     }
 
@@ -4052,12 +4056,18 @@ impl BucketCommitEngine {
             Some(MarketMembership::Grouped(group)) => Some(group),
             _ => None,
         };
+        let source_epoch = observation.source_time.0.unix_timestamp();
         if self.paper_state.scope_is_dropped(
             &observation.wallet,
             &market.to_string(),
             group.as_deref(),
-            observation.source_time.0.unix_timestamp(),
-        )? {
+            source_epoch,
+        )? || self
+            .paper_state
+            .wallet_scope_drops(&observation.wallet, source_epoch)?
+            .iter()
+            .any(|drop| drop.dropped_at_epoch == source_epoch)
+        {
             self.routed_frame_receipts.insert(receipt.sequence);
             return Ok(FrameRoute::Ignored);
         }
@@ -4936,6 +4946,19 @@ impl BucketCommitEngine {
                 context,
             );
         }
+        let lookups = NotingScopeLookups::new(&self.paper_state, &aggregates, context);
+        let durable_drops = self.paper_state.wallet_scope_drops(&wallet, source_epoch)?;
+        if !scope_drops.is_empty() && durable_drops.iter().any(|drop| drop.scope_kind == "event") {
+            scope_drops.retain(|drop| match lookups.market(&drop.scope_id) {
+                MarketLookup::Grouped(group) => !durable_drops.iter().any(|existing| {
+                    existing.scope_kind == "event"
+                        && existing.scope_id == group
+                        && existing.dropped_at_epoch <= drop.dropped_at_epoch
+                }),
+                _ => true,
+            });
+            lookups.check(true)?;
+        }
         let seen = durable.iter().filter(|state| state.is_some()).count();
         if seen == aggregates.len() && changed.is_empty() {
             if context.bracket_commit
@@ -5141,8 +5164,6 @@ impl BucketCommitEngine {
                 context,
             );
         }
-        let lookups = NotingScopeLookups::new(&self.paper_state, &aggregates, context);
-        let durable_drops = self.paper_state.wallet_scope_drops(&wallet, source_epoch)?;
         let mut starts = durable_drops
             .iter()
             .map(|drop| {
@@ -5314,7 +5335,8 @@ impl BucketCommitEngine {
             )
         };
         let scoped = classify(&dropped, certified);
-        let without_drops = classify(&BTreeSet::new(), false);
+        let without_drops = (!dropped.is_empty()).then(|| classify(&BTreeSet::new(), false));
+        let without_drops = without_drops.as_ref().unwrap_or(&scoped);
         let has_problem = |result: &Result<pe_position_ledger::ScopedSecond, LedgerError>| {
             result.as_ref().is_ok_and(|second| {
                 !second.problems.is_empty()
@@ -5331,7 +5353,7 @@ impl BucketCommitEngine {
             resolving_late
                 || dropped.iter().any(|scope| scope.kind == ScopeKind::Event)
                 || has_problem(&scoped)
-                || has_problem(&without_drops),
+                || has_problem(without_drops),
         )?;
         if covered && changed.is_empty() {
             let covered_mutations = recordable_mutations
@@ -5412,6 +5434,10 @@ impl BucketCommitEngine {
         let mutations = scoped.apply;
         let trade_decisions = scoped.decisions;
         let mut candidate = self.ledger.clone();
+        #[cfg(test)]
+        if let Some(before_apply) = self.before_apply.take() {
+            before_apply(&mut candidate);
+        }
         let applied = match candidate.apply_all_or_none(&mutations) {
             Ok(applied) => applied,
             Err(error) => {
@@ -6610,7 +6636,10 @@ fn scoped_history_buys(
             MarketId(pe_core_types::VenueMarketId(scope.id))
         };
         if consumed.contains(&market)
-            || routed.get(&mutation.source_trade_id) == Some(&"scope_dropped")
+            || matches!(
+                routed.get(&mutation.source_trade_id),
+                Some(&"scope_dropped" | &"anchor_covered_late")
+            )
         {
             buys.push((market, mutation.source_trade_id.clone()));
         }
@@ -9594,6 +9623,45 @@ mod activity_exemption_tests {
     }
 
     #[test]
+    fn integrity_failure_after_classification_fences_through_commit() {
+        let (_dir, paper, mut engine) = fixture();
+        let record = group("TRADE", "integrity", 100, 0, false, "0xa1");
+        let wallet = record.group_id.components().wallet;
+        let id = record.group_id.key().clone();
+        // Break the classified-snapshot invariant; application must catch the real overflow.
+        engine.before_apply = Some(|ledger| {
+            ledger.replace_wallet_snapshot(
+                WalletAddress([0xaa; 20]),
+                HashMap::from([(
+                    MarketOutcomeId::new(MarketId(VenueMarketId("0xa1".to_owned())), OutcomeId(0)),
+                    PositionState {
+                        long_contracts: ShareAmount::from_atomic(u64::MAX),
+                        short_contracts: ShareAmount::ZERO,
+                    },
+                )]),
+            );
+        });
+        let result = engine.commit(vec![record], &context(), basis()).unwrap();
+        assert_eq!(result.newly_fenced, Some(WalletFenceCause::Overflow));
+        assert_eq!(result.dispositions[&id.0], "position_overflow");
+        assert_eq!(
+            paper
+                .wallet_fence(&wallet)
+                .unwrap()
+                .unwrap()
+                .source_trade_id,
+            id
+        );
+        assert!(engine.is_fenced(&wallet));
+        assert!(engine.ledger().position(&wallet).is_none());
+        assert!(paper.leader_positions().unwrap().is_empty());
+        assert!(paper.open_decision_pending().unwrap().is_empty());
+        assert!(paper.gate_history().unwrap().is_empty());
+        assert!(paper.wallet_scope_drops(&wallet, 100).unwrap().is_empty());
+        assert_eq!(paper.scope_drop_boundary_unix().unwrap(), None);
+    }
+
+    #[test]
     fn conditionless_redemption_uses_only_verified_token_scope() {
         for verified in [false, true] {
             let (_dir, paper, mut engine) = fixture();
@@ -9730,6 +9798,140 @@ mod activity_exemption_tests {
                     .unwrap();
                 assert_eq!(matches!(route, FrameRoute::Ignored), kind != "unknown");
                 assert!(paper.open_decision_pending().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn frames_in_an_imported_certified_second_wait_for_the_complete_read() {
+        use crate::frame_admission::{FeedHistoryFrontier, FeedLatchBasis, FrameIdentityProof};
+        use pe_event_log::{EnvelopeIn, Writer};
+        let (dir, paper, mut engine) = fixture();
+        let wallet = WalletAddress([0xaa; 20]);
+        paper
+            .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                wallet,
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: 99,
+            })
+            .unwrap();
+        engine.complete_history.insert(wallet);
+        engine.entry_gate = CopyEntryGate::new(CopyEntryGateConfig, paper.gate_history().unwrap());
+        engine
+            .ledger
+            .replace_wallet_snapshot(wallet, HashMap::new());
+        let path = dir.path().join("certified-frames.log");
+        let mut writer = Writer::open(&path).unwrap();
+        let receipts = [(100, "0xa2"), (101, "0xa3")].map(|(epoch, market)| {
+            let at = time::OffsetDateTime::from_unix_timestamp(epoch).unwrap();
+            writer.append_synced(EnvelopeIn {
+                source_id: SourceId(crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned()),
+                schema_version: ACTIVITY_SCHEMA_VERSION, parser_version: ACTIVITY_PARSER_VERSION,
+                observed_at: SourceTimestamp(at), received_at: ReceivedAt(at), content_type: ContentType::Json,
+                payload: serde_json::to_vec(&json!({
+                    "proxyWallet": wallet.to_string(), "timestamp": epoch, "conditionId": market,
+                    "type": "TRADE", "size": "2", "usdcSize": "1", "transactionHash": "frame",
+                    "price": "0.5", "asset": "asset", "side": "BUY", "outcomeIndex": 0, "outcome": "Yes",
+                })).unwrap(),
+            }).unwrap()
+        });
+        drop(writer);
+        paper
+            .import_scope_drops(
+                1,
+                &[(
+                    WalletScopeDrop {
+                        wallet,
+                        scope_kind: "market".to_owned(),
+                        scope_id: "0xa1".to_owned(),
+                        cause: "underflow".to_owned(),
+                        source_trade_id: None,
+                        dropped_at_epoch: 100,
+                        proof_json: "{}".to_owned(),
+                        recorded_at_unix: 100,
+                    },
+                    receipts[0],
+                )],
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        engine.verified_frontiers.insert(
+            wallet,
+            FeedHistoryFrontier {
+                version: 1,
+                wallet,
+                fixed_end: 99,
+                commitment: receipts[0],
+                page_occurrences: Vec::new(),
+                pages: Vec::new(),
+            },
+        );
+        let index = SourceReceiptIndex::replay(&path).unwrap();
+        for (i, epoch) in [100, 101].into_iter().enumerate() {
+            let at = time::OffsetDateTime::from_unix_timestamp(epoch).unwrap();
+            let route = engine
+                .prepare_activity_frame(
+                    receipts[i],
+                    &index,
+                    FrameAdmissionContext {
+                        admitted_at: at,
+                        stale_secs: 90,
+                        quality: ReconstructionQuality::new(100).unwrap(),
+                        signal_config: SignalConfig::default(),
+                        copy_eligible: true,
+                        configuration: synthetic_legacy17_runtime_config(),
+                        basis: basis(),
+                        latch: FeedLatchBasis::default(),
+                        paper_prefix: None,
+                        identity: Some(FrameIdentityProof {
+                            provenance: crate::asset_identity::IdentityProvenance {
+                                asset: pe_core_types::PolymarketTokenId("asset".to_owned()),
+                                source_log_sequence: receipts[i].sequence.0,
+                                canonical_page_hash: receipts[i].this_hash.to_hex().to_string(),
+                            },
+                            receipt: receipts[i],
+                        }),
+                        freshness_policy: PaperFreshnessPolicy {
+                            activity_ws_enabled: true,
+                            copy_latency_budget_secs: 120,
+                        },
+                    },
+                )
+                .unwrap();
+            if epoch == 100 {
+                assert!(
+                    matches!(route, FrameRoute::Ignored),
+                    "certified second must wait for REST"
+                );
+                assert!(paper.open_decision_pending().unwrap().is_empty());
+                let buy = group("TRADE", "frame", epoch, 0, false, "0xa2");
+                let id = buy.group_id.key().clone();
+                let result = engine.commit(vec![buy], &context(), basis()).unwrap();
+                assert_eq!(result.dispositions[&id.0], "not_an_entry");
+                assert!(result.pending.is_empty());
+                assert_eq!(
+                    paper
+                        .market_history_record(&wallet, &MarketId(VenueMarketId("0xa2".to_owned())))
+                        .unwrap()
+                        .unwrap()
+                        .source_trade_id,
+                    id
+                );
+                assert_eq!(
+                    engine.ledger.position(&wallet).unwrap().positions[&MarketOutcomeId::new(
+                        MarketId(VenueMarketId("0xa2".to_owned())),
+                        OutcomeId(0)
+                    )]
+                        .long_contracts
+                        .atomic(),
+                    2_000_000
+                );
+            } else {
+                assert!(
+                    matches!(route, FrameRoute::Admission(_)),
+                    "later second is copyable"
+                );
             }
         }
     }

@@ -20493,6 +20493,197 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_scope_drop_during_process_target_preparation_converges_without_posts() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let now = OffsetDateTime::now_utc();
+        let identity = Identity::generate();
+        let sealed = sealed_delayed_market_credentials(&identity);
+        let mut template = finality_prepared();
+        let condition = template.economic.market.condition_id.0.clone();
+        let payloads = economic_source_payloads_with_end(
+            &condition,
+            Some(now.unix_timestamp() + 300),
+            Some("0xee"),
+        );
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let posts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().fallback({
+            let barrier = barrier.clone();
+            let release = release.clone();
+            let posts = posts.clone();
+            move |method: axum::http::Method, uri: axum::http::Uri| {
+                let barrier = barrier.clone();
+                let release = release.clone();
+                let posts = posts.clone();
+                let sealed = sealed.clone();
+                let payloads = payloads.clone();
+                let condition = condition.clone();
+                async move {
+                    let body = match uri.path() {
+                        "/rest/v1/account_credentials" => serde_json::json!([{
+                            "account_id":"acct", "bundle_version":1, "key_id":"key", "sealed_bundle":sealed,
+                        }]),
+                        "/rest/v1/accounts" => serde_json::json!([{
+                            "account_id":"acct", "live_sizing_mode":"contract", "live_sizing_contracts":1,
+                        }]),
+                        "/markets" => serde_json::from_slice(&payloads[0]).unwrap(),
+                        path if path == format!("/markets/{condition}") => serde_json::from_slice(&payloads[1]).unwrap(),
+                        path if path == format!("/clob-markets/{condition}") => serde_json::from_slice(&payloads[2]).unwrap(),
+                        "/book" => {
+                            barrier.wait().await;
+                            release.notified().await;
+                            serde_json::from_slice(&payloads[3]).unwrap()
+                        }
+                        "/api/geoblock" => serde_json::json!({"blocked":false,"country":"US"}),
+                        "/auth/ban-status/closed-only" => serde_json::json!({"closed_only":false}),
+                        "/balance-allowance" => serde_json::json!({"balance":"100000000","allowances":{
+                            pe_venue_polymarket::CTF_EXCHANGE_V2.to_string():"100000000",
+                        }}),
+                        "/positions" => serde_json::json!([]),
+                        "/version" => serde_json::json!({"version":2}),
+                        "/order" if method == axum::http::Method::POST => {
+                            posts.fetch_add(1, Ordering::SeqCst);
+                            return (StatusCode::BAD_REQUEST, Json(serde_json::Value::Null));
+                        }
+                        _ => return (StatusCode::NOT_FOUND, Json(serde_json::Value::Null)),
+                    };
+                    (StatusCode::OK, Json(body))
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut snapshot = armed_snapshot("acct");
+        snapshot.fetched_at_unix = Some(now.unix_timestamp());
+        let mut state = fanout_state(&dir, db.clone(), snapshot, &base, Some(identity));
+        state.clock = Arc::new(move || now);
+        state.config.clob_base_url = base.clone();
+        state.config.data_base_url = base.clone();
+        state.admission = LiveAdmissionBuilder::new(
+            state.config.http.clone(),
+            &base,
+            &base,
+            state.config.source_log.clone(),
+        )
+        .with_clock(Arc::new(move || now));
+        state.config.book_fetcher = Arc::new(
+            ReqwestClobBookFetcher::new(state.config.http.clone())
+                .with_base_url(base)
+                .with_source_log(state.config.source_log.clone()),
+        );
+        let mut runtime = state.config.runtime_config.snapshot().as_ref().clone();
+        runtime.per_trade_cap = pe_strategy_winner_follow::PerTradeCap::Unlimited;
+        runtime.min_fill_price = Decimal::ZERO;
+        runtime.max_fill_price = dec!(0.99);
+        state.config.runtime_config.store(runtime);
+        let account = AccountId::new("acct").unwrap();
+        bind_empty_live_risk_to_paper_prefix(&state, &mut template, now);
+        append_economic_sources(
+            &state,
+            &mut template,
+            &account,
+            now,
+            Some(crate::bucket_commit::PaperFreshnessPolicy {
+                activity_ws_enabled: true,
+                copy_latency_budget_secs: 120,
+            }),
+            Some("0xee"),
+        )
+        .await;
+        let row = db.open_decision_pending().unwrap().remove(0);
+        let continuation: DecisionContinuationV3 =
+            serde_json::from_str(&row.frozen_inputs_json).unwrap();
+        let mut signal = projection_signal();
+        signal.source_trade_id = continuation.facts.source_trade_id;
+        signal.market_id = continuation.facts.market_id;
+        signal.leader_price = continuation.facts.price;
+        signal.observed_at =
+            OffsetDateTime::from_unix_timestamp(continuation.facts.source_epoch).unwrap();
+        signal.received_at = signal.observed_at;
+        let observation = template.economic.observation.unwrap();
+        db.close_decision_pending(
+            &signal.source_trade_id,
+            "{}",
+            "dispatch_staged",
+            now.unix_timestamp(),
+        )
+        .unwrap();
+        db.stage_dispatch_seed(&DispatchSeedRecord {
+            dispatch_id: "fresh-scope-drop".to_owned(),
+            signal_json: serde_json::to_string(
+                &serde_json::json!({"schema_version":1,"signal":signal,"observation":observation}),
+            )
+            .unwrap(),
+            source_trade_id: signal.source_trade_id.0.clone(),
+            created_at_unix: now.unix_timestamp(),
+            targets: vec![DispatchTargetSeed {
+                account_id: "acct".to_owned(),
+                credential_bundle_version: 1,
+                credential_key_id: "key".to_owned(),
+            }],
+        })
+        .unwrap();
+        db.flip_dispatch_ready("fresh-scope-drop", "fill").unwrap();
+        let seed = db.dispatch_seed("fresh-scope-drop").unwrap().unwrap();
+        let target = db.dispatch_targets("fresh-scope-drop").unwrap().remove(0);
+        let task = tokio::spawn(async move {
+            let result =
+                process_target(&mut state, &seed, &target, &signal, &observation, now).await;
+            (state, result)
+        });
+        tokio::time::timeout(Duration::from_secs(15), barrier.wait())
+            .await
+            .unwrap();
+        let path = dir.path().join("live.journal");
+        assert!(
+            replay_account(&path, &account)
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(event.payload, LiveJournalPayload::AdmissionEvaluated(_)))
+        );
+        db.import_scope_drops(
+            1,
+            &[(
+                pe_paper_state::WalletScopeDrop {
+                    wallet: WalletAddress([0xaa; 20]),
+                    scope_kind: "event".to_owned(),
+                    scope_id: "0xee".to_owned(),
+                    cause: "conversion".to_owned(),
+                    source_trade_id: None,
+                    dropped_at_epoch: now.unix_timestamp(),
+                    proof_json: "{}".to_owned(),
+                    recorded_at_unix: now.unix_timestamp(),
+                },
+                fixture_receipt(1),
+            )],
+            &Default::default(),
+        )
+        .unwrap();
+        release.notify_one();
+        let (state, result) = task.await.unwrap();
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        assert_eq!(result.unwrap(), PassControl::Continue);
+        let target = db.dispatch_targets("fresh-scope-drop").unwrap().remove(0);
+        assert_eq!(target.state, "terminal");
+        assert_eq!(
+            target.terminal_reason.as_deref(),
+            Some("scope_dropped_before_post")
+        );
+        let events = replay_live_account(&state, &account).unwrap();
+        assert_eq!(events.iter().filter(|event| matches!(&event.payload,
+            LiveJournalPayload::OrderPreparationFailed(audit) if audit.failure == pe_execution_core::LiveOrderPreparationFailure::PrePostScopeDropped
+        )).count(), 1);
+        let inventory = verified_recovery_inventory(&state).unwrap();
+        assert!(inventory.approved_admissions.is_empty());
+        assert!(inventory.open_orders.is_empty());
+        assert_eq!(inventory.terminal_admissions.len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn scope_drop_after_approved_or_during_preparation_converges_without_posts() {
         let app = Router::new().route("/positions", get(empty_positions));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
