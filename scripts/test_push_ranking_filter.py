@@ -1202,6 +1202,66 @@ class FormatThreePublicationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "content hash mismatch"):
             pr.validate_publish_request(request)
 
+    def test_request_carries_sorted_distinct_non_null_groups_from_all_evidence(self):
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE clob_payout_evidence_v2 SET neg_risk_market_id=NULL")
+            con.executemany(
+                "INSERT INTO clob_payout_evidence_v2 (market_id, neg_risk_market_id) VALUES (?, ?)",
+                [("group-c-first", "0xc"), ("group-a", "0xa"), ("group-c-again", "0xc")],
+            )
+        request = pr.prepare_publish_request(self.args, self.now)
+        self.assertEqual(request["batch"]["neg_risk_group_ids"], ["0xa", "0xc"])
+        request["batch"]["neg_risk_group_ids"].append("0xd")
+        with self.assertRaisesRegex(ValueError, "content hash mismatch"):
+            pr.validate_publish_request(request)
+
+    def test_group_read_shares_the_history_snapshot(self):
+        with sqlite3.connect(self.db) as con:
+            con.execute("PRAGMA journal_mode=WAL")
+        real = pr.partial_backfill_wallets
+
+        def change_groups_after_snapshot(connection):
+            captured = real(connection)
+            with sqlite3.connect(self.db) as writer:
+                writer.execute("UPDATE clob_payout_evidence_v2 SET neg_risk_market_id='0xd'")
+            return captured
+
+        with mock.patch.object(pr, "partial_backfill_wallets", change_groups_after_snapshot):
+            request = pr.prepare_publish_request(self.args, self.now)
+        self.assertEqual(request["batch"]["neg_risk_group_ids"], ["0xa"])
+        fresh = pr.prepare_publish_request(self.args, self.now)
+        self.assertEqual(fresh["batch"]["neg_risk_group_ids"], ["0xd"])
+
+    def test_resume_publishes_saved_groups_after_cache_changes(self):
+        request = pr.prepare_publish_request(self.args, self.now)
+        saved = self.root / "ranking_publish_request.json"
+        pr.save_publish_request(str(saved), request)
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE clob_payout_evidence_v2 SET neg_risk_market_id='0xd'")
+        fresh = pr.prepare_publish_request(self.args, self.now)
+        self.assertEqual(fresh["batch"]["neg_risk_group_ids"], ["0xd"])
+        self.assertNotEqual(fresh["publish_key"], request["publish_key"])
+        latest = [{"batch_id": 42, "rank": 1, "survives": True}]
+        with (
+            mock.patch.object(sys, "argv", ["push", "--resume-request", str(saved)]),
+            mock.patch.dict(os.environ, {"SUPABASE_URL": "https://example.test", "SUPABASE_SECRET_KEY": "test"}),
+            mock.patch.object(pr, "prepare_publish_request", side_effect=AssertionError("resume rebuilt request")),
+            mock.patch.object(pr, "_req", side_effect=[
+                (200, 42), (200, [{"batch_id": 42}]), (200, latest),
+                (200, [{"config_hash": request["batch"]["config_hash"]}]),
+            ]) as rpc,
+        ):
+            self.assertEqual(pr.main(), 0)
+        body = rpc.call_args_list[0].kwargs["body"]
+        self.assertEqual(body["p_batch"]["neg_risk_group_ids"], ["0xa"])
+        self.assertEqual(body["p_publish_key"], request["publish_key"])
+
+    def test_empty_evidence_group_set_is_published_explicitly(self):
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE clob_payout_evidence_v2 SET neg_risk_market_id=NULL")
+        request = pr.prepare_publish_request(self.args, self.now)
+        self.assertEqual(request["batch"]["neg_risk_group_ids"], [])
+
     def test_limits_refuse_fractional_nonfinite_and_postgres_overflow(self):
         for location, key in (("scheduled_horizon", "minimum_secs"),
                               ("scheduled_horizon", "maximum_secs_exclusive"), (None, "latency_shift_secs")):
