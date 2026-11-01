@@ -89,7 +89,7 @@ impl ReconciliationFetcher for GammaFetcher {
 }
 
 fn verified_gamma_payload() -> Vec<u8> {
-    br#"[{"conditionId":"0xverified-condition","clobTokenIds":["123"]}]"#.to_vec()
+    br#"[{"conditionId":"0x0000000000000000000000000000000000000000000000000000000000000022","clobTokenIds":["123"]}]"#.to_vec()
 }
 
 async fn settle_until(mut predicate: impl FnMut() -> bool) {
@@ -125,14 +125,14 @@ fn watchlist() -> Watchlist {
 
 fn ws_payload(epoch: i64) -> Vec<u8> {
     format!(
-        r#"{{"proxyWallet":"{WALLET}","conditionId":"0xcondition","asset":"123","side":"BUY","size":"5","price":"0.5","timestamp":"{epoch}","transactionHash":"0xabc","outcomeIndex":"0"}}"#
+        r#"{{"proxyWallet":"{WALLET}","conditionId":"0x0000000000000000000000000000000000000000000000000000000000000011","asset":"123","side":"BUY","size":"5","price":"0.5","timestamp":"{epoch}","transactionHash":"0xabc","outcomeIndex":"0"}}"#
     )
     .into_bytes()
 }
 
 fn rest_payload(epoch: i64) -> Vec<u8> {
     format!(
-        r#"[{{"proxyWallet":"{WALLET}","type":"TRADE","conditionId":"0xcondition","asset":"123","side":"BUY","size":"5","usdcSize":"2.5","price":"0.5","timestamp":"{epoch}","transactionHash":"0xabc","outcomeIndex":"0"}}]"#
+        r#"[{{"proxyWallet":"{WALLET}","type":"TRADE","conditionId":"0x0000000000000000000000000000000000000000000000000000000000000011","asset":"123","side":"BUY","size":"5","usdcSize":"2.5","price":"0.5","timestamp":"{epoch}","transactionHash":"0xabc","outcomeIndex":"0"}}]"#
     )
     .into_bytes()
 }
@@ -343,7 +343,10 @@ async fn delayed_indexing_restart_and_four_paths_apply_one_aggregate() {
     );
     let positions = paper_state.leader_positions().unwrap();
     assert_eq!(positions.len(), 1);
-    assert_eq!(positions[0].market_id.to_string(), "0xverified-condition");
+    assert_eq!(
+        positions[0].market_id.to_string(),
+        "0x0000000000000000000000000000000000000000000000000000000000000022"
+    );
     assert_eq!(positions[0].outcome_id.0, 0);
     assert_eq!(positions[0].long_contracts.atomic(), 5_000_000);
     let group_id = parse_activity_trade_observation(&ws_payload(epoch))
@@ -372,7 +375,7 @@ async fn delayed_indexing_restart_and_four_paths_apply_one_aggregate() {
     );
     assert_eq!(
         effect.correction().unwrap().verified.market().to_string(),
-        "0xverified-condition"
+        "0x0000000000000000000000000000000000000000000000000000000000000022"
     );
 
     let sources: Vec<String> = Reader::replay(&source_log)

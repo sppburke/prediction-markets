@@ -121,7 +121,7 @@ impl PageFetcher for MapFetcher {
                 .filter_map(|token| {
                     token.strip_prefix("asset-").map(|index| {
                         json!({
-                            "conditionId": format!("condition-{index}"),
+                            "conditionId": format!("0x{index:0>64}"),
                             "clobTokenIds": [token]
                         })
                     })
@@ -169,7 +169,7 @@ fn stable_bracket_responses(wallets: &[WalletAddress]) -> HashMap<String, Vec<Ve
         let activity = serde_json::to_vec(&vec![json!({
             "proxyWallet": wallet,
             "timestamp": 10,
-            "conditionId": format!("condition-{index}"),
+            "conditionId": format!("0x{index:0>64}"),
             "type": "TRADE",
             "size": "1",
             "usdcSize": "0.5",
@@ -185,7 +185,7 @@ fn stable_bracket_responses(wallets: &[WalletAddress]) -> HashMap<String, Vec<Ve
         let positions = serde_json::to_vec(&vec![json!({
             "proxyWallet": wallet,
             "asset": format!("asset-{index}"),
-            "conditionId": format!("condition-{index}"),
+            "conditionId": format!("0x{index:0>64}"),
             "size": "1",
             "outcomeIndex": 0,
             "negativeRisk": false

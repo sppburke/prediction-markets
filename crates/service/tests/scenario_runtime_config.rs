@@ -334,8 +334,9 @@ async fn hot_snapshot_never_overwrites_running_bankroll() {
 /// to the exact durable bytes and binds back to configuration A's canonical hash.
 #[tokio::test]
 async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
-    const FROZEN_MARKET: &str = "0xfrozen-config-a";
-    const FRESH_MARKET: &str = "0xfresh-config-b";
+    const FROZEN_MARKET: &str =
+        "0x0000000000000000000000000000000000000000000000000000000000000001";
+    const FRESH_MARKET: &str = "0x0000000000000000000000000000000000000000000000000000000000000002";
 
     let dir = TempDir::new().unwrap();
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
@@ -349,7 +350,9 @@ async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
         config_a.clone(),
     );
 
-    let fresh_trade = entry_trade("fresh-config-b", FRESH_MARKET, dec!(0.60));
+    let mut fresh_trade = entry_trade("fresh-config-b", FRESH_MARKET, dec!(0.60));
+    fresh_trade.observed_at = OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap();
+    fresh_trade.received_at = fresh_trade.observed_at;
     let (control_tx, control_rx) = mpsc::channel(8);
 
     let books = HashMap::from([
@@ -438,8 +441,9 @@ async fn pending_uses_frozen_config_a_while_fresh_trade_uses_live_config_b() {
 /// Even if the live snapshot has already advanced to B, that continuation must reinstall A.
 #[tokio::test]
 async fn in_process_bucket_continuation_uses_its_frozen_config() {
-    const FROZEN_MARKET: &str = "0xin-process-frozen-a";
-    const FRESH_MARKET: &str = "0xin-process-fresh-b";
+    const FROZEN_MARKET: &str =
+        "0x0000000000000000000000000000000000000000000000000000000000000003";
+    const FRESH_MARKET: &str = "0x0000000000000000000000000000000000000000000000000000000000000004";
     const SOURCE_EPOCH: i64 = 1_700_000_100;
 
     let dir = TempDir::new().unwrap();
@@ -531,11 +535,10 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
     assert_eq!(commit.pending.len(), 1);
     let pending_id = commit.pending[0].clone();
 
-    send_trade_bucket(
-        &control_tx,
-        entry_trade("in-process-fresh-b", FRESH_MARKET, dec!(0.60)),
-    )
-    .await;
+    let mut fresh_trade = entry_trade("in-process-fresh-b", FRESH_MARKET, dec!(0.60));
+    fresh_trade.observed_at = OffsetDateTime::from_unix_timestamp(SOURCE_EPOCH + 1).unwrap();
+    fresh_trade.received_at = fresh_trade.observed_at;
+    send_trade_bucket(&control_tx, fresh_trade).await;
     drop(control_tx);
     run.await.unwrap();
 
@@ -773,7 +776,10 @@ async fn dynamic_continuation_load_failure_stops_the_orchestrator() {
     let connection = rusqlite::Connection::open(&state_path).unwrap();
     connection.execute_batch("CREATE TRIGGER corrupt_fresh_continuation AFTER INSERT ON decision_pending
         BEGIN UPDATE decision_pending SET frozen_inputs_json = '{}' WHERE source_trade_id = NEW.source_trade_id; END;").unwrap();
-    let read = pending_read("0xdynamic-load-failure", 1_700_000_100);
+    let read = pending_read(
+        "0x0000000000000000000000000000000000000000000000000000000000000005",
+        1_700_000_100,
+    );
     let id = read.aggregates[0].group_id.key().clone();
     let context = pending_context(&read, flat_snapshot(dec!(0.90)));
     let run = tokio::spawn(orchestrator.run_coordinated(std::future::pending::<()>()));

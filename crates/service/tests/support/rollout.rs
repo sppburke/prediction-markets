@@ -332,7 +332,7 @@ async fn serve(
     };
     let mut a = state.authority.lock().unwrap();
     let answer=match path {
-        "/rest/v1/accounts"|"/rest/v1/account_credentials"=>json!([]),
+        "/rest/v1/accounts"|"/rest/v1/account_credentials"|"/rest/v1/ranking_scope_drops"|"/rest/v1/ranking_neg_risk_group_spans"=>json!([]),
         "/rest/v1/service_config"=>json!(state.rows),
         "/rest/v1/ranking_batches"=>json!([{"batch_id":1}]),
         "/rest/v1/ranking_entries"|"/rest/v1/latest_ranking"=>json!((1..=state.ranked_wallets).map(|n|json!({"batch_id":1,"rank":n,"wallet_hex":wallet(n).to_string(),"ls_tstat":"3","hit_rate":"0.65","n_trades":100,"last_trade_unix":if n == 2 && state.stale_ranked_wallet_2.load(Ordering::SeqCst) { state.now - 300_000 } else { state.now - 20 },"survives":true})).collect::<Vec<_>>()),

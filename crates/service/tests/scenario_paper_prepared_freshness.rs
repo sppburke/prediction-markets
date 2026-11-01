@@ -3738,9 +3738,15 @@ async fn boot_fence_completes_staged_handoff_atomically_in_both_recovery_orders(
             let history = h.paper.gate_history().unwrap();
             assert_eq!(h.prepared_count(), 1);
 
-            // The same source group with a changed semantic revision fences during boot's
-            // first activity read, through the real validator and bucket commit owner. A novel
-            // revision invalidates that attempt before any positions read or anchor install.
+            // A legacy fence remains authoritative during boot reconciliation. Retaining a
+            // changed revision invalidates the bracket, whose retry observes the fence.
+            rusqlite::Connection::open(h.dir.path().join("paper.db"))
+                .unwrap()
+                .execute(
+                    "INSERT INTO wallet_fences VALUES (?1, ?2, 'invalid_mapping', '{}', ?3)",
+                    rusqlite::params![wallet().to_string(), held.id.0, EPOCH],
+                )
+                .unwrap();
             let mut changed: Value = serde_json::from_slice(&held.activity).unwrap();
             changed[0]["size"] = "11".into();
             let validator = pe_service::position_seeder::CausalPositionValidator::new(
@@ -5355,7 +5361,7 @@ async fn frame_final_before_rest_then_reconcile() {
         assert_eq!(
             group.disposition,
             if route == "late" {
-                "reanchor_required_late_group"
+                "scope_dropped"
             } else {
                 "wallet_fenced_applied"
             }
@@ -8920,6 +8926,14 @@ async fn ac_b_membership_reference_checks() {
     let server_rows = rows.clone();
     let router = axum::Router::new()
         .route(
+            "/rest/v1/ranking_scope_drops",
+            axum::routing::get(|| async { axum::Json(json!([])) }),
+        )
+        .route(
+            "/rest/v1/ranking_neg_risk_group_spans",
+            axum::routing::get(|| async { axum::Json(json!([])) }),
+        )
+        .route(
             "/rest/v1/ranking_batches",
             axum::routing::get(|| async { axum::Json(json!([{"batch_id": 546}])) }),
         )
@@ -9374,7 +9388,8 @@ open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I",
         "{failed:?}"
     );
     // A capture that lacks a frame received from the window on is refused, whatever its cohort.
-    retain(6, &[0, 1, 2, 3, 4]);
+    let retired = usize::try_from(bad_type.sequence.0).unwrap();
+    retain(retired + 1, &(0..retired).collect::<Vec<_>>());
     let output = ac_b_capture(&h, &log, "retired", *pin_offset, pin_seq.0, None);
     assert!(output.status.success(), "{output:?}");
     let refused = inspection_run(

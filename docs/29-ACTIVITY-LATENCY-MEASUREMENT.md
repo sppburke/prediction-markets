@@ -251,7 +251,8 @@ KEEP = {b"pe-service.activity-frame-admission", b"pe-service.activity-frame-fall
         b"polymarket-public.activity-reconciliation", b"pe-service.watchlist-ranking",
         b"pe-service.watchlist-admission", b"pe-service.watchlist-knockout",
         b"pe-service.watchlist-capacity-config", b"pe-service.watchlist-deferral",
-        b"polymarket.gamma.markets"}
+        b"polymarket.gamma.markets", b"supabase.ranking_scope_drops",
+        b"supabase.ranking_neg_risk_group_spans", b"supabase.ranking_batches.scope_drops"}
 
 # 1. One backup-API step: a single read transaction and a page copy (rowids kept). The CLI
 #    `.backup` steps 100 pages at a time and restarts on every production write.

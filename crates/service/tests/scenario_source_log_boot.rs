@@ -746,7 +746,7 @@ fn install_committed_open_read_for_wallet(
         .unwrap();
     let payload = serde_json::to_vec(&serde_json::json!([{
         "proxyWallet": wallet, "timestamp": NOW_UNIX + 25_000,
-        "conditionId": "0xboot-open", "type": "TRADE", "size": "2.5", "usdcSize": "1.25",
+        "conditionId": "0x00000000000000000000000000000000000000000000000000000000000000b0", "type": "TRADE", "size": "2.5", "usdcSize": "1.25",
         "transactionHash": "0xboot-open", "price": "0.5", "asset": "boot-token",
         "side": "BUY", "outcomeIndex": 0, "outcome": "Yes", "isCombo": false,
     }]))
@@ -954,6 +954,7 @@ async fn pre_start_boot_membership_case(case: PreStartBootCase) {
         source.requests.lock().unwrap().push(uri.clone());
         let query = uri.query().unwrap_or_default();
         Json(match uri.path() {
+            "/rest/v1/ranking_scope_drops" | "/rest/v1/ranking_neg_risk_group_spans" => json!([]),
             "/rest/v1/service_config" => {
                 let rows = [
                     ("active_watchlist_size", "1", "integer"),
@@ -978,6 +979,9 @@ async fn pre_start_boot_membership_case(case: PreStartBootCase) {
                     ("polymarket_fee_rate", "0.04", "decimal"),
                 ];
                 json!(rows.map(|(key, value, value_type)| json!({"key": key, "value": value, "value_type": value_type})))
+            }
+            "/rest/v1/ranking_batches" if query.contains("batch_id=eq.8") => {
+                json!([{"batch_id":8}])
             }
             "/rest/v1/ranking_batches" => {
                 let captured = source.batch.swap(9, Ordering::SeqCst);
@@ -1100,7 +1104,17 @@ async fn pre_start_boot_membership_case(case: PreStartBootCase) {
     assert_eq!(
         boot_requests
             .iter()
-            .filter(|uri| uri.path() == "/rest/v1/ranking_batches")
+            .filter(|uri| uri.path() == "/rest/v1/ranking_batches"
+                && !uri.query().unwrap_or_default().contains("batch_id=eq."))
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(
+        boot_requests
+            .iter()
+            .filter(|uri| uri.path() == "/rest/v1/ranking_batches"
+                && uri.query().unwrap_or_default().contains("batch_id=eq.8"))
             .count(),
         1,
         "{stderr}"
@@ -1248,10 +1262,10 @@ async fn pre_start_boot_membership_case(case: PreStartBootCase) {
                 .collect::<Vec<_>>(),
             [
                 "/rest/v1/service_config",
-                "/rest/v1/ranking_batches",
-                "/rest/v1/ranking_entries",
                 "/rest/v1/paper_bankroll",
                 "/rest/v1/paper_positions",
+                "/rest/v1/ranking_batches",
+                "/rest/v1/ranking_entries",
             ],
             "only boot reads; no producer requests"
         );
@@ -1326,6 +1340,11 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
         authority.requests.lock().unwrap().push(uri.clone());
         let query = uri.query().unwrap_or_default();
         Json(match uri.path() {
+            "/rest/v1/ranking_scope_drops" | "/rest/v1/ranking_neg_risk_group_spans" => json!([]),
+            "/rest/v1/ranking_batches" if query.contains("batch_id=eq.573") => {
+                json!([{"batch_id":573}])
+            }
+            "/rest/v1/ranking_batches" => json!([{"batch_id":572}]),
             "/rest/v1/service_config" => {
                 // Financial15 rows: the two legacy-only keys (`fill_mode`, `polymarket_fee_rate`)
                 // are unknown after Start and would refuse the snapshot.
@@ -1716,6 +1735,10 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
     let config_path = dir.path().join("service.toml");
     std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
     if checkpoint_parity {
+        PaperStateDb::open(&paths.fixed_main)
+            .unwrap()
+            .import_scope_drops(572, &[], &Default::default())
+            .unwrap();
         // Restore the exact same initial durable state before each boot. The full walk and
         // checkpoint must recover both the unmatched Prepared and the independent open entry.
         let initial = [&paths.fixed_main, &paths.source_log, &paths.paper_log]
@@ -4779,6 +4802,7 @@ async fn progressive_boot_skips_waves_after_membership_record() {
     ) -> Json<serde_json::Value> {
         use serde_json::json;
         Json(match uri.path() {
+            "/rest/v1/ranking_scope_drops" | "/rest/v1/ranking_neg_risk_group_spans" => json!([]),
             "/rest/v1/service_config" => {
                 let rows = [
                     ("active_watchlist_size", "1", "integer"),

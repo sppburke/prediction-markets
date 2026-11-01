@@ -851,7 +851,7 @@ async fn run() -> Result<()> {
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
         );
-        if let Some(start) = financial_start {
+        if financial_start.is_some() {
             // #628: one observation, so the balance and the progress marker cannot straddle a
             // concurrent fill and make a legitimate first fill look like a corrupt balance.
             let authoritative = client
@@ -864,13 +864,6 @@ async fn run() -> Result<()> {
                 authoritative.map(|(bankroll, _)| bankroll),
                 starting_bankroll,
             )?;
-            paper_state
-                .seed_financial_start(start)
-                .context("seed local financial Start")?;
-            client
-                .seed_financial_start(start)
-                .await
-                .context("seed authoritative financial Start")?;
         } else if migration_boot.session.is_some() {
             supabase_authoritative_boot_observed(
                 &client,
@@ -898,6 +891,56 @@ async fn run() -> Result<()> {
     } else {
         None
     };
+
+    let boot_source_log = Arc::new(tokio::sync::Mutex::new(match boot_sink.take() {
+        Some(sink) => sink,
+        None => pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
+            .context("open boot source-log recorder")?,
+    }));
+    let boot_scope_drops =
+        supabase_reader::ScopeDropLoader::boot(paper_state.clone(), boot_source_log.clone());
+    let ranking_client = reqwest::Client::new();
+    let (initial_watchlist, bootstrap_last_trade, boot_batch_marker, post_start_record_replayed) =
+        load_boot_membership(
+            &cfg,
+            &ranking_client,
+            membership_generation.as_ref(),
+            source_log_boot.as_ref(),
+            &boot_scope_drops,
+        )
+        .await?;
+    info!(
+        active = initial_watchlist.active_count,
+        total = initial_watchlist.entries.len(),
+        batch_id = ?boot_batch_marker,
+        durable = financial_start.is_some(),
+        "watchlist membership rebuilt"
+    );
+
+    // Pre-Start and Start-pinned survivor-filtered reads require a nonempty membership.
+    // A synchronized post-Start record may instead establish an intentionally empty generation.
+    anyhow::ensure!(
+        post_start_record_replayed || !initial_watchlist.entries.is_empty(),
+        "no wallets to copy: the boot membership generation contains no SURVIVING rows"
+    );
+    if initial_watchlist.entries.is_empty() {
+        warn!("replayed post-Start membership is empty; booting with zero live wallets");
+    }
+
+    drop(boot_scope_drops);
+
+    if let Some(start) = financial_start {
+        let client = supabase_state.as_ref().context(
+            "active financial era requires the authoritative client before paper writer boot",
+        )?;
+        paper_state
+            .seed_financial_start(start)
+            .context("seed local financial Start")?;
+        client
+            .seed_financial_start(start)
+            .await
+            .context("seed authoritative financial Start")?;
+    }
 
     // Open the sole paper writer and converge the active financial prefix before reading any
     // bankroll used for sizing or API state.
@@ -946,43 +989,6 @@ async fn run() -> Result<()> {
     };
     let leader_ledger =
         build_leader_ledger(&paper_state).context("rehydrate leader position ledger")?;
-
-    let boot_source_log = Arc::new(tokio::sync::Mutex::new(match boot_sink.take() {
-        Some(sink) => sink,
-        None => pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
-            .context("open boot source-log recorder")?,
-    }));
-    let boot_scope_drops =
-        supabase_reader::ScopeDropLoader::boot(paper_state.clone(), boot_source_log.clone());
-    let ranking_client = reqwest::Client::new();
-    let (initial_watchlist, bootstrap_last_trade, boot_batch_marker, post_start_record_replayed) =
-        load_boot_membership(
-            &cfg,
-            &ranking_client,
-            membership_generation.as_ref(),
-            source_log_boot.as_ref(),
-            &boot_scope_drops,
-        )
-        .await?;
-    info!(
-        active = initial_watchlist.active_count,
-        total = initial_watchlist.entries.len(),
-        batch_id = ?boot_batch_marker,
-        durable = financial_start.is_some(),
-        "watchlist membership rebuilt"
-    );
-
-    // Pre-Start and Start-pinned survivor-filtered reads require a nonempty membership.
-    // A synchronized post-Start record may instead establish an intentionally empty generation.
-    anyhow::ensure!(
-        post_start_record_replayed || !initial_watchlist.entries.is_empty(),
-        "no wallets to copy: the boot membership generation contains no SURVIVING rows"
-    );
-    if initial_watchlist.entries.is_empty() {
-        warn!("replayed post-Start membership is empty; booting with zero live wallets");
-    }
-
-    drop(boot_scope_drops);
 
     // Durable fences are decision boundaries and filter BEFORE the bracket;
     // history completeness filters AFTER it — the bracket's complete fixed-end
