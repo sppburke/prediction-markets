@@ -1198,6 +1198,19 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
             "{:?}",
             report.reasons
         );
+        // Only the short run's thresholds and its intentionally open positions may fail; any other
+        // financial gate failure (drawdown, a measured copy delay over budget) must surface here.
+        let intended = [
+            "complete days ",
+            "closed copies ",
+            "LCB_5pct is not positive",
+            "paper p95 copy delay is absent or above budget",
+            "paper positions remain open at the sealed financial prefix",
+        ];
+        assert_eq!(report.reasons.len(), intended.len(), "{:?}", report.reasons);
+        for (reason, prefix) in report.reasons.iter().zip(intended) {
+            assert!(reason.starts_with(prefix), "{:?}", report.reasons);
+        }
         server.abort();
         return;
     }
