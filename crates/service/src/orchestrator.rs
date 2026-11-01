@@ -1969,10 +1969,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     && let Err(msg) = self.resume_committed_rows(&result.pending).await
                 {
                     self.pending_load_failure = Some(msg.clone());
-                    let _ = committed.send(Err(msg));
+                    let _ = committed
+                        .send(Err(crate::bucket_commit::BucketCommitError::Invariant(msg)));
                     return;
                 }
-                let result = result.map_err(|error| error.to_string());
                 let _ = committed.send(result);
             }
             OrchestratorControl::ResolutionCandidate {

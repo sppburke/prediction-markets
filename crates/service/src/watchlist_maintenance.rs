@@ -3596,16 +3596,14 @@ mod tests {
                             context,
                             committed,
                         } => {
-                            let result = engine
-                                .commit(
-                                    aggregates,
-                                    context.as_ref(),
-                                    crate::bucket_commit::FrozenDecisionBasis {
-                                        win_rate_p: pe_core_types::Probability::ZERO,
-                                        bankroll: Decimal::ZERO,
-                                    },
-                                )
-                                .map_err(|error| error.to_string());
+                            let result = engine.commit(
+                                aggregates,
+                                context.as_ref(),
+                                crate::bucket_commit::FrozenDecisionBasis {
+                                    win_rate_p: pe_core_types::Probability::ZERO,
+                                    bankroll: Decimal::ZERO,
+                                },
+                            );
                             committed.send(result).unwrap();
                         }
                         OrchestratorControl::InstallAnchors {

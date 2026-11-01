@@ -209,18 +209,14 @@ async fn run_once(
                         .any(|source| source == ACTIVITY_POLL_SOURCE_ID),
                     "bucket delivery cannot precede its raw polling page"
                 );
-                let _ = committed.send(
-                    engine
-                        .commit(
-                            aggregates,
-                            context.as_ref(),
-                            pe_service::bucket_commit::FrozenDecisionBasis {
-                                win_rate_p: pe_core_types::Probability::ZERO,
-                                bankroll: rust_decimal::Decimal::ZERO,
-                            },
-                        )
-                        .map_err(|error| error.to_string()),
-                );
+                let _ = committed.send(engine.commit(
+                    aggregates,
+                    context.as_ref(),
+                    pe_service::bucket_commit::FrozenDecisionBasis {
+                        win_rate_p: pe_core_types::Probability::ZERO,
+                        bankroll: rust_decimal::Decimal::ZERO,
+                    },
+                ));
             }
         }
     });

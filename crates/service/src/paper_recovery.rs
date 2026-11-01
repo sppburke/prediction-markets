@@ -6222,6 +6222,7 @@ pub(crate) fn applied_disposition(
     let not_applied = matches!(
         disposition,
         "raw_only"
+            | "scope_dropped"
             | "reanchor_required_redemption"
             | "reanchor_required_late_group"
             | "anchor_covered"

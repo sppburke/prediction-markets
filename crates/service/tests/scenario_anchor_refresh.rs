@@ -364,22 +364,18 @@ fn poller_harness_with_fetcher(
                     context,
                     committed,
                 } => {
-                    let _ = committed.send(
-                        engine
-                            .commit_with_freshness_policy(
-                                aggregates,
-                                context.as_ref(),
-                                FrozenDecisionBasis {
-                                    win_rate_p: pe_core_types::Probability::ZERO,
-                                    bankroll: rust_decimal::Decimal::ZERO,
-                                },
-                                Some(pe_service::bucket_commit::PaperFreshnessPolicy {
-                                    activity_ws_enabled: false,
-                                    copy_latency_budget_secs: 2,
-                                }),
-                            )
-                            .map_err(|error| error.to_string()),
-                    );
+                    let _ = committed.send(engine.commit_with_freshness_policy(
+                        aggregates,
+                        context.as_ref(),
+                        FrozenDecisionBasis {
+                            win_rate_p: pe_core_types::Probability::ZERO,
+                            bankroll: rust_decimal::Decimal::ZERO,
+                        },
+                        Some(pe_service::bucket_commit::PaperFreshnessPolicy {
+                            activity_ws_enabled: false,
+                            copy_latency_budget_secs: 2,
+                        }),
+                    ));
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
                     let capture = ledger_capture(engine.ledger(), &actor_paper, wallet)
@@ -503,18 +499,14 @@ async fn refresh_outcome_for_install_rejection(
                     context,
                     committed,
                 } => {
-                    let _ = committed.send(
-                        engine
-                            .commit(
-                                aggregates,
-                                context.as_ref(),
-                                FrozenDecisionBasis {
-                                    win_rate_p: pe_core_types::Probability::ZERO,
-                                    bankroll: rust_decimal::Decimal::ZERO,
-                                },
-                            )
-                            .map_err(|error| error.to_string()),
-                    );
+                    let _ = committed.send(engine.commit(
+                        aggregates,
+                        context.as_ref(),
+                        FrozenDecisionBasis {
+                            win_rate_p: pe_core_types::Probability::ZERO,
+                            bankroll: rust_decimal::Decimal::ZERO,
+                        },
+                    ));
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
                     let _ = captured.send(

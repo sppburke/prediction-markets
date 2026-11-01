@@ -246,7 +246,7 @@ fn wallet(byte: u8) -> WalletAddress {
 }
 
 fn condition(byte: u8) -> String {
-    format!("0xcondition{byte:02x}")
+    format!("0x{byte:02x}")
 }
 
 fn asset(byte: u8) -> String {
@@ -947,6 +947,9 @@ fn recording_validator(
 fn fresh(wallets: &[WalletAddress]) -> (TempDir, Arc<PaperStateDb>, BucketCommitEngine) {
     let dir = tempfile::tempdir().unwrap();
     let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    for byte in 0..=20 {
+        paper.record_market_group(&condition(byte), "").unwrap();
+    }
     for wallet in wallets {
         paper
             .record_reconciled_history_status(&WalletHistoryStatusRecord {
@@ -1082,11 +1085,8 @@ fn spawn_hooked_control_actor(
                     context,
                     committed,
                 } => {
-                    let _ = committed.send(
-                        engine
-                            .commit(aggregates, context.as_ref(), zero_basis())
-                            .map_err(|error| error.to_string()),
-                    );
+                    let _ =
+                        committed.send(engine.commit(aggregates, context.as_ref(), zero_basis()));
                 }
                 _ => {}
             }
@@ -1123,7 +1123,7 @@ fn canonical_capture_hash_matches_sorted_anchored_balances() {
     let capture = ledger_capture(&ledger, &paper, wallet).unwrap();
     assert_eq!(
         capture.hash,
-        "c08a170362315f92f6ee39615f7db11e308c4a7db8f2b1b044813fe8a67113c4"
+        "0c1103df5cb64a019c388cc8ad90da7873099d145ff08a5465736c44c2a43fe6"
     );
     assert_eq!(capture.cursor, Some(42));
     assert_eq!(capture.anchor_seq, None);
@@ -1298,12 +1298,12 @@ async fn full_history_repairs_all_older_markets_and_preserves_old_records_on_res
                     .unwrap();
                 assert!(result.pending.is_empty());
                 if side == "BUY" {
-                    assert!(
-                        result
-                            .dispositions
-                            .values()
-                            .all(|value| value == "not_first_entry")
-                    );
+                    assert!(result.dispositions.values().all(|value| value
+                        == if matches!(kind, "anchored" | "seeded") {
+                            "scope_dropped"
+                        } else {
+                            "not_first_entry"
+                        }));
                 }
             }
         }
@@ -1353,12 +1353,12 @@ async fn full_history_repairs_all_older_markets_and_preserves_old_records_on_res
                     .unwrap();
                 assert!(result.pending.is_empty());
                 if side == "BUY" {
-                    assert!(
-                        result
-                            .dispositions
-                            .values()
-                            .all(|value| value == "not_first_entry")
-                    );
+                    assert!(result.dispositions.values().all(|value| value
+                        == if matches!(kind, "anchored" | "seeded") {
+                            "scope_dropped"
+                        } else {
+                            "not_first_entry"
+                        }));
                 }
             }
         }
@@ -2719,7 +2719,7 @@ async fn concurrent_shared_corrected_asset_replays_identically_in_both_completio
 }
 
 #[tokio::test]
-async fn concurrent_fenced_and_deferred_wallets_do_not_abort_healthy_install() {
+async fn concurrent_scoped_and_deferred_wallets_do_not_abort_healthy_install() {
     let fenced = wallet(0x15);
     let deferred = wallet(0x16);
     let healthy = wallet(0x17);
@@ -2730,7 +2730,7 @@ async fn concurrent_fenced_and_deferred_wallets_do_not_abort_healthy_install() {
     underflow["type"] = json!("REDEEM");
     responses.insert(
         activity_url(fenced),
-        vec![serde_json::to_vec(&vec![underflow]).unwrap()],
+        vec![serde_json::to_vec(&vec![underflow]).unwrap(); 3],
     );
     responses.insert(
         activity_url(deferred),
@@ -2744,6 +2744,12 @@ async fn concurrent_fenced_and_deferred_wallets_do_not_abort_healthy_install() {
         position_url(deferred, PositionPartition::Redeemable),
         vec![b"[]".to_vec()],
     );
+    for partition in [
+        PositionPartition::NotRedeemable,
+        PositionPartition::Redeemable,
+    ] {
+        responses.insert(position_url(fenced, partition), vec![b"[]".to_vec(); 2]);
+    }
     let fetcher = Arc::new(GatedFetcher::new(
         responses,
         vec![fenced, deferred, healthy],
@@ -2757,10 +2763,10 @@ async fn concurrent_fenced_and_deferred_wallets_do_not_abort_healthy_install() {
         .validate_direct(&[fenced, deferred, healthy], &mut engine, &paper)
         .await
         .unwrap();
-    assert_eq!(accepted.len(), 1);
-    assert_eq!(accepted[0].wallet, healthy);
-    assert!(paper.is_wallet_fenced(&fenced).unwrap());
-    assert!(paper.position_validation(&fenced).unwrap().is_none());
+    assert_eq!(accepted.len(), 2);
+    assert!(accepted.iter().any(|anchor| anchor.wallet == healthy));
+    assert!(!paper.is_wallet_fenced(&fenced).unwrap());
+    assert!(paper.position_validation(&fenced).unwrap().is_some());
     assert!(paper.position_validation(&deferred).unwrap().is_none());
     assert!(paper.position_validation(&healthy).unwrap().is_some());
 }
@@ -2868,7 +2874,7 @@ async fn intervening_once_retries_then_accepts_and_clears_reanchor() {
 }
 
 #[tokio::test]
-async fn changed_activity_revision_fences_and_installs_nothing() {
+async fn changed_activity_revision_drops_scope_and_completes_on_retry() {
     let wallet = wallet(0x31);
     let (_dir, paper, mut engine) = fresh(&[wallet]);
     let first =
@@ -2877,23 +2883,36 @@ async fn changed_activity_revision_fences_and_installs_nothing() {
         serde_json::to_vec(&vec![activity(wallet, 1, "2.000000", "0xrevision", 10)]).unwrap();
     let positions = serde_json::to_vec(&vec![position(wallet, 1, "1.000000")]).unwrap();
     let responses = HashMap::from([
-        (activity_url(wallet), vec![first, changed]),
+        (
+            activity_url(wallet),
+            vec![
+                first,
+                changed.clone(),
+                changed.clone(),
+                changed.clone(),
+                changed,
+            ],
+        ),
         (
             position_url(wallet, PositionPartition::NotRedeemable),
-            vec![positions],
+            vec![positions.clone(), positions.clone(), positions],
         ),
         (
             position_url(wallet, PositionPartition::Redeemable),
-            vec![b"[]".to_vec()],
+            vec![b"[]".to_vec(); 3],
         ),
     ]);
     let accepted = validator(responses)
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
-        .expect("a deterministic durable fence is quarantined, not boot-fatal");
-    assert!(accepted.is_empty());
-    assert!(paper.is_wallet_fenced(&wallet).unwrap());
-    assert!(paper.position_validation(&wallet).unwrap().is_none());
+        .expect("a retained revision retries the bracket");
+    assert_eq!(accepted.len(), 1);
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+    assert!(paper.position_validation(&wallet).unwrap().is_some());
+    assert_eq!(
+        paper.wallet_scope_drops(&wallet, END).unwrap()[0].cause,
+        "revised_applied_aggregate"
+    );
 }
 
 #[tokio::test]
@@ -3611,18 +3630,14 @@ async fn serialized_admission_preparer_runs_the_bracket_before_acknowledgement()
                     context,
                     committed,
                 } => {
-                    let _ = committed.send(
-                        engine
-                            .commit(
-                                aggregates,
-                                context.as_ref(),
-                                pe_service::bucket_commit::FrozenDecisionBasis {
-                                    win_rate_p: pe_core_types::Probability::ZERO,
-                                    bankroll: rust_decimal::Decimal::ZERO,
-                                },
-                            )
-                            .map_err(|error| error.to_string()),
-                    );
+                    let _ = committed.send(engine.commit(
+                        aggregates,
+                        context.as_ref(),
+                        pe_service::bucket_commit::FrozenDecisionBasis {
+                            win_rate_p: pe_core_types::Probability::ZERO,
+                            bankroll: rust_decimal::Decimal::ZERO,
+                        },
+                    ));
                 }
                 _ => {}
             }
@@ -3666,7 +3681,7 @@ async fn periodic_refresh_skips_an_existing_fence_but_genuine_admission_stays_fa
 }
 
 #[tokio::test]
-async fn periodic_refresh_skips_a_wallet_newly_fenced_inside_the_bracket() {
+async fn periodic_refresh_defers_repeated_revisions_without_fencing() {
     let wallet = wallet(0x77);
     let (_dir, paper, mut engine) = fresh(&[wallet]);
     install_empty_anchor(&mut engine, &paper, wallet, 0);
@@ -3698,12 +3713,12 @@ async fn periodic_refresh_skips_a_wallet_newly_fenced_inside_the_bracket() {
     );
     let anchors_before = paper.position_anchors(&wallet).unwrap();
 
-    // A recoverable fence permits one retry; another novel revision defers without installing.
+    // Another novel revision exhausts the bounded retry without installing.
     assert_eq!(
         preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
         AnchorRefreshOutcome::Deferred
     );
-    assert!(paper.is_wallet_fenced(&wallet).unwrap());
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
     assert_eq!(paper.position_anchors(&wallet).unwrap(), anchors_before);
     assert_eq!(
         fetcher
@@ -3747,7 +3762,7 @@ async fn paper_service_rollout_periodic_refresh_recovers_a_stable_revision_on_bo
         validator_from_fetcher(Arc::clone(&fetcher)),
     );
 
-    // The first read retains R1 and fences; the bounded retry sees only that disposed revision.
+    // The first read retains R1; the bounded retry recognizes the exact revision.
     assert_eq!(
         preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
         AnchorRefreshOutcome::Anchored
@@ -3760,8 +3775,11 @@ async fn paper_service_rollout_periodic_refresh_recovers_a_stable_revision_on_bo
     assert_eq!(anchor.activity_cutoff_unix, END);
     assert_full_history_proof(&anchor.proof_json);
     let proof: Value = serde_json::from_str(&anchor.proof_json).unwrap();
-    assert_eq!(proof["cleared_fence"]["cause"], "revised_applied_aggregate");
-    assert_eq!(proof["cleared_fence"]["source_trade_id"], id.0);
+    assert!(proof["cleared_fence"].is_null());
+    assert_eq!(
+        paper.wallet_scope_drops(&wallet, END).unwrap()[0].cause,
+        "revised_applied_aggregate"
+    );
     assert!(paper.position_validation_current(&wallet).unwrap());
     let coverage = paper.wallet_coverage(&wallet).unwrap();
     assert_eq!(coverage.activity_cutoff_unix, Some(END));
@@ -3781,7 +3799,7 @@ async fn paper_service_rollout_periodic_refresh_recovers_a_stable_revision_on_bo
             .unwrap()
             .unwrap()
             .disposition,
-        "revised_applied_aggregate"
+        "scope_dropped"
     );
     assert_eq!(paper.decision_pending_history().unwrap(), pending);
     assert_eq!(
@@ -3987,7 +4005,7 @@ fn cursor_and_anchor_sequence_cas_reject_stale_expectations() {
 }
 
 #[test]
-fn covered_late_generation_change_rejects_an_otherwise_unchanged_anchor() {
+fn covered_late_scope_drop_survives_an_unchanged_anchor() {
     let wallet = wallet(0x67);
     let (_dir, paper, mut engine) = fresh(&[wallet]);
     install_empty_anchor(&mut engine, &paper, wallet, 100);
@@ -4025,16 +4043,17 @@ fn covered_late_generation_change_rejects_an_otherwise_unchanged_anchor() {
         )
         .unwrap();
 
-    assert!(matches!(
-        engine.install_anchors(&[candidate]),
-        Err(pe_service::bucket_commit::AnchorInstallError::CoverageGenerationChanged { .. })
-    ));
+    engine.install_anchors(&[candidate]).unwrap();
     let after = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
     assert_eq!(after.hash, captured.hash);
     assert_eq!(after.cursor, captured.cursor);
-    assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 1);
-    assert!(paper.position_validation(&wallet).unwrap().is_none());
-    assert!(paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+    assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 2);
+    assert!(paper.position_validation(&wallet).unwrap().is_some());
+    assert!(!paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+    assert_eq!(
+        paper.wallet_scope_drops(&wallet, 100).unwrap()[0].scope_id,
+        condition(2)
+    );
 }
 
 #[test]
@@ -4381,11 +4400,7 @@ async fn anchor_install_ledger_race_defers_one_wallet_and_durability_aborts() {
                         committed,
                     } => {
                         committed
-                            .send(
-                                engine
-                                    .commit(aggregates, context.as_ref(), zero_basis())
-                                    .map_err(|error| error.to_string()),
-                            )
+                            .send(engine.commit(aggregates, context.as_ref(), zero_basis()))
                             .unwrap();
                     }
                     OrchestratorControl::InstallAnchors {
@@ -4567,11 +4582,7 @@ async fn each_source_error_variant_aborts_admission_preparation() {
 }
 
 #[tokio::test]
-async fn boot_bracket_quarantines_a_newly_fenced_wallet_and_accepts_the_rest() {
-    // Live shape from the #544 activation rehearsal: one wallet's visible
-    // activity cannot reconstruct its holdings (position_underflow), the
-    // commit fences it durably, and the boot bracket must continue with the
-    // remaining universe instead of aborting the one-shot activation.
+async fn boot_bracket_keeps_a_scoped_problem_wallet_and_accepts_the_rest() {
     let fenced_wallet = wallet(0x71);
     let healthy = wallet(0x72);
     let (_dir, paper, mut engine) = fresh(&[fenced_wallet, healthy]);
@@ -4582,18 +4593,31 @@ async fn boot_bracket_quarantines_a_newly_fenced_wallet_and_accepts_the_rest() {
     underflow_redeem["type"] = json!("REDEEM");
     responses.insert(
         activity_url(fenced_wallet),
-        vec![serde_json::to_vec(&vec![underflow_redeem]).unwrap()],
+        vec![serde_json::to_vec(&vec![underflow_redeem]).unwrap(); 3],
     );
 
+    for partition in [
+        PositionPartition::NotRedeemable,
+        PositionPartition::Redeemable,
+    ] {
+        responses.insert(
+            position_url(fenced_wallet, partition),
+            vec![b"[]".to_vec(); 2],
+        );
+    }
     let accepted = validator(responses)
         .validate_direct(&[fenced_wallet, healthy], &mut engine, &paper)
         .await
-        .expect("a per-wallet fence must not abort the boot bracket");
+        .expect("a scoped problem must not abort the boot bracket");
 
-    assert_eq!(accepted.len(), 1);
-    assert_eq!(accepted[0].wallet, healthy);
-    assert!(paper.is_wallet_fenced(&fenced_wallet).unwrap());
-    assert!(paper.position_validation(&fenced_wallet).unwrap().is_none());
+    assert_eq!(accepted.len(), 2);
+    assert!(accepted.iter().any(|anchor| anchor.wallet == healthy));
+    assert!(!paper.is_wallet_fenced(&fenced_wallet).unwrap());
+    assert!(paper.position_validation(&fenced_wallet).unwrap().is_some());
+    assert_eq!(
+        paper.wallet_scope_drops(&fenced_wallet, END).unwrap().len(),
+        1
+    );
     assert!(paper.position_validation(&healthy).unwrap().is_some());
 }
 
@@ -5497,11 +5521,7 @@ async fn runtime_rejected_brackets_do_not_complete_history() {
                         context,
                         committed,
                     } => {
-                        let _ = committed.send(
-                            engine
-                                .commit(aggregates, &context, zero_basis())
-                                .map_err(|error| error.to_string()),
-                        );
+                        let _ = committed.send(engine.commit(aggregates, &context, zero_basis()));
                     }
                     OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
                         let _ = captured.send(
@@ -5524,15 +5544,13 @@ async fn runtime_rejected_brackets_do_not_complete_history() {
                                     .unwrap();
                             }
                             "cas_fenced" => {
-                                let mut row = activity(wallet, 9, "2", "0xinstall-fence", 110);
-                                row["type"] = json!("REDEEM");
-                                engine
-                                    .commit(
-                                        vec![aggregate(row, wallet)],
-                                        &context(110),
-                                        zero_basis(),
-                                    )
-                                    .unwrap();
+                                rusqlite::Connection::open(&state_path).unwrap().execute(
+                                    "INSERT INTO wallet_fences VALUES (?1, 'legacy', 'position_underflow', '{}', 110)", [wallet.to_string()]).unwrap();
+                                engine = BucketCommitEngine::load(
+                                    actor_paper.clone(),
+                                    engine.ledger().clone(),
+                                )
+                                .unwrap();
                                 assert!(engine.is_fenced(&wallet));
                             }
                             "cas_cursor" => {
@@ -7710,11 +7728,9 @@ async fn reentry_baseline_refuses_previously_raw_only_unknown_effect() {
     actor.await.unwrap();
 }
 
-/// PASS: a live conversion fences its wallet; the fenced re-entry clears that fence, installs the
-/// stable positions, repairs history from the BUY alone, and re-reading the stored conversion
-/// does not fence again. FAIL: the conversion blocks recovery, consumes history, or re-fences.
+/// A conversion drop survives re-entry and history includes only the BUY.
 #[tokio::test]
-async fn live_conversion_fence_recovers_through_reentry_with_buy_only_history() {
+async fn conversion_scope_survives_reentry_with_buy_only_history() {
     let wallet = wallet(0xe6);
     let (dir, paper, mut engine) = fresh(&[wallet]);
     install_empty_anchor(&mut engine, &paper, wallet, 5);
@@ -7729,7 +7745,7 @@ async fn live_conversion_fence_recovers_through_reentry_with_buy_only_history() 
     };
     engine.commit(groups(), &context(10), zero_basis()).unwrap();
     assert_eq!(
-        paper.wallet_fence(&wallet).unwrap().unwrap().cause,
+        paper.wallet_scope_drops(&wallet, END).unwrap()[0].cause,
         "conversion_unknown_conditions"
     );
 
@@ -7764,8 +7780,9 @@ async fn live_conversion_fence_recovers_through_reentry_with_buy_only_history() 
         .max_by_key(|anchor| anchor.anchor_seq)
         .unwrap();
     let proof: Value = serde_json::from_str(&anchor.proof_json).unwrap();
+    assert!(proof["cleared_fence"].is_null());
     assert_eq!(
-        proof["cleared_fence"]["cause"],
+        paper.wallet_scope_drops(&wallet, 4003).unwrap()[0].cause,
         "conversion_unknown_conditions"
     );
     assert!(anchor.balances_json.contains(&condition(1)));

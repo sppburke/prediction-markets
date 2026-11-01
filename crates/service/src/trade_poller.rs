@@ -2907,20 +2907,16 @@ impl WalletOperation {
                 identities.unresolved.insert(group);
                 continue;
             };
-            let differs = components.condition_id.as_ref() != Some(&verified.condition_id)
-                || components.outcome != Some(verified.outcome);
-            if differs {
-                identities.overrides.insert(
-                    group,
-                    IdentityOverride {
-                        verified: MarketOutcomeId::new(
-                            MarketId(VenueMarketId(verified.condition_id.0.clone())),
-                            verified.outcome,
-                        ),
-                        evidence_hash: verified.evidence_hash.clone(),
-                    },
-                );
-            }
+            identities.overrides.insert(
+                group,
+                IdentityOverride {
+                    verified: MarketOutcomeId::new(
+                        MarketId(VenueMarketId(verified.condition_id.0.clone())),
+                        verified.outcome,
+                    ),
+                    evidence_hash: verified.evidence_hash.clone(),
+                },
+            );
         }
         Ok(identities)
     }
@@ -2976,7 +2972,7 @@ impl WalletOperation {
         result
             .await
             .map_err(|_| ReconciliationError::ControlClosed)?
-            .map_err(ReconciliationError::BucketCommit)
+            .map_err(|error| ReconciliationError::BucketCommit(error.to_string()))
     }
 }
 

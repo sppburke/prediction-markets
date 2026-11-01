@@ -3373,7 +3373,12 @@ impl BracketFinancialHarness {
         &self,
         wallet: WalletAddress,
         epoch: i64,
-    ) -> oneshot::Receiver<Result<pe_service::bucket_commit::BucketCommitResult, String>> {
+    ) -> oneshot::Receiver<
+        Result<
+            pe_service::bucket_commit::BucketCommitResult,
+            pe_service::bucket_commit::BucketCommitError,
+        >,
+    > {
         let bodies = golden_trade_bodies(1, epoch);
         self.record_entry_admission(&bodies, epoch).await;
         let payload = Self::entry_payload(wallet, epoch);

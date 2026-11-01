@@ -1450,20 +1450,16 @@ impl CausalPositionValidator {
                     );
                     continue;
                 };
-                if components.condition_id.as_ref() != Some(&identity.condition_id)
-                    || components.outcome != Some(identity.outcome)
-                {
-                    identity_overrides.insert(
-                        aggregate.group_id.key().clone(),
-                        IdentityOverride {
-                            verified: MarketOutcomeId::new(
-                                MarketId(VenueMarketId(identity.condition_id.0.clone())),
-                                identity.outcome,
-                            ),
-                            evidence_hash: identity.evidence_hash.clone(),
-                        },
-                    );
-                }
+                identity_overrides.insert(
+                    aggregate.group_id.key().clone(),
+                    IdentityOverride {
+                        verified: MarketOutcomeId::new(
+                            MarketId(VenueMarketId(identity.condition_id.0.clone())),
+                            identity.outcome,
+                        ),
+                        evidence_hash: identity.evidence_hash.clone(),
+                    },
+                );
             }
         }
         Ok(PreparedActivity {
@@ -1555,7 +1551,10 @@ impl CausalPositionValidator {
             let result = acknowledgement
                 .await
                 .map_err(|_| CausalPositionError::AcknowledgementClosed)?
-                .map_err(|message| CausalPositionError::BucketCommit { wallet, message })?;
+                .map_err(|error| CausalPositionError::BucketCommit {
+                    wallet,
+                    message: error.to_string(),
+                })?;
             if result.retained_revision {
                 return Err(CausalPositionError::InterveningActivity { wallet });
             }

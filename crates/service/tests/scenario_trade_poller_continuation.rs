@@ -40,8 +40,8 @@ use tokio::sync::{mpsc, oneshot};
 
 const BASE_URL: &str = "https://data.example.test";
 const WALLET_HEX: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const MARKET_A: &str = "0xcondition-a";
-const MARKET_B: &str = "0xcondition-b";
+const MARKET_A: &str = "0xca";
+const MARKET_B: &str = "0xcb";
 const EPOCH: i64 = 1_900_000_000;
 
 struct QueueFetcher {
@@ -99,7 +99,7 @@ impl ReconciliationFetcher for GammaFetcher {
             "combo tokens never enter identity lookup"
         );
         Box::pin(async {
-            Ok(br#"[{"conditionId":"0xcondition-a","clobTokenIds":["asset-a"]},{"conditionId":"0xcondition-b","clobTokenIds":["asset-b"]}]"#.to_vec())
+            Ok(br#"[{"conditionId":"0xca","clobTokenIds":["asset-a"]},{"conditionId":"0xcb","clobTokenIds":["asset-b"]}]"#.to_vec())
         })
     }
 }
@@ -254,6 +254,9 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
     let dir = tempfile::tempdir().unwrap();
     let source_log_path = dir.path().join("source.log");
     let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    for market in [MARKET_A, MARKET_B] {
+        paper.record_market_group(market, "").unwrap();
+    }
     paper.set_cursor(&wallet(), 0).unwrap();
     paper
         .record_reconciled_history_status(&WalletHistoryStatusRecord {
@@ -358,9 +361,7 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
                 committed,
             } = command
             {
-                let result = engine
-                    .commit(aggregates, context.as_ref(), zero_basis())
-                    .map_err(|error| error.to_string());
+                let result = engine.commit(aggregates, context.as_ref(), zero_basis());
                 let _ = committed.send(result);
             }
         }
@@ -416,7 +417,7 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
     );
     assert_eq!(engine.ledger().snapshots(), &ledger_before_read);
     assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
-    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
     assert!(paper.open_decision_pending().unwrap().is_empty());
 
     let groups = paper.activity_groups_after(&wallet(), EPOCH - 1).unwrap();
@@ -425,10 +426,10 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
             .iter()
             .find(|group| group.source_trade_id == group_id)
             .expect("both buckets must become durable before the round exits");
-        assert_eq!(group.disposition, "reanchor_required_late_group");
+        assert_eq!(group.disposition, "scope_dropped");
         assert!(matches!(
             LedgerEffect::from_document(&group.proof_json),
-            Ok(LedgerEffect::RawOnly)
+            Ok(LedgerEffect::Trade { .. } | LedgerEffect::Redeem { .. })
         ));
     }
 }
@@ -563,6 +564,9 @@ async fn poller_multipage_commitment_survives_restart() {
     let source_path = dir.path().join("source.log");
     let state_path = dir.path().join("paper.db");
     let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    for market in [MARKET_A, MARKET_B] {
+        paper.record_market_group(market, "").unwrap();
+    }
     support::install_empty_anchor(&paper, wallet(), 0);
     paper
         .record_reconciled_history_status(&WalletHistoryStatusRecord {
@@ -691,6 +695,9 @@ async fn poller_multipage_commitment_survives_restart() {
     let positions_before = paper.leader_positions().unwrap();
     drop(paper);
     let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    for market in [MARKET_A, MARKET_B] {
+        paper.record_market_group(market, "").unwrap();
+    }
     let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&source_path).unwrap();
     for page in &continuation.page_occurrences {
         assert_eq!(
@@ -805,6 +812,9 @@ async fn copied_listing_read_commits_once_and_repeats_without_fence() {
     let source_path = dir.path().join("source.log");
     let state_path = dir.path().join("paper.db");
     let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    for market in [MARKET_A, MARKET_B] {
+        paper.record_market_group(market, "").unwrap();
+    }
     support::install_empty_anchor(&paper, wallet(), 0);
     paper
         .record_reconciled_history_status(&WalletHistoryStatusRecord {
@@ -856,6 +866,9 @@ async fn copied_listing_read_commits_once_and_repeats_without_fence() {
 
     drop(paper);
     let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    for market in [MARKET_A, MARKET_B] {
+        paper.record_market_group(market, "").unwrap();
+    }
     let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&source_path).unwrap();
     let rows = paper.open_decision_pending().unwrap();
     assert_eq!(rows.len(), 1);
@@ -898,6 +911,7 @@ struct RunningPoll {
     append_ack_gate: Arc<tokio::sync::Semaphore>,
     append_ack_arrived: Arc<tokio::sync::Notify>,
     bucket_ack_gate: Arc<tokio::sync::Semaphore>,
+    integrity_fence_after_commit: Arc<std::sync::atomic::AtomicBool>,
     boundary_ack_gate: Arc<tokio::sync::Semaphore>,
     boundary_results: Arc<Mutex<VecDeque<BoundaryReply>>>,
     boundary_publications: Arc<Mutex<Vec<(i64, pe_event_log::AppendReceipt)>>>,
@@ -1072,6 +1086,9 @@ fn start_recorded_poller_with_completion_stop(
     let paper_path = dir.path().join("paper.db");
     let restarting = paper_path.exists();
     let paper = Arc::new(PaperStateDb::open(&paper_path).unwrap());
+    for market in [MARKET_A, MARKET_B] {
+        paper.record_market_group(market, "").unwrap();
+    }
     // Reopening a cancelled run must preserve its cursor, anchors and applied ledger effects.
     for wallet in wallets.iter().filter(|_| !restarting) {
         paper.set_cursor(wallet, EPOCH - 10).unwrap();
@@ -1121,6 +1138,9 @@ fn start_recorded_poller_with_completion_stop(
     let append_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let append_ack_arrived = Arc::new(tokio::sync::Notify::new());
     let bucket_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let integrity_fence_after_commit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let actor_integrity_fence = integrity_fence_after_commit.clone();
+    let actor_state_path = paper_path.clone();
     let boundary_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let boundary_results = Arc::new(Mutex::new(VecDeque::new()));
     let boundary_publications = Arc::new(Mutex::new(Vec::new()));
@@ -1196,7 +1216,7 @@ fn start_recorded_poller_with_completion_stop(
                     context,
                     committed,
                 } => {
-                    let result = if real_owner {
+                    let mut result = if real_owner {
                         let (committed, result) = oneshot::channel();
                         real_tx
                             .send(OrchestratorControl::CommitActivityBucket {
@@ -1220,6 +1240,16 @@ fn start_recorded_poller_with_completion_stop(
                             )
                             .unwrap()
                     };
+                    if actor_integrity_fence.swap(false, Ordering::SeqCst) {
+                        assert!(!real_owner);
+                        rusqlite::Connection::open(&actor_state_path).unwrap().execute(
+                            "INSERT INTO wallet_fences VALUES (?1, ?2, 'position_underflow', '{}', ?3)",
+                            rusqlite::params![result.wallet.to_string(), aggregates[0].group_id.key().0, context.recorded_at_unix]).unwrap();
+                        engine =
+                            BucketCommitEngine::load(actor_paper.clone(), engine.ledger().clone())
+                                .unwrap();
+                        result.newly_fenced = Some(pe_position_ledger::WalletFenceCause::Underflow);
+                    }
                     commits.push((aggregates, context, result.clone()));
                     let _ = control_events
                         .send(ControlCompletion::BucketCommitted)
@@ -1408,6 +1438,7 @@ fn start_recorded_poller_with_completion_stop(
             append_ack_gate,
             append_ack_arrived,
             bucket_ack_gate,
+            integrity_fence_after_commit,
             boundary_ack_gate,
             boundary_results,
             boundary_publications,
@@ -1439,10 +1470,9 @@ fn stream_row(wallet: WalletAddress, transaction: &str, epoch: i64) -> Value {
     row
 }
 
-/// PASS: a binding recorded before an earlier bucket fences the wallet survives both empty and
-/// target-absent retries. Runtime and boot retain the same receipt and hold the same boundary.
+/// An integrity fence between buckets retains bound observations across retries and restart.
 #[tokio::test(start_paused = true)]
-async fn fenced_retries_preserve_bound_targets_and_boundary_until_disposed() {
+async fn integrity_fenced_retries_preserve_bound_targets_and_boundary_until_disposed() {
     let dir = tempfile::tempdir().unwrap();
     let cutoff = (EPOCH.div_euclid(86_400) + 1) * 86_400;
     let (mut running, paper) =
@@ -1457,6 +1487,9 @@ async fn fenced_retries_preserve_bound_targets_and_boundary_until_disposed() {
         .unwrap();
     running.round_completed().await;
 
+    running
+        .integrity_fence_after_commit
+        .store(true, Ordering::SeqCst);
     running.now.store(cutoff - 1, Ordering::SeqCst);
     let target = stream_row(wallet(), "bound-after-fence", cutoff - 1);
     let mut stream = target.clone();
@@ -1791,7 +1824,7 @@ async fn queued_refresh_wallet_that_becomes_obligated_yields_its_turn() {
     let missing = activity_row(
         "TRADE",
         "0xmissing",
-        "0xcondition-a",
+        "0xca",
         "BUY",
         "10",
         "asset-a",
@@ -4796,6 +4829,9 @@ async fn restart_between_fence_witness_and_revision_keeps_unacknowledged_obligat
     let commits = running.finish().await;
     let (aggregates, context, _) = commits.last().unwrap();
     let paper = Arc::new(PaperStateDb::open(&before).unwrap());
+    for market in [MARKET_A, MARKET_B] {
+        paper.record_market_group(market, "").unwrap();
+    }
     let original_state = paper
         .activity_group_state(original_aggregate.group_id.key())
         .unwrap()
@@ -4829,6 +4865,9 @@ async fn restart_between_fence_witness_and_revision_keeps_unacknowledged_obligat
     drop(engine);
     drop(paper);
     let paper = Arc::new(PaperStateDb::open(&before).unwrap());
+    for market in [MARKET_A, MARKET_B] {
+        paper.record_market_group(market, "").unwrap();
+    }
     let fence = paper.wallet_fences().unwrap();
     assert_eq!(
         pe_service::trade_poller::rebuild_reconciliation_obligations(
@@ -5190,6 +5229,9 @@ async fn restamp_twins_single_multirow_and_recorded_siblings_preserve_later_deci
             for count in [1, 3] {
                 let dir = tempfile::tempdir().unwrap();
                 let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+                for market in [MARKET_A, MARKET_B] {
+                    paper.record_market_group(market, "").unwrap();
+                }
                 support::install_empty_anchor(&paper, wallet(), 0);
                 paper
                     .record_reconciled_history_status(&WalletHistoryStatusRecord {
@@ -5641,6 +5683,9 @@ async fn ordinary_redemptions_and_trade_redeem_combos_preserve_first_entry_decis
         for entry_epoch in [EPOCH, EPOCH + 1] {
             let dir = tempfile::tempdir().unwrap();
             let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            for market in [MARKET_A, MARKET_B] {
+                paper.record_market_group(market, "").unwrap();
+            }
             support::install_empty_anchor(&paper, wallet(), 0);
             paper
                 .record_reconciled_history_status(&WalletHistoryStatusRecord {
@@ -5688,7 +5733,25 @@ async fn ordinary_redemptions_and_trade_redeem_combos_preserve_first_entry_decis
             .await;
             assert_eq!(commits.len(), if entry_epoch == EPOCH { 1 } else { 2 });
             assert!(commits[0].1.identity_unresolved.is_empty());
-            assert!(commits[0].1.identity_overrides.is_empty());
+            assert!(
+                commits[0]
+                    .1
+                    .identity_overrides
+                    .iter()
+                    .all(|(id, identity)| {
+                        commits[0].0.iter().any(|aggregate| {
+                            aggregate.group_id.key() == id
+                                && aggregate
+                                    .group_id
+                                    .components()
+                                    .condition_id
+                                    .as_ref()
+                                    .is_some_and(|condition| {
+                                        condition.0 == identity.verified.market().to_string()
+                                    })
+                        })
+                    })
+            );
             assert_eq!(commits[0].2.dispositions[&raw_id.0], "raw_only");
             let entry_commit = commits.last().unwrap();
             assert_eq!(entry_commit.2.dispositions[&entry_id.0], "decision_pending");
@@ -5708,6 +5771,9 @@ async fn twin_beside_genuinely_new_activity_retains_late_and_partial_routing() {
         for alongside_recorded in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            for market in [MARKET_A, MARKET_B] {
+                paper.record_market_group(market, "").unwrap();
+            }
             support::install_empty_anchor(&paper, wallet(), 0);
             let current = activity_row(
                 "TRADE",
@@ -5759,24 +5825,17 @@ async fn twin_beside_genuinely_new_activity_retains_late_and_partial_routing() {
             assert_eq!(commits[0].1.restamp_twins.len(), 1);
             let result = &commits[0].2;
             assert!(result.pending.is_empty());
-            if alongside_recorded && !covered {
-                assert_eq!(
-                    result.newly_fenced,
-                    Some(pe_position_ledger::WalletFenceCause::LateEqualSecondGroup)
-                );
-                assert!(paper.is_wallet_fenced(&wallet()).unwrap());
-            } else {
-                assert_eq!(
-                    result.dispositions[&genuine_id.0],
-                    if covered {
-                        "anchor_covered_late"
-                    } else {
-                        "reanchor_required_late_group"
-                    }
-                );
-                assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
-                assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
-            }
+            assert_eq!(result.newly_fenced, None);
+            assert_eq!(
+                result.dispositions[&genuine_id.0],
+                if covered {
+                    "anchor_covered_late"
+                } else {
+                    "scope_dropped"
+                }
+            );
+            assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+            assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
         }
     }
 }

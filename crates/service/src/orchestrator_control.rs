@@ -16,7 +16,7 @@ use pe_source_polymarket_public::ActivityAggregate;
 use pe_trader_index::WatchlistEntry;
 use tokio::sync::oneshot;
 
-use crate::bucket_commit::{BucketCommitResult, BucketDecisionContext};
+use crate::bucket_commit::{BucketCommitError, BucketCommitResult, BucketDecisionContext};
 use crate::paper_recovery::{HaltState, MembershipChange, RiskHaltOwner};
 use crate::position_seeder::AnchorInstall;
 use crate::watchlist_maintenance::MembershipCommit;
@@ -98,7 +98,7 @@ pub enum OrchestratorControl {
     CommitActivityBucket {
         aggregates: Vec<ActivityAggregate>,
         context: Arc<BucketDecisionContext>,
-        committed: oneshot::Sender<Result<BucketCommitResult, String>>,
+        committed: oneshot::Sender<Result<BucketCommitResult, BucketCommitError>>,
     },
     /// CLOB resolution evidence was durably appended by the caller. The orchestrator
     /// serializes its Prepared/authority/local/Final financial transition.

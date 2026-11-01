@@ -1432,18 +1432,14 @@ async fn full_structural_set_backfills_vacancy_from_stale_survivors_in_rank_orde
                     context,
                     committed,
                 } => {
-                    let _ = committed.send(
-                        engine
-                            .commit(
-                                aggregates,
-                                &context,
-                                FrozenDecisionBasis {
-                                    win_rate_p: pe_core_types::Probability::ZERO,
-                                    bankroll: Decimal::ZERO,
-                                },
-                            )
-                            .map_err(|error| error.to_string()),
-                    );
+                    let _ = committed.send(engine.commit(
+                        aggregates,
+                        &context,
+                        FrozenDecisionBasis {
+                            win_rate_p: pe_core_types::Probability::ZERO,
+                            bankroll: Decimal::ZERO,
+                        },
+                    ));
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
                     let _ = captured.send(
@@ -1652,18 +1648,14 @@ async fn budgeted_admission_reaches_100_across_ticks() {
                     context,
                     committed,
                 } => {
-                    let _ = committed.send(
-                        engine
-                            .commit(
-                                aggregates,
-                                &context,
-                                FrozenDecisionBasis {
-                                    win_rate_p: pe_core_types::Probability::ZERO,
-                                    bankroll: Decimal::ZERO,
-                                },
-                            )
-                            .map_err(|e| e.to_string()),
-                    );
+                    let _ = committed.send(engine.commit(
+                        aggregates,
+                        &context,
+                        FrozenDecisionBasis {
+                            win_rate_p: pe_core_types::Probability::ZERO,
+                            bankroll: Decimal::ZERO,
+                        },
+                    ));
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
                     let _ = captured.send(
