@@ -75,6 +75,10 @@ struct Authority {
 }
 struct HttpState {
     boot_waves: bool,
+    ranking_batch: std::sync::atomic::AtomicI64,
+    scope_drops: Mutex<Vec<Value>>,
+    group_spans: Mutex<Vec<Value>>,
+    import_reads: Mutex<Vec<i64>>,
     rows: Vec<ConfigRow>,
     now: i64,
     ranked_wallets: usize,
@@ -107,6 +111,10 @@ pub async fn boundary_mark() {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     let state = Arc::new(HttpState {
         boot_waves: false,
+        ranking_batch: std::sync::atomic::AtomicI64::new(1),
+        scope_drops: Mutex::new(Vec::new()),
+        group_spans: Mutex::new(Vec::new()),
+        import_reads: Mutex::new(Vec::new()),
         rows: Vec::new(),
         now: 0,
         ranked_wallets: 0,
@@ -331,11 +339,21 @@ async fn serve(
         serde_json::from_slice(&bytes).unwrap()
     };
     let mut a = state.authority.lock().unwrap();
+    let batch = q
+        .get("batch_id")
+        .and_then(|id| id.strip_prefix("eq."))
+        .map(|id| id.parse::<i64>().unwrap())
+        .unwrap_or_else(|| state.ranking_batch.load(Ordering::SeqCst));
     let answer=match path {
-        "/rest/v1/accounts"|"/rest/v1/account_credentials"|"/rest/v1/ranking_scope_drops"|"/rest/v1/ranking_neg_risk_group_spans"=>json!([]),
+        "/rest/v1/accounts"|"/rest/v1/account_credentials"=>json!([]),
+        "/rest/v1/ranking_scope_drops"=> {
+            state.import_reads.lock().unwrap().push(batch);
+            json!(state.scope_drops.lock().unwrap().iter().filter(|row| row["batch_id"] == batch).cloned().collect::<Vec<_>>())
+        },
+        "/rest/v1/ranking_neg_risk_group_spans"=>json!(*state.group_spans.lock().unwrap()),
         "/rest/v1/service_config"=>json!(state.rows),
-        "/rest/v1/ranking_batches"=>json!([{"batch_id":1}]),
-        "/rest/v1/ranking_entries"|"/rest/v1/latest_ranking"=>json!((1..=state.ranked_wallets).map(|n|json!({"batch_id":1,"rank":n,"wallet_hex":wallet(n).to_string(),"ls_tstat":"3","hit_rate":"0.65","n_trades":100,"last_trade_unix":if n == 2 && state.stale_ranked_wallet_2.load(Ordering::SeqCst) { state.now - 300_000 } else { state.now - 20 },"survives":true})).collect::<Vec<_>>()),
+        "/rest/v1/ranking_batches"=>json!([{"batch_id":batch}]),
+        "/rest/v1/ranking_entries"|"/rest/v1/latest_ranking"=>json!((1..=state.ranked_wallets).map(|n|json!({"batch_id":batch,"rank":n,"wallet_hex":wallet(n).to_string(),"ls_tstat":"3","hit_rate":"0.65","n_trades":100,"last_trade_unix":if n == 2 && state.stale_ranked_wallet_2.load(Ordering::SeqCst) { state.now - 300_000 } else { state.now - 20 },"survives":true})).collect::<Vec<_>>()),
         "/rest/v1/service_runtime"=>json!([{"updated_at":a.projection_generation.to_string(),"watchlist_size":a.projection.len()}]),
         "/rest/v1/rpc/service_watchlist_replace_v1"=> { assert_eq!(body["expected_token"],a.projection_generation.to_string());a.projection=body["entries"].as_array().unwrap().clone();a.projection_generation+=1;json!([{"new_token":a.projection_generation.to_string(),"count":a.projection.len()}]) },
         "/rest/v1/paper_bankroll"=>json!([{"bankroll_str":a.cash.to_string(),"last_prepared_seq":a.progress}]),
@@ -522,14 +540,22 @@ fn envelope(payload: Vec<u8>, source: &str, at: i64, schema: u32, parser: u32) -
 /// PASS: a real, fully configured binary copies during slow admission, clears only a safe fence,
 /// repairs first-entry history, settles once, and restores checkpoint+suffix and exact decisions.
 pub async fn run() {
-    run_case(false).await;
+    run_case(false, false).await;
 }
 
 pub async fn run_boot_waves() {
-    run_case(true).await;
+    run_case(true, false).await;
 }
 
-async fn run_case(boot_waves: bool) {
+/// PASS: runtime ranking imports and local anomalies exclude only their scopes; revised BUYs
+/// retain their original fill without fencing. Restart preserves drops, imports, dispositions,
+/// fills, balances and history, and the sealed CLI verifier reproduces every decision exactly.
+/// This short run does not meet the qualification duration or closed-copy sample thresholds.
+pub async fn scope_drops() {
+    run_case(false, true).await;
+}
+
+async fn run_case(boot_waves: bool, scope_drops: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -556,7 +582,7 @@ async fn run_case(boot_waves: bool) {
         supabase_authoritative: true,
         // The unchanged 25-bps cap must cover the venue minimum and its nonzero fee.
         bankroll_usd: "10000".to_owned(),
-        maintenance_interval_secs: if boot_waves { 3600 } else { 1 },
+        maintenance_interval_secs: if boot_waves || scope_drops { 3600 } else { 1 },
         trade_poll_interval_secs: 1,
         gamma_resolution_poll_interval_secs: 1,
         supabase_refresh_interval_secs: 1,
@@ -572,6 +598,10 @@ async fn run_case(boot_waves: bool) {
     assert_eq!(runtime.price_impact_cap_bps, 100);
     let state = Arc::new(HttpState {
         boot_waves,
+        ranking_batch: std::sync::atomic::AtomicI64::new(1),
+        scope_drops: Mutex::new(Vec::new()),
+        group_spans: Mutex::new(Vec::new()),
+        import_reads: Mutex::new(Vec::new()),
         rows: crate::golden::golden_config_rows(&runtime),
         now,
         ranked_wallets: if boot_waves { 5 } else { 4 },
@@ -595,13 +625,13 @@ async fn run_case(boot_waves: bool) {
         positions: Mutex::new(Vec::new()),
         slow_started: Notify::new(),
         slow: Semaphore::new(0),
-        release_slow: AtomicBool::new(boot_waves),
-        gamma_fails: AtomicBool::new(!boot_waves),
+        release_slow: AtomicBool::new(boot_waves || scope_drops),
+        gamma_fails: AtomicBool::new(!boot_waves && !scope_drops),
         stale_ranked_wallet_2: AtomicBool::new(false),
         gamma_failures: std::sync::atomic::AtomicUsize::new(0),
         resolved: AtomicBool::new(false),
     });
-    if boot_waves {
+    if boot_waves || scope_drops {
         state.activity.lock().unwrap().clear();
     }
     let server = tokio::spawn(
@@ -637,10 +667,14 @@ async fn run_case(boot_waves: bool) {
         .unwrap();
     drop(side);
     boot.session.unwrap().finish().unwrap();
-    let paper = PaperStateDb::open(&cfg.paper_state_db_path).unwrap();
+    let paper = Arc::new(PaperStateDb::open(&cfg.paper_state_db_path).unwrap());
     let wallets = (1..=state.ranked_wallets).map(wallet).collect::<Vec<_>>();
     for w in &wallets {
-        crate::support::install_full_history_anchor(&paper, *w, now - 10);
+        if scope_drops {
+            crate::support::install_verified_empty_anchor(&paper, *w, now - 10);
+        } else {
+            crate::support::install_full_history_anchor(&paper, *w, now - 10);
+        }
         paper
             .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
                 wallet: *w,
@@ -773,6 +807,397 @@ async fn run_case(boot_waves: bool) {
         .await;
         state.slow.add_permits(4);
         child.stop().await;
+        server.abort();
+        return;
+    }
+    if scope_drops {
+        let config_path = root.join("service.toml");
+        std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
+        let child = Child::start(&config_path);
+        let client = reqwest::Client::new();
+        until(|| paper.scope_drop_batch_imported(1).unwrap()).await;
+        until(|| {
+            std::fs::read(&cfg.status_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|status| {
+                    status["uptime_secs"]
+                        .as_u64()
+                        .is_some_and(|uptime| uptime >= 2)
+                })
+        })
+        .await;
+        assert!(
+            client
+                .get(format!("http://{bind}/health/ready"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_success()
+        );
+        let epoch = OffsetDateTime::now_utc().unix_timestamp();
+        *state.scope_drops.lock().unwrap() = vec![json!({
+            "batch_id":2,"wallet_hex":wallet(1),"scope_kind":"market","scope_id":condition(1),
+            "cause":"underflow","dropped_at_unix":epoch - 1
+        })];
+        *state.group_spans.lock().unwrap() =
+            vec![json!({"group_id":condition(90),"from_batch_id":2,"to_batch_id":null})];
+        state.ranking_batch.store(2, Ordering::SeqCst);
+        until(|| paper.scope_drop_batch_imported(2).unwrap()).await;
+        assert_eq!(
+            paper.ranker_group_snapshot().unwrap(),
+            (Some(2), std::collections::BTreeSet::from([condition(90)]))
+        );
+        let dropped = row(wallet(1), 1, epoch, 1001);
+        let id = |row: &Value| {
+            pe_source_polymarket_public::parse_activity_trade_observation(
+                &serde_json::to_vec(row).unwrap(),
+            )
+            .unwrap()
+            .group_id
+            .key()
+            .clone()
+        };
+        let dropped_id = id(&dropped);
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .insert(wallet(1).to_string(), vec![dropped]);
+        until(|| paper.activity_group_state(&dropped_id).unwrap().is_some()).await;
+        assert_eq!(
+            paper
+                .activity_group_state(&dropped_id)
+                .unwrap()
+                .unwrap()
+                .disposition,
+            "scope_dropped"
+        );
+        until(|| OffsetDateTime::now_utc().unix_timestamp() > epoch).await;
+        let epoch = OffsetDateTime::now_utc().unix_timestamp();
+        let healthy = row(wallet(1), 2, epoch, 1002);
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get_mut(&wallet(1).to_string())
+            .unwrap()
+            .push(healthy);
+        eprintln!("scope drops: waiting for first healthy buy");
+        until(|| paper.list_fills().unwrap().len() == 1).await;
+        let mut anomaly = row(wallet(2), 3, epoch, 2003);
+        anomaly["type"] = "MERGE".into();
+        anomaly["asset"] = "".into();
+        anomaly["side"] = "".into();
+        anomaly["outcomeIndex"] = 999.into();
+        anomaly["outcome"] = "".into();
+        anomaly["price"] = "1".into();
+        anomaly["usdcSize"] = "0".into();
+        let anomaly_read = crate::support::producer_shaped_read_v2(
+            wallet(2),
+            &serde_json::to_vec(&vec![anomaly.clone()]).unwrap(),
+            epoch,
+            epoch,
+            crate::support::scenario_receipt(1),
+        );
+        let anomaly_id = anomaly_read.aggregates[0].group_id.key().clone();
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .insert(wallet(2).to_string(), vec![anomaly]);
+        eprintln!("scope drops: waiting for local merge underflow");
+        until(|| {
+            !paper
+                .wallet_scope_drops(&wallet(2), epoch)
+                .unwrap()
+                .is_empty()
+        })
+        .await;
+        let local = paper.wallet_scope_drops(&wallet(2), epoch).unwrap();
+        assert_eq!(local.len(), 1);
+        assert_eq!(
+            (
+                &*local[0].scope_id,
+                &*local[0].cause,
+                local[0].source_trade_id.as_ref()
+            ),
+            (
+                condition(3).as_str(),
+                "position_underflow",
+                Some(&anomaly_id)
+            )
+        );
+        assert!(!paper.is_wallet_fenced(&wallet(2)).unwrap());
+        until(|| OffsetDateTime::now_utc().unix_timestamp() > epoch).await;
+        let epoch = OffsetDateTime::now_utc().unix_timestamp();
+        let excluded = row(wallet(2), 3, epoch, 2013);
+        let excluded_id = id(&excluded);
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get_mut(&wallet(2).to_string())
+            .unwrap()
+            .extend([excluded, row(wallet(2), 4, epoch, 2004)]);
+        eprintln!("scope drops: waiting for local healthy buy");
+        until(|| paper.list_fills().unwrap().len() == 2).await;
+        assert_eq!(
+            paper
+                .activity_group_state(&excluded_id)
+                .unwrap()
+                .unwrap()
+                .disposition,
+            "scope_dropped"
+        );
+        until(|| OffsetDateTime::now_utc().unix_timestamp() > epoch).await;
+        let epoch = OffsetDateTime::now_utc().unix_timestamp();
+        let original = row(wallet(1), 5, epoch, 1005);
+        let original_id = id(&original);
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get_mut(&wallet(1).to_string())
+            .unwrap()
+            .push(original.clone());
+        eprintln!("scope drops: waiting for original copied buy");
+        until(|| paper.list_fills().unwrap().len() == 3).await;
+        until(|| OffsetDateTime::now_utc().unix_timestamp() > epoch).await;
+        let later = OffsetDateTime::now_utc().unix_timestamp();
+        let mut revised = original;
+        revised["size"] = "101".into();
+        revised["usdcSize"] = "50.5".into();
+        let revised_read = crate::support::producer_shaped_read_v2(
+            wallet(1),
+            &serde_json::to_vec(&vec![revised.clone()]).unwrap(),
+            epoch,
+            later,
+            crate::support::scenario_receipt(1),
+        );
+        let revision = revised_read.aggregates[0]
+            .semantic_revision
+            .as_str()
+            .to_owned();
+        {
+            let mut activity = state.activity.lock().unwrap();
+            let rows = activity.get_mut(&wallet(1).to_string()).unwrap();
+            *rows.iter_mut().find(|row| id(row) == original_id).unwrap() = revised;
+            rows.push(row(wallet(1), 6, later, 1006));
+        }
+        eprintln!("scope drops: waiting for revision and later buy");
+        until(|| paper.list_fills().unwrap().len() == 4).await;
+        assert!(
+            paper
+                .activity_revision_retained_without_fence(&original_id, &revision)
+                .unwrap()
+        );
+        let logs = child.stop().await;
+        assert!(logs.contains("ranking scope drops imported"), "{logs}");
+        let financial = paper.financial_snapshot(now + 1000).unwrap();
+        let history = paper.gate_history().unwrap();
+        let decisions = paper.decision_pending_history().unwrap();
+        let fills = paper.list_fills().unwrap();
+        let groups = wallets
+            .iter()
+            .map(|w| paper.activity_groups_after(w, 0).unwrap())
+            .collect::<Vec<_>>();
+        let drops = wallets
+            .iter()
+            .map(|w| paper.wallet_scope_drops(w, later).unwrap())
+            .collect::<Vec<_>>();
+        let coverage = wallets
+            .iter()
+            .map(|w| paper.wallet_coverage(w).unwrap())
+            .collect::<Vec<_>>();
+        let imports = state.import_reads.lock().unwrap().clone();
+        assert!(
+            decisions
+                .iter()
+                .all(|row| row.state == pe_paper_state::DecisionPendingState::Terminal)
+        );
+        for w in &wallets {
+            assert!(!paper.is_wallet_fenced(w).unwrap());
+            assert!(!paper.wallet_coverage(w).unwrap().reanchor_required);
+        }
+        *state.positions.lock().unwrap() = paper.leader_positions().unwrap().into_iter().map(|position| {
+            let market = usize::from_str_radix(position.market_id.0.0.trim_start_matches("0x"), 16).unwrap();
+            json!({"proxyWallet":position.wallet,"conditionId":position.market_id.0.0,
+                "asset":(market*2+101+usize::from(position.outcome_id.0)).to_string(),
+                "outcomeIndex":position.outcome_id.0,"size":position.long_contracts.to_decimal().to_string(),
+                "negativeRisk":false,"redeemable":false})
+        }).collect();
+        std::fs::remove_file(&cfg.status_path).unwrap();
+        let child = Child::start(&config_path);
+        until(|| {
+            std::fs::read(&cfg.status_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|status| {
+                    status["uptime_secs"]
+                        .as_u64()
+                        .is_some_and(|uptime| uptime >= 2)
+                })
+        })
+        .await;
+        assert!(
+            client
+                .get(format!("http://{bind}/health/ready"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .is_success()
+        );
+        child.stop().await;
+        assert_eq!(paper.financial_snapshot(now + 1000).unwrap(), financial);
+        assert_eq!(paper.gate_history().unwrap(), history);
+        assert_eq!(paper.decision_pending_history().unwrap(), decisions);
+        assert_eq!(paper.list_fills().unwrap(), fills);
+        assert_eq!(*state.import_reads.lock().unwrap(), imports);
+        assert!(paper.scope_drop_batch_imported(1).unwrap());
+        assert!(paper.scope_drop_batch_imported(2).unwrap());
+        assert_eq!(
+            paper.ranker_group_snapshot().unwrap(),
+            (Some(2), std::collections::BTreeSet::from([condition(90)]))
+        );
+        assert_eq!(
+            state.authority.lock().unwrap().projection.len(),
+            wallets.len()
+        );
+        for (i, w) in wallets.iter().enumerate() {
+            assert_eq!(paper.activity_groups_after(w, 0).unwrap(), groups[i]);
+            assert_eq!(paper.wallet_scope_drops(w, later).unwrap(), drops[i]);
+            assert_eq!(paper.wallet_coverage(w).unwrap(), coverage[i]);
+            assert!(!paper.is_wallet_fenced(w).unwrap());
+        }
+        let cutoff = last_second_of_day(now) + 1;
+        let mut source = Writer::open(&cfg.source_event_log_path).unwrap();
+        let boundary_receipt = source
+            .append_synced(envelope(
+                serde_json::to_vec(&json!({"kind":"daily_boundary","cutoff_unix":cutoff})).unwrap(),
+                "pe-service.boundary",
+                cutoff,
+                1,
+                1,
+            ))
+            .unwrap();
+        let price = Price::new(dec!(0.50)).unwrap();
+        let prices = financial
+            .positions
+            .iter()
+            .map(|position| {
+                let receipt = source
+                    .append_synced(envelope(
+                        serde_json::to_vec(&json!({"history":[{"t":cutoff,"p":"0.50"}]})).unwrap(),
+                        "pe-service.clob-prices-history",
+                        cutoff,
+                        1,
+                        1,
+                    ))
+                    .unwrap();
+                pe_service::paper_recovery::PaperMarkPrice {
+                    market_id: position.market_id.0.0.clone(),
+                    outcome_id: position.outcome_id.0,
+                    price: Some(price),
+                    sample_unix: Some(cutoff),
+                    receipt: Some(receipt),
+                    closure_receipt: None,
+                    invalid: None,
+                }
+            })
+            .collect();
+        drop(source);
+        let valued = financial
+            .positions
+            .iter()
+            .map(|position| (position.long.checked_sub(position.short).unwrap(), price))
+            .collect::<Vec<_>>();
+        let mark = pe_service::paper_recovery::PortfolioMark {
+            boundary_receipt,
+            cutoff_unix: cutoff,
+            source_tail: TailBinding::from(&Scanner::verify(&cfg.source_event_log_path).unwrap()),
+            financial_prefix_seq: financial.last_prepared_seq,
+            prices,
+            cash: financial.cash,
+            equity: pe_risk_engine::current_equity(&pe_risk_engine::EquityInputs {
+                cash: financial.cash,
+                positions: &valued,
+            })
+            .unwrap(),
+            invalid: None,
+        };
+        Writer::open(&cfg.event_log_path)
+            .unwrap()
+            .append_synced(envelope(
+                serde_json::to_vec(&PaperLogRecord::PortfolioMark(Box::new(mark))).unwrap(),
+                "pe-service.paper",
+                cutoff,
+                2,
+                1,
+            ))
+            .unwrap();
+        let source_prefix =
+            TailBinding::from(&Scanner::verify(&cfg.source_event_log_path).unwrap());
+        let keys = decisions
+            .iter()
+            .map(|row| (row.source_trade_id.clone(), row.semantic_revision.clone()))
+            .collect::<Vec<_>>();
+        let digest = paper
+            .seal_decision_evidence_for_source_prefix(&keys, &keys, source_prefix.last_sequence)
+            .unwrap();
+        let seal = pe_service::paper_recovery::QualificationSealed {
+            start_receipt,
+            source_prefix,
+            financial_prefix: TailBinding::from(&Scanner::verify(&cfg.event_log_path).unwrap()),
+            live_prefix: TailBinding::from(
+                &pe_execution_core::LiveJournal::verified_tail(root.join("live_journal.log"))
+                    .unwrap(),
+            ),
+            decision_evidence_digest: blake3::hash(&digest).to_hex().to_string(),
+            sealed_cutoff_unix: cutoff,
+            reason: pe_service::paper_recovery::SealReason::Complete,
+        };
+        let receipt = Writer::open(&cfg.event_log_path)
+            .unwrap()
+            .append_synced(envelope(
+                serde_json::to_vec(&PaperLogRecord::QualificationSealed(Box::new(seal))).unwrap(),
+                "pe-service.paper",
+                cutoff,
+                2,
+                1,
+            ))
+            .unwrap();
+        let output_path = root.join("qualification.json");
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+        command
+            .env_clear()
+            .args(["--qualify", "--paper-log"])
+            .arg(&cfg.event_log_path)
+            .arg("--source-log")
+            .arg(&cfg.source_event_log_path)
+            .arg("--live-journal")
+            .arg(root.join("live_journal.log"))
+            .arg("--paper-state")
+            .arg(&cfg.paper_state_db_path)
+            .arg("--seal-hash")
+            .arg(receipt.this_hash.to_hex().as_str())
+            .arg("--output")
+            .arg(&output_path);
+        let output = crate::support::bounded_command_output(command).await;
+        assert!(output.status.success(), "{output:?}");
+        let report: pe_service::qualification::QualificationReport =
+            serde_json::from_slice(&std::fs::read(output_path).unwrap()).unwrap();
+        assert!(report.replay.exact, "{:?}", report.reasons);
+        assert_eq!(report.replay.fills, 4);
+        assert_eq!(report.replay.decisions, 4);
+        assert_eq!(
+            report.verdict,
+            pe_service::qualification::QualificationVerdict::Fail,
+            "{:?}",
+            report.reasons
+        );
         server.abort();
         return;
     }
@@ -1230,6 +1655,10 @@ impl CheckpointFixture {
         runtime.sizing_dollar_usd = dec!(5);
         let state = Arc::new(HttpState {
             boot_waves: false,
+            ranking_batch: std::sync::atomic::AtomicI64::new(1),
+            scope_drops: Mutex::new(Vec::new()),
+            group_spans: Mutex::new(Vec::new()),
+            import_reads: Mutex::new(Vec::new()),
             rows: crate::golden::golden_config_rows(&runtime),
             now,
             ranked_wallets: 1,

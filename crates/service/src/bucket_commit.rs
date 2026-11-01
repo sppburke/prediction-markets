@@ -4948,6 +4948,13 @@ impl BucketCommitEngine {
         }
         let lookups = NotingScopeLookups::new(&self.paper_state, &aggregates, context);
         let durable_drops = self.paper_state.wallet_scope_drops(&wallet, source_epoch)?;
+        scope_drops.retain(|drop| {
+            !durable_drops.iter().any(|existing| {
+                existing.scope_kind == "market"
+                    && existing.scope_id == drop.scope_id
+                    && existing.dropped_at_epoch <= drop.dropped_at_epoch
+            })
+        });
         if !scope_drops.is_empty() && durable_drops.iter().any(|drop| drop.scope_kind == "event") {
             scope_drops.retain(|drop| match lookups.market(&drop.scope_id) {
                 MarketLookup::Grouped(group) => !durable_drops.iter().any(|existing| {
@@ -6626,7 +6633,9 @@ fn scoped_history_buys(
                         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             })
         });
-        let market = if canonical {
+        let market = if canonical
+            || routed.get(&mutation.source_trade_id) == Some(&"anchor_covered_late")
+        {
             market_id.clone()
         } else {
             let Some(scope) = resolve_problem_scope(record.aggregate, DropCause::Unmapped, lookups)

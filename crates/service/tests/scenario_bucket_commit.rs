@@ -4077,20 +4077,24 @@ fn covered_late_buy_repairs_history_with_or_without_a_revision() {
         let late = position_row(
             "TRADE",
             "0xcovered-history",
-            MARKET_B,
+            "\\xca",
             0,
             "BUY",
             "1",
             "0.5",
             100,
         );
+        let mut ctx = context(100, true);
+        ctx.identity_overrides.insert(
+            late.group_id.key().clone(),
+            IdentityOverride {
+                verified: market_outcome(MARKET_B, 0),
+                evidence_hash: "a".repeat(64),
+            },
+        );
         let market = market_outcome(MARKET_B, 0).market().clone();
         let result = engine
-            .commit_read(
-                vec![current.clone(), late.clone()],
-                &context(100, true),
-                zero_basis(),
-            )
+            .commit_read(vec![current.clone(), late.clone()], &ctx, zero_basis())
             .unwrap();
         assert_eq!(
             result.dispositions[&late.group_id.key().0],
@@ -4118,11 +4122,7 @@ fn covered_late_buy_repairs_history_with_or_without_a_revision() {
                         .unwrap();
             }
             engine
-                .commit_read(
-                    vec![current.clone(), late.clone()],
-                    &context(100, true),
-                    zero_basis(),
-                )
+                .commit_read(vec![current.clone(), late.clone()], &ctx, zero_basis())
                 .unwrap();
             assert_eq!(
                 paper.market_history_record(&wallet(), &market).unwrap(),
@@ -4130,7 +4130,80 @@ fn covered_late_buy_repairs_history_with_or_without_a_revision() {
             );
             assert_eq!(state(&engine, MARKET_B, 0), ShareAmount::ZERO);
         }
+        let later = position_row(
+            "TRADE",
+            "0xlater-covered",
+            MARKET_B,
+            0,
+            "BUY",
+            "1",
+            "0.5",
+            101,
+        );
+        let result = engine
+            .commit_read(vec![later.clone()], &context(101, true), zero_basis())
+            .unwrap();
+        assert_eq!(
+            result.dispositions[&later.group_id.key().0],
+            "not_first_entry"
+        );
+        assert!(result.pending.is_empty());
     }
+}
+
+/// PASS: an earlier market drop retires an all-durable ambiguity carrier without membership,
+/// even with an unrelated event drop; a later verified-ungrouped market still admits a BUY.
+#[test]
+fn durable_market_drop_retires_ambiguity_without_membership() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let receipt = support::scenario_receipt(500);
+    let drops = [("market", MARKET_A, 50), ("event", "0xee", 60)].map(|(kind, scope, start)| {
+        (
+            pe_paper_state::WalletScopeDrop {
+                wallet: wallet(),
+                scope_kind: kind.to_owned(),
+                scope_id: scope.to_owned(),
+                cause: "underflow".to_owned(),
+                source_trade_id: None,
+                dropped_at_epoch: start,
+                proof_json: "{}".to_owned(),
+                recorded_at_unix: 70,
+            },
+            receipt,
+        )
+    });
+    paper
+        .import_scope_drops(1, &drops, &Default::default())
+        .unwrap();
+    rusqlite::Connection::open(dir.path().join("paper.db"))
+        .unwrap()
+        .execute(
+            "DELETE FROM meta WHERE key = ?1",
+            [format!("neg_risk_group:{MARKET_A}")],
+        )
+        .unwrap();
+    let carrier = pair_effect("REWARD", "0xcarrier", MARKET_A, "1", 100);
+    engine
+        .commit_read(vec![carrier.clone()], &context(100, true), zero_basis())
+        .unwrap();
+    let mut ctx = context(100, true);
+    ctx.decision_inputs_json = json!({"ambiguous_observations": [{
+        "group_id": carrier.group_id.key(), "receipt": receipt, "source_epoch": 100,
+        "candidates": [(carrier.group_id.key(), 100)], "market_id": MARKET_A,
+    }]})
+    .to_string();
+    let result = engine
+        .commit_read(vec![carrier], &ctx, zero_basis())
+        .unwrap();
+    assert!(result.already_committed);
+    assert!(paper.activity_observation_unbound_retired(receipt).unwrap());
+    assert_eq!(paper.market_membership(MARKET_A).unwrap(), None);
+    let healthy = position_row("TRADE", "0xhealthy", MARKET_B, 0, "BUY", "1", "0.5", 102);
+    let result = engine
+        .commit_read(vec![healthy.clone()], &context(102, true), zero_basis())
+        .unwrap();
+    assert_eq!(result.pending, vec![healthy.group_id.key().clone()]);
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
 }
 
 #[test]
