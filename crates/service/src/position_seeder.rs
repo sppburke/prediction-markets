@@ -1263,10 +1263,10 @@ impl CausalPositionValidator {
             return Err(CausalPositionError::InterveningActivity { wallet });
         }
         let first_ledger = {
-            let mut engine = engine.lock().await;
+            let engine = &mut *engine.lock().await;
             let captured = ledger_capture(engine.ledger(), paper_state, wallet)?;
             #[cfg(feature = "scenario")]
-            self.run_step_hook(wallet, 1, &mut engine);
+            self.run_step_hook(wallet, 1, engine);
             captured
         };
         let first_positions =
@@ -1297,10 +1297,10 @@ impl CausalPositionValidator {
             return Err(CausalPositionError::InterveningActivity { wallet });
         }
         let second_ledger = {
-            let mut engine = engine.lock().await;
+            let engine = &mut *engine.lock().await;
             let captured = ledger_capture(engine.ledger(), paper_state, wallet)?;
             #[cfg(feature = "scenario")]
-            self.run_step_hook(wallet, 3, &mut engine);
+            self.run_step_hook(wallet, 3, engine);
             captured
         };
         let second_positions =
