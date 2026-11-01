@@ -2370,6 +2370,27 @@ impl PaperStateDb {
             .optional()?)
     }
 
+    /// Read the published batch and its exact group set under one connection lock.
+    pub fn ranker_group_snapshot(
+        &self,
+    ) -> Result<(Option<i64>, BTreeSet<String>), PaperStateError> {
+        let conn = self.lock();
+        let batch = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'ranker_group_batch'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut statement = conn.prepare(
+            "SELECT substr(key, 14) FROM meta WHERE key GLOB 'ranker_group:*' ORDER BY key",
+        )?;
+        let groups = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok((batch, groups))
+    }
+
     /// Persist the rollback boundary before a live scope-drop journal append.
     pub fn record_scope_drop_boundary(&self, recorded_at_unix: i64) -> Result<(), PaperStateError> {
         let mut conn = self.lock();

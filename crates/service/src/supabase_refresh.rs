@@ -22,7 +22,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
 use crate::live_watchlist::LiveWatchlist;
-use crate::supabase_reader::{self, SupabaseError};
+use crate::supabase_reader::{ScopeDropLoader, SupabaseError};
 
 #[derive(Debug, Error)]
 pub enum BootScoreRefreshError {
@@ -41,8 +41,9 @@ async fn refresh_scores_once(
     anon_key: &str,
     secret_key: &str,
     writer_lock: &Mutex<()>,
+    scope_drops: &ScopeDropLoader,
 ) -> Result<(usize, usize), SupabaseError> {
-    let fresh = fetch_score_batch(client, base_url, anon_key, secret_key).await?;
+    let fresh = fetch_score_batch(client, base_url, anon_key, secret_key, scope_drops).await?;
     let fetched = fresh.entries.len();
     let live_total = {
         let _writer = writer_lock.lock().await;
@@ -56,8 +57,11 @@ async fn fetch_score_batch(
     base_url: &str,
     anon_key: &str,
     secret_key: &str,
+    scope_drops: &ScopeDropLoader,
 ) -> Result<Watchlist, SupabaseError> {
-    let (fresh, _) = supabase_reader::fetch(client, base_url, anon_key, secret_key).await?;
+    let (fresh, _) = scope_drops
+        .fetch(client, base_url, anon_key, secret_key)
+        .await?;
     Ok(fresh)
 }
 
@@ -65,6 +69,7 @@ async fn fetch_score_batch(
 /// `apply_refresh` deliberately retains the replayed score of a wallet the current batch omits,
 /// so boot removes such a wallet from live only. It stays structural; the next ranked change
 /// decides its membership and can re-admit it with a current score.
+#[allow(clippy::too_many_arguments)]
 pub async fn boot_refresh_scores_and_release(
     live: &LiveWatchlist,
     client: &reqwest::Client,
@@ -73,8 +78,9 @@ pub async fn boot_refresh_scores_and_release(
     secret_key: &str,
     writer_lock: &Mutex<()>,
     producer_start: &watch::Sender<bool>,
+    scope_drops: &ScopeDropLoader,
 ) -> Result<(), BootScoreRefreshError> {
-    let fresh = fetch_score_batch(client, base_url, anon_key, secret_key).await?;
+    let fresh = fetch_score_batch(client, base_url, anon_key, secret_key, scope_drops).await?;
     apply_boot_scores_and_release(live, &fresh, writer_lock, producer_start).await
 }
 
@@ -490,6 +496,7 @@ pub async fn run_supabase_refresh_loop(
     writer_lock: Arc<Mutex<()>>,
     mut dirty: watch::Receiver<u64>,
     projection_status: WatchlistProjectionStatus,
+    scope_drops: ScopeDropLoader,
 ) {
     let projector = HttpWatchlistProjector::new(client.clone(), &base_url, &secret_key);
     let mut projection_token = None;
@@ -545,6 +552,7 @@ pub async fn run_supabase_refresh_loop(
                         &anon_key,
                         &secret_key,
                         &writer_lock,
+                        &scope_drops,
                     ).await {
                         Ok((fetched, live_total)) => {
                             // Consume the generation emitted by `apply_refresh`: this branch
@@ -575,6 +583,16 @@ mod tests {
 
     use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp};
     use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
+
+    fn test_loader(temp: &tempfile::TempDir) -> ScopeDropLoader {
+        ScopeDropLoader::boot(
+            Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap()),
+            Arc::new(Mutex::new(
+                crate::source_event_sink::SourceEventSink::open(temp.path().join("source.log"))
+                    .unwrap(),
+            )),
+        )
+    }
 
     fn boot_live(wallet: WalletAddress, win_rate_bps: i32) -> LiveWatchlist {
         LiveWatchlist::new(Watchlist {
@@ -626,6 +644,8 @@ mod tests {
     async fn failing_boot_score_fetch_does_not_release_producers() {
         let live = boot_live(WalletAddress([42; 20]), 6_000);
         let (start, ready) = watch::channel(false);
+        let temp = tempfile::tempdir().unwrap();
+        let loader = test_loader(&temp);
         let result = boot_refresh_scores_and_release(
             &live,
             &reqwest::Client::new(),
@@ -634,6 +654,7 @@ mod tests {
             "",
             &Mutex::new(()),
             &start,
+            &loader,
         )
         .await;
         assert!(matches!(
@@ -712,6 +733,8 @@ mod tests {
         use axum::{Json, Router, extract::Query, routing::get};
         let retained = WalletAddress::from_hex(&format!("0x{:040x}", 1_001)).unwrap();
         let app = Router::new()
+                .route("/rest/v1/ranking_scope_drops", get(|| async { Json(serde_json::json!([])) }))
+                .route("/rest/v1/ranking_neg_risk_group_spans", get(|| async { Json(serde_json::json!([])) }))
             .route("/rest/v1/ranking_batches", get(|| async { Json(serde_json::json!([{"batch_id": 1}])) }))
             .route("/rest/v1/ranking_entries", get(move |Query(query): Query<std::collections::HashMap<String, String>>| async move {
                 assert_eq!(query["limit"], "1000");
@@ -729,8 +752,10 @@ mod tests {
         let live = boot_live(retained, 0);
         let client = reqwest::Client::new();
         let writer = Mutex::new(());
+        let temp = tempfile::tempdir().unwrap();
+        let loader = test_loader(&temp);
         assert_eq!(
-            refresh_scores_once(&live, &client, &base, "anon", "", &writer)
+            refresh_scores_once(&live, &client, &base, "anon", "", &writer, &loader)
                 .await
                 .unwrap(),
             (1_001, 1)
@@ -740,10 +765,18 @@ mod tests {
             BasisPoints(2_000)
         );
         let (start, ready) = watch::channel(false);
-        boot_refresh_scores_and_release(&live, &client, &base, "anon", "", &writer, &start)
-            .await
-            .unwrap();
+        boot_refresh_scores_and_release(
+            &live, &client, &base, "anon", "", &writer, &start, &loader,
+        )
+        .await
+        .unwrap();
         assert!(*ready.borrow());
+        assert!(
+            PaperStateDb::open(&temp.path().join("paper.db"))
+                .unwrap()
+                .scope_drop_batch_imported(1)
+                .unwrap()
+        );
         assert_eq!(live.structural_membership(), HashSet::from([retained]));
         assert_eq!(live.snapshot().entries.len(), 1);
         assert_eq!(live.snapshot().entries[0].win_rate_bps, BasisPoints(6_000));
@@ -755,6 +788,8 @@ mod tests {
         use axum::{Json, Router, extract::Query, response::IntoResponse, routing::get};
         for foreign_batch in [false, true] {
             let app = Router::new()
+                .route("/rest/v1/ranking_scope_drops", get(|| async { Json(serde_json::json!([])) }))
+                .route("/rest/v1/ranking_neg_risk_group_spans", get(|| async { Json(serde_json::json!([])) }))
                 .route("/rest/v1/ranking_batches", get(|| async { Json(serde_json::json!([{"batch_id": 1}])) }))
                 .route("/rest/v1/ranking_entries", get(move |Query(query): Query<std::collections::HashMap<String, String>>| async move {
                     if query["offset"] != "0" {
@@ -775,7 +810,10 @@ mod tests {
             let before = serde_json::to_vec(&live.snapshot().entries).unwrap();
             let client = reqwest::Client::new();
             let writer = Mutex::new(());
-            let result = refresh_scores_once(&live, &client, &base, "anon", "", &writer).await;
+            let temp = tempfile::tempdir().unwrap();
+            let loader = test_loader(&temp);
+            let result =
+                refresh_scores_once(&live, &client, &base, "anon", "", &writer, &loader).await;
             assert!(matches!(
                 result,
                 Err(SupabaseError::Status(503)
@@ -786,9 +824,11 @@ mod tests {
             ));
             let (start, ready) = watch::channel(false);
             assert!(
-                boot_refresh_scores_and_release(&live, &client, &base, "anon", "", &writer, &start)
-                    .await
-                    .is_err()
+                boot_refresh_scores_and_release(
+                    &live, &client, &base, "anon", "", &writer, &start, &loader
+                )
+                .await
+                .is_err()
             );
             assert!(!*ready.borrow());
             assert_eq!(

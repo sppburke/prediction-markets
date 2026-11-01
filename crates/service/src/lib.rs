@@ -30,6 +30,7 @@ pub mod live_watchlist;
 pub mod logging;
 pub mod mark_prices;
 pub mod market_end_cache;
+mod market_membership;
 pub mod mid_price_cache;
 pub mod orchestrator;
 pub mod orchestrator_control;
@@ -41,6 +42,7 @@ pub mod position_seeder;
 pub mod qualification;
 pub mod risk_inputs;
 pub mod runtime_config;
+mod scope_drops;
 pub mod snapshot_worker;
 pub mod source_checkpoint;
 pub mod source_event_sink;
@@ -61,3 +63,5 @@ pub mod watchlist_maintenance;
 pub mod frame_admission;
 
 pub mod feed_audit;
+
+pub use market_membership::fetch_market_membership;

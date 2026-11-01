@@ -19,7 +19,7 @@ use crate::config_poller::{CapacityRequest, WatchlistCapacityApplier};
 use crate::live_watchlist::LiveWatchlist;
 use crate::paper_recovery::{MembershipReason, SealedMembershipEvidence};
 use crate::runtime_config::AppliedWatchlistCapacity;
-use crate::supabase_reader::{self, SupabaseError};
+use crate::supabase_reader::SupabaseError;
 use crate::watchlist_admission::{
     AdmissionError, AdmissionPreparer, Deferral, DeferralContext, DeferralOutcome,
 };
@@ -94,13 +94,16 @@ impl SupabaseWatchlistCapacity {
 
     async fn apply_inner(&self, request: CapacityRequest) -> Result<usize, CapacityError> {
         let target = request.target;
-        let (incoming, incoming_last_trade) = supabase_reader::fetch(
-            &self.client,
-            &self.supabase_url,
-            &self.supabase_anon_key,
-            &self.supabase_secret_key,
-        )
-        .await?;
+        let (incoming, incoming_last_trade) = self
+            .preparer
+            .scope_drop_loader()?
+            .fetch(
+                &self.client,
+                &self.supabase_url,
+                &self.supabase_anon_key,
+                &self.supabase_secret_key,
+            )
+            .await?;
         let fenced = crate::position_seeder::unrecoverable_fenced_wallets(&self.paper_state)
             .map_err(MembershipApplyError::from)?;
         validate_unique_ranking(&incoming.entries)?;
@@ -535,6 +538,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source_log = test_source_log(&temp);
         let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        paper_state
+            .import_scope_drops(1, &[], &Default::default())
+            .unwrap();
         let (control_tx, mut control_rx) = mpsc::channel(1);
         let verifier_source_log = source_log.path.clone();
         let control = tokio::spawn(async move {
@@ -633,6 +639,10 @@ mod tests {
             })
             .collect();
         let app = Router::new()
+            .route("/rest/v1/ranking_scope_drops", get(move || async move { Json(serde_json::json!([{
+                "batch_id":1, "wallet_hex":newcomer.to_string(), "scope_kind":"event", "scope_id":"capacity-group", "cause":"conversion", "dropped_at_unix":1
+            }])) }))
+            .route("/rest/v1/ranking_neg_risk_group_spans", get(|| async { Json(serde_json::json!([{"group_id":"capacity-group","from_batch_id":1,"to_batch_id":null}])) }))
             .route(
                 "/rest/v1/ranking_batches",
                 get(|| async { Json(serde_json::json!([{"batch_id": 1}])) }),
@@ -689,10 +699,32 @@ mod tests {
                 let mut attempts = 0;
                 while let Some(command) = control_rx.recv().await {
                     match command {
+                        OrchestratorControl::ImportScopeDrops {
+                            batch_id,
+                            drops,
+                            group_ids,
+                            acknowledged,
+                        } => {
+                            acknowledged
+                                .send(
+                                    fake_paper_state
+                                        .import_scope_drops(batch_id, &drops, &group_ids)
+                                        .map_err(|error| error.to_string()),
+                                )
+                                .unwrap();
+                        }
                         OrchestratorControl::PrepareAdmissions {
                             wallets,
                             acknowledged,
                         } => {
+                            assert!(fake_paper_state.scope_drop_batch_imported(1).unwrap());
+                            assert_eq!(
+                                fake_paper_state
+                                    .wallet_scope_drops(&newcomer, 1)
+                                    .unwrap()
+                                    .len(),
+                                1
+                            );
                             let mut wallets = wallets;
                             wallets.sort_unstable_by_key(|w| w.0);
                             fake_install_anchors(&fake_paper_state, &wallets, 1_700_000_100);
@@ -864,6 +896,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source_log = test_source_log(&temp);
         let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        paper_state
+            .import_scope_drops(1, &[], &Default::default())
+            .unwrap();
         for wallet in [blocked, survivor] {
             paper_state
                 .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
@@ -1007,6 +1042,9 @@ mod tests {
         let source_log = test_source_log(&temp);
         let state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
         state
+            .import_scope_drops(1, &[], &Default::default())
+            .unwrap();
+        state
             .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
                 wallet: retained,
                 complete: true,
@@ -1097,6 +1135,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source_log = test_source_log(&temp);
         let state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        state
+            .import_scope_drops(1, &[], &Default::default())
+            .unwrap();
         let live = LiveWatchlist::new(watchlist(vec![entry(existing)]));
         let writer_lock = Arc::new(Mutex::new(()));
         let applied = AppliedWatchlistCapacity::new(1);
@@ -1226,6 +1267,9 @@ mod tests {
         let source_log = test_source_log(&temp);
         let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
         paper_state
+            .import_scope_drops(1, &[], &Default::default())
+            .unwrap();
+        paper_state
             .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
                 wallet: newcomer,
                 complete: true,
@@ -1320,7 +1364,8 @@ mod tests {
                             }))
                             .unwrap();
                     }
-                    OrchestratorControl::RetentionCommit { .. }
+                    OrchestratorControl::ImportScopeDrops { .. }
+                    | OrchestratorControl::RetentionCommit { .. }
                     | OrchestratorControl::ActivityFrameDecision { .. }
                     | OrchestratorControl::RetireWallet { .. }
                     | OrchestratorControl::ReconciliationUpdate { .. }
@@ -1444,6 +1489,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source_log = test_source_log(&temp);
         let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        paper_state
+            .import_scope_drops(1, &[], &Default::default())
+            .unwrap();
         let conn = rusqlite::Connection::open(temp.path().join("paper.db")).unwrap();
         conn.execute("INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'test', 'invalid_mapping', '{}', 1)", [fenced.to_string()]).unwrap();
         let live = LiveWatchlist::new(watchlist(vec![entry(existing)]));
@@ -1551,6 +1599,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source_log = test_source_log(&temp);
         let paper = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        paper
+            .import_scope_drops(1, &[], &Default::default())
+            .unwrap();
         paper
             .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
                 wallet: survivor,
@@ -1677,6 +1728,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source_log = test_source_log(&temp);
         let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        paper_state
+            .import_scope_drops(1, &[], &Default::default())
+            .unwrap();
         let live = LiveWatchlist::new(watchlist(vec![entry(existing)]));
         let writer_lock = Arc::new(Mutex::new(()));
         let applied = AppliedWatchlistCapacity::new(1);
@@ -1749,6 +1803,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let source_log = test_source_log(&temp);
         let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        paper_state
+            .import_scope_drops(1, &[], &Default::default())
+            .unwrap();
         let live = LiveWatchlist::new(watchlist(vec![entry(excluded)]));
         live.remove_fenced(&HashSet::from([excluded]));
         assert!(live.snapshot().entries.is_empty());

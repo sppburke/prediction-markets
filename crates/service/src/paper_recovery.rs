@@ -1014,6 +1014,7 @@ pub(crate) fn repair_historical_membership_with_pin(
 pub struct ReplayedMembership {
     pub watchlist: Watchlist,
     pub last_ranking_batch_id: i64,
+    pub applied_ranking_batch_ids: std::collections::BTreeSet<i64>,
     pub post_start_record_replayed: bool,
 }
 
@@ -1098,6 +1099,7 @@ fn replay_membership_from(
     }
 
     let mut last_ranking_batch_id = start.ranking_batch_id;
+    let mut applied_ranking_batch_ids = std::collections::BTreeSet::from([start.ranking_batch_id]);
     let Some(first_membership_sequence) = era.frames.iter().find_map(|frame| {
         matches!(
             &frame.frame,
@@ -1118,6 +1120,7 @@ fn replay_membership_from(
         return Ok(Some(ReplayedMembership {
             watchlist: watchlist_with_entries(start_batch, entries),
             last_ranking_batch_id,
+            applied_ranking_batch_ids,
             post_start_record_replayed: false,
         }));
     };
@@ -1191,11 +1194,13 @@ fn replay_membership_from(
         }
         if let Some(batch_id) = ranking_batch_id {
             last_ranking_batch_id = *batch_id;
+            applied_ranking_batch_ids.insert(*batch_id);
         }
     }
     Ok(Some(ReplayedMembership {
         watchlist: watchlist_with_entries(start_batch, entries),
         last_ranking_batch_id,
+        applied_ranking_batch_ids,
         post_start_record_replayed: true,
     }))
 }
@@ -2860,6 +2865,14 @@ mod paper_log_tests {
             serde_json::to_vec(&replayed.watchlist.entries).unwrap()
         );
         assert_eq!(replayed.last_ranking_batch_id, 8);
+        assert_eq!(
+            replayed.applied_ranking_batch_ids,
+            std::collections::BTreeSet::from([7, 8])
+        );
+        assert_eq!(
+            indexed.applied_ranking_batch_ids,
+            replayed.applied_ranking_batch_ids
+        );
         assert!(replayed.post_start_record_replayed);
         assert_eq!(replayed.watchlist.entries.len(), 1);
         assert_eq!(replayed.watchlist.entries[0].wallet, first);

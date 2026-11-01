@@ -1492,9 +1492,12 @@ async fn live_reentry_tick(
     {
         (&watchlist.entries, last_trade)
     } else {
-        fetched = match supabase_reader::fetch_batch(
-            client, base_url, anon_key, secret_key, batch_id,
-        )
+        fetched = match async {
+            preparer
+                .scope_drop_loader()?
+                .fetch_batch(client, base_url, anon_key, secret_key, batch_id)
+                .await
+        }
         .await
         {
             Ok(fetched) => fetched,
@@ -1929,9 +1932,12 @@ async fn maintenance_tick_inner(
                         && latest != sync.marker
                     {
                         sync.attempted_batch_id = Some(batch_id);
-                        match supabase_reader::fetch_batch(
-                            client, base_url, anon_key, secret_key, batch_id,
-                        )
+                        match async {
+                            preparer
+                                .scope_drop_loader()?
+                                .fetch_batch(client, base_url, anon_key, secret_key, batch_id)
+                                .await
+                        }
                         .await
                         {
                             Ok((incoming, incoming_last_trade)) => {
@@ -1983,9 +1989,12 @@ async fn maintenance_tick_inner(
                         && (latest != sync.marker || capacity_changed)
                     {
                         sync.attempted_batch_id = Some(batch_id);
-                        match supabase_reader::fetch_batch(
-                            client, base_url, anon_key, secret_key, batch_id,
-                        )
+                        match async {
+                            preparer
+                                .scope_drop_loader()?
+                                .fetch_batch(client, base_url, anon_key, secret_key, batch_id)
+                                .await
+                        }
                         .await
                         {
                             Ok((incoming, incoming_last_trade)) => 'replacement: {
@@ -2440,9 +2449,12 @@ async fn knockout_tick(
         && freed > 0
     {
         let exclude: Vec<WalletAddress> = backfill_excluded.iter().copied().collect();
-        match supabase_reader::fetch_candidates(
-            client, base_url, anon_key, secret_key, batch_id, &exclude,
-        )
+        match async {
+            preparer
+                .scope_drop_loader()?
+                .fetch_candidates(client, base_url, anon_key, secret_key, batch_id, &exclude)
+                .await
+        }
         .await
         {
             Ok((w, candidate_last_trade)) => {
@@ -3327,7 +3339,15 @@ mod tests {
                     let offset = q["offset"].parse::<usize>().unwrap();
                     selected.into_iter().skip(offset).take(limit).collect()
                 }
-                async fn batches(State(fake): State<Fake>) -> Json<serde_json::Value> {
+                async fn batches(
+                    State(fake): State<Fake>,
+                    Query(query): Query<HashMap<String, String>>,
+                ) -> Json<serde_json::Value> {
+                    if let Some(batch) = query.get("batch_id") {
+                        return Json(
+                            serde_json::json!([{"batch_id": batch.strip_prefix("eq.").unwrap().parse::<i64>().unwrap()}]),
+                        );
+                    }
                     Json(match fake.latest_batch.load(Ordering::SeqCst) {
                         -1 => serde_json::json!([]),
                         id => serde_json::json!([{ "batch_id": id }]),
@@ -3373,6 +3393,14 @@ mod tests {
                     Json(Vec::new())
                 }
                 let app = Router::new()
+                    .route(
+                        "/rest/v1/ranking_scope_drops",
+                        get(|| async { Json(serde_json::json!([])) }),
+                    )
+                    .route(
+                        "/rest/v1/ranking_neg_risk_group_spans",
+                        get(|| async { Json(serde_json::json!([])) }),
+                    )
                     .route("/rest/v1/ranking_batches", get(batches))
                     .route("/rest/v1/ranking_entries", get(entries))
                     .route("/rest/v1/latest_ranking", get(latest))
@@ -3481,6 +3509,20 @@ mod tests {
                 .unwrap();
                 while let Some(message) = control_rx.recv().await {
                     match message {
+                        OrchestratorControl::ImportScopeDrops {
+                            batch_id,
+                            drops,
+                            group_ids,
+                            acknowledged,
+                        } => {
+                            acknowledged
+                                .send(
+                                    fake_paper_state
+                                        .import_scope_drops(batch_id, &drops, &group_ids)
+                                        .map_err(|error| error.to_string()),
+                                )
+                                .unwrap();
+                        }
                         OrchestratorControl::PrepareAdmissions {
                             wallets,
                             acknowledged,
@@ -3961,6 +4003,7 @@ mod tests {
             assert_eq!(h.controls(), vec![(set(&[b]), set(&[a]))]);
             assert_eq!(members(&h.live), set(&[a, b]));
             assert_eq!(marker, Some(2));
+            assert!(h.paper_state.scope_drop_batch_imported(2).unwrap());
             assert_eq!(h.paper_state.cursor(&b).unwrap(), Some(NOW - 60));
         }
 
@@ -4906,6 +4949,7 @@ mod tests {
             assert_eq!(h.controls(), vec![(set(&[bench]), set(&[idle]))]);
             assert_eq!(members(&h.live), set(&[bench]));
             assert!(evicted.contains(&idle));
+            assert!(h.paper_state.scope_drop_batch_imported(1).unwrap());
             assert_eq!(h.paper_state.cursor(&bench).unwrap(), Some(NOW - 60));
         }
 

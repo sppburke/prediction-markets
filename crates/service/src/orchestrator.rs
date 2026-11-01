@@ -1786,6 +1786,25 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
     async fn apply_control_message(&mut self, message: OrchestratorControl) {
         match message {
+            OrchestratorControl::ImportScopeDrops {
+                batch_id,
+                drops,
+                group_ids,
+                acknowledged,
+            } => {
+                let result = self
+                    .paper_state
+                    .import_scope_drops(batch_id, &drops, &group_ids)
+                    .map_err(|error| error.to_string());
+                if result.is_ok() {
+                    info!(
+                        batch_id,
+                        drops = drops.len(),
+                        "ranking scope drops imported"
+                    );
+                }
+                let _ = acknowledged.send(result);
+            }
             OrchestratorControl::RetentionCommit {
                 request,
                 acknowledged,
@@ -3928,6 +3947,24 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             }
         }
 
+        let group = if admission.market.neg_risk {
+            admission.market.neg_risk_market_id.as_deref()
+        } else {
+            Some("")
+        };
+        let result = group
+            .ok_or_else(|| "admission missing neg-risk group".to_owned())
+            .and_then(|group| {
+                self.paper_state
+                    .record_market_group(&condition_id.0, group)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = result {
+            error!(%error, trade = %trade.source_trade_id, "record admitted market membership failed");
+            self.intake_stopped = true;
+            return;
+        }
+
         // Gate E (docs/19): a YES copy skips while another market of its neg-risk group holds an open YES.
         if !already_staged
             && admission.market.neg_risk
@@ -3961,14 +3998,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     .await;
                     return;
                 }
-                Ok(None) => {
-                    if let Err(error) = self.paper_state.record_market_group(&condition_id.0, group)
-                    {
-                        error!(%error, trade = %trade.source_trade_id, "record neg-risk market group failed");
-                        self.intake_stopped = true;
-                        return;
-                    }
-                }
+                Ok(None) => {}
                 Err(error) => {
                     error!(%error, trade = %trade.source_trade_id, "read held YES in neg-risk group failed");
                     self.intake_stopped = true;
@@ -5286,7 +5316,7 @@ mod tests {
         }
 
         #[tokio::test(start_paused = true)]
-        async fn group_gate_bypass_and_store_errors() {
+        async fn admission_membership_and_group_gate_fail_closed_on_store_errors() {
             for (neg_risk, group, insert_failure) in [
                 (false, Some("group"), false),
                 (true, None, false),
@@ -5302,8 +5332,8 @@ mod tests {
                 let connection =
                     rusqlite::Connection::open(harness._fixture.dir.path().join("paper.db"))
                         .unwrap();
-                let fails = neg_risk && group.is_some();
-                connection.execute_batch(if insert_failure || !fails {
+                let grouped = neg_risk && group.is_some();
+                connection.execute_batch(if insert_failure || !grouped {
                     "CREATE TRIGGER fail_group_insert BEFORE INSERT ON meta WHEN NEW.key LIKE 'neg_risk_group:%' BEGIN SELECT RAISE(FAIL, 'group insert failed'); END;"
                 } else {
                     "ALTER TABLE settled_markets RENAME TO unavailable_settled_markets;"
@@ -5311,29 +5341,15 @@ mod tests {
                 harness.release.take().unwrap().send(()).unwrap();
                 harness.owner.handle_trade_once(harness.trade.clone()).await;
                 assert_eq!(harness.books.started.lock().unwrap().len(), 1);
-                assert_eq!(harness.owner.intake_stopped, fails);
+                assert!(harness.owner.intake_stopped);
                 let row = harness
                     .owner
                     .paper_state
                     .decision_pending_for(&harness.trade.source_trade_id)
                     .unwrap()
                     .unwrap();
-                assert_eq!(
-                    row.state,
-                    if fails {
-                        DecisionPendingState::Open
-                    } else {
-                        DecisionPendingState::Terminal
-                    }
-                );
-                if fails {
-                    assert!(row.terminal_disposition.is_none());
-                } else {
-                    assert_eq!(
-                        harness.evidence().body.book.unwrap().outcome,
-                        "below_minimum"
-                    );
-                }
+                assert_eq!(row.state, DecisionPendingState::Open);
+                assert!(row.terminal_disposition.is_none());
                 let seeds: usize = connection
                     .query_row("SELECT COUNT(*) FROM dispatch_seeds", [], |row| row.get(0))
                     .unwrap();
@@ -5354,7 +5370,7 @@ mod tests {
                         |row| row.get(0),
                     )
                     .unwrap();
-                assert_eq!(mappings, 0);
+                assert_eq!(mappings, usize::from(grouped && !insert_failure));
             }
         }
 
@@ -5744,6 +5760,78 @@ mod tests {
             paper_writer,
             start,
         }
+    }
+
+    #[tokio::test]
+    async fn scope_drop_imports_apply_in_control_message_order_and_acknowledge_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let (control, rx) = mpsc::channel(3);
+        let owner = build_test_orchestrator(
+            crate::paper_recovery::PaperLog::open(dir.path().join("paper.log")).unwrap(),
+            state.clone(),
+            rx,
+            String::new(),
+            None,
+        );
+        let wallet = pe_core_types::WalletAddress([42; 20]);
+        let mut replies = Vec::new();
+        for (batch_id, kind, cause) in [
+            (10, "market", "underflow"),
+            (11, "invalid", "overflow"),
+            (12, "market", "overflow"),
+        ] {
+            let (acknowledged, reply) = tokio::sync::oneshot::channel();
+            let receipt = AppendReceipt {
+                sequence: pe_core_types::EventSeq(1),
+                this_hash: blake3::hash(b"import-evidence"),
+            };
+            control
+                .send(OrchestratorControl::ImportScopeDrops {
+                    batch_id,
+                    drops: vec![(
+                        pe_paper_state::WalletScopeDrop {
+                            wallet,
+                            scope_kind: kind.to_owned(),
+                            scope_id: "market".to_owned(),
+                            cause: cause.to_owned(),
+                            source_trade_id: None,
+                            dropped_at_epoch: NOW,
+                            proof_json: String::new(),
+                            recorded_at_unix: NOW,
+                        },
+                        receipt,
+                    )],
+                    group_ids: std::collections::BTreeSet::from([format!("group-{batch_id}")]),
+                    acknowledged,
+                })
+                .await
+                .unwrap();
+            replies.push(reply);
+        }
+        assert!(!state.scope_drop_batch_imported(10).unwrap());
+        drop(control);
+        owner.run(std::future::pending()).await;
+        for (index, reply) in replies.into_iter().enumerate() {
+            assert_eq!(reply.await.unwrap().is_ok(), index != 1);
+        }
+        assert!(state.scope_drop_batch_imported(10).unwrap());
+        assert!(!state.scope_drop_batch_imported(11).unwrap());
+        assert!(state.scope_drop_batch_imported(12).unwrap());
+        let drops = state.wallet_scope_drops(&wallet, NOW).unwrap();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].cause, "underflow");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&drops[0].proof_json).unwrap()["batch_id"],
+            10
+        );
+        assert_eq!(
+            state.ranker_group_snapshot().unwrap(),
+            (
+                Some(12),
+                std::collections::BTreeSet::from(["group-12".to_owned()])
+            )
+        );
     }
 
     fn test_orchestrator(

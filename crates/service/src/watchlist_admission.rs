@@ -740,6 +740,20 @@ impl AdmissionPreparer {
         self
     }
 
+    pub(crate) fn scope_drop_loader(
+        &self,
+    ) -> Result<crate::supabase_reader::ScopeDropLoader, crate::supabase_reader::SupabaseError>
+    {
+        let source_log = self.source_log.clone().ok_or_else(|| {
+            crate::supabase_reader::SupabaseError::ScopeImport("source log unavailable".to_owned())
+        })?;
+        Ok(crate::supabase_reader::ScopeDropLoader::runtime(
+            self.inner.paper_state.clone(),
+            source_log,
+            self.inner.control_tx.clone(),
+        ))
+    }
+
     /// Seed the ranking's last-trade cursor before the causal bracket captures its ledger hash.
     /// The validator needs the seeded cursor to stay unchanged through anchor installation.
     /// The validator-free branch first passes the durable history gate.

@@ -49,6 +49,13 @@ pub struct AdmissionLedgerCapture {
 
 /// A control-plane update consumed ahead of trade events by the orchestrator's biased select.
 pub enum OrchestratorControl {
+    /// Apply one fully recorded ranking import between decisions and bucket commits.
+    ImportScopeDrops {
+        batch_id: i64,
+        drops: Vec<(pe_paper_state::WalletScopeDrop, AppendReceipt)>,
+        group_ids: std::collections::BTreeSet<String>,
+        acknowledged: oneshot::Sender<Result<(), String>>,
+    },
     /// Commit a retention boundary while dispatch staging is excluded by the single owner.
     RetentionCommit {
         request: Box<crate::source_checkpoint::retention::RetentionCommitRequest>,
