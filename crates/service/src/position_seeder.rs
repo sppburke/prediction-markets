@@ -25,8 +25,8 @@ use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAssetMapping, ActivityParseError,
     ActivityReadError, ActivityValidationError, CompleteActivityRead, CompletePositionsRead,
-    PositionClassification, PositionReadError, ReconciliationFetcher, fetch_complete_activity,
-    fetch_complete_positions,
+    PositionClassification, PositionReadError, ReconciliationFetcher, ReqwestFetcher,
+    fetch_complete_activity, fetch_complete_positions,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -38,7 +38,8 @@ use crate::asset_identity::{
     AssetIdentityResolver, BootSourceLog, IdentityProvenance, ResolvedIdentities,
 };
 use crate::bucket_commit::{
-    AnchorInstallError, BucketCommitEngine, BucketDecisionContext, IdentityOverride,
+    AnchorInstallError, BucketCommitEngine, BucketCommitError, BucketDecisionContext,
+    IdentityOverride,
 };
 use crate::orchestrator_control::{AdmissionLedgerCapture, OrchestratorControl};
 use crate::trade_poller::{ACTIVITY_POLL_SOURCE_ID, restamp_twins};
@@ -158,6 +159,16 @@ pub enum CausalPositionError {
     ProofEncoding(#[from] serde_json::Error),
     #[error("activity bucket commit failed for {wallet}: {message}")]
     BucketCommit {
+        wallet: WalletAddress,
+        message: String,
+    },
+    #[error("market membership required for {wallet}: {markets:?}")]
+    MembershipRequired {
+        wallet: WalletAddress,
+        markets: Vec<String>,
+    },
+    #[error("market membership acquisition for {wallet}: {message}")]
+    Membership {
         wallet: WalletAddress,
         message: String,
     },
@@ -297,7 +308,9 @@ impl CausalPositionError {
             Self::UnsafeRecovery { .. } | Self::Fenced { .. } | Self::DuplicateOutcome { .. } => {
                 FailureClass::WalletPersistent
             }
-            Self::InterveningActivity { .. }
+            Self::MembershipRequired { .. }
+            | Self::Membership { .. }
+            | Self::InterveningActivity { .. }
             | Self::PositionRevision { .. }
             | Self::LedgerRevision { .. } => FailureClass::WalletTransient,
             Self::AnchorInstall(error) => error.class(),
@@ -515,6 +528,9 @@ impl CausalPositionError {
             } => "positions.page_too_large",
             Self::ProofEncoding(_) => "validation.proof_encoding",
             Self::BucketCommit { .. } => "validation.bucket_commit",
+            Self::MembershipRequired { .. } | Self::Membership { .. } => {
+                "validation.market_membership"
+            }
             Self::Fenced { .. } => "validation.fenced",
             Self::UnsafeRecovery { .. } => "validation.unsafe_recovery",
             Self::InterveningActivity { .. } => "validation.intervening_activity",
@@ -607,6 +623,11 @@ pub struct CausalPositionValidator {
     fetcher: Arc<dyn ReconciliationFetcher>,
     asset_identity: Arc<AssetIdentityResolver>,
     base_url: Arc<str>,
+    market_membership: Option<(
+        String,
+        Arc<ReqwestFetcher>,
+        crate::activity_ingest::SourceLogHandle,
+    )>,
     source_log_generation: Arc<str>,
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
     #[cfg(feature = "scenario")]
@@ -660,6 +681,7 @@ impl CausalPositionValidator {
             fetcher,
             asset_identity,
             base_url: base_url.into(),
+            market_membership: None,
             source_log_generation: source_log_generation.into(),
             now: Arc::new(|| time::OffsetDateTime::now_utc().unix_timestamp()),
             #[cfg(feature = "scenario")]
@@ -667,6 +689,41 @@ impl CausalPositionValidator {
             #[cfg(feature = "scenario")]
             install_hook: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_market_membership(
+        mut self,
+        base_url: String,
+        fetcher: Arc<ReqwestFetcher>,
+        source_log: crate::activity_ingest::SourceLogHandle,
+    ) -> Self {
+        self.market_membership = Some((base_url, fetcher, source_log));
+        self
+    }
+
+    async fn acquire_membership(
+        &self,
+        wallet: WalletAddress,
+        paper_state: &PaperStateDb,
+        markets: Vec<String>,
+    ) -> Result<(), CausalPositionError> {
+        let (base_url, fetcher, source_log) =
+            self.market_membership
+                .as_ref()
+                .ok_or_else(|| CausalPositionError::Membership {
+                    wallet,
+                    message: "membership reader unavailable".to_owned(),
+                })?;
+        for market in markets {
+            crate::fetch_market_membership(paper_state, base_url, fetcher, source_log, &market)
+                .await
+                .map_err(|error| CausalPositionError::Membership {
+                    wallet,
+                    message: format!("{error:#}"),
+                })?;
+        }
+        Ok(())
     }
 
     /// Boot-migration form: every fetched activity/positions page is appended
@@ -963,8 +1020,16 @@ impl CausalPositionValidator {
                 }
                 metadata_reads.extend(std::mem::take(&mut prepared.metadata_reads));
                 unresolved_assets.extend(std::mem::take(&mut prepared.unresolved_assets));
-                self.commit_control(wallet, &activity, &prepared, twins, control_tx, false)
-                    .await?;
+                self.commit_control(
+                    wallet,
+                    &activity,
+                    &prepared,
+                    twins,
+                    control_tx,
+                    paper_state,
+                    false,
+                )
+                .await?;
                 baseline_completed = Some(Instant::now());
                 Some(activity)
             } else {
@@ -1003,6 +1068,7 @@ impl CausalPositionValidator {
                 &first_prepared,
                 first_twins,
                 control_tx,
+                paper_state,
                 false,
             )
             .await?;
@@ -1040,6 +1106,7 @@ impl CausalPositionValidator {
                     &second_prepared,
                     second_twins,
                     control_tx,
+                    paper_state,
                     true,
                 )
                 .await?
@@ -1081,6 +1148,7 @@ impl CausalPositionValidator {
                     &final_prepared,
                     final_twins,
                     control_tx,
+                    paper_state,
                     true,
                 )
                 .await?
@@ -1136,6 +1204,39 @@ impl CausalPositionValidator {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_direct_read(
+        &self,
+        wallet: WalletAddress,
+        activity: &CompleteActivityRead,
+        prepared: &PreparedActivity,
+        paper_state: &PaperStateDb,
+        engine: &Arc<tokio::sync::Mutex<&mut BucketCommitEngine>>,
+        count_change: bool,
+    ) -> Result<bool, CausalPositionError> {
+        loop {
+            let result = {
+                let mut engine = engine.lock().await;
+                commit_direct(
+                    wallet,
+                    activity,
+                    prepared,
+                    paper_state,
+                    &mut engine,
+                    count_change,
+                    &self.source_log_generation,
+                )
+            };
+            match result {
+                Err(CausalPositionError::MembershipRequired { markets, .. }) => {
+                    self.acquire_membership(wallet, paper_state, markets)
+                        .await?;
+                }
+                result => return result,
+            }
+        }
+    }
+
     async fn validate_one_direct(
         &self,
         wallet: WalletAddress,
@@ -1148,19 +1249,21 @@ impl CausalPositionValidator {
         let first_prepared = self.prepare_activity(wallet, &first_activity).await?;
         metadata_reads.extend(first_prepared.metadata_reads.clone());
         unresolved_assets.extend(first_prepared.unresolved_assets.clone());
-        let first_ledger = {
-            let mut engine = engine.lock().await;
-            if commit_direct(
+        if self
+            .commit_direct_read(
                 wallet,
                 &first_activity,
                 &first_prepared,
                 paper_state,
-                &mut engine,
+                engine,
                 false,
-                &self.source_log_generation,
-            )? {
-                return Err(CausalPositionError::InterveningActivity { wallet });
-            }
+            )
+            .await?
+        {
+            return Err(CausalPositionError::InterveningActivity { wallet });
+        }
+        let first_ledger = {
+            let mut engine = engine.lock().await;
             let captured = ledger_capture(engine.ledger(), paper_state, wallet)?;
             #[cfg(feature = "scenario")]
             self.run_step_hook(wallet, 1, &mut engine);
@@ -1180,19 +1283,21 @@ impl CausalPositionValidator {
         resolve_missing_mapping(wallet, &first_positions, &second_prepared.mapping)?;
         metadata_reads.extend(second_prepared.metadata_reads.clone());
         unresolved_assets.extend(second_prepared.unresolved_assets.clone());
-        let second_ledger = {
-            let mut engine = engine.lock().await;
-            if commit_direct(
+        if self
+            .commit_direct_read(
                 wallet,
                 &second_activity,
                 &second_prepared,
                 paper_state,
-                &mut engine,
+                engine,
                 true,
-                &self.source_log_generation,
-            )? {
-                return Err(CausalPositionError::InterveningActivity { wallet });
-            }
+            )
+            .await?
+        {
+            return Err(CausalPositionError::InterveningActivity { wallet });
+        }
+        let second_ledger = {
+            let mut engine = engine.lock().await;
             let captured = ledger_capture(engine.ledger(), paper_state, wallet)?;
             #[cfg(feature = "scenario")]
             self.run_step_hook(wallet, 3, &mut engine);
@@ -1212,19 +1317,21 @@ impl CausalPositionValidator {
         resolve_missing_mapping(wallet, &second_positions, &final_prepared.mapping)?;
         unresolved_assets.extend(final_prepared.unresolved_assets.clone());
         metadata_reads.extend(final_prepared.metadata_reads.clone());
-        let final_ledger = {
-            let mut engine = engine.lock().await;
-            if commit_direct(
+        if self
+            .commit_direct_read(
                 wallet,
                 &final_activity,
                 &final_prepared,
                 paper_state,
-                &mut engine,
+                engine,
                 true,
-                &self.source_log_generation,
-            )? {
-                return Err(CausalPositionError::InterveningActivity { wallet });
-            }
+            )
+            .await?
+        {
+            return Err(CausalPositionError::InterveningActivity { wallet });
+        }
+        let final_ledger = {
+            let engine = engine.lock().await;
             ledger_capture(engine.ledger(), paper_state, wallet)?
         };
         let final_activity = ActivityEvidence::from(final_activity);
@@ -1519,6 +1626,7 @@ impl CausalPositionValidator {
         Ok(twins)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn commit_control(
         &self,
         wallet: WalletAddress,
@@ -1526,6 +1634,7 @@ impl CausalPositionValidator {
         prepared: &PreparedActivity,
         twins: HashSet<SourceTradeId>,
         control_tx: &mpsc::Sender<OrchestratorControl>,
+        paper_state: &PaperStateDb,
         count_change: bool,
     ) -> Result<bool, CausalPositionError> {
         let mut changed = false;
@@ -1539,22 +1648,33 @@ impl CausalPositionValidator {
             twins,
         )?);
         for bucket in buckets {
-            let (committed, acknowledgement) = oneshot::channel();
-            control_tx
-                .send(OrchestratorControl::CommitActivityBucket {
-                    aggregates: bucket,
-                    context: Arc::clone(&context),
-                    committed,
-                })
-                .await
-                .map_err(|_| CausalPositionError::ControlClosed)?;
-            let result = acknowledgement
-                .await
-                .map_err(|_| CausalPositionError::AcknowledgementClosed)?
-                .map_err(|error| CausalPositionError::BucketCommit {
-                    wallet,
-                    message: error.to_string(),
-                })?;
+            let result = loop {
+                let (committed, acknowledgement) = oneshot::channel();
+                control_tx
+                    .send(OrchestratorControl::CommitActivityBucket {
+                        aggregates: bucket.clone(),
+                        context: Arc::clone(&context),
+                        committed,
+                    })
+                    .await
+                    .map_err(|_| CausalPositionError::ControlClosed)?;
+                match acknowledgement
+                    .await
+                    .map_err(|_| CausalPositionError::AcknowledgementClosed)?
+                {
+                    Ok(result) => break result,
+                    Err(BucketCommitError::MembershipRequired(markets)) => {
+                        self.acquire_membership(wallet, paper_state, markets)
+                            .await?;
+                    }
+                    Err(error) => {
+                        return Err(CausalPositionError::BucketCommit {
+                            wallet,
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            };
             if result.retained_revision {
                 return Err(CausalPositionError::InterveningActivity { wallet });
             }
@@ -1984,9 +2104,14 @@ fn commit_direct(
             }
             Ok(BatchOutcome::Complete { changed })
         })
-        .map_err(|error| CausalPositionError::BucketCommit {
-            wallet,
-            message: error.to_string(),
+        .map_err(|error| match error {
+            BucketCommitError::MembershipRequired(markets) => {
+                CausalPositionError::MembershipRequired { wallet, markets }
+            }
+            error => CausalPositionError::BucketCommit {
+                wallet,
+                message: error.to_string(),
+            },
         })?;
     match outcome {
         BatchOutcome::Complete { changed } => Ok(changed),
@@ -2650,6 +2775,7 @@ mod tests {
                     &prepared,
                     HashSet::new(),
                     &control_tx,
+                    &PaperStateDb::open(&dir.path().join("paper.db")).unwrap(),
                     true
                 )
                 .await
@@ -2659,7 +2785,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_batch_surfaces_fence_after_committing_its_prefix() {
+    fn direct_batch_drops_the_problem_scope_and_commits_later_buckets() {
         let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         let observed_at = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
         let row = |epoch: i64, activity_type: &str, asset: &str, market: &str, tx: &str| {
@@ -2681,9 +2807,9 @@ mod tests {
         };
         let parsed = parse_activity_response(
             &serde_json::to_vec(&vec![
-                row(1, "TRADE", "asset-first", "market-first", "0xfirst"),
-                row(2, "REDEEM", "asset-fence", "market-fence", "0xfence"),
-                row(3, "TRADE", "asset-later", "market-later", "0xlater"),
+                row(1, "TRADE", "asset-first", "0xf1", "0xfirst"),
+                row(2, "REDEEM", "asset-fence", "0xf2", "0xfence"),
+                row(3, "TRADE", "asset-later", "0xf3", "0xlater"),
             ])
             .unwrap(),
             wallet,
@@ -2715,6 +2841,9 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        for market in ["0xf1", "0xf2", "0xf3"] {
+            paper.record_market_group(market, "").unwrap();
+        }
         let mut engine =
             BucketCommitEngine::load(Arc::clone(&paper), PositionLedger::new()).unwrap();
         paper.set_cursor(&wallet, 0).unwrap();
@@ -2744,7 +2873,7 @@ mod tests {
             }])
             .unwrap();
 
-        let error = commit_direct(
+        let changed = commit_direct(
             wallet,
             &activity,
             &prepared,
@@ -2753,21 +2882,25 @@ mod tests {
             false,
             "fixture-generation",
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(error, CausalPositionError::Fenced { .. }));
+        assert!(!changed);
+        assert_eq!(
+            paper.wallet_scope_drops(&wallet, 100).unwrap()[0].scope_id,
+            "0xf2"
+        );
         assert!(paper.activity_group_state(&first_id).unwrap().is_some());
         assert!(paper.activity_group_state(&fence_id).unwrap().is_some());
-        assert!(paper.activity_group_state(&later_id).unwrap().is_none());
-        assert!(paper.is_wallet_fenced(&wallet).unwrap());
-        assert!(engine.is_fenced(&wallet));
+        assert!(paper.activity_group_state(&later_id).unwrap().is_some());
+        assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+        assert!(!engine.is_fenced(&wallet));
         assert_eq!(
             engine
                 .ledger()
                 .position(&wallet)
                 .and_then(|snapshot| {
                     snapshot.positions.get(&MarketOutcomeId::new(
-                        MarketId(VenueMarketId("market-first".to_owned())),
+                        MarketId(VenueMarketId("0xf1".to_owned())),
                         OutcomeId(0),
                     ))
                 })

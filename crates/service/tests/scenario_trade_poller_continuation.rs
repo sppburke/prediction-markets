@@ -99,7 +99,7 @@ impl ReconciliationFetcher for GammaFetcher {
             "combo tokens never enter identity lookup"
         );
         Box::pin(async {
-            Ok(br#"[{"conditionId":"0xca","clobTokenIds":["asset-a"]},{"conditionId":"0xcb","clobTokenIds":["asset-b"]}]"#.to_vec())
+            Ok(br#"[{"conditionId":"0xca","clobTokenIds":["asset-a"]},{"conditionId":"0xcb","clobTokenIds":["asset-b"]},{"conditionId":"0xcc","clobTokenIds":["asset-c"]},{"conditionId":"0xce","clobTokenIds":["asset-d"]}]"#.to_vec())
         })
     }
 }
@@ -905,6 +905,7 @@ enum ControlCompletion {
 type BoundaryReply = Option<Result<(), DailyBoundaryError>>;
 
 struct RunningPoll {
+    crash_boundary: Arc<Mutex<Option<pe_service::trade_poller::ReconciliationCrashBoundary>>>,
     health: pe_service::health::SharedHealth,
     anchor_ack_gate: Arc<tokio::sync::Semaphore>,
     anchor_ack_drop: Arc<std::sync::atomic::AtomicBool>,
@@ -1024,7 +1025,7 @@ impl RunningPoll {
     }
 
     async fn finish(self) -> Vec<RecordedBucket> {
-        self.stop.send(()).unwrap();
+        let _ = self.stop.send(());
         self.poller.await.unwrap().unwrap();
         drop(self.source);
         drop(self.triggers);
@@ -1082,6 +1083,29 @@ fn start_recorded_poller_with_completion_stop(
     boundary_anchor: Option<i64>,
     stop_after_completion: Option<WalletAddress>,
     copy_budget_secs: u64,
+) -> (RunningPoll, Arc<PaperStateDb>) {
+    start_recorded_poller_with_membership(
+        dir,
+        wallets,
+        real_owner,
+        anchors,
+        boundary_anchor,
+        stop_after_completion,
+        copy_budget_secs,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_recorded_poller_with_membership(
+    dir: &tempfile::TempDir,
+    wallets: &[WalletAddress],
+    real_owner: bool,
+    anchors: bool,
+    boundary_anchor: Option<i64>,
+    stop_after_completion: Option<WalletAddress>,
+    copy_budget_secs: u64,
+    membership_reader: Option<(String, Arc<pe_source_polymarket_public::ReqwestFetcher>)>,
 ) -> (RunningPoll, Arc<PaperStateDb>) {
     let paper_path = dir.path().join("paper.db");
     let restarting = paper_path.exists();
@@ -1216,7 +1240,7 @@ fn start_recorded_poller_with_completion_stop(
                     context,
                     committed,
                 } => {
-                    let mut result = if real_owner {
+                    let result = if real_owner {
                         let (committed, result) = oneshot::channel();
                         real_tx
                             .send(OrchestratorControl::CommitActivityBucket {
@@ -1226,19 +1250,24 @@ fn start_recorded_poller_with_completion_stop(
                             })
                             .await
                             .unwrap();
-                        result.await.unwrap().unwrap()
+                        result.await.unwrap()
                     } else {
-                        engine
-                            .commit_with_freshness_policy(
-                                aggregates.clone(),
-                                &context,
-                                zero_basis(),
-                                Some(pe_service::bucket_commit::PaperFreshnessPolicy {
-                                    activity_ws_enabled: true,
-                                    copy_latency_budget_secs: copy_budget_secs,
-                                }),
-                            )
-                            .unwrap()
+                        engine.commit_with_freshness_policy(
+                            aggregates.clone(),
+                            &context,
+                            zero_basis(),
+                            Some(pe_service::bucket_commit::PaperFreshnessPolicy {
+                                activity_ws_enabled: true,
+                                copy_latency_budget_secs: copy_budget_secs,
+                            }),
+                        )
+                    };
+                    let mut result = match result {
+                        Ok(result) => result,
+                        Err(error) => {
+                            let _ = committed.send(Err(error));
+                            continue;
+                        }
                     };
                     if actor_integrity_fence.swap(false, Ordering::SeqCst) {
                         assert!(!real_owner);
@@ -1367,6 +1396,7 @@ fn start_recorded_poller_with_completion_stop(
     let (held_tx, held) = tokio::sync::watch::channel(
         pe_service::trade_poller::HeldObligations::from(&obligations),
     );
+    let crash_boundary = Arc::new(Mutex::new(None));
     let poller = TradePoller::new(
         TradePollerConfig {
             base_url: BASE_URL.to_owned(),
@@ -1391,6 +1421,7 @@ fn start_recorded_poller_with_completion_stop(
         obligations,
         preparer,
     )
+    .with_crash_boundary(crash_boundary.clone())
     .with_source_receipt_index(receipts)
     .with_clock(Arc::new(move || {
         OffsetDateTime::from_unix_timestamp(clock.load(Ordering::SeqCst)).unwrap()
@@ -1402,6 +1433,11 @@ fn start_recorded_poller_with_completion_stop(
     })
     .with_wait_observer(wait_tx)
     .with_held_obligations(held_tx);
+    let poller = if let Some((base_url, fetcher)) = membership_reader {
+        poller.with_market_membership(base_url, fetcher)
+    } else {
+        poller
+    };
     let mut run = Box::pin(poller.run_until(async move {
         if let Some(target) = stop_after_completion {
             // Completed is emitted synchronously inside the join arm, after the select's
@@ -1432,6 +1468,7 @@ fn start_recorded_poller_with_completion_stop(
     }));
     (
         RunningPoll {
+            crash_boundary,
             health,
             anchor_ack_gate,
             anchor_ack_drop,
@@ -3537,8 +3574,7 @@ async fn corrected_identity_binding_replays_from_raw_metadata() {
     );
 }
 
-/// PASS: source legs stay separate; multiple candidates for corrected stamps create the existing
-/// invalid-mapping fence and never manufacture a binding to an arbitrary target.
+/// Source legs stay separate; ambiguity drops the effective market and never binds an arbitrary target.
 #[tokio::test(start_paused = true)]
 async fn transaction_legs_remain_distinct_during_correlation() {
     for (previous_epoch, verified_mapping) in [
@@ -3586,17 +3622,20 @@ async fn transaction_legs_remain_distinct_during_correlation() {
         running.completed(wallet()).await;
         let commits = running.finish().await;
         if !verified_mapping {
-            assert!(commits.is_empty());
             assert!(paper.wallet_fences().unwrap().is_empty());
-            assert_eq!(
+            assert!(
+                paper
+                    .wallet_scope_drops(&wallet(), EPOCH)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
                 pe_service::trade_poller::rebuild_reconciliation_obligations(
                     &dir.path().join("source.log"),
                     &paper
                 )
                 .unwrap()
-                .len(),
-                1,
-                "raw candidates without a verified mapping remain outstanding"
+                .is_empty()
             );
             continue;
         }
@@ -3611,10 +3650,7 @@ async fn transaction_legs_remain_distinct_during_correlation() {
                 .sum::<u64>(),
             5
         );
-        assert_eq!(
-            commits[0].2.newly_fenced,
-            Some(pe_position_ledger::WalletFenceCause::InvalidMapping)
-        );
+        assert_eq!(commits[0].2.newly_fenced, None);
         assert!(commits[0].2.pending.is_empty());
         let frame = source_frames(&dir.path().join("source.log"))
             .into_iter()
@@ -3650,8 +3686,11 @@ async fn transaction_legs_remain_distinct_during_correlation() {
                 epoch
             );
         }
-        let fence = paper.wallet_fences().unwrap().remove(0);
-        assert_eq!(fence.cause, "invalid_mapping");
+        assert!(paper.wallet_fences().unwrap().is_empty());
+        assert_eq!(
+            paper.wallet_scope_drops(&wallet(), EPOCH).unwrap()[0].scope_id,
+            MARKET_B
+        );
         assert!(
             pe_service::trade_poller::rebuild_reconciliation_obligations(
                 &dir.path().join("source.log"),
@@ -4487,6 +4526,9 @@ async fn existing_fence_discharges_new_ambiguity_and_releases_oldest_boundary() 
     running.round_completed().await;
     let mut first = stream_row(wallet(), "first-ambiguity", EPOCH);
     first["conditionId"] = json!("incorrect-stamp");
+    running
+        .integrity_fence_after_commit
+        .store(true, Ordering::SeqCst);
     running.observe(first).await;
     let left = stream_row(wallet(), "first-ambiguity", EPOCH);
     let mut right = left.clone();
@@ -4788,10 +4830,10 @@ async fn mixed_exact_and_corrected_legs_keep_individual_bindings() {
     );
 }
 
-/// PASS: a crash after the fence witness but before the revision transaction keeps the fence
-/// and retains the unacknowledged observation on reopen; retry preserves the original economic effect.
+/// A failed carrier rolls back its drop, retirement and revision together. Reopen keeps the
+/// observation outstanding; retry preserves the original economic effect.
 #[tokio::test(start_paused = true)]
-async fn restart_between_fence_witness_and_revision_keeps_unacknowledged_obligation() {
+async fn restart_after_failed_ambiguity_carrier_preserves_unacknowledged_obligation() {
     let dir = tempfile::tempdir().unwrap();
     let (mut running, _) = start_recorded_poller(&dir, &[wallet()]);
     let original = stream_row(wallet(), "witness-revision", EPOCH);
@@ -4812,7 +4854,7 @@ async fn restart_between_fence_witness_and_revision_keeps_unacknowledged_obligat
         .unwrap();
     let mut stream = original.clone();
     stream["conditionId"] = json!("incorrect-stamp");
-    running.observe(stream).await;
+    let observation = running.observe(stream).await;
     let mut revision = original;
     revision["size"] = json!("2");
     let mut other_leg = revision.clone();
@@ -4848,11 +4890,14 @@ async fn restart_between_fence_witness_and_revision_keeps_unacknowledged_obligat
         error.contains("injected revision transaction failure"),
         "{error}"
     );
-    assert_eq!(
-        paper.wallet_fences().unwrap().len(),
-        1,
-        "the first transaction committed"
+    assert!(paper.wallet_fences().unwrap().is_empty());
+    assert!(
+        paper
+            .wallet_scope_drops(&wallet(), EPOCH)
+            .unwrap()
+            .is_empty()
     );
+    assert!(!paper.activity_observation_retired(observation).unwrap());
     let changed = aggregates
         .iter()
         .find(|item| item.group_id == original_aggregate.group_id)
@@ -4892,6 +4937,16 @@ async fn restart_between_fence_witness_and_revision_keeps_unacknowledged_obligat
         .commit(aggregates.clone(), context, zero_basis())
         .unwrap();
     assert_eq!(paper.wallet_fences().unwrap(), fence);
+    assert_eq!(paper.wallet_scope_drops(&wallet(), EPOCH).unwrap().len(), 1);
+    assert!(paper.activity_observation_retired(observation).unwrap());
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            &paper
+        )
+        .unwrap()
+        .is_empty()
+    );
     assert!(
         paper
             .activity_revision_disposed(changed.group_id.key(), changed.semantic_revision.as_str())
@@ -5593,10 +5648,10 @@ async fn feed_observation_stamped_after_its_history_row_still_binds() {
 
 /// AC5 boundary: a restamp first seen beside its unrecorded original is not a twin. A feed
 /// observation of it, stamped like neither row or exactly like the restamp, keeps the
-/// invalid-mapping fence instead of letting both rows apply; the ledger is unchanged, and the
+/// market drop instead of letting both rows apply; the ledger is unchanged, and the
 /// obligation stays disposed across a rebuild.
 #[tokio::test(start_paused = true)]
-async fn feed_observation_of_a_first_seen_restamp_pair_keeps_the_fence() {
+async fn feed_observation_of_a_first_seen_restamp_pair_drops_the_market() {
     for exact in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
@@ -5640,10 +5695,19 @@ async fn feed_observation_of_a_first_seen_restamp_pair_keeps_the_fence() {
             })
             .unwrap();
         assert!(context.restamp_twins.is_empty(), "exact={exact}");
+        let inputs: Value = serde_json::from_str(&context.decision_inputs_json).unwrap();
         assert_eq!(
-            result.newly_fenced,
-            Some(pe_position_ledger::WalletFenceCause::InvalidMapping),
-            "exact={exact}"
+            inputs["ambiguous_observations"][0]["candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        assert_eq!(result.newly_fenced, None, "exact={exact}");
+        assert_eq!(
+            paper.wallet_scope_drops(&wallet(), EPOCH).unwrap()[0].scope_id,
+            MARKET_B
         );
         assert_eq!(
             build_leader_ledger(&paper).unwrap().snapshots(),
@@ -5965,4 +6029,1312 @@ async fn known_redemption_preserves_balance_and_decision_during_deferred_anchor(
         .unwrap();
     assert_eq!(balance.long_contracts, ShareAmount::from_whole(5).unwrap());
     running.finish().await;
+}
+
+/// AC7: the first bucket from the earliest implicated second carries S1 once. Later
+/// candidate seconds use the durable drop without certifying another problem second.
+#[tokio::test(start_paused = true)]
+async fn ambiguity_carriers_use_the_earliest_observation_or_candidate_second() {
+    for observation_epoch in [EPOCH - 6, EPOCH - 3, EPOCH - 1] {
+        for earlier_drop in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut running, paper) = start_recorded_poller_with_membership(
+                &dir,
+                &[wallet()],
+                true,
+                false,
+                None,
+                None,
+                120,
+                None,
+            );
+            running
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .respond
+                .send(b"[]".to_vec())
+                .unwrap();
+            running.round_completed().await;
+            if earlier_drop {
+                paper
+                    .import_scope_drops(
+                        1,
+                        &[(
+                            pe_paper_state::WalletScopeDrop {
+                                wallet: wallet(),
+                                scope_kind: "market".to_owned(),
+                                scope_id: MARKET_B.to_owned(),
+                                cause: "imported".to_owned(),
+                                source_trade_id: None,
+                                dropped_at_epoch: EPOCH - 8,
+                                proof_json: "{}".to_owned(),
+                                recorded_at_unix: EPOCH,
+                            },
+                            pe_event_log::AppendReceipt {
+                                sequence: pe_core_types::EventSeq(0),
+                                this_hash: blake3::hash(b"fixture"),
+                            },
+                        )],
+                        &Default::default(),
+                    )
+                    .unwrap();
+            }
+            let mut observation = stream_row(wallet(), "ambiguous", observation_epoch);
+            observation["conditionId"] = json!("incorrect-stamp");
+            let receipt = running.observe(observation).await;
+            let first = stream_row(wallet(), "ambiguous", EPOCH - 5);
+            let mut last = stream_row(wallet(), "ambiguous", EPOCH - 2);
+            last["conditionId"] = json!("0xcc");
+            let middle = stream_row(wallet(), "unrelated-in-dropped-market", EPOCH - 4);
+            let unrelated = activity_row(
+                "TRADE",
+                "unrelated-healthy",
+                MARKET_A,
+                "BUY",
+                "1",
+                "asset-a",
+                EPOCH - 2,
+            );
+            let page =
+                serde_json::to_vec(&[last, unrelated.clone(), middle.clone(), first]).unwrap();
+            running
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .respond
+                .send(page.clone())
+                .unwrap();
+            assert_eq!(running.completed(wallet()).await, vec![receipt]);
+            assert!(paper.wallet_fences().unwrap().is_empty());
+            assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+            let scope_drop = paper
+                .wallet_scope_drops(&wallet(), EPOCH)
+                .unwrap()
+                .remove(0);
+            assert_eq!(scope_drop.scope_id, MARKET_B);
+            assert_eq!(
+                scope_drop.dropped_at_epoch,
+                if earlier_drop {
+                    EPOCH - 8
+                } else {
+                    observation_epoch.min(EPOCH - 5)
+                }
+            );
+            let gate = paper
+                .entry_gate_result(aggregate(unrelated).group_id.key())
+                .unwrap()
+                .unwrap();
+            assert_eq!(gate.result, "admitted");
+            assert_eq!(
+                paper
+                    .activity_group_state(aggregate(middle).group_id.key())
+                    .unwrap()
+                    .unwrap()
+                    .disposition,
+                "scope_dropped"
+            );
+            assert!(paper.activity_observation_retired(receipt).unwrap());
+            let commits = running.finish().await;
+            assert_eq!(
+                commits
+                    .iter()
+                    .filter(|(_, context, _)| serde_json::from_str::<Value>(
+                        &context.decision_inputs_json
+                    )
+                    .unwrap()
+                    .get("ambiguous_observations")
+                    .is_some())
+                    .count(),
+                1
+            );
+            let original_groups = paper.activity_groups_after(&wallet(), EPOCH - 10).unwrap();
+            let original_positions = paper.leader_positions().unwrap();
+            let original_gates = paper.decision_pending_history().unwrap();
+            drop(paper);
+            let (mut resumed, paper) = start_recorded_poller_with_membership(
+                &dir,
+                &[wallet()],
+                true,
+                false,
+                None,
+                None,
+                120,
+                None,
+            );
+            resumed
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .respond
+                .send(page)
+                .unwrap();
+            resumed.completed(wallet()).await;
+            resumed.finish().await;
+            assert_eq!(
+                paper.activity_groups_after(&wallet(), EPOCH - 10).unwrap(),
+                original_groups
+            );
+            assert_eq!(paper.leader_positions().unwrap(), original_positions);
+            assert_eq!(paper.decision_pending_history().unwrap(), original_gates);
+            assert!(
+                pe_service::trade_poller::rebuild_reconciliation_obligations(
+                    &dir.path().join("source.log"),
+                    &paper
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ambiguity_carrier_before_candidates_blocks_the_intervening_buy_across_crash() {
+    for crash_after_carrier in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut running, paper) = start_recorded_poller_with_membership(
+            &dir,
+            &[wallet()],
+            true,
+            false,
+            None,
+            None,
+            120,
+            None,
+        );
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(b"[]".to_vec())
+            .unwrap();
+        running.round_completed().await;
+        let mut observation = stream_row(wallet(), "candidates", EPOCH - 6);
+        observation["conditionId"] = json!("incorrect-stamp");
+        let receipt = running.observe(observation).await;
+        let carrier = stream_row(wallet(), "intervening", EPOCH - 5);
+        let first = stream_row(wallet(), "candidates", EPOCH - 4);
+        let mut last = stream_row(wallet(), "candidates", EPOCH - 2);
+        last["conditionId"] = json!("0xcc");
+        let rows = vec![last, first, carrier.clone()];
+        let page = serde_json::to_vec(&rows).unwrap();
+        let held = running
+            .bucket_ack_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(page.clone())
+            .unwrap();
+        assert!(matches!(
+            running.controls.recv().await,
+            Some(ControlCompletion::BucketCommitted)
+        ));
+        assert!(paper.activity_observation_retired(receipt).unwrap());
+        assert_eq!(
+            paper
+                .activity_groups_after(&wallet(), EPOCH - 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            paper
+                .activity_group_state(aggregate(carrier).group_id.key())
+                .unwrap()
+                .unwrap()
+                .disposition,
+            "scope_dropped"
+        );
+        if crash_after_carrier {
+            running.stop.send(()).unwrap();
+            tokio::task::yield_now().await;
+            drop(held);
+            running.poller.await.unwrap().unwrap();
+            drop(running.source);
+            drop(running.triggers);
+            running.ingest.await.unwrap();
+            running.control.await.unwrap();
+            drop(paper);
+            let (mut resumed, paper) = start_recorded_poller_with_membership(
+                &dir,
+                &[wallet()],
+                true,
+                false,
+                None,
+                None,
+                120,
+                None,
+            );
+            resumed
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .respond
+                .send(page)
+                .unwrap();
+            resumed.completed(wallet()).await;
+            resumed.finish().await;
+            assert_eq!(
+                paper
+                    .activity_groups_after(&wallet(), EPOCH - 10)
+                    .unwrap()
+                    .len(),
+                3
+            );
+            assert!(paper.leader_positions().unwrap().is_empty());
+            assert!(paper.open_decision_pending().unwrap().is_empty());
+        } else {
+            drop(held);
+            running.completed(wallet()).await;
+            running.finish().await;
+            assert_eq!(
+                paper
+                    .activity_groups_after(&wallet(), EPOCH - 10)
+                    .unwrap()
+                    .len(),
+                3
+            );
+            assert!(paper.leader_positions().unwrap().is_empty());
+            assert!(paper.open_decision_pending().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ambiguity_with_durable_candidates_retires_exact_observations_without_rewriting_decisions()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller_with_membership(
+        &dir,
+        &[wallet()],
+        true,
+        false,
+        None,
+        None,
+        120,
+        None,
+    );
+    let first = stream_row(wallet(), "durable-candidates", EPOCH - 5);
+    let mut last = stream_row(wallet(), "durable-candidates", EPOCH - 2);
+    last["conditionId"] = json!("0xcc");
+    let page = serde_json::to_vec(&[last, first]).unwrap();
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(page.clone())
+        .unwrap();
+    running.round_completed().await;
+    let groups = paper.activity_groups_after(&wallet(), EPOCH - 10).unwrap();
+    let positions = paper.leader_positions().unwrap();
+    let gates = paper.decision_pending_history().unwrap();
+    for _ in 0..2 {
+        let mut observation = stream_row(wallet(), "durable-candidates", EPOCH - 4);
+        observation["conditionId"] = json!("incorrect-stamp");
+        let receipt = running.observe(observation).await;
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(page.clone())
+            .unwrap();
+        running.completed(wallet()).await;
+        assert!(paper.activity_observation_retired(receipt).unwrap());
+        assert_eq!(
+            paper.activity_groups_after(&wallet(), EPOCH - 10).unwrap(),
+            groups
+        );
+        assert_eq!(paper.leader_positions().unwrap(), positions);
+        assert_eq!(paper.decision_pending_history().unwrap(), gates);
+    }
+    running.finish().await;
+    assert_eq!(
+        paper.wallet_scope_drops(&wallet(), EPOCH).unwrap()[0].dropped_at_epoch,
+        EPOCH - 5
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn ambiguity_without_provenance_uses_the_observation_scope_or_retires_without_one() {
+    for condition in ["unmapped", r"\xCD"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut running, paper) = start_recorded_poller_with_owner(&dir, &[wallet()], true);
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(b"[]".to_vec())
+            .unwrap();
+        running.round_completed().await;
+        let mut observation = stream_row(wallet(), "unresolved-ambiguity", EPOCH);
+        observation["conditionId"] = json!(condition);
+        observation["asset"] = json!("unverified");
+        let receipt = running.observe(observation.clone()).await;
+        let mut other = observation.clone();
+        other["conditionId"] = json!("another-unmapped");
+        other["outcomeIndex"] = json!(1);
+        let mut candidate = observation.clone();
+        candidate["conditionId"] = json!("candidate-unmapped");
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(serde_json::to_vec(&[candidate, other]).unwrap())
+            .unwrap();
+        running.completed(wallet()).await;
+        running.finish().await;
+        assert!(paper.activity_observation_retired(receipt).unwrap());
+        let drops = paper.wallet_scope_drops(&wallet(), EPOCH).unwrap();
+        if condition == "unmapped" {
+            assert!(drops.is_empty());
+        } else {
+            assert_eq!(drops[0].scope_id, "0xcd");
+        }
+        assert!(paper.wallet_fences().unwrap().is_empty());
+        assert!(
+            pe_service::trade_poller::rebuild_reconciliation_obligations(
+                &dir.path().join("source.log"),
+                &paper
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ambiguity_carrier_crashes_before_and_after_commit_converge() {
+    use pe_service::trade_poller::ReconciliationCrashBoundary;
+    let mut expected = None;
+    for crash in [
+        None,
+        Some(ReconciliationCrashBoundary::Commitment),
+        Some(ReconciliationCrashBoundary::Bucket),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut running, paper) = start_recorded_poller_with_membership(
+            &dir,
+            &[wallet()],
+            true,
+            false,
+            None,
+            None,
+            120,
+            None,
+        );
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(b"[]".to_vec())
+            .unwrap();
+        running.round_completed().await;
+        *running.crash_boundary.lock().unwrap() = crash;
+        let mut observation = stream_row(wallet(), "crash-ambiguity", EPOCH - 6);
+        observation["conditionId"] = json!("incorrect-stamp");
+        let receipt = running.observe(observation).await;
+        let mut last = stream_row(wallet(), "crash-ambiguity", EPOCH - 2);
+        last["conditionId"] = json!("0xcc");
+        let rows = vec![
+            last,
+            stream_row(wallet(), "crash-ambiguity", EPOCH - 4),
+            stream_row(wallet(), "unrelated-carrier", EPOCH - 5),
+        ];
+        let page = serde_json::to_vec(&rows).unwrap();
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(page.clone())
+            .unwrap();
+        if let Some(crash) = crash {
+            assert!(running.poller.await.unwrap().is_err());
+            drop(running.source);
+            drop(running.triggers);
+            running.ingest.await.unwrap();
+            running.control.await.unwrap();
+            assert_eq!(
+                paper.activity_observation_retired(receipt).unwrap(),
+                crash == ReconciliationCrashBoundary::Bucket
+            );
+            assert_eq!(
+                paper.cursor(&wallet()).unwrap(),
+                Some(if crash == ReconciliationCrashBoundary::Bucket {
+                    EPOCH - 5
+                } else {
+                    EPOCH - 10
+                })
+            );
+            drop(paper);
+            let (mut resumed, paper) = start_recorded_poller_with_membership(
+                &dir,
+                &[wallet()],
+                true,
+                false,
+                None,
+                None,
+                120,
+                None,
+            );
+            resumed
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .respond
+                .send(page)
+                .unwrap();
+            resumed.completed(wallet()).await;
+            resumed.finish().await;
+            let result = (
+                paper.activity_groups_after(&wallet(), EPOCH - 10).unwrap(),
+                paper.leader_positions().unwrap(),
+                paper.gate_history().unwrap(),
+            );
+            assert_eq!(Some(&result), expected.as_ref());
+        } else {
+            running.completed(wallet()).await;
+            running.finish().await;
+            expected = Some((
+                paper.activity_groups_after(&wallet(), EPOCH - 10).unwrap(),
+                paper.leader_positions().unwrap(),
+                paper.gate_history().unwrap(),
+            ));
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ambiguity_keeps_unmatched_ordering_and_publishes_frontier_on_the_next_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller_with_membership(
+        &dir,
+        &[wallet()],
+        true,
+        false,
+        None,
+        None,
+        120,
+        None,
+    );
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let initial_frontier = paper.feed_history_frontiers().unwrap();
+    running.coordinator_gate.lock().unwrap().0 = true;
+    let mut observation = stream_row(wallet(), "ambiguous-and-unmatched", EPOCH - 6);
+    observation["conditionId"] = json!("incorrect-stamp");
+    let ambiguity = running.observe(observation).await;
+    let unmatched_row = stream_row(wallet(), "missing-from-read", EPOCH - 3);
+    let unmatched = running.observe(unmatched_row.clone()).await;
+    let waker = {
+        let mut gate = running.coordinator_gate.lock().unwrap();
+        gate.0 = false;
+        gate.1.take()
+    };
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+    let first = stream_row(wallet(), "ambiguous-and-unmatched", EPOCH - 5);
+    let mut last = stream_row(wallet(), "ambiguous-and-unmatched", EPOCH - 2);
+    last["conditionId"] = json!("0xcc");
+    let blocked = aggregate(last.clone()).group_id.key().clone();
+    let mut rows = vec![last, first];
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&rows).unwrap())
+        .unwrap();
+    running.completed(wallet()).await;
+    assert!(paper.activity_observation_retired(ambiguity).unwrap());
+    assert!(!paper.activity_observation_retired(unmatched).unwrap());
+    assert!(paper.activity_group_state(&blocked).unwrap().is_none());
+    assert_eq!(paper.feed_history_frontiers().unwrap(), initial_frontier);
+    rows.push(unmatched_row);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&rows).unwrap())
+        .unwrap();
+    running.completed(wallet()).await;
+    running.finish().await;
+    assert!(paper.activity_group_state(&blocked).unwrap().is_some());
+    let frontiers = paper.feed_history_frontiers().unwrap();
+    assert_ne!(frontiers, initial_frontier);
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            &paper
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+/// AC6: cold membership takes the typed owner acknowledgement, records CLOB evidence,
+/// and retries the frozen bucket to the same classifications as recorded membership.
+#[tokio::test]
+async fn membership_cold_and_warm_poller_acknowledgements_classify_identically() {
+    use axum::{Json, Router, extract::Path, http::StatusCode, routing::get};
+    use pe_source_polymarket_public::ReqwestFetcher;
+    for case in [
+        "healthy",
+        "market_drop",
+        "merge",
+        "redemption",
+        "event_drop",
+        "conversion_token",
+        "unknown_token",
+        "ranker_group",
+        "ranker_zero_unknown",
+        "legacy_group",
+        "absent_token",
+        "absent_no_token",
+        "unknown_group",
+        "grouped_market",
+        "ungrouped_market",
+    ] {
+        let mut expected = None;
+        for warm in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let server_calls = calls.clone();
+            let event = !matches!(
+                case,
+                "healthy"
+                    | "market_drop"
+                    | "merge"
+                    | "redemption"
+                    | "absent_no_token"
+                    | "unknown_group"
+                    | "ungrouped_market"
+            );
+            let memberships = HashMap::from([
+                (MARKET_A.to_owned(), "".to_owned()),
+                (
+                    MARKET_B.to_owned(),
+                    if event { "0xee" } else { "" }.to_owned(),
+                ),
+                (
+                    "0xcc".to_owned(),
+                    if event { "0xee" } else { "" }.to_owned(),
+                ),
+                (
+                    "0xcd".to_owned(),
+                    if case == "ungrouped_market" || case == "merge" {
+                        ""
+                    } else {
+                        "absent"
+                    }
+                    .to_owned(),
+                ),
+                ("0xee".to_owned(), "absent".to_owned()),
+                ("0xce".to_owned(), "".to_owned()),
+            ]);
+            let answers = memberships.clone();
+            let app = Router::new().route("/markets/{market}", get(move |Path(market): Path<String>| {
+                let calls = server_calls.clone();
+                let membership = answers[&market].clone();
+                async move {
+                    calls.lock().unwrap().push(market.clone());
+                    if membership == "absent" { (StatusCode::NOT_FOUND, Json(json!({"error":"market not found"}))) }
+                    else { (StatusCode::OK, Json(json!({"condition_id":market, "neg_risk":!membership.is_empty(), "neg_risk_market_id":membership}))) }
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let fetcher = Arc::new(
+                ReqwestFetcher::new(reqwest::Client::new())
+                    .with_max_retries(0)
+                    .with_min_interval_ms(0),
+            );
+            let (mut running, paper) = start_recorded_poller_with_membership(
+                &dir,
+                &[wallet()],
+                true,
+                false,
+                None,
+                None,
+                120,
+                Some((
+                    if matches!(case, "healthy" | "market_drop") {
+                        "http://127.0.0.1:0".to_owned()
+                    } else {
+                        format!("http://{address}")
+                    },
+                    fetcher,
+                )),
+            );
+            let conn = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+            for (market, membership) in &memberships {
+                conn.execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    [format!("neg_risk_group:{market}")],
+                )
+                .unwrap();
+                if warm {
+                    paper.record_market_group(market, membership).unwrap();
+                }
+            }
+            if matches!(case, "legacy_group") {
+                paper.record_market_group("0xcf", "0xee").unwrap();
+            }
+            let prior_drop = match case {
+                "market_drop" => Some(("market", MARKET_B)),
+                "event_drop" => Some(("event", "0xee")),
+                _ => None,
+            };
+            let groups = if matches!(case, "ranker_group" | "ranker_zero_unknown") {
+                std::collections::BTreeSet::from(["0xee".to_owned()])
+            } else {
+                Default::default()
+            };
+            let drops = prior_drop
+                .map(|(kind, id)| {
+                    (
+                        pe_paper_state::WalletScopeDrop {
+                            wallet: wallet(),
+                            scope_kind: kind.to_owned(),
+                            scope_id: id.to_owned(),
+                            cause: "imported".to_owned(),
+                            source_trade_id: None,
+                            dropped_at_epoch: EPOCH - 9,
+                            proof_json: "{}".to_owned(),
+                            recorded_at_unix: EPOCH,
+                        },
+                        pe_event_log::AppendReceipt {
+                            sequence: pe_core_types::EventSeq(0),
+                            this_hash: blake3::hash(b"fixture"),
+                        },
+                    )
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            paper.import_scope_drops(1, &drops, &groups).unwrap();
+            let mut problem = activity_row(
+                "MERGE",
+                "membership-problem",
+                "0xcd",
+                "BUY",
+                "1",
+                "",
+                EPOCH - 5,
+            );
+            problem.as_object_mut().unwrap().remove("asset");
+            match case {
+                "healthy" | "market_drop" => {}
+                "redemption" => {
+                    problem["type"] = json!("REDEEM");
+                    problem["asset"] = json!("asset-b");
+                }
+                "event_drop" => {
+                    problem["type"] = json!("TRADE");
+                    problem["asset"] = json!("asset-b");
+                }
+                "conversion_token" | "unknown_token" => {
+                    problem["type"] = json!(if case == "unknown_token" {
+                        "MYSTERY"
+                    } else {
+                        "CONVERSION"
+                    });
+                    problem["asset"] = json!("asset-b");
+                    problem.as_object_mut().unwrap().remove("conditionId");
+                }
+                "ranker_group" | "ranker_zero_unknown" | "legacy_group" | "unknown_group" => {
+                    problem["type"] = json!(if case == "ranker_zero_unknown" {
+                        "MYSTERY"
+                    } else {
+                        "CONVERSION"
+                    });
+                    problem["conditionId"] = json!("0xee");
+                    if case == "ranker_zero_unknown" {
+                        problem["size"] = json!("0");
+                    }
+                }
+                "absent_token" | "absent_no_token" => {
+                    problem["type"] = json!("CONVERSION");
+                    if case == "absent_token" {
+                        problem["asset"] = json!("asset-b");
+                    }
+                }
+                "grouped_market" | "ungrouped_market" => {
+                    problem["type"] = json!("CONVERSION");
+                    if case == "grouped_market" {
+                        problem["conditionId"] = json!(MARKET_B);
+                    }
+                }
+                _ => {}
+            }
+            let healthy = activity_row(
+                "TRADE",
+                "same-second-healthy",
+                MARKET_A,
+                "BUY",
+                "1",
+                "asset-a",
+                EPOCH - 5,
+            );
+            let later = activity_row(
+                "TRADE",
+                "later-sibling",
+                "0xcc",
+                "BUY",
+                "1",
+                "asset-c",
+                EPOCH - 2,
+            );
+            let other = activity_row(
+                "TRADE",
+                "later-healthy",
+                "0xce",
+                "BUY",
+                "1",
+                "asset-d",
+                EPOCH - 1,
+            );
+            let other_id = aggregate(other.clone()).group_id.key().clone();
+            let rows = if matches!(case, "healthy" | "market_drop") {
+                vec![healthy]
+            } else {
+                vec![other, later, healthy, problem]
+            };
+            running
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .respond
+                .send(serde_json::to_vec(&rows).unwrap())
+                .unwrap();
+            running.round_completed().await;
+            running.finish().await;
+            server.abort();
+            assert!(paper.wallet_fences().unwrap().is_empty(), "{case}/{warm}");
+            if !matches!(case, "healthy" | "market_drop") {
+                assert_eq!(
+                    paper.entry_gate_result(&other_id).unwrap().unwrap().result,
+                    "admitted",
+                    "{case}/{warm}"
+                );
+                if event {
+                    let sibling = aggregate(activity_row(
+                        "TRADE",
+                        "later-sibling",
+                        "0xcc",
+                        "BUY",
+                        "1",
+                        "asset-c",
+                        EPOCH - 2,
+                    ));
+                    assert_eq!(
+                        paper
+                            .activity_group_state(sibling.group_id.key())
+                            .unwrap()
+                            .unwrap()
+                            .disposition,
+                        "scope_dropped",
+                        "{case}/{warm}"
+                    );
+                }
+            }
+            assert!(
+                !paper.wallet_coverage(&wallet()).unwrap().reanchor_required,
+                "{case}/{warm}"
+            );
+            let result = (
+                paper.wallet_scope_drops(&wallet(), EPOCH).unwrap(),
+                paper.activity_groups_after(&wallet(), EPOCH - 10).unwrap(),
+                paper.leader_positions().unwrap(),
+                paper.gate_history().unwrap(),
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&result, expected, "{case}/{warm}");
+            } else {
+                expected = Some(result);
+            }
+            let calls = calls.lock().unwrap().len();
+            if warm || matches!(case, "healthy" | "market_drop") {
+                assert_eq!(calls, 0, "{case}/{warm}");
+            } else {
+                assert!(calls > 0, "{case}/{warm}");
+            }
+            let logged = source_frames(&dir.path().join("source.log"))
+                .into_iter()
+                .filter(|frame| frame.source_id.0 == "polymarket.clob.market.http")
+                .count();
+            assert_eq!(logged, calls, "{case}/{warm}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn membership_poller_terminal_answers_commit_and_transient_answers_preserve_progress() {
+    use axum::{Json, Router, http::StatusCode, routing::get};
+    use pe_source_polymarket_public::ReqwestFetcher;
+    for (status, body, terminal, delay) in [
+        (404, json!({"error":"market not found"}), true, false),
+        (400, json!({"error":"Invalid market"}), true, false),
+        (400, json!({"error":"context canceled"}), false, false),
+        (408, json!({"error":"timeout"}), false, false),
+        (425, json!({"error":"too early"}), false, false),
+        (503, json!({"error":"unavailable"}), false, false),
+        (
+            200,
+            json!({"condition_id":"another-market","neg_risk":false}),
+            false,
+            false,
+        ),
+        (
+            200,
+            json!({"condition_id":"0xcd","neg_risk":false}),
+            false,
+            true,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (requested, mut requests) = mpsc::channel(1);
+        let retry = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_retry = retry.clone();
+        let app = Router::new().route(
+            "/markets/0xcd",
+            get(move || {
+                let requested = requested.clone();
+                let body = body.clone();
+                let succeeds = server_retry.load(Ordering::SeqCst);
+                async move {
+                    let (release, released) = oneshot::channel();
+                    requested.send(release).await.unwrap();
+                    let _ = released.await;
+                    if succeeds {
+                        return (
+                            StatusCode::OK,
+                            Json(json!({"condition_id":"0xcd", "neg_risk":false})),
+                        );
+                    }
+                    if delay {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    (StatusCode::from_u16(status).unwrap(), Json(body))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let fetcher = Arc::new(
+            ReqwestFetcher::new(reqwest::Client::new())
+                .with_timeout(1)
+                .with_max_retries(0)
+                .with_min_interval_ms(0),
+        );
+        let (mut running, paper) = start_recorded_poller_with_membership(
+            &dir,
+            &[wallet()],
+            true,
+            false,
+            None,
+            None,
+            120,
+            Some((format!("http://{address}"), fetcher)),
+        );
+        let mut row = activity_row("MERGE", "cold-merge", "0xcd", "BUY", "1", "", EPOCH - 5);
+        row.as_object_mut().unwrap().remove("asset");
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(serde_json::to_vec(std::slice::from_ref(&row)).unwrap())
+            .unwrap();
+        let release = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paper.cursor(&wallet()).unwrap(), Some(EPOCH - 10));
+        assert!(
+            paper
+                .activity_groups_after(&wallet(), EPOCH - 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            paper
+                .wallet_scope_drops(&wallet(), EPOCH)
+                .unwrap()
+                .is_empty()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), running.round_completed())
+            .await
+            .unwrap();
+        assert_eq!(paper.market_membership("0xcd").unwrap().is_some(), terminal);
+        assert_eq!(
+            paper
+                .activity_groups_after(&wallet(), EPOCH - 10)
+                .unwrap()
+                .len(),
+            usize::from(terminal)
+        );
+        if !terminal {
+            assert_eq!(paper.cursor(&wallet()).unwrap(), Some(EPOCH - 10));
+            retry.store(true, Ordering::SeqCst);
+            let observation = activity_row(
+                "TRADE",
+                "retry-trigger",
+                MARKET_A,
+                "BUY",
+                "1",
+                "asset-a",
+                EPOCH - 5,
+            );
+            running.observe(observation.clone()).await;
+            running
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .respond
+                .send(serde_json::to_vec(&[observation, row]).unwrap())
+                .unwrap();
+            requests.recv().await.unwrap().send(()).unwrap();
+            running.completed(wallet()).await;
+            assert_eq!(
+                paper.market_membership("0xcd").unwrap(),
+                Some(pe_paper_state::MarketMembership::Ungrouped)
+            );
+            assert_eq!(
+                paper
+                    .activity_groups_after(&wallet(), EPOCH - 10)
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), running.finish())
+            .await
+            .unwrap();
+        let frames = source_frames(&dir.path().join("source.log"));
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.source_id.0 == "polymarket.clob.market.http")
+                .count(),
+            if terminal { 1 } else { 2 }
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.source_id.0 == "polymarket.clob.market")
+                .count(),
+            usize::from(!delay) + usize::from(!terminal)
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn membership_cold_late_and_revised_poller_routes_preserve_progress_until_acquired() {
+    use axum::{Json, Router, routing::get};
+    use pe_source_polymarket_public::ReqwestFetcher;
+    for route in ["revised", "partial", "late", "covered"] {
+        for kind in ["SPLIT", "MERGE"] {
+            let mut expected = None;
+            for warm in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let (requested, mut requests) = mpsc::channel(1);
+                let app = Router::new().route(
+                    "/markets/0xcd",
+                    get(move || {
+                        let requested = requested.clone();
+                        async move {
+                            let (release, released) = oneshot::channel();
+                            requested.send(release).await.unwrap();
+                            released.await.unwrap();
+                            Json(json!({"condition_id":"0xcd", "neg_risk":false}))
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let reader = Arc::new(
+                    ReqwestFetcher::new(reqwest::Client::new())
+                        .with_max_retries(0)
+                        .with_min_interval_ms(0),
+                );
+                let (mut running, paper) = start_recorded_poller_with_membership(
+                    &dir,
+                    &[wallet()],
+                    true,
+                    false,
+                    None,
+                    None,
+                    120,
+                    Some((format!("http://{address}"), reader)),
+                );
+                if warm {
+                    paper.record_market_group("0xcd", "").unwrap();
+                }
+                let mut problem =
+                    activity_row(kind, "cold-position", "0xcd", "BUY", "1", "", EPOCH - 5);
+                problem.as_object_mut().unwrap().remove("asset");
+                let prior = match route {
+                    "revised" => {
+                        let mut original = problem.clone();
+                        original["size"] = json!("0");
+                        Some(original)
+                    }
+                    "partial" | "late" => Some(activity_row(
+                        "REWARD",
+                        "prior",
+                        MARKET_B,
+                        "BUY",
+                        "1",
+                        "",
+                        if route == "partial" {
+                            EPOCH - 5
+                        } else {
+                            EPOCH - 3
+                        },
+                    )),
+                    _ => None,
+                };
+                running
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap()
+                    .respond
+                    .send(
+                        serde_json::to_vec(&prior.clone().into_iter().collect::<Vec<_>>()).unwrap(),
+                    )
+                    .unwrap();
+                running.round_completed().await;
+                if route == "covered" {
+                    cover_recorded_groups(&paper, EPOCH - 4);
+                }
+                let before_cursor = paper.cursor(&wallet()).unwrap();
+                let before_groups = paper.activity_groups_after(&wallet(), EPOCH - 10).unwrap();
+                let before_history = paper.gate_history().unwrap();
+                let observation = activity_row(
+                    "TRADE",
+                    "observation",
+                    MARKET_A,
+                    "BUY",
+                    "1",
+                    "asset-a",
+                    EPOCH - 5,
+                );
+                let receipt = running.observe(observation.clone()).await;
+                let mut rows = vec![observation, problem.clone()];
+                if matches!(route, "partial" | "late") {
+                    rows.extend(prior);
+                }
+                running
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap()
+                    .respond
+                    .send(serde_json::to_vec(&rows).unwrap())
+                    .unwrap();
+                if !warm {
+                    let release =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(
+                        paper.cursor(&wallet()).unwrap(),
+                        before_cursor,
+                        "{route}/{kind}"
+                    );
+                    assert_eq!(
+                        paper.activity_groups_after(&wallet(), EPOCH - 10).unwrap(),
+                        before_groups
+                    );
+                    assert_eq!(paper.gate_history().unwrap(), before_history);
+                    assert!(
+                        paper
+                            .wallet_scope_drops(&wallet(), EPOCH)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert!(!paper.activity_observation_retired(receipt).unwrap());
+                    assert!(
+                        !paper
+                            .activity_revision_retained_without_fence(
+                                aggregate(problem.clone()).group_id.key(),
+                                aggregate(problem).semantic_revision.as_str()
+                            )
+                            .unwrap()
+                    );
+                    release.send(()).unwrap();
+                }
+                running.completed(wallet()).await;
+                running.finish().await;
+                assert!(paper.wallet_fences().unwrap().is_empty());
+                let result = (
+                    paper.wallet_scope_drops(&wallet(), EPOCH).unwrap(),
+                    paper.activity_groups_after(&wallet(), EPOCH - 10).unwrap(),
+                    paper.leader_positions().unwrap(),
+                    paper.gate_history().unwrap(),
+                );
+                if let Some(expected) = &expected {
+                    assert_eq!(&result, expected, "{route}/{kind}/{warm}");
+                } else {
+                    expected = Some(result);
+                }
+                assert!(
+                    pe_service::trade_poller::rebuild_reconciliation_obligations(
+                        &dir.path().join("source.log"),
+                        &paper
+                    )
+                    .unwrap()
+                    .is_empty()
+                );
+                server.abort();
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ambiguity_carrier_certifies_only_a_drop_starting_at_its_own_second() {
+    for observation_epoch in [EPOCH - 6, EPOCH - 3, EPOCH - 1] {
+        for prior_start in [None, Some(EPOCH - 8), Some(EPOCH - 5)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut running, paper) = start_recorded_poller_with_membership(
+                &dir,
+                &[wallet()],
+                true,
+                false,
+                None,
+                None,
+                120,
+                None,
+            );
+            running
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .respond
+                .send(b"[]".to_vec())
+                .unwrap();
+            running.round_completed().await;
+            if let Some(start) = prior_start {
+                paper
+                    .import_scope_drops(
+                        1,
+                        &[(
+                            pe_paper_state::WalletScopeDrop {
+                                wallet: wallet(),
+                                scope_kind: "market".to_owned(),
+                                scope_id: MARKET_B.to_owned(),
+                                cause: "imported".to_owned(),
+                                source_trade_id: None,
+                                dropped_at_epoch: start,
+                                proof_json: "{}".to_owned(),
+                                recorded_at_unix: EPOCH,
+                            },
+                            pe_event_log::AppendReceipt {
+                                sequence: pe_core_types::EventSeq(0),
+                                this_hash: blake3::hash(b"fixture"),
+                            },
+                        )],
+                        &Default::default(),
+                    )
+                    .unwrap();
+            }
+            let mut observation = stream_row(wallet(), "certification", observation_epoch);
+            observation["conditionId"] = json!("incorrect-stamp");
+            running.observe(observation).await;
+            let first = stream_row(wallet(), "certification", EPOCH - 5);
+            let mut last = stream_row(wallet(), "certification", EPOCH - 2);
+            last["conditionId"] = json!("0xcc");
+            let unrelated = activity_row(
+                "TRADE",
+                "carrier-other-market",
+                MARKET_A,
+                "BUY",
+                "1",
+                "asset-a",
+                EPOCH - 5,
+            );
+            let unrelated_id = aggregate(unrelated.clone()).group_id.key().clone();
+            running
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .respond
+                .send(serde_json::to_vec(&[last, first, unrelated]).unwrap())
+                .unwrap();
+            running.completed(wallet()).await;
+            running.finish().await;
+            let start = prior_start
+                .unwrap_or(EPOCH)
+                .min(observation_epoch)
+                .min(EPOCH - 5);
+            let gate = paper.entry_gate_result(&unrelated_id).unwrap().unwrap();
+            assert_eq!(
+                gate.result == "admitted",
+                start != EPOCH - 5,
+                "{observation_epoch}/{prior_start:?}: {}",
+                gate.result
+            );
+            assert!(gate.history_consumed);
+            assert_eq!(
+                paper.wallet_scope_drops(&wallet(), EPOCH).unwrap()[0].dropped_at_epoch,
+                start
+            );
+        }
+    }
 }

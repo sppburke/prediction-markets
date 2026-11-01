@@ -2600,7 +2600,6 @@ impl PaperStateDb {
                         || wallet_already_fenced
                         || ((authorized || known_scoped_revision)
                             && wallet_hex == record.wallet.to_string()
-                            && source_epoch == record.source_epoch
                             && activity_type == record.activity_type));
                 if !exact_retry && !retained_revision {
                     return Err(PaperStateError::ActivityRevisionConflict(
@@ -8927,7 +8926,12 @@ mod tests {
 
     #[test]
     fn scope_drops_unfenced_revisions_require_exact_authority_and_invalidate_once() {
-        for disposition in ["scope_dropped", "raw_only"] {
+        for (disposition, revised_second) in [
+            ("scope_dropped", 100),
+            ("raw_only", 100),
+            ("scope_dropped", 101),
+            ("raw_only", 101),
+        ] {
             let (dir, db) = db();
             db.seed_cursor_if_absent(&wallet(), 10).unwrap();
             let original = activity_bucket(wallet(), 100, &['a']);
@@ -8937,6 +8941,8 @@ mod tests {
                 .unwrap();
             let before = db.wallet_coverage(&wallet()).unwrap().coverage_generation;
             let mut revised = original.clone();
+            revised.source_epoch = revised_second;
+            revised.dispositions[0].source_epoch = revised_second;
             revised.dispositions[0].semantic_revision = "r2".to_owned();
             revised.dispositions[0].disposition = disposition.to_owned();
             revised.scope_drop_boundary_unix = Some(1000);

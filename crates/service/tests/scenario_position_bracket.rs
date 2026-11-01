@@ -8186,3 +8186,489 @@ async fn reentry_union_mapping_rejects_baseline_tail_classification_conflict() {
     drop(tx);
     actor.await.unwrap();
 }
+
+/// AC6: both real bracket entry points reacquire cold evidence through the existing
+/// membership read; the direct form replays its rolled-back activity batch.
+#[tokio::test]
+async fn membership_cold_and_warm_bracket_acknowledgements_classify_identically() {
+    use axum::{Json, Router, extract::Path, http::StatusCode, routing::get};
+    use pe_source_polymarket_public::ReqwestFetcher;
+    for case in [
+        "healthy",
+        "market_drop",
+        "merge",
+        "redemption",
+        "event_trade",
+        "conversion_token",
+        "unknown_token",
+        "ranker_group",
+        "ranker_zero_unknown",
+        "legacy_group",
+        "absent_token",
+        "absent_no_token",
+        "unknown_group",
+        "removed_group",
+        "grouped_market",
+        "ungrouped_market",
+        "revised",
+        "partial",
+        "late_split",
+        "late_merge",
+        "covered",
+        "flat_late_conversion",
+    ] {
+        let mut expected = None;
+        for direct in [false, true] {
+            for warm in [false, true] {
+                let wallet = wallet(0xa1);
+                let (dir, paper, mut engine) = fresh(&[wallet]);
+                install_empty_anchor(
+                    &mut engine,
+                    &paper,
+                    wallet,
+                    if matches!(case, "covered" | "flat_late_conversion") {
+                        25
+                    } else {
+                        5
+                    },
+                );
+                let event = matches!(
+                    case,
+                    "event_trade"
+                        | "conversion_token"
+                        | "unknown_token"
+                        | "ranker_group"
+                        | "ranker_zero_unknown"
+                        | "legacy_group"
+                        | "absent_token"
+                        | "grouped_market"
+                        | "flat_late_conversion"
+                );
+                let memberships = HashMap::from([
+                    (condition(1), "".to_owned()),
+                    (condition(0x21), if event { "0xee" } else { "" }.to_owned()),
+                    ("0xcd".to_owned(), "absent".to_owned()),
+                    ("0xee".to_owned(), "absent".to_owned()),
+                ]);
+                let mut problem = activity(wallet, 0x21, "1", "membership-problem", 20);
+                problem["type"] = json!("MERGE");
+                problem.as_object_mut().unwrap().remove("asset");
+                match case {
+                    "redemption" | "event_trade" => {
+                        problem["type"] = json!(if case == "redemption" {
+                            "REDEEM"
+                        } else {
+                            "TRADE"
+                        });
+                        problem["conditionId"] = json!("0xcd");
+                        problem["asset"] = json!(asset(0x21));
+                    }
+                    "conversion_token" | "unknown_token" => {
+                        problem["type"] = json!(if case == "unknown_token" {
+                            "MYSTERY"
+                        } else {
+                            "CONVERSION"
+                        });
+                        problem["asset"] = json!(asset(0x21));
+                        problem.as_object_mut().unwrap().remove("conditionId");
+                    }
+                    "ranker_group"
+                    | "ranker_zero_unknown"
+                    | "legacy_group"
+                    | "unknown_group"
+                    | "removed_group"
+                    | "flat_late_conversion" => {
+                        problem["type"] = json!(if case == "ranker_zero_unknown" {
+                            "MYSTERY"
+                        } else {
+                            "CONVERSION"
+                        });
+                        problem["conditionId"] = json!("0xee");
+                        if case == "ranker_zero_unknown" {
+                            problem["size"] = json!("0");
+                        }
+                    }
+                    "absent_token" | "absent_no_token" => {
+                        problem["type"] = json!("CONVERSION");
+                        problem["conditionId"] = json!("0xcd");
+                        if case == "absent_token" {
+                            problem["asset"] = json!(asset(0x21));
+                        }
+                    }
+                    "grouped_market" | "ungrouped_market" => {
+                        problem["type"] = json!("CONVERSION");
+                    }
+                    "late_split" => {
+                        problem["type"] = json!("SPLIT");
+                    }
+                    _ => {}
+                }
+                let mut rows = if matches!(case, "healthy" | "market_drop") {
+                    vec![]
+                } else {
+                    vec![problem.clone()]
+                };
+                rows.push(activity(wallet, 1, "1", "healthy", 20));
+                if case == "revised" {
+                    let mut original = problem.clone();
+                    original["size"] = json!("0");
+                    engine
+                        .commit(
+                            vec![aggregate(original, wallet)],
+                            &context(20),
+                            zero_basis(),
+                        )
+                        .unwrap();
+                }
+                if matches!(case, "partial" | "late_split" | "late_merge") {
+                    let mut prior = activity(
+                        wallet,
+                        2,
+                        "1",
+                        "prior",
+                        if case == "partial" { 20 } else { 30 },
+                    );
+                    prior["type"] = json!("REWARD");
+                    engine
+                        .commit(
+                            vec![aggregate(prior.clone(), wallet)],
+                            &context(30),
+                            zero_basis(),
+                        )
+                        .unwrap();
+                    rows.push(prior);
+                }
+                let conn = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+                for (market, membership) in &memberships {
+                    conn.execute(
+                        "DELETE FROM meta WHERE key = ?1",
+                        [format!("neg_risk_group:{market}")],
+                    )
+                    .unwrap();
+                    if warm {
+                        paper.record_market_group(market, membership).unwrap();
+                    }
+                }
+                if case == "legacy_group" {
+                    paper.record_market_group("0xcf", "0xee").unwrap();
+                }
+                let group_set = if matches!(
+                    case,
+                    "ranker_group"
+                        | "ranker_zero_unknown"
+                        | "removed_group"
+                        | "flat_late_conversion"
+                ) {
+                    std::collections::BTreeSet::from(["0xee".to_owned()])
+                } else {
+                    Default::default()
+                };
+                let prior_drop = match case {
+                    "market_drop" => Some(("market", condition(0x21))),
+                    "event_trade" => Some(("event", "0xee".to_owned())),
+                    _ => None,
+                };
+                let drops = prior_drop
+                    .map(|(kind, id)| {
+                        (
+                            pe_paper_state::WalletScopeDrop {
+                                wallet,
+                                scope_kind: kind.to_owned(),
+                                scope_id: id,
+                                cause: "imported".to_owned(),
+                                source_trade_id: None,
+                                dropped_at_epoch: 6,
+                                proof_json: "{}".to_owned(),
+                                recorded_at_unix: 10,
+                            },
+                            pe_event_log::AppendReceipt {
+                                sequence: pe_core_types::EventSeq(0),
+                                this_hash: blake3::hash(b"fixture"),
+                            },
+                        )
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                paper.import_scope_drops(1, &drops, &group_set).unwrap();
+                if case == "removed_group" {
+                    paper
+                        .import_scope_drops(2, &[], &Default::default())
+                        .unwrap();
+                }
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let server_calls = calls.clone();
+                let answers = memberships.clone();
+                let app = Router::new().route("/markets/{market}", get(move |Path(market): Path<String>| {
+                    let calls = server_calls.clone();
+                    let membership = answers[&market].clone();
+                    async move {
+                        calls.lock().unwrap().push(market.clone());
+                        if membership == "absent" { (StatusCode::NOT_FOUND, Json(json!({"error":"market not found"}))) }
+                        else { (StatusCode::OK, Json(json!({"condition_id":market, "neg_risk":!membership.is_empty(), "neg_risk_market_id":membership}))) }
+                    }
+                }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let fetcher = Arc::new(QueueFetcher::new(HashMap::from([
+                    (
+                        activity_url(wallet),
+                        vec![serde_json::to_vec(&rows).unwrap(); 6],
+                    ),
+                    (
+                        position_url(wallet, PositionPartition::NotRedeemable),
+                        vec![serde_json::to_vec(&[position(wallet, 1, "1")]).unwrap(); 4],
+                    ),
+                    (
+                        position_url(wallet, PositionPartition::Redeemable),
+                        vec![b"[]".to_vec(); 4],
+                    ),
+                    (
+                        condition_url(0x21, false),
+                        vec![condition_metadata(0x21, false)],
+                    ),
+                ])));
+                let source_path = dir.path().join("membership.log");
+                let source = pe_service::activity_ingest::SourceLogHandle::boot(Arc::new(
+                    tokio::sync::Mutex::new(SourceEventSink::open(&source_path).unwrap()),
+                ));
+                let validator = validator_from_fetcher(fetcher).with_market_membership(
+                    if matches!(case, "healthy" | "market_drop") {
+                        "http://127.0.0.1:0".to_owned()
+                    } else {
+                        format!("http://{address}")
+                    },
+                    Arc::new(
+                        ReqwestFetcher::new(reqwest::Client::new())
+                            .with_max_retries(0)
+                            .with_min_interval_ms(0),
+                    ),
+                    source,
+                );
+                if direct {
+                    let result = validator
+                        .validate_direct(&[wallet], &mut engine, &paper)
+                        .await;
+                    assert!(result.is_ok(), "{case}/{direct}/{warm}: {result:?}");
+                } else {
+                    let (tx, rx) = mpsc::channel(2);
+                    let actor = spawn_control_actor(rx, engine, paper.clone());
+                    let outcomes = validator
+                        .validate_via_control(
+                            &[wallet],
+                            &tx,
+                            &paper,
+                            pe_service::position_seeder::ValidationPurpose::CatchUp,
+                            None,
+                        )
+                        .await;
+                    assert!(
+                        outcomes.shared.is_none(),
+                        "{case}/{direct}/{warm}: {:?}",
+                        outcomes.shared
+                    );
+                    assert!(
+                        outcomes.deferred.is_empty(),
+                        "{case}/{direct}/{warm}: {:?}",
+                        outcomes.deferred
+                    );
+                    assert_eq!(outcomes.accepted.len(), 1, "{case}/{direct}/{warm}");
+                    let (acknowledged, result) = tokio::sync::oneshot::channel();
+                    tx.send(OrchestratorControl::InstallAnchors {
+                        installs: outcomes.accepted,
+                        acknowledged,
+                    })
+                    .await
+                    .unwrap();
+                    result.await.unwrap().unwrap();
+                    drop(tx);
+                    actor.await.unwrap();
+                }
+                drop(validator);
+                server.abort();
+                assert!(
+                    paper.wallet_fences().unwrap().is_empty(),
+                    "{case}/{direct}/{warm}"
+                );
+                let result = (
+                    paper
+                        .wallet_scope_drops(&wallet, END)
+                        .unwrap()
+                        .into_iter()
+                        .map(|drop| {
+                            (
+                                drop.scope_kind,
+                                drop.scope_id,
+                                drop.cause,
+                                drop.source_trade_id,
+                                drop.dropped_at_epoch,
+                                drop.proof_json,
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    paper.activity_groups_after(&wallet, 0).unwrap(),
+                    paper.leader_positions().unwrap(),
+                    paper.gate_history().unwrap(),
+                );
+                if let Some(expected) = &expected {
+                    assert_eq!(&result, expected, "{case}/{direct}/{warm}");
+                } else {
+                    expected = Some(result);
+                }
+                let calls = calls.lock().unwrap().len();
+                if warm || matches!(case, "healthy" | "market_drop") {
+                    assert_eq!(calls, 0, "{case}/{direct}/{warm}");
+                } else {
+                    assert!(calls > 0, "{case}/{direct}/{warm}");
+                }
+                let recorded = Reader::replay(&source_path)
+                    .unwrap()
+                    .map(|frame| frame.unwrap().1)
+                    .filter(|frame| frame.source_id.0 == "polymarket.clob.market.http")
+                    .count();
+                assert_eq!(recorded, calls);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn membership_acquired_between_boot_batch_replays_survives_a_later_rollback_and_restart() {
+    use axum::{Json, Router, extract::Path, http::StatusCode, routing::get};
+    use pe_source_polymarket_public::ReqwestFetcher;
+    let wallet = wallet(0xa1);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 5);
+    let mut rows = vec![activity(wallet, 1, "1", "before-membership", 10)];
+    for (byte, epoch) in [(0x21, 20), (0x22, 30)] {
+        let mut row = activity(wallet, byte, "1", &format!("merge-{byte}"), epoch);
+        row["type"] = json!("MERGE");
+        row.as_object_mut().unwrap().remove("asset");
+        rows.push(row);
+    }
+    let succeed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_succeed = succeed.clone();
+    let server_paper = paper.clone();
+    let app = Router::new().route(
+        "/markets/{market}",
+        get(move |Path(market): Path<String>| {
+            let succeed = server_succeed.clone();
+            let paper = server_paper.clone();
+            async move {
+                // Each typed rejection has rolled back its entire activity read before HTTP.
+                assert!(paper.activity_groups_after(&wallet, 0).unwrap().is_empty());
+                assert!(paper.wallet_scope_drops(&wallet, END).unwrap().is_empty());
+                assert_eq!(paper.cursor(&wallet).unwrap(), Some(5));
+                paper.record_market_group("independent-writer", "").unwrap();
+                if market == "0x22" && !succeed.load(Ordering::SeqCst) {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error":"retry later"})),
+                    )
+                } else {
+                    (
+                        StatusCode::OK,
+                        Json(json!({"condition_id":market,"neg_risk":false})),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let source_path = dir.path().join("membership.log");
+    let reader = Arc::new(
+        ReqwestFetcher::new(reqwest::Client::new())
+            .with_max_retries(0)
+            .with_min_interval_ms(0),
+    );
+    let make_validator = || {
+        let fetcher = Arc::new(QueueFetcher::new(HashMap::from([
+            (
+                activity_url(wallet),
+                vec![serde_json::to_vec(&rows).unwrap(); 3],
+            ),
+            (
+                position_url(wallet, PositionPartition::NotRedeemable),
+                vec![serde_json::to_vec(&[position(wallet, 1, "1")]).unwrap(); 2],
+            ),
+            (
+                position_url(wallet, PositionPartition::Redeemable),
+                vec![b"[]".to_vec(); 2],
+            ),
+            (
+                condition_url(0x21, false),
+                vec![condition_metadata(0x21, false)],
+            ),
+            (
+                condition_url(0x22, false),
+                vec![condition_metadata(0x22, false)],
+            ),
+            (
+                format!("{BASE}/markets?condition_ids=0x21&condition_ids=0x22&limit=500"),
+                vec![
+                    serde_json::to_vec(&json!([
+                        {"conditionId":"0x21","clobTokenIds":["asset-21","asset-21-no"]},
+                        {"conditionId":"0x22","clobTokenIds":["asset-22","asset-22-no"]}
+                    ]))
+                    .unwrap(),
+                ],
+            ),
+        ])));
+        validator_from_fetcher(fetcher).with_market_membership(
+            format!("http://{address}"),
+            reader.clone(),
+            pe_service::activity_ingest::SourceLogHandle::boot(Arc::new(tokio::sync::Mutex::new(
+                SourceEventSink::open(&source_path).unwrap(),
+            ))),
+        )
+    };
+    let validator = make_validator();
+    let failure = bracket_failure(
+        validator
+            .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
+            .await,
+    );
+    assert_eq!(
+        failure.class(),
+        pe_service::position_seeder::FailureClass::WalletTransient,
+        "{failure:?}"
+    );
+    assert_eq!(failure.kind(), "validation.market_membership");
+    assert_eq!(
+        paper.market_membership("0x21").unwrap(),
+        Some(pe_paper_state::MarketMembership::Ungrouped)
+    );
+    assert_eq!(paper.market_membership("0x22").unwrap(), None);
+    assert!(paper.activity_groups_after(&wallet, 0).unwrap().is_empty());
+    assert!(paper.wallet_scope_drops(&wallet, END).unwrap().is_empty());
+    assert_eq!(paper.cursor(&wallet).unwrap(), Some(5));
+    drop(validator);
+    drop(engine);
+    let reopened = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    let mut restarted =
+        BucketCommitEngine::load(reopened.clone(), build_leader_ledger(&reopened).unwrap())
+            .unwrap();
+    assert_eq!(
+        reopened.market_membership("0x21").unwrap(),
+        Some(pe_paper_state::MarketMembership::Ungrouped)
+    );
+    succeed.store(true, Ordering::SeqCst);
+    make_validator()
+        .validate_direct(&[wallet], &mut restarted, &reopened)
+        .await
+        .unwrap();
+    assert_eq!(reopened.activity_groups_after(&wallet, 0).unwrap().len(), 3);
+    let attempts = Reader::replay(&source_path)
+        .unwrap()
+        .map(|frame| frame.unwrap().1)
+        .filter(|frame| frame.source_id.0 == "polymarket.clob.market.http")
+        .count();
+    assert_eq!(attempts, 3);
+    server.abort();
+}

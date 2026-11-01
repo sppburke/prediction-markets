@@ -1071,7 +1071,12 @@ async fn run() -> Result<()> {
             source_log_generation,
             Arc::clone(&asset_identity),
         )
-    };
+    }
+    .with_market_membership(
+        cfg.polymarket_clob_base_url.clone(),
+        clob_resolution_fetcher.clone(),
+        pe_service::activity_ingest::SourceLogHandle::boot(Arc::clone(&boot_source_log)),
+    );
     let mut boot_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
         .context("load boot activity ledger owner")?;
     let boot_wallets = live_watchlist
@@ -1269,6 +1274,11 @@ async fn run() -> Result<()> {
         cfg.polymarket_base_url.clone(),
         runtime_source_generation,
         Arc::clone(&asset_identity),
+    )
+    .with_market_membership(
+        cfg.polymarket_clob_base_url.clone(),
+        clob_resolution_fetcher.clone(),
+        source_log.clone(),
     );
 
     projection_dirty.mark();
@@ -1510,6 +1520,8 @@ async fn run() -> Result<()> {
     let poller_admission_preparer = admission_preparer.clone();
     let poller_asset_identity = Arc::clone(&asset_identity);
     let poller_source_receipts = source_receipts.clone();
+    let poller_clob_base_url = cfg.polymarket_clob_base_url.clone();
+    let poller_membership_fetcher = clob_resolution_fetcher.clone();
     let public_poll_shutdown = shutdown.subscribe();
     supervisor.spawn(TaskName::PublicActivityPoll, async move {
         if poller_start.wait_for(|started| *started).await.is_err() {
@@ -1535,6 +1547,7 @@ async fn run() -> Result<()> {
             obligations,
             Some(poller_admission_preparer),
         )
+        .with_market_membership(poller_clob_base_url, poller_membership_fetcher)
         .with_source_receipt_index(poller_source_receipts)
         .with_held_obligations(held_obligations_tx)
         .run_until(public_poll_shutdown.wait_for(ShutdownPhase::StopProducers))

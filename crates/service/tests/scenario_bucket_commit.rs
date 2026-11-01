@@ -16,7 +16,7 @@ use pe_core_types::{
 use pe_paper_state::{
     DecisionPendingState, NoCopyDisposition, PaperStateDb, WalletHistoryStatusRecord,
 };
-use pe_position_ledger::{AppliedEffect, LedgerEffect, PositionLedger, WalletFenceCause};
+use pe_position_ledger::{AppliedEffect, LedgerEffect, PositionLedger};
 use pe_service::bucket_commit::{
     BucketCommitEngine, BucketDecisionContext, DecisionContinuationV3, IdentityOverride,
 };
@@ -135,10 +135,10 @@ impl CommitFixtureRead for BucketCommitEngine {
         if !template.decision_inputs_json.is_empty() {
             let template_inputs: Value =
                 serde_json::from_str(&template.decision_inputs_json).unwrap();
-            if let Some(observations) = template_inputs.get("invalid_mapping_observations") {
+            if let Some(observations) = template_inputs.get("ambiguous_observations") {
                 let mut inputs: Value =
                     serde_json::from_str(&context.decision_inputs_json).unwrap();
-                inputs["invalid_mapping_observations"] = observations.clone();
+                inputs["ambiguous_observations"] = observations.clone();
                 context.decision_inputs_json = serde_json::to_string(&inputs).unwrap();
             }
         }
@@ -316,7 +316,7 @@ fn fresh_anchored() -> (tempfile::TempDir, Arc<PaperStateDb>, BucketCommitEngine
 }
 
 #[test]
-fn scoped_revision_retry_and_anchor_preserve_original_then_legacy_fence() {
+fn scoped_revision_retry_and_anchor_preserve_original_through_ambiguity() {
     let (dir, paper, mut engine) = fresh_anchored();
     let original = position_row(
         "TRADE",
@@ -363,7 +363,10 @@ fn scoped_revision_retry_and_anchor_preserve_original_then_legacy_fence() {
     let pending_before_retry = paper.open_decision_pending().unwrap();
     let mut ambiguous_mapping = ordinary.clone();
     ambiguous_mapping.decision_inputs_json = json!({
-        "invalid_mapping_observations": [(id.clone(), support::scenario_receipt(500))],
+        "ambiguous_observations": [{
+            "group_id": id, "receipt": support::scenario_receipt(500), "source_epoch": 100,
+            "candidates": [(id.clone(), 100)], "market_id": MARKET_A,
+        }],
     })
     .to_string();
     {
@@ -439,7 +442,7 @@ fn scoped_revision_retry_and_anchor_preserve_original_then_legacy_fence() {
     let coverage = paper.wallet_coverage(&wallet()).unwrap();
     assert_eq!(coverage.coverage_generation, generation);
 
-    // Reconciliation still recognizes R1, but a first-time invalid-mapping fence must witness R0.
+    // The ambiguity carrier preserves the original and the already retained revision.
     let retry = engine
         .commit_read(vec![revised.clone()], &ordinary, zero_basis())
         .unwrap();
@@ -448,17 +451,17 @@ fn scoped_revision_retry_and_anchor_preserve_original_then_legacy_fence() {
     let quarantined = engine
         .commit_read(vec![revised.clone()], &ambiguous_mapping, zero_basis())
         .unwrap();
-    assert_eq!(
-        quarantined.newly_fenced,
-        Some(WalletFenceCause::InvalidMapping)
+    assert_eq!(quarantined.newly_fenced, None);
+    assert!(quarantined.already_committed);
+    assert!(
+        paper
+            .activity_observation_retired(support::scenario_receipt(500))
+            .unwrap()
     );
     assert!(!quarantined.retained_revision);
     assert!(quarantined.pending.is_empty());
-    assert!(engine.is_fenced(&wallet()));
-    assert_eq!(
-        paper.wallet_fence(&wallet()).unwrap().unwrap().cause,
-        "invalid_mapping"
-    );
+    assert!(!engine.is_fenced(&wallet()));
+    assert!(paper.wallet_fence(&wallet()).unwrap().is_none());
     assert_eq!(paper.activity_group_state(&id).unwrap(), original_state);
     assert_eq!(
         paper
@@ -469,10 +472,6 @@ fn scoped_revision_retry_and_anchor_preserve_original_then_legacy_fence() {
     assert_eq!(paper.wallet_coverage(&wallet()).unwrap(), coverage);
     assert_eq!(paper.decision_pending_history().unwrap(), pending);
 
-    let invalid_mapping_fence = paper.wallet_fence(&wallet()).unwrap().unwrap();
-    assert!(
-        !pe_service::position_seeder::recoverable_fence(&paper, &invalid_mapping_fence).unwrap()
-    );
     let history = paper.gate_history().unwrap();
     let history_status = paper.wallet_history_status(&wallet()).unwrap();
     let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
@@ -501,7 +500,7 @@ fn scoped_revision_retry_and_anchor_preserve_original_then_legacy_fence() {
                 BucketCommitEngine::load(Arc::clone(&paper), build_leader_ledger(&paper).unwrap())
                     .unwrap();
         }
-        for (retry_context, already_committed) in [(&ordinary, true), (&ambiguous_mapping, false)] {
+        for (retry_context, already_committed) in [(&ordinary, true), (&ambiguous_mapping, true)] {
             let retry = engine
                 .commit_read(vec![revised.clone()], retry_context, zero_basis())
                 .unwrap();
@@ -509,11 +508,8 @@ fn scoped_revision_retry_and_anchor_preserve_original_then_legacy_fence() {
             assert!(!retry.retained_revision);
             assert!(retry.pending.is_empty());
             assert!(retry.newly_fenced.is_none());
-            assert!(engine.is_fenced(&wallet()));
-            assert_eq!(
-                paper.wallet_fence(&wallet()).unwrap(),
-                Some(invalid_mapping_fence.clone())
-            );
+            assert!(!engine.is_fenced(&wallet()));
+            assert!(paper.wallet_fence(&wallet()).unwrap().is_none());
             assert_eq!(paper.activity_group_state(&id).unwrap(), original_state);
             assert_eq!(
                 paper

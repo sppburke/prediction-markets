@@ -31,8 +31,8 @@ use pe_position_ledger::LedgerEffect;
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate, ActivityReadError,
-    ActivityType, NormalizedActivity, ReconciliationFetcher, fetch_complete_activity,
-    parse_activity_trade_observation,
+    ActivityType, NormalizedActivity, ReconciliationFetcher, ReqwestFetcher,
+    fetch_complete_activity, parse_activity_trade_observation,
 };
 use pe_trader_index::WatchlistTier;
 use time::OffsetDateTime;
@@ -46,9 +46,9 @@ use crate::activity_ingest::{
 use crate::asset_identity::{AssetIdentityResolver, IdentityProvenance};
 use crate::bucket_commit::{
     ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
-    ACTIVITY_READ_COMMITMENT_SOURCE_ID, BucketCommitResult, BucketDecisionContext,
-    IdentityOverride, ObservationBinding, PageOccurrence, activity_read_commitment_payload_v2,
-    joined_read_pages,
+    ACTIVITY_READ_COMMITMENT_SOURCE_ID, AmbiguousObservation, BucketCommitError,
+    BucketCommitResult, BucketDecisionContext, IdentityOverride, ObservationBinding,
+    PageOccurrence, activity_read_commitment_payload_v2, joined_read_pages,
 };
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
@@ -1003,6 +1003,8 @@ pub(crate) enum ReconciliationError {
     InjectedCrash(ReconciliationCrashBoundary),
     #[error("asset identity resolution: {0}")]
     Identity(SourceError),
+    #[error("market membership acquisition: {0}")]
+    Membership(anyhow::Error),
     #[error("source-log coordinator closed")]
     SourceLogClosed,
     #[error("paper-state: {0}")]
@@ -1023,7 +1025,7 @@ pub(crate) enum ReconciliationError {
 
 impl ReconciliationError {
     fn retryable(&self) -> bool {
-        matches!(self, Self::Activity(_))
+        matches!(self, Self::Activity(_) | Self::Membership(_))
             || matches!(
                 self,
                 Self::Identity(SourceError::Transient { .. } | SourceError::RateLimited { .. })
@@ -1041,6 +1043,7 @@ pub enum ReconciliationCrashBoundary {
 /// Existing polling actor, now a complete fixed-end reconciliation coordinator.
 pub struct TradePoller {
     config: TradePollerConfig,
+    market_membership: Option<(String, Arc<ReqwestFetcher>)>,
     live_watchlist: LiveWatchlist,
     fetcher: Arc<dyn ReconciliationFetcher>,
     asset_identity: Arc<AssetIdentityResolver>,
@@ -1233,6 +1236,7 @@ impl TradePoller {
     ) -> Self {
         Self {
             config,
+            market_membership: None,
             live_watchlist,
             fetcher,
             asset_identity,
@@ -1258,6 +1262,16 @@ impl TradePoller {
             #[cfg(feature = "scenario")]
             wait_observer: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_market_membership(
+        mut self,
+        base_url: String,
+        fetcher: Arc<ReqwestFetcher>,
+    ) -> Self {
+        self.market_membership = Some((base_url, fetcher));
+        self
     }
 
     #[cfg(feature = "scenario")]
@@ -1948,6 +1962,7 @@ impl TradePoller {
     fn operation(&self) -> WalletOperation {
         WalletOperation {
             config: self.config.clone(),
+            market_membership: self.market_membership.clone(),
             fetcher: self.fetcher.clone(),
             asset_identity: self.asset_identity.clone(),
             source_log: self.source_log.clone(),
@@ -2090,6 +2105,7 @@ impl TradePoller {
 #[derive(Clone)]
 struct WalletOperation {
     config: TradePollerConfig,
+    market_membership: Option<(String, Arc<ReqwestFetcher>)>,
     fetcher: Arc<dyn ReconciliationFetcher>,
     asset_identity: Arc<AssetIdentityResolver>,
     source_log: SourceLogHandle,
@@ -2416,6 +2432,7 @@ impl WalletOperation {
         // Only unmatched observations block ordering. Matched observations use the endpoint's
         // bucket clock; the original stream second remains in the binding and the age check.
         let mut all_acknowledged = true;
+        let mut ambiguities = correlation.ambiguous.iter().peekable();
         for (bucket, identities) in buckets.zip(identities) {
             if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
                 return Err(ReconciliationError::Preempted);
@@ -2424,7 +2441,6 @@ impl WalletOperation {
             if correlation
                 .unmatched_epoch
                 .is_some_and(|epoch| source_epoch >= epoch)
-                && correlation.ambiguous.is_empty()
             {
                 all_acknowledged = false;
                 break;
@@ -2447,11 +2463,17 @@ impl WalletOperation {
                 .filter(|group| restamp_twins.contains(*group))
                 .cloned()
                 .collect();
-            if !correlation.ambiguous.is_empty() {
+            let mut carried = Vec::new();
+            while ambiguities
+                .peek()
+                .is_some_and(|observation| observation.start_epoch() <= source_epoch)
+            {
+                carried.extend(ambiguities.next());
+            }
+            if !carried.is_empty() {
                 let mut inputs: serde_json::Value =
                     serde_json::from_str(&context.decision_inputs_json)?;
-                inputs["invalid_mapping_observations"] =
-                    serde_json::to_value(&correlation.ambiguous)?;
+                inputs["ambiguous_observations"] = serde_json::to_value(carried)?;
                 context.decision_inputs_json = serde_json::to_string(&inputs)?;
             }
             let result = self.commit_bucket(bucket, context).await?;
@@ -2561,13 +2583,14 @@ impl WalletOperation {
         let pairs =
             crate::bucket_commit::read_restamp_pairs(rows).map_err(ActivityReadError::from)?;
         // A pair first seen together, neither stamp recorded, is one trade that bucket routing
-        // would apply twice, so a feed observation of either stamp keeps the ambiguity fence.
-        let mut first_seen = HashSet::new();
+        // would apply twice, so a feed observation of either stamp is ambiguous.
+        let mut first_seen = HashMap::new();
         for (restamp, original) in &pairs {
             if self.paper_state.activity_group_state(restamp)?.is_none()
                 && self.paper_state.activity_group_state(original)?.is_none()
             {
-                first_seen.extend([restamp.clone(), original.clone()]);
+                first_seen.insert(restamp.clone(), original.clone());
+                first_seen.insert(original.clone(), restamp.clone());
             }
         }
         // A restamp counts with its original only as a twin of a recorded original.
@@ -2646,7 +2669,14 @@ impl WalletOperation {
                 }
                 let original = stream.group_id.components();
                 let mut candidates = if let Some(exact) = by_group.get(&obligation.group_id) {
-                    vec![*exact]
+                    std::iter::once(*exact)
+                        .chain(
+                            first_seen
+                                .get(&obligation.group_id)
+                                .and_then(|other| by_group.get(other))
+                                .copied(),
+                        )
+                        .collect::<Vec<_>>()
                 } else {
                     aggregates
                         .iter()
@@ -2675,18 +2705,55 @@ impl WalletOperation {
                         })
                         .cloned()
                 };
-                if !by_group.contains_key(&obligation.group_id) && provenance.is_none() {
-                    candidates.clear();
-                }
                 if candidates.len() > 1
                     || candidates
                         .iter()
-                        .any(|candidate| first_seen.contains(candidate.group_id.key()))
+                        .any(|candidate| first_seen.contains_key(candidate.group_id.key()))
                 {
-                    result
-                        .ambiguous
-                        .push((obligation.group_id.clone(), obligation.receipt));
+                    let market_id = candidates
+                        .iter()
+                        .find_map(|candidate| {
+                            identities.iter().find_map(|identity| {
+                                identity.overrides.get(candidate.group_id.key())
+                            })
+                        })
+                        .map(|identity| identity.verified.market().to_string())
+                        .or_else(|| {
+                            original
+                                .condition_id
+                                .as_ref()
+                                .map(|condition| condition.0.to_ascii_lowercase())
+                                .map(|condition| {
+                                    condition
+                                        .strip_prefix("\\x")
+                                        .map_or_else(|| condition.clone(), |hex| format!("0x{hex}"))
+                                })
+                                .filter(|condition| {
+                                    condition.strip_prefix("0x").is_some_and(|hex| {
+                                        !hex.is_empty()
+                                            && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                                    })
+                                })
+                        });
+                    result.ambiguous.push(AmbiguousObservation {
+                        group_id: obligation.group_id.clone(),
+                        receipt: obligation.receipt,
+                        source_epoch: *epoch,
+                        candidates: candidates
+                            .iter()
+                            .map(|candidate| {
+                                (
+                                    candidate.group_id.key().clone(),
+                                    candidate.source_time.0.unix_timestamp(),
+                                )
+                            })
+                            .collect(),
+                        market_id,
+                    });
                     continue;
+                }
+                if !by_group.contains_key(&obligation.group_id) && provenance.is_none() {
+                    candidates.clear();
                 }
                 let target = candidates.first().copied();
                 let Some(target) = target else {
@@ -2737,6 +2804,9 @@ impl WalletOperation {
                 });
             }
         }
+        result
+            .ambiguous
+            .sort_by_key(AmbiguousObservation::start_epoch);
         Ok(result)
     }
 
@@ -2960,19 +3030,43 @@ impl WalletOperation {
         aggregates: Vec<ActivityAggregate>,
         context: BucketDecisionContext,
     ) -> Result<BucketCommitResult, ReconciliationError> {
-        let (committed, result) = oneshot::channel();
-        self.control_tx
-            .send(OrchestratorControl::CommitActivityBucket {
-                aggregates,
-                context: Arc::new(context),
-                committed,
-            })
-            .await
-            .map_err(|_| ReconciliationError::ControlClosed)?;
-        result
-            .await
-            .map_err(|_| ReconciliationError::ControlClosed)?
-            .map_err(|error| ReconciliationError::BucketCommit(error.to_string()))
+        let context = Arc::new(context);
+        loop {
+            let (committed, result) = oneshot::channel();
+            self.control_tx
+                .send(OrchestratorControl::CommitActivityBucket {
+                    aggregates: aggregates.clone(),
+                    context: context.clone(),
+                    committed,
+                })
+                .await
+                .map_err(|_| ReconciliationError::ControlClosed)?;
+            match result
+                .await
+                .map_err(|_| ReconciliationError::ControlClosed)?
+            {
+                Ok(result) => return Ok(result),
+                Err(BucketCommitError::MembershipRequired(markets)) => {
+                    let (base_url, fetcher) = self.market_membership.as_ref().ok_or_else(|| {
+                        ReconciliationError::Membership(anyhow::anyhow!(
+                            "membership reader unavailable"
+                        ))
+                    })?;
+                    for market in markets {
+                        crate::fetch_market_membership(
+                            &self.paper_state,
+                            base_url,
+                            fetcher,
+                            &self.source_log,
+                            &market,
+                        )
+                        .await
+                        .map_err(ReconciliationError::Membership)?;
+                    }
+                }
+                Err(error) => return Err(ReconciliationError::BucketCommit(error.to_string())),
+            }
+        }
     }
 }
 
@@ -3042,7 +3136,7 @@ struct Correlation {
     matched: Vec<MatchedObservation>,
     unmatched_epoch: Option<i64>,
     unmatched: Vec<(i64, SourceTradeId)>,
-    ambiguous: Vec<(SourceTradeId, AppendReceipt)>,
+    ambiguous: Vec<AmbiguousObservation>,
 }
 
 struct MatchedObservation {
