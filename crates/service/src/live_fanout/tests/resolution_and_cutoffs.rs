@@ -1289,7 +1289,7 @@ async fn bind_current_economics(
         },
     )
     .unwrap();
-    append_economic_sources(state, prepared, account, now, None).await;
+    append_economic_sources(state, prepared, account, now, None, None).await;
     if prepared.prepared.token_id.0 != "123" {
         // The shared fixture emits 123/124. Retain the corresponding recorded responses for
         // this condition's distinct token pair, keeping its observation/continuation fixture.

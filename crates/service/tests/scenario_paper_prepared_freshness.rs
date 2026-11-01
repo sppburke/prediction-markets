@@ -6021,6 +6021,27 @@ async fn queue_shutdown_crashes() {
         assert_eq!(h.paper.open_decision_pending().unwrap().len(), 1);
         assert!(h.paper.leader_positions().unwrap().is_empty());
         h.stop().await;
+        if boundary == FrameCrashBoundary::Prepared {
+            h.paper
+                .import_scope_drops(
+                    589,
+                    &[(
+                        pe_paper_state::WalletScopeDrop {
+                            wallet: wallet(),
+                            scope_kind: "market".to_owned(),
+                            scope_id: recorded.admission.market.condition_id.0.clone(),
+                            cause: "underflow".to_owned(),
+                            source_trade_id: None,
+                            dropped_at_epoch: recorded.epoch,
+                            proof_json: "{}".to_owned(),
+                            recorded_at_unix: EPOCH,
+                        },
+                        recorded.admission.receipts.clob_long,
+                    )],
+                    &Default::default(),
+                )
+                .unwrap();
+        }
         let writer =
             pe_service::paper_recovery::PaperLog::open(h.dir.path().join("paper.log")).unwrap();
         pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK
@@ -10125,4 +10146,200 @@ async fn frame_identity_wait_rechecks_freshness_and_eligibility_before_consuming
         }
         h.stop().await;
     }
+}
+
+#[tokio::test]
+async fn scope_drop_boot_import_blocks_open_decisions_for_both_outcomes_and_keeps_pre_start() {
+    for kind in ["market", "event"] {
+        for outcome in [0, 1] {
+            for start_delta in [-1, 0, 1] {
+                let mut h = Harness::new().await;
+                let recorded = h.record_group_entry(1, wallet(), outcome, "0xee").await;
+                h.paper
+                    .import_scope_drops(588, &[], &Default::default())
+                    .unwrap();
+                h.freeze(&recorded, true).await;
+                h.paper
+                    .import_scope_drops(
+                        589,
+                        &[(
+                            pe_paper_state::WalletScopeDrop {
+                                wallet: wallet(),
+                                scope_kind: kind.to_owned(),
+                                scope_id: if kind == "market" {
+                                    recorded.admission.market.condition_id.0.clone()
+                                } else {
+                                    "0xee".to_owned()
+                                },
+                                cause: "underflow".to_owned(),
+                                source_trade_id: None,
+                                dropped_at_epoch: recorded.epoch + start_delta,
+                                proof_json: "{}".to_owned(),
+                                recorded_at_unix: EPOCH,
+                            },
+                            recorded.admission.receipts.clob_long,
+                        )],
+                        &Default::default(),
+                    )
+                    .unwrap();
+                h.attempt(&recorded, at());
+                h.arm();
+                h.start(false);
+                h.barrier().await;
+                h.stop().await;
+                let terminal = h.terminal(&recorded);
+                assert_eq!(terminal.state, DecisionPendingState::Terminal);
+                let blocked = start_delta <= 0;
+                if blocked {
+                    assert_eq!(
+                        terminal.terminal_disposition.as_deref(),
+                        Some("no_copy:scope_dropped_before_dispatch")
+                    );
+                    assert_eq!(h.prepared_count(), 0);
+                    assert!(h.paper.list_fills().unwrap().is_empty());
+                    assert!(!h.paper.dispatch_seeds_exist().unwrap());
+                } else {
+                    assert_eq!(h.prepared_count(), 1);
+                    assert_eq!(h.paper.list_fills().unwrap().len(), 1);
+                }
+                replay_decision_pending(&terminal).unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn scope_drop_resumed_staged_decision_terminates_before_prepared() {
+    for kind in ["market", "event"] {
+        let mut h = Harness::new().await;
+        let recorded = h.record_group_entry(1, wallet(), 1, "0xee").await;
+        h.arm();
+        *h.hooks.frame_crash_boundary.lock().unwrap() =
+            Some(pe_service::orchestrator::FrameCrashBoundary::Staging);
+        h.attempt(&recorded, at());
+        h.start(true);
+        h.poll_owner_failure(&recorded, None).await;
+        h.stop().await;
+        assert_eq!(h.terminal(&recorded).state, DecisionPendingState::Open);
+        let seed = h.paper.pending_dispatch_seeds().unwrap().remove(0);
+        h.paper
+            .import_scope_drops(
+                589,
+                &[(
+                    pe_paper_state::WalletScopeDrop {
+                        wallet: wallet(),
+                        scope_kind: kind.to_owned(),
+                        scope_id: if kind == "market" {
+                            recorded.admission.market.condition_id.0.clone()
+                        } else {
+                            "0xee".to_owned()
+                        },
+                        cause: "underflow".to_owned(),
+                        source_trade_id: None,
+                        dropped_at_epoch: recorded.epoch,
+                        proof_json: "{}".to_owned(),
+                        recorded_at_unix: EPOCH,
+                    },
+                    recorded.admission.receipts.clob_long,
+                )],
+                &Default::default(),
+            )
+            .unwrap();
+        h.attempt(&recorded, at());
+        h.start(false);
+        h.barrier().await;
+        h.stop().await;
+        let terminal = h.terminal(&recorded);
+        assert_eq!(
+            terminal.terminal_disposition.as_deref(),
+            Some("no_copy:scope_dropped_before_dispatch")
+        );
+        assert_eq!(h.prepared_count(), 0);
+        assert!(h.paper.list_fills().unwrap().is_empty());
+        let seed = h.paper.dispatch_seed(&seed.dispatch_id).unwrap().unwrap();
+        assert_eq!(seed.state, "ready");
+        assert_eq!(
+            seed.paper_outcome.as_deref(),
+            Some("no_fill:scope_dropped_before_dispatch")
+        );
+        replay_decision_pending(&terminal).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn scope_drop_import_waits_for_bucket_dispatch_prepared_then_excludes_later_sibling() {
+    let mut h = Harness::new().await;
+    let held = h.record(1).await;
+    h.attempt(&held, at());
+    h.start_frames();
+    h.poll(&held).await;
+    h.stop().await;
+    let copying = h.record_group_entry(2, wallet(), 0, "0xee").await;
+    h.attempt(&copying, at());
+    *h.prices.gate.market.lock().unwrap() = Some(held.admission.market.condition_id.0.clone());
+    h.prices.gate.blocked.store(true, Ordering::SeqCst);
+    let gate = h.prices.gate.clone();
+    h.start_frames();
+    let control = h.control.as_ref().unwrap().clone();
+    let (acknowledged, mut ack) = tokio::sync::oneshot::channel();
+    {
+        let pending = h.poll(&copying);
+        tokio::pin!(pending);
+        tokio::select! { biased; _ = gate.started.notified() => {}, _ = &mut pending => panic!("copy completed before risk wait") }
+        assert_eq!(h.prepared_count(), 1);
+        control
+            .send(OrchestratorControl::ImportScopeDrops {
+                batch_id: 589,
+                drops: vec![(
+                    pe_paper_state::WalletScopeDrop {
+                        wallet: wallet(),
+                        scope_kind: "event".to_owned(),
+                        scope_id: "0xee".to_owned(),
+                        cause: "underflow".to_owned(),
+                        source_trade_id: None,
+                        dropped_at_epoch: copying.epoch,
+                        proof_json: "{}".to_owned(),
+                        recorded_at_unix: EPOCH,
+                    },
+                    copying.admission.receipts.clob_long,
+                )],
+                group_ids: Default::default(),
+                acknowledged,
+            })
+            .await
+            .unwrap();
+        assert!(ack.try_recv().is_err());
+        assert!(!h.paper.scope_drop_batch_imported(589).unwrap());
+        gate.release.notify_one();
+        pending.await;
+    }
+    ack.await.unwrap().unwrap();
+    assert_eq!(h.prepared_count(), 2);
+    assert_eq!(h.paper.list_fills().unwrap().len(), 2);
+    assert!(h.paper.scope_drop_batch_imported(589).unwrap());
+    let sibling = h.record_group_entry(3, wallet(), 1, "0xee").await;
+    h.paper
+        .record_market_group(&sibling.admission.market.condition_id.0, "0xee")
+        .unwrap();
+    h.poll(&sibling).await;
+    assert_eq!(
+        h.paper
+            .activity_group_state(&sibling.id)
+            .unwrap()
+            .unwrap()
+            .disposition,
+        "scope_dropped"
+    );
+    let healthy = h.record(4).await;
+    h.hooks
+        .financial_clock_unix
+        .store(EPOCH + 1, Ordering::SeqCst);
+    h.attempt(&healthy, at() + time::Duration::seconds(1));
+    h.paper
+        .record_market_group(&healthy.admission.market.condition_id.0, "")
+        .unwrap();
+    h.poll(&healthy).await;
+    h.stop().await;
+    assert_eq!(h.prepared_count(), 3);
+    assert_eq!(h.paper.list_fills().unwrap().len(), 3);
 }

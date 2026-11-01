@@ -4046,3 +4046,218 @@ fn revisions_classify_other_unseen_records_with_only_the_revised_scope_dropped()
         );
     }
 }
+
+#[test]
+fn routed_redeem_revision_cannot_enter_healthy_market_arithmetic() {
+    let (_dir, paper, mut engine) = fresh_anchored();
+    let original = position_row("REDEEM", "0xrouted-redeem", MARKET_A, 0, "", "0", "1", 100);
+    engine
+        .commit_read(vec![original], &context(100, true), zero_basis())
+        .unwrap();
+    let revised = position_row("REDEEM", "0xrouted-redeem", MARKET_A, 0, "", "1", "1", 100);
+    let buy = position_row(
+        "TRADE",
+        "0xhealthy-buy",
+        MARKET_B,
+        0,
+        "BUY",
+        "1",
+        "0.5",
+        100,
+    );
+    let buy_id = buy.group_id.key().clone();
+    let mut ctx = context(100, true);
+    ctx.identity_overrides.insert(
+        revised.group_id.key().clone(),
+        IdentityOverride {
+            verified: market_outcome(MARKET_B, 0),
+            evidence_hash: "a".repeat(64),
+        },
+    );
+    let result = engine
+        .commit_read(vec![revised, buy], &ctx, zero_basis())
+        .unwrap();
+    assert_eq!(state(&engine, MARKET_B, 0).atomic(), 1_000_000);
+    assert_eq!(result.dispositions[&buy_id.0], "not_an_entry");
+    let drops = paper.wallet_scope_drops(&wallet(), 100).unwrap();
+    assert_eq!(drops.len(), 1);
+    assert_eq!(drops[0].scope_id, MARKET_A);
+    assert_eq!(
+        paper
+            .market_history_record(&wallet(), &MarketId(VenueMarketId(MARKET_B.to_owned())))
+            .unwrap()
+            .unwrap()
+            .source_trade_id,
+        buy_id
+    );
+}
+
+#[test]
+fn bracket_raw_reward_does_not_repair_scoped_buy_history() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let buy = position_row("TRADE", "0xscoped-buy", "\\xca", 0, "BUY", "1", "0.5", 100);
+    let reward = position_row("REWARD", "0xraw-reward", MARKET_A, 0, "", "1", "1", 100);
+    let mut ctx = context(100, true);
+    ctx.identity_overrides.insert(
+        buy.group_id.key().clone(),
+        IdentityOverride {
+            verified: market_outcome(MARKET_B, 0),
+            evidence_hash: "a".repeat(64),
+        },
+    );
+    engine
+        .commit_read(vec![buy.clone(), reward.clone()], &ctx, zero_basis())
+        .unwrap();
+    let witness = paper
+        .market_history_record(&wallet(), &MarketId(VenueMarketId(MARKET_A.to_owned())))
+        .unwrap()
+        .unwrap();
+    for restart in [false, true] {
+        if restart {
+            let reopened = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            engine =
+                BucketCommitEngine::load(reopened.clone(), build_leader_ledger(&reopened).unwrap())
+                    .unwrap();
+        }
+        ctx.bracket_commit = true;
+        engine
+            .commit_read(vec![buy.clone(), reward.clone()], &ctx, zero_basis())
+            .unwrap();
+        assert_eq!(
+            paper
+                .market_history_record(&wallet(), &witness.market_id)
+                .unwrap(),
+            Some(witness.clone())
+        );
+        assert!(
+            paper
+                .market_history_record(&wallet(), &MarketId(VenueMarketId(MARKET_B.to_owned())))
+                .unwrap()
+                .is_none()
+        );
+    }
+    let later = position_row(
+        "TRADE",
+        "0xfirst-healthy-b",
+        MARKET_B,
+        0,
+        "BUY",
+        "1",
+        "0.5",
+        101,
+    );
+    assert_eq!(
+        engine
+            .commit_read(vec![later], &context(101, true), zero_basis())
+            .unwrap()
+            .pending
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn routed_corrected_buy_keeps_its_history_witness_across_retry_restart_and_bracket() {
+    let (dir, paper, mut engine) = fresh_anchored();
+    let original = position_row("TRADE", "0xrouted-buy", MARKET_A, 0, "BUY", "0", "0.5", 100);
+    engine
+        .commit_read(vec![original], &context(100, true), zero_basis())
+        .unwrap();
+    let revised = position_row("TRADE", "0xrouted-buy", MARKET_A, 0, "BUY", "1", "0.5", 100);
+    let mut ctx = context(100, true);
+    ctx.identity_overrides.insert(
+        revised.group_id.key().clone(),
+        IdentityOverride {
+            verified: market_outcome(MARKET_B, 0),
+            evidence_hash: "a".repeat(64),
+        },
+    );
+    engine
+        .commit_read(vec![revised.clone()], &ctx, zero_basis())
+        .unwrap();
+    let witness = paper
+        .market_history_record(&wallet(), market_outcome(MARKET_B, 0).market())
+        .unwrap()
+        .unwrap();
+    assert_eq!(witness.source_trade_id, *revised.group_id.key());
+    for restart in [false, true] {
+        if restart {
+            let reopened = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            engine =
+                BucketCommitEngine::load(reopened.clone(), build_leader_ledger(&reopened).unwrap())
+                    .unwrap();
+        }
+        ctx.bracket_commit = restart;
+        assert!(
+            engine
+                .commit_read(vec![revised.clone()], &ctx, zero_basis())
+                .unwrap()
+                .already_committed
+        );
+        assert_eq!(
+            paper
+                .market_history_record(&wallet(), &witness.market_id)
+                .unwrap(),
+            Some(witness.clone())
+        );
+    }
+    let later = position_row("TRADE", "0xlater-b", MARKET_B, 0, "BUY", "1", "0.5", 101);
+    assert!(
+        engine
+            .commit_read(vec![later], &context(101, true), zero_basis())
+            .unwrap()
+            .pending
+            .is_empty()
+    );
+}
+
+#[test]
+fn pre_anchor_event_drop_excludes_new_sibling_and_admits_another_market() {
+    let (_dir, paper, mut engine) = fresh_anchored();
+    install_anchor(&mut engine, &paper, 100, Vec::new(), 1);
+    let sibling = "0xcdee";
+    paper.record_market_group(sibling, "0xee").unwrap();
+    paper
+        .import_scope_drops(
+            589,
+            &[(
+                pe_paper_state::WalletScopeDrop {
+                    wallet: wallet(),
+                    scope_kind: "event".to_owned(),
+                    scope_id: "0xee".to_owned(),
+                    cause: "underflow".to_owned(),
+                    source_trade_id: None,
+                    dropped_at_epoch: 50,
+                    proof_json: "{}".to_owned(),
+                    recorded_at_unix: 101,
+                },
+                support::scenario_receipt(99),
+            )],
+            &Default::default(),
+        )
+        .unwrap();
+    let excluded = position_row("TRADE", "0xnew-sibling", sibling, 1, "BUY", "1", "0.5", 101);
+    let healthy = position_row(
+        "TRADE",
+        "0xhealthy-elsewhere",
+        MARKET_B,
+        0,
+        "BUY",
+        "1",
+        "0.5",
+        101,
+    );
+    let excluded_id = excluded.group_id.key().clone();
+    let healthy_id = healthy.group_id.key().clone();
+    let result = engine
+        .commit_read(vec![excluded, healthy], &context(101, true), zero_basis())
+        .unwrap();
+    assert_eq!(result.dispositions[&excluded_id.0], "scope_dropped");
+    assert_eq!(result.pending, [healthy_id]);
+    assert_eq!(state(&engine, sibling, 1), ShareAmount::ZERO);
+    assert_eq!(state(&engine, MARKET_B, 0).atomic(), 1_000_000);
+    assert_eq!(
+        replay_wallet_ledger(&paper, wallet()).unwrap().snapshots(),
+        engine.ledger().snapshots()
+    );
+}

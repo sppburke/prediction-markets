@@ -579,6 +579,7 @@ impl Harness {
             &self.account.account_id,
             self.now,
             None,
+            None,
         )
         .await;
         // Reuse the recorded market fixture, substituting this condition's token identities.

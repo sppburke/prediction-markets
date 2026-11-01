@@ -2732,17 +2732,12 @@ async fn resolve_financial_condition(
         parsed.condition_id.as_deref() == Some(condition.0.as_str()),
         "CLOB resolution condition differs from request"
     );
-    let group = if parsed.neg_risk == Some(true) {
-        parsed
-            .neg_risk_market_id
-            .as_deref()
-            .context("CLOB resolution missing neg-risk group")?
-    } else {
-        ""
-    };
-    paper_state
-        .record_market_group(&condition.0, group)
-        .context("record CLOB resolution membership")?;
+    pe_service::record_market_membership(
+        paper_state,
+        &condition.0,
+        parsed.neg_risk_market_id.as_deref(),
+    )
+    .context("record CLOB resolution membership")?;
     let ClobPayoutResolution::Resolved(payout) = parsed.resolution_evidence().payout else {
         return Ok(());
     };
@@ -2942,11 +2937,13 @@ mod tests {
         let mut writer = pe_event_log::Writer::open(dir.path().join("source.log")).unwrap();
         let (source, mut source_rx) = pe_service::activity_ingest::SourceLogHandle::channel(1);
         let (control, mut control_rx) = mpsc::channel(1);
-        for (id, grouped, resolved, fails) in [
-            ("grouped", true, false, false),
-            ("ungrouped", false, false, false),
-            ("failed", true, false, true),
-            ("resolved", true, true, false),
+        for (id, flag, group, resolved, fails) in [
+            ("grouped", Some(true), Some("group"), false, false),
+            ("ungrouped", Some(false), None, false, false),
+            ("group_without_flag", None, Some("group"), false, false),
+            ("flag_without_group", Some(true), None, false, false),
+            ("failed", Some(true), Some("group"), false, true),
+            ("resolved", Some(true), Some("group"), true, false),
         ] {
             if fails {
                 connection.execute_batch("CREATE TRIGGER fail_group_insert BEFORE INSERT ON meta WHEN NEW.key LIKE 'neg_risk_group:%' BEGIN SELECT RAISE(FAIL, 'group insert failed'); END;").unwrap();
@@ -2954,8 +2951,8 @@ mod tests {
             let payload = serde_json::to_vec(&serde_json::json!({
                 "condition_id": id,
                 "closed": resolved,
-                "neg_risk": grouped,
-                "neg_risk_market_id": if grouped { Some("group") } else { None },
+                "neg_risk": flag,
+                "neg_risk_market_id": group,
                 "is_50_50_outcome": false,
                 "tokens": [
                     {"token_id":"11", "outcome":"Yes", "winner":resolved, "price":if resolved { "1" } else { "0.5" }},
@@ -3003,7 +3000,7 @@ mod tests {
             } else {
                 result.unwrap();
             }
-            let group: Option<String> = connection
+            let stored: Option<String> = connection
                 .query_row(
                     "SELECT value FROM meta WHERE key = ?1",
                     params![format!("neg_risk_group:{id}")],
@@ -3012,14 +3009,8 @@ mod tests {
                 .optional()
                 .unwrap();
             assert_eq!(
-                group.as_deref(),
-                if grouped && !fails {
-                    Some("group")
-                } else if !grouped {
-                    Some("")
-                } else {
-                    None
-                }
+                stored.as_deref(),
+                (!fails).then_some(group.unwrap_or_default())
             );
             if fails {
                 connection

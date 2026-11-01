@@ -4618,6 +4618,37 @@ impl PaperStateDb {
         Ok(())
     }
 
+    /// Check cumulative drops and record `submitted` in the same immediate transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_dispatch_target_unless_scope_dropped(
+        &self,
+        target: &DispatchTargetRow,
+        wallet: &WalletAddress,
+        market_id: &str,
+        group_id: Option<&str>,
+        source_epoch: i64,
+        now_unix: i64,
+    ) -> Result<bool, PaperStateError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if scope_is_dropped(&tx, wallet, market_id, group_id, source_epoch)? {
+            return Ok(false);
+        }
+        let updated = tx.execute(
+            "UPDATE dispatch_targets SET state = 'submitted', terminal_reason = NULL,
+             updated_at_unix = ?3 WHERE dispatch_id = ?1 AND account_id = ?2",
+            params![target.dispatch_id, target.account_id, now_unix],
+        )?;
+        if updated != 1 {
+            return Err(PaperStateError::Internal(format!(
+                "dispatch target {}/{} not found",
+                target.dispatch_id, target.account_id
+            )));
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Stamp `finalized_at_unix` when every target of a `ready` aggregate is terminal
     /// (also finalizes a zero-live-outcome seed whose targets were all terminalized at
     /// boot). Returns `true` when this call performed the finalization.

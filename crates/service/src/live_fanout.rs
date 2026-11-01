@@ -24,9 +24,9 @@ use pe_execution_core::live_executor::{
     classify_live_account_responses, classify_live_admission, verify_live_admission_evaluation,
 };
 use pe_execution_core::live_journal::{
-    LiveAccountBindingAudit, LivePositionEvidenceAudit, LivePositionPageAudit,
-    PolygonFinalityClassification, SanitizedHttpRequestDescriptor, classify_polygon_finality,
-    verify_polygon_finalized, verify_polygon_reconciliation,
+    LiveAccountBindingAudit, LiveAdmissionArtifactAudit, LivePositionEvidenceAudit,
+    LivePositionPageAudit, PolygonFinalityClassification, SanitizedHttpRequestDescriptor,
+    classify_polygon_finality, verify_polygon_finalized, verify_polygon_reconciliation,
 };
 use pe_execution_core::{
     AdmissionReceipts, CanonicalPositionAudit, CredentialBindingIdentity, EconomicInputs,
@@ -2031,6 +2031,105 @@ where
     Ok(())
 }
 
+async fn ensure_target_membership(
+    state: &FanoutState,
+    admission: &LiveAdmissionArtifactAudit,
+) -> bool {
+    let condition = &admission.market.condition_id.0;
+    let acquire = async {
+        if let Some(membership) = state.config.paper_state.market_membership(condition)? {
+            return Ok::<_, anyhow::Error>(membership != pe_paper_state::MarketMembership::Absent);
+        }
+        if let Ok(envelope) = state
+            .config
+            .source_receipts
+            .source_envelope(admission.receipts.clob_long)
+            && envelope.source_id.0 == CLOB_LONG_MARKET_SOURCE_ID
+            && envelope.schema_version == LIVE_MARKET_SCHEMA_VERSION
+            && envelope.parser_version == LIVE_MARKET_PARSER_VERSION
+            && envelope.content_type == ContentType::Json
+            && let Ok(market) = parse_clob_market(&envelope.payload)
+            && market.condition_id.as_deref() == Some(condition.as_str())
+        {
+            crate::market_membership::record_market_membership(
+                &state.config.paper_state,
+                condition,
+                market.neg_risk_market_id.as_deref(),
+            )?;
+            return Ok(true);
+        }
+        let membership = crate::market_membership::fetch_market_membership(
+            &state.config.paper_state,
+            &state.config.clob_base_url,
+            &pe_source_polymarket_public::ReqwestFetcher::new(state.config.http.clone()),
+            &state.config.source_log,
+            condition,
+        )
+        .await?;
+        Ok(membership != pe_paper_state::MarketMembership::Absent)
+    }
+    .await;
+    match acquire {
+        Ok(known) => known,
+        Err(error) => {
+            warn!(%error, %condition, "target membership unavailable; submission paused");
+            false
+        }
+    }
+}
+
+fn submit_target_unless_scope_dropped(
+    state: &FanoutState,
+    target: &DispatchTargetRow,
+    identity: &LiveOrderIdentity,
+    now: OffsetDateTime,
+) -> Result<bool, FanoutError> {
+    let projection = identity
+        .fill_projection
+        .as_deref()
+        .ok_or_else(|| FanoutError::Signal("live fill projection is missing".to_owned()))?;
+    let source_trade_id = projection
+        .source_trade_id
+        .as_ref()
+        .ok_or_else(|| FanoutError::Signal("live source trade identity is missing".to_owned()))?;
+    let row = state
+        .config
+        .paper_state
+        .decision_pending_for(&SourceTradeId(source_trade_id.clone()))?
+        .ok_or_else(|| FanoutError::Signal("decision continuation is missing".to_owned()))?;
+    let membership = state
+        .config
+        .paper_state
+        .market_membership(&projection.market_id)?;
+    let group = match &membership {
+        Some(pe_paper_state::MarketMembership::Grouped(group)) => Some(group.as_str()),
+        Some(pe_paper_state::MarketMembership::Ungrouped) => None,
+        _ => {
+            return Err(FanoutError::Signal(
+                "target membership is missing".to_owned(),
+            ));
+        }
+    };
+    let submitted = state
+        .config
+        .paper_state
+        .submit_dispatch_target_unless_scope_dropped(
+            target,
+            &row.wallet,
+            &projection.market_id,
+            group,
+            row.source_epoch,
+            now.unix_timestamp(),
+        )?;
+    if !submitted {
+        state
+            .config
+            .paper_state
+            .record_scope_drop_boundary(now.unix_timestamp())?;
+    }
+    Ok(submitted)
+}
+
 async fn resume_approved_with_venue<V, C>(
     state: &mut FanoutState,
     target: &DispatchTargetRow,
@@ -2056,6 +2155,9 @@ where
             None,
             preparation_check_at,
         )?;
+        return Ok(false);
+    }
+    if !ensure_target_membership(state, &pending.admission.economic.admission).await {
         return Ok(false);
     }
     match executor
@@ -2200,14 +2302,22 @@ where
                 )?;
                 return Ok(false);
             }
-            state.config.paper_state.set_dispatch_target_state(
-                &target.dispatch_id,
-                &target.account_id,
-                "submitted",
-                None,
-                latest_at.unix_timestamp(),
+            let submitted = submit_target_unless_scope_dropped(
+                state,
+                target,
+                &prepared.audit().identity,
+                latest_at,
             )?;
             drop(guard);
+            if !submitted {
+                let outcome = executor.terminalize_prepared(
+                    prepared,
+                    latest_at,
+                    pe_execution_core::LiveOrderPreparationFailure::PrePostScopeDropped,
+                )?;
+                persist_outcome(state, target, &outcome, latest_at)?;
+                return Ok(false);
+            }
             let outcome =
                 post_prepared_target(state, target, &executor, prepared, copy_deadline, clock)
                     .await?;
@@ -2864,6 +2974,9 @@ async fn process_target(
     }
     let journal = state.config.journal.clone();
     let executor = LiveExecutor::new(&venue, journal.as_ref());
+    if !ensure_target_membership(state, &request.economic.admission).await {
+        return Ok(PassControl::StopSeed);
+    }
     match executor
         .prepare_with_observed_account_and_clock(
             request,
@@ -2983,14 +3096,22 @@ async fn process_target(
                 persist_outcome(state, target, &outcome, final_at)?;
                 return Ok(PassControl::Continue);
             }
-            state.config.paper_state.set_dispatch_target_state(
-                &target.dispatch_id,
-                &target.account_id,
-                "submitted",
-                None,
-                final_at.unix_timestamp(),
+            let submitted = submit_target_unless_scope_dropped(
+                state,
+                target,
+                &prepared.audit().identity,
+                final_at,
             )?;
             drop(guard);
+            if !submitted {
+                let outcome = executor.terminalize_prepared(
+                    prepared,
+                    final_at,
+                    pe_execution_core::LiveOrderPreparationFailure::PrePostScopeDropped,
+                )?;
+                persist_outcome(state, target, &outcome, final_at)?;
+                return Ok(PassControl::Continue);
+            }
             let outcome = post_prepared_target(
                 state,
                 target,
@@ -15205,6 +15326,7 @@ mod tests {
     fn economic_source_payloads_with_end(
         condition_id: &str,
         scheduled_end_unix: Option<i64>,
+        group: Option<&str>,
     ) -> [Vec<u8>; 4] {
         let gamma = serde_json::to_vec(&serde_json::json!([{
             "conditionId": condition_id,
@@ -15243,6 +15365,9 @@ mod tests {
                     .unwrap(),
             );
         }
+        if let Some(group) = group {
+            clob_long["neg_risk_market_id"] = serde_json::json!(group);
+        }
         let clob_long = serde_json::to_vec(&clob_long).unwrap();
         let clob_compact = format!(
             r#"{{"c":"{condition_id}","t":[{{"t":"123","o":"Yes"}},{{"t":"124","o":"No"}}],"mts":0.01,"mos":1,"nr":false,"fd":{{"r":0.00024,"e":1,"to":true}}}}"#
@@ -15256,7 +15381,7 @@ mod tests {
     }
 
     fn economic_source_payloads(condition_id: &str) -> [Vec<u8>; 4] {
-        economic_source_payloads_with_end(condition_id, None)
+        economic_source_payloads_with_end(condition_id, None, None)
     }
 
     fn economic_source_envelopes(
@@ -15267,6 +15392,7 @@ mod tests {
         let payloads = economic_source_payloads_with_end(
             &economic.market.condition_id.0,
             economic.admission.scheduled_end_unix,
+            None,
         );
         let receipts = [
             economic.admission.receipts.gamma,
@@ -15321,13 +15447,18 @@ mod tests {
         account_id: &AccountId,
         received_at: OffsetDateTime,
         copy_policy: Option<crate::bucket_commit::PaperFreshnessPolicy>,
+        group: Option<&str>,
     ) {
         let transaction_hash = activity_transaction_hash(&prepared.identity);
         let economic = &mut prepared.economic;
-        let payloads = economic_source_payloads_with_end(
+        let mut payloads = economic_source_payloads_with_end(
             &economic.market.condition_id.0,
             economic.admission.scheduled_end_unix,
+            group,
         );
+        let mut book: serde_json::Value = serde_json::from_slice(&payloads[3]).unwrap();
+        book["asset_id"] = serde_json::json!(economic.market.token_id.0);
+        payloads[3] = serde_json::to_vec(&book).unwrap();
         let source_ids = [
             GAMMA_MARKETS_SOURCE_ID,
             CLOB_LONG_MARKET_SOURCE_ID,
@@ -15827,7 +15958,7 @@ mod tests {
         prior.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
         prior.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
         bind_empty_live_risk_to_paper_prefix(state, &mut prior, now);
-        append_economic_sources(state, &mut prior, account_id, now, None).await;
+        append_economic_sources(state, &mut prior, account_id, now, None, None).await;
         append_approved_admission(state.config.journal.as_ref(), account_id, &prior, now);
         let prepared = state
             .config
@@ -15866,8 +15997,16 @@ mod tests {
         pe_execution_core::live_journal::ApprovedAdmissionRecoveryEntry,
         pe_venue_polymarket::PreparedPolymarketBuy,
     ) {
-        stage_recoverable_approved_with_copy_policy(state, now, risk_price_receipt, false, None)
-            .await
+        stage_recoverable_approved_with_copy_policy(
+            state,
+            now,
+            risk_price_receipt,
+            false,
+            None,
+            0,
+            None,
+        )
+        .await
     }
 
     async fn stage_recoverable_approved_with_copy_policy(
@@ -15876,6 +16015,8 @@ mod tests {
         risk_price_receipt: Option<AppendReceipt>,
         wire_two: bool,
         copy_policy: Option<crate::bucket_commit::PaperFreshnessPolicy>,
+        outcome: u8,
+        group: Option<&str>,
     ) -> (
         pe_execution_core::live_journal::ApprovedAdmissionRecoveryEntry,
         pe_venue_polymarket::PreparedPolymarketBuy,
@@ -15888,6 +16029,18 @@ mod tests {
             &["acct"],
         );
         let mut prepared = finality_prepared();
+        prepared.economic.market.outcome_index = outcome;
+        prepared.economic.market.token_id =
+            prepared.economic.admission.market.ordered_outcome_token_ids[usize::from(outcome)]
+                .clone();
+        prepared
+            .identity
+            .fill_projection
+            .as_mut()
+            .unwrap()
+            .outcome_id = i64::from(outcome);
+        prepared.prepared.outcome_id = OutcomeId(u16::from(outcome));
+        prepared.prepared.token_id = prepared.economic.market.token_id.clone();
         if wire_two {
             prepared.economic.version =
                 pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION;
@@ -15962,7 +16115,7 @@ mod tests {
         } else {
             bind_empty_live_risk_to_paper_prefix(state, &mut prepared, now);
         }
-        append_economic_sources(state, &mut prepared, &account_id, now, copy_policy).await;
+        append_economic_sources(state, &mut prepared, &account_id, now, copy_policy, group).await;
         // The fake venue returns this prepared order verbatim; the resume path requires it to
         // match the request derived from the admission (ladder debit and identity hashes).
         prepared.prepared.worst_case_debit = prepared.prepared.maker_collateral;
@@ -16018,9 +16171,16 @@ mod tests {
             activity_ws_enabled: true,
             copy_latency_budget_secs: 120,
         };
-        let (pending, _) =
-            stage_recoverable_approved_with_copy_policy(&mut state, now, None, false, Some(policy))
-                .await;
+        let (pending, _) = stage_recoverable_approved_with_copy_policy(
+            &mut state,
+            now,
+            None,
+            false,
+            Some(policy),
+            0,
+            None,
+        )
+        .await;
         assert_eq!(
             pending.admission.economic.version,
             pe_execution_core::economic::ECONOMIC_PREPARED_VERSION
@@ -16058,6 +16218,8 @@ mod tests {
                 None,
                 true,
                 Some(policy),
+                0,
+                None,
             )
             .await;
             let deadline = approved_recovery_copy_deadline(&state, &pending).unwrap();
@@ -16180,7 +16342,7 @@ mod tests {
         prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
         prepared.economic.risk.evaluated_at_unix_ms = unix_millis_i64(now);
         bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
-        append_economic_sources(&state, &mut prepared, &account_id, now, None).await;
+        append_economic_sources(&state, &mut prepared, &account_id, now, None, None).await;
         prepared.economic.observation = None;
         append_approved_admission(state.config.journal.as_ref(), &account_id, &prepared, now);
 
@@ -18013,6 +18175,7 @@ mod tests {
             &account_id,
             OffsetDateTime::UNIX_EPOCH,
             None,
+            None,
         )
         .await;
         append_approved_admission(
@@ -18069,7 +18232,7 @@ mod tests {
             now,
         );
         bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
-        append_economic_sources(&state, &mut prepared, &account_id, now, None).await;
+        append_economic_sources(&state, &mut prepared, &account_id, now, None, None).await;
         let mut admission = approved_admission(&prepared);
         admission.economic.risk.snapshot.absolute_pnl_bps = BasisPoints(-1_000);
         admission.economic.risk.decision = RiskDecisionAudit::Approved;
@@ -18201,7 +18364,7 @@ mod tests {
                 now.unix_timestamp().saturating_mul(1_000);
             prepared.economic.risk.price_receipts.clear();
             bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
-            append_economic_sources(&state, &mut prepared, &account_id, now, None).await;
+            append_economic_sources(&state, &mut prepared, &account_id, now, None, None).await;
             if preparation_failed {
                 append_approved_admission(
                     state.config.journal.as_ref(),
@@ -20291,6 +20454,233 @@ mod tests {
         )));
     }
 
+    #[tokio::test]
+    async fn target_membership_falls_back_to_clob_and_defers_on_failure() {
+        for status in [200, 503] {
+            let dir = tempdir().unwrap();
+            let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let mut state = fanout_state(
+                &dir,
+                db.clone(),
+                LiveAccountsSnapshot::default(),
+                "http://127.0.0.1:9",
+                None,
+            );
+            let admission = finality_prepared().economic.admission;
+            let condition = admission.market.condition_id.0.clone();
+            let body = serde_json::json!({"condition_id": condition, "neg_risk_market_id": "0xee"});
+            let app = Router::new().route(
+                &format!("/markets/{condition}"),
+                get(move || {
+                    let body = body.clone();
+                    async move { (StatusCode::from_u16(status).unwrap(), Json(body)) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            state.config.clob_base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            assert_eq!(
+                ensure_target_membership(&state, &admission).await,
+                status == 200
+            );
+            assert_eq!(
+                db.market_membership(&condition).unwrap(),
+                (status == 200)
+                    .then(|| pe_paper_state::MarketMembership::Grouped("0xee".to_owned()))
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_drop_after_approved_or_during_preparation_converges_without_posts() {
+        let app = Router::new().route("/positions", get(empty_positions));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for kind in ["market", "event"] {
+            for during_prepare in [false, true] {
+                for projection_crash in [false, true] {
+                    let dir = tempdir().unwrap();
+                    let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+                    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+                    let mut snapshot = armed_snapshot("acct");
+                    snapshot.fetched_at_unix = Some(now.unix_timestamp());
+                    let mut state =
+                        fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
+                    state.config.data_base_url = format!("http://{address}");
+                    state.clock = Arc::new(move || now);
+                    let (pending, prepared) = stage_recoverable_approved_with_copy_policy(
+                        &mut state,
+                        now,
+                        None,
+                        true,
+                        Some(crate::bucket_commit::PaperFreshnessPolicy {
+                            activity_ws_enabled: true,
+                            copy_latency_budget_secs: 120,
+                        }),
+                        1,
+                        (kind == "event").then_some("0xee"),
+                    )
+                    .await;
+                    if !during_prepare {
+                        state.config.journal = Arc::new(
+                            LiveJournal::open(dir.path().join("restart-scratch.journal")).unwrap(),
+                        );
+                        state.config.journal =
+                            Arc::new(LiveJournal::open(&state.config.journal_path).unwrap());
+                        state.live = std::sync::Mutex::new(LiveState::default());
+                    }
+                    let condition = pending.admission.economic.market.condition_id.0.clone();
+                    assert_eq!(db.market_membership(&condition).unwrap(), None);
+                    stage(&db, "unaffected", now.unix_timestamp(), &["other"]);
+                    let evidence_receipt = pending.admission.economic.admission.receipts.clob_long;
+                    let drop = pe_paper_state::WalletScopeDrop {
+                        wallet: WalletAddress([0xaa; 20]),
+                        scope_kind: kind.to_owned(),
+                        scope_id: if kind == "event" {
+                            "0xee".to_owned()
+                        } else {
+                            condition.clone()
+                        },
+                        cause: "underflow".to_owned(),
+                        source_trade_id: None,
+                        dropped_at_epoch: now.unix_timestamp(),
+                        proof_json: "{}".to_owned(),
+                        recorded_at_unix: now.unix_timestamp(),
+                    };
+                    if !during_prepare {
+                        db.import_scope_drops(
+                            589,
+                            &[(drop.clone(), evidence_receipt)],
+                            &Default::default(),
+                        )
+                        .unwrap();
+                    }
+                    let connection =
+                        rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+                    if projection_crash {
+                        connection.execute_batch("CREATE TRIGGER fail_terminal BEFORE UPDATE ON dispatch_targets WHEN NEW.state = 'terminal' BEGIN SELECT RAISE(ABORT, 'injected terminal projection failure'); END;").unwrap();
+                    }
+                    let current_account_state = venue_account_state_from_audit(
+                        pending.admission.account_state.as_ref().unwrap(),
+                    );
+                    let account_binding = account_binding_fixture(
+                        &pending.account_id,
+                        "0x1111111111111111111111111111111111111111",
+                    );
+                    let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+                    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+                    let release = Arc::new(tokio::sync::Notify::new());
+                    let posts = Arc::new(AtomicUsize::new(0));
+                    let venue = RecoveryPostVenue {
+                        client: reqwest::Client::new(),
+                        order_url: String::new(),
+                        prepared,
+                        observed_at: now,
+                        prepare_clock_millis: None,
+                        prepare_advance_millis: 0,
+                        post_attempts: Some(posts.clone()),
+                        post_deadlines: None,
+                        account_state: Some(current_account_state.clone()),
+                        prepare_barrier: during_prepare.then(|| barrier.clone()),
+                        prepare_release: during_prepare.then(|| release.clone()),
+                    };
+                    let task = tokio::spawn(async move {
+                        let venue_context = RecoveryVenueContext {
+                            venue: &venue,
+                            account_binding: &account_binding,
+                            custody_wallet: "0x1111111111111111111111111111111111111111",
+                        };
+                        let result = resume_approved_with_venue(
+                            &mut state,
+                            &target,
+                            pending,
+                            RecoveryExecutionState {
+                                mode: LiveModeSnapshot {
+                                    requested: LiveControlMode::LiveTiny,
+                                    effective: LiveControlMode::LiveTiny,
+                                },
+                                account_state: current_account_state,
+                                binding: CredentialBindingIdentity {
+                                    version: 1,
+                                    key_id: "key".to_owned(),
+                                },
+                            },
+                            Some(now + time::Duration::seconds(120)),
+                            &venue_context,
+                            || now,
+                        )
+                        .await;
+                        (state, result)
+                    });
+                    if during_prepare {
+                        barrier.wait().await;
+                        db.import_scope_drops(
+                            589,
+                            &[(drop, evidence_receipt)],
+                            &Default::default(),
+                        )
+                        .unwrap();
+                        release.notify_one();
+                    }
+                    let (mut state, result) = task.await.unwrap();
+                    if projection_crash {
+                        assert!(result.is_err());
+                        assert_eq!(
+                            db.dispatch_targets("dispatch-finality").unwrap()[0].state,
+                            "pending"
+                        );
+                        connection
+                            .execute_batch("DROP TRIGGER fail_terminal")
+                            .unwrap();
+                        state.config.journal = Arc::new(
+                            LiveJournal::open(dir.path().join("restart-scratch.journal")).unwrap(),
+                        );
+                        state.config.journal =
+                            Arc::new(LiveJournal::open(&state.config.journal_path).unwrap());
+                        state.live = std::sync::Mutex::new(LiveState::default());
+                        run_recovery_pass(&mut state, || now, false).await.unwrap();
+                    } else {
+                        assert!(!result.unwrap());
+                    }
+                    assert_eq!(posts.load(Ordering::SeqCst), 0);
+                    let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+                    assert_eq!(target.state, "terminal");
+                    assert_eq!(
+                        target.terminal_reason.as_deref(),
+                        Some("scope_dropped_before_post")
+                    );
+                    assert_eq!(
+                        db.scope_drop_boundary_unix().unwrap(),
+                        Some(now.unix_timestamp())
+                    );
+                    assert_eq!(
+                        db.market_membership(&condition).unwrap(),
+                        Some(if kind == "event" {
+                            pe_paper_state::MarketMembership::Grouped("0xee".to_owned())
+                        } else {
+                            pe_paper_state::MarketMembership::Ungrouped
+                        })
+                    );
+                    assert_eq!(
+                        db.dispatch_targets("unaffected").unwrap()[0].state,
+                        "pending"
+                    );
+                    let inventory = verified_recovery_inventory(&state).unwrap();
+                    assert!(inventory.approved_admissions.is_empty());
+                    assert!(inventory.open_orders.is_empty());
+                    assert_eq!(inventory.terminal_admissions.len(), 1);
+                    let events =
+                        replay_live_account(&state, &AccountId::new("acct").unwrap()).unwrap();
+                    assert_eq!(events.iter().filter(|event| matches!(&event.payload, LiveJournalPayload::OrderPreparationFailed(audit)
+                        if audit.failure == pe_execution_core::LiveOrderPreparationFailure::PrePostScopeDropped)).count(), 1);
+                }
+            }
+        }
+        server.abort();
+    }
+
     /// PASS: StopProducers reached while venue preparation is parked prevents the POST and
     /// terminalizes the now-durable Prepared capability before it can be consumed.
     /// FAIL: any loopback POST after StopProducers, or the durable Prepared capability is left
@@ -20719,6 +21109,7 @@ mod tests {
             &account_id,
             OffsetDateTime::UNIX_EPOCH,
             None,
+            None,
         )
         .await;
         append_approved_admission(
@@ -20759,6 +21150,26 @@ mod tests {
             .journal
             .append(account_id, fill.timestamp, fill.payload)
             .unwrap();
+        db.record_market_group(&prepared.economic.market.condition_id.0, "0xee")
+            .unwrap();
+        db.import_scope_drops(
+            589,
+            &[(
+                pe_paper_state::WalletScopeDrop {
+                    wallet: WalletAddress([0xaa; 20]),
+                    scope_kind: "event".to_owned(),
+                    scope_id: "0xee".to_owned(),
+                    cause: "underflow".to_owned(),
+                    source_trade_id: None,
+                    dropped_at_epoch: 0,
+                    proof_json: "{}".to_owned(),
+                    recorded_at_unix: 1,
+                },
+                prepared.economic.admission.receipts.clob_long,
+            )],
+            &Default::default(),
+        )
+        .unwrap();
         let seed = db.unfinalized_ready_dispatch_seeds().unwrap().remove(0);
         let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
         let control = process_target(
@@ -21006,6 +21417,7 @@ mod tests {
             (Failure::PrePostRiskDayChanged, false),
             (Failure::PrePostRiskPriceExpired, false),
             (Failure::PrePostLadderExpired, false),
+            (Failure::PrePostScopeDropped, false),
             (Failure::PrePostAdmissionExpired, false),
             (Failure::PrePostMarkUnavailable, false),
             (Failure::PrePostNotArmed, true),

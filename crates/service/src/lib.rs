@@ -64,4 +64,4 @@ pub mod frame_admission;
 
 pub mod feed_audit;
 
-pub use market_membership::fetch_market_membership;
+pub use market_membership::{fetch_market_membership, record_market_membership};

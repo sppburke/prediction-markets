@@ -4940,18 +4940,21 @@ impl BucketCommitEngine {
         if seen == aggregates.len() && changed.is_empty() {
             if context.bracket_commit
                 && !self.fences.contains(&wallet)
-                && durable.iter().flatten().any(|state| {
-                    matches!(
-                        state.disposition.as_str(),
-                        "raw_only"
-                            | "anchor_covered"
-                            | "anchor_covered_late"
-                            | "reanchor_required_late_group"
-                            | "reanchor_required_redemption"
-                    )
-                })
                 && !self
-                    .covered_history_effects(wallet, source_epoch, &recordable_mutations)
+                    .covered_history_effects(
+                        wallet,
+                        source_epoch,
+                        &recordable_mutations
+                            .iter()
+                            .zip(&durable)
+                            .filter(|(_, state)| {
+                                state.as_ref().is_some_and(|state| {
+                                    history_repair_disposition(&state.disposition)
+                                })
+                            })
+                            .map(|(mutation, _)| mutation.clone())
+                            .collect::<Vec<_>>(),
+                    )
                     .is_empty()
             {
                 // An older bracket may have recorded these groups without consuming
@@ -5285,6 +5288,14 @@ impl BucketCommitEngine {
                 || self.complete_history.contains(&wallet),
                 |status| status.complete,
             );
+        let classification_records = records
+            .iter()
+            .filter(|record| !routed.contains_key(record.aggregate.group_id.key()))
+            .map(|record| SecondRecord {
+                aggregate: record.aggregate,
+                mutation: record.mutation.clone(),
+            })
+            .collect::<Vec<_>>();
         let classify = |drops: &BTreeSet<Scope>, certified| {
             classify_scoped_second(
                 complete_read_entry_policy(current_paper_version(complete_read_version(
@@ -5292,7 +5303,7 @@ impl BucketCommitEngine {
                 ))),
                 &self.ledger,
                 wallet,
-                &records,
+                &classification_records,
                 drops,
                 certified,
                 context.reconstruction_quality,
@@ -5372,7 +5383,13 @@ impl BucketCommitEngine {
         let history_effects = self.buy_history_effects(
             wallet,
             source_epoch,
-            scoped_history_buys(&records, &scoped.consumed, &scoped.ignored, &lookups),
+            scoped_history_buys(
+                &records,
+                &scoped.consumed,
+                &scoped.ignored,
+                &routed,
+                &lookups,
+            ),
         );
         let first_entries = history_effects
             .iter()
@@ -5392,16 +5409,8 @@ impl BucketCommitEngine {
                 &problem.trigger,
             )?);
         }
-        let mutations = scoped
-            .apply
-            .into_iter()
-            .filter(|mutation| !routed.contains_key(&mutation.source_trade_id))
-            .collect::<Vec<_>>();
-        let trade_decisions = scoped
-            .decisions
-            .into_iter()
-            .filter(|decision| !routed.contains_key(&decision.source_trade_id))
-            .collect::<Vec<_>>();
+        let mutations = scoped.apply;
+        let trade_decisions = scoped.decisions;
         let mut candidate = self.ledger.clone();
         let applied = match candidate.apply_all_or_none(&mutations) {
             Ok(applied) => applied,
@@ -5794,7 +5803,8 @@ impl BucketCommitEngine {
                     aggregate.group_id.key().0.clone(),
                     "already_committed".to_owned(),
                 );
-                if repair_history {
+                if repair_history && history_repair_disposition(&state.disposition) {
+                    mutations.push(mutation.clone());
                     let original = self
                         .paper_state
                         .activity_group_state(aggregate.group_id.key())?;
@@ -5841,15 +5851,7 @@ impl BucketCommitEngine {
         let history_effects = if context.bracket_commit && self.fences.contains(&wallet) {
             Vec::new()
         } else {
-            self.covered_history_effects(
-                wallet,
-                source_epoch,
-                if repair_history {
-                    resolved_mutations
-                } else {
-                    &mutations
-                },
-            )
+            self.covered_history_effects(wallet, source_epoch, &mutations)
         };
         let unresolved_trigger = (!context.bracket_commit)
             .then(|| {
@@ -6552,10 +6554,22 @@ fn log_scope_drops(drops: &[WalletScopeDrop]) {
     }
 }
 
+fn history_repair_disposition(disposition: &str) -> bool {
+    matches!(
+        disposition,
+        "raw_only"
+            | "anchor_covered"
+            | "anchor_covered_late"
+            | "reanchor_required_late_group"
+            | "reanchor_required_redemption"
+    )
+}
+
 fn scoped_history_buys(
     records: &[SecondRecord<'_>],
     consumed: &[MarketId],
     ignored: &[(SourceTradeId, ActivityType)],
+    routed: &HashMap<SourceTradeId, &str>,
     lookups: &dyn ScopeLookups,
 ) -> Vec<(MarketId, SourceTradeId)> {
     let mut buys = Vec::new();
@@ -6595,7 +6609,9 @@ fn scoped_history_buys(
             };
             MarketId(pe_core_types::VenueMarketId(scope.id))
         };
-        if consumed.contains(&market) {
+        if consumed.contains(&market)
+            || routed.get(&mutation.source_trade_id) == Some(&"scope_dropped")
+        {
             buys.push((market, mutation.source_trade_id.clone()));
         }
     }

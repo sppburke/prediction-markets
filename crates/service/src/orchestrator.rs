@@ -3947,18 +3947,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             }
         }
 
-        let group = if admission.market.neg_risk {
-            admission.market.neg_risk_market_id.as_deref()
-        } else {
-            Some("")
-        };
-        let result = group
-            .ok_or_else(|| "admission missing neg-risk group".to_owned())
-            .and_then(|group| {
-                self.paper_state
-                    .record_market_group(&condition_id.0, group)
-                    .map_err(|error| error.to_string())
-            });
+        let result = crate::market_membership::record_market_membership(
+            &self.paper_state,
+            &condition_id.0,
+            admission.market.neg_risk_market_id.as_deref(),
+        );
         if let Err(error) = result {
             error!(%error, trade = %trade.source_trade_id, "record admitted market membership failed");
             self.intake_stopped = true;
@@ -4351,6 +4344,52 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             return;
         }
 
+        let dropped = self
+            .paper_state
+            .market_membership(&condition_id.0)
+            .and_then(|membership| {
+                self.paper_state.scope_is_dropped(
+                    &trade.wallet,
+                    &condition_id.0,
+                    match &membership {
+                        Some(pe_paper_state::MarketMembership::Grouped(group)) => {
+                            Some(group.as_str())
+                        }
+                        _ => None,
+                    },
+                    trade.observed_at.unix_timestamp(),
+                )
+            });
+        match dropped {
+            Ok(false) => {}
+            Ok(true) => {
+                let disposition = pe_paper_state::NoCopyDisposition {
+                    provenance: match trade.provenance {
+                        TradeProvenance::RestPoll => "rest_poll",
+                        TradeProvenance::ActivityWs => "activity_ws",
+                    }
+                    .to_owned(),
+                    age_secs: 0,
+                    reason: "scope_dropped_before_dispatch".to_owned(),
+                    recorded_at_unix: dispatch_stale_at.unix_timestamp(),
+                };
+                self.commit_no_copy_or_rollback(
+                    &trade,
+                    &leader_row,
+                    &disposition,
+                    &rb,
+                    Some(&signal.market_id),
+                    decision_evidence.as_ref(),
+                );
+                return;
+            }
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "scope drop dispatch check failed");
+                self.intake_stopped = true;
+                return;
+            }
+        }
+
         let dispatch_id = match self.stage_dispatch_if_targeted(
             &signal,
             &observation,
@@ -4679,7 +4718,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             age_secs = disposition.age_secs,
             budget_secs = self.copy_latency_budget_secs,
             reason = %disposition.reason,
-            "stale observation: admitted with no-copy disposition"
+            "decision terminated with no-copy disposition"
         );
         #[cfg(feature = "scenario")]
         if self.take_scenario_fault(|h| &h.fail_next_no_copy_commit) {
@@ -5180,11 +5219,12 @@ mod tests {
                     crate::paper_recovery::PaperLog::open(fixture.dir.path().join("paper.log"))
                         .unwrap();
                 let base = "https://offline.invalid";
+                let condition = continuation.facts.market_id.to_string();
                 let mids = serde_json::to_vec(&serde_json::json!([{
-                    "conditionId": "new", "outcomePrices": "[\"0.5\",\"0.5\"]", "clobTokenIds": "[\"123\",\"456\"]"
+                    "conditionId": condition, "outcomePrices": "[\"0.5\",\"0.5\"]", "clobTokenIds": "[\"123\",\"456\"]"
                 }])).unwrap();
                 let mid_fetcher = FixtureFetcher::new(HashMap::from([(
-                    format!("{base}/markets?condition_ids=new&limit=500"),
+                    format!("{base}/markets?condition_ids={condition}&limit=500"),
                     mids,
                 )]));
                 let mut owner = Orchestrator::new(
@@ -5239,7 +5279,7 @@ mod tests {
                 let economic =
                     seal_test_economic(fixture.metadata_receipt, fixture.metadata_receipt);
                 let mut market = pe_source_polymarket_public::LiveMarketEvidence {
-                    condition_id: PolymarketConditionId("new".to_owned()),
+                    condition_id: PolymarketConditionId(condition),
                     ordered_outcome_token_ids: [
                         PolymarketTokenId("123".to_owned()),
                         PolymarketTokenId("456".to_owned()),
@@ -5332,8 +5372,8 @@ mod tests {
                 let connection =
                     rusqlite::Connection::open(harness._fixture.dir.path().join("paper.db"))
                         .unwrap();
-                let grouped = neg_risk && group.is_some();
-                connection.execute_batch(if insert_failure || !grouped {
+                let group_gate = neg_risk && group.is_some();
+                connection.execute_batch(if insert_failure || !group_gate {
                     "CREATE TRIGGER fail_group_insert BEFORE INSERT ON meta WHEN NEW.key LIKE 'neg_risk_group:%' BEGIN SELECT RAISE(FAIL, 'group insert failed'); END;"
                 } else {
                     "ALTER TABLE settled_markets RENAME TO unavailable_settled_markets;"
@@ -5370,7 +5410,7 @@ mod tests {
                         |row| row.get(0),
                     )
                     .unwrap();
-                assert_eq!(mappings, usize::from(grouped && !insert_failure));
+                assert_eq!(mappings, usize::from(group_gate && !insert_failure));
             }
         }
 
@@ -5382,7 +5422,7 @@ mod tests {
                 assert!(futures::poll!(&mut decision).is_pending());
                 assert_eq!(
                     *harness.books.started.lock().unwrap(),
-                    [("new".to_owned(), "123".to_owned())]
+                    [(harness.trade.market_id.to_string(), "123".to_owned())]
                 );
                 harness.release.take().unwrap().send(()).unwrap();
                 decision.await;

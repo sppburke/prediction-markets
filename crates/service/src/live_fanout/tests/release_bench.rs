@@ -246,6 +246,7 @@ async fn strict_order_events(
         account,
         evaluated_at,
         Some(copy_policy),
+        None,
     )
     .await;
     if separate_conditions {

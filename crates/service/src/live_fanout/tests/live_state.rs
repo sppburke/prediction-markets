@@ -193,6 +193,8 @@ async fn live_state_matches_strict_financial_and_recovery_file_oracles() {
             activity_ws_enabled: true,
             copy_latency_budget_secs: 120,
         }),
+        0,
+        None,
     )
     .await;
     let account = pending.account_id.clone();
@@ -458,6 +460,8 @@ async fn live_state_missing_admission_sources_are_retried_after_source_append() 
             activity_ws_enabled: true,
             copy_latency_budget_secs: 120,
         }),
+        0,
+        None,
     )
     .await;
     let account = &pending.account_id;

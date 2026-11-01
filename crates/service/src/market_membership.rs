@@ -13,6 +13,17 @@ const HTTP_ATTEMPT_SOURCE_ID: &str = "polymarket.clob.market.http";
 const HTTP_ATTEMPT_SCHEMA_VERSION: u32 = 1;
 const HTTP_ATTEMPT_PARSER_VERSION: u32 = 1;
 
+/// Record the CLOB group id independently of the neg-risk flag.
+pub fn record_market_membership(
+    paper_state: &PaperStateDb,
+    condition_id: &str,
+    group_id: Option<&str>,
+) -> Result<()> {
+    paper_state
+        .record_market_group(condition_id, group_id.unwrap_or_default())
+        .context("retry CLOB membership recording")
+}
+
 /// Acquire and record one market's membership. Every error permits a later retry.
 pub async fn fetch_market_membership(
     paper_state: &PaperStateDb,
@@ -97,17 +108,9 @@ pub async fn fetch_market_membership(
             market.condition_id.as_deref() == Some(condition_id),
             "retry CLOB body naming another market"
         );
-        if market.neg_risk == Some(true) {
-            market
-                .neg_risk_market_id
-                .context("retry CLOB market without neg-risk group")?
-        } else {
-            String::new()
-        }
+        market.neg_risk_market_id.unwrap_or_default()
     };
-    paper_state
-        .record_market_group(condition_id, &value)
-        .context("retry CLOB membership recording")?;
+    record_market_membership(paper_state, condition_id, Some(&value))?;
     paper_state
         .market_membership(condition_id)?
         .context("recorded CLOB membership missing")
@@ -131,6 +134,16 @@ mod tests {
                 200,
                 json!({"condition_id":"market", "neg_risk":true,"neg_risk_market_id":"group"}),
                 Some(MarketMembership::Grouped("group".to_owned())),
+            ),
+            (
+                200,
+                json!({"condition_id":"market", "neg_risk_market_id":"group"}),
+                Some(MarketMembership::Grouped("group".to_owned())),
+            ),
+            (
+                200,
+                json!({"condition_id":"market", "neg_risk":true}),
+                Some(MarketMembership::Ungrouped),
             ),
             (
                 200,
@@ -158,7 +171,6 @@ mod tests {
                 json!({"condition_id":"another", "neg_risk":false}),
                 None,
             ),
-            (200, json!({"condition_id":"market", "neg_risk":true}), None),
         ] {
             let temp = tempfile::tempdir().unwrap();
             let state = PaperStateDb::open(&temp.path().join("paper.db")).unwrap();
