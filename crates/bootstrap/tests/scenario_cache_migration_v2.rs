@@ -16034,6 +16034,11 @@ async fn history_v3_ever_infra_wallet_is_never_read_rescanned_or_repaired() {
             receipt(&unmarked, 4, WALLET).map(|receipt| receipt.0),
             Some(i64::try_from(retained.len()).unwrap())
         );
+        // Finalizing scans the stored history against its chain and certifies it again, drops kept.
+        finalize_cache_v2_unbound(&unmarked, None, FRESH_END + 5).unwrap();
+        let recertified = certificate_row(&unmarked, WALLET);
+        assert_eq!(recertified[0], rusqlite::types::Value::Integer(4));
+        assert_eq!(recertified[3..], certificate[3..]);
         assert_eq!(query_values(&unmarked, &history), retained);
     }
 }
@@ -16120,6 +16125,11 @@ async fn history_v3_frozen_repair_of_a_later_infra_wallet_keeps_its_history() {
         receipt(&unmarked, 4, WALLET).map(|receipt| receipt.0),
         Some(i64::try_from(retained.len()).unwrap())
     );
+    // Finalizing scans the stored history against its chain and certifies it again, drops kept.
+    finalize_cache_v2_unbound(&unmarked, None, FRESH_END + 5).unwrap();
+    let recertified = certificate_row(&unmarked, WALLET);
+    assert_eq!(recertified[0], rusqlite::types::Value::Integer(4));
+    assert_eq!(recertified[3..], certificate[3..]);
     assert_eq!(query_values(&unmarked, &history), retained);
 }
 
