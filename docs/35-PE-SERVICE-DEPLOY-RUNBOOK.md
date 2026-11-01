@@ -1305,10 +1305,12 @@ SQL apply.
      AND (to_batch_id IS NULL OR <new-batch-id> < to_batch_id) ORDER BY group_id;
    ```
 
-   Compare the full sorted result with the saved request's `neg_risk_group_ids` before proceeding.
+   Compare the full sorted result with the saved request's `neg_risk_group_ids`.
    Span presence alone is insufficient: an unchanged group need not open a new span. Resume from
    verified SQL/publisher identities and a matching published request; do not republish a different
-   set under an old key. An empty table supplies no published group evidence to the service.
+   set under an old key. An empty table supplies no published group evidence to the service, so
+   step 3 needs only the SQL: the service imports the group set at runtime when a batch first
+   carries one, and this readback is recorded whenever that batch arrives.
 
 3. **Guarded service swap.** Stage and prepare the checkpoint while the old unit serves; record
    reviewed revision, desired/staged/installed/running hashes and helper hashes through steps 1–3
