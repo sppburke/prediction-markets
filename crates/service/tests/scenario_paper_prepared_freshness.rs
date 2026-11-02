@@ -10445,3 +10445,325 @@ async fn scope_drop_import_waits_for_bucket_dispatch_prepared_then_excludes_late
     assert_eq!(h.prepared_count(), 3);
     assert_eq!(h.paper.list_fills().unwrap().len(), 3);
 }
+
+/// Later REST anomalies cannot rewrite a frame's frozen authority, gate or first entry.
+/// New frames still pass through the dropped-scope admission guard.
+#[tokio::test(start_paused = true)]
+async fn frame_authority_survives_rest_anomaly_restart_and_qualification_selection() {
+    let mut h = Harness::new().await;
+    let recorded = h.record(1).await;
+    h.attempt(&recorded, at());
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    h.deliver_frame(&recorded, |_| {}).await;
+    let before = h.terminal(&recorded);
+    let gate = h.paper.entry_gate_result(&recorded.id).unwrap();
+    let history = h.paper.gate_history().unwrap();
+    let unconsumed = h.record(2).await;
+    h.paper
+        .record_market_group(&unconsumed.admission.market.condition_id.0, "")
+        .unwrap();
+    let mut rows: Value = serde_json::from_slice(&recorded.activity).unwrap();
+    rows[0]["usdcSize"] = json!("4.212e-7");
+    let mut unconsumed_rows: Value = serde_json::from_slice(&unconsumed.activity).unwrap();
+    unconsumed_rows[0]["timestamp"] = json!(EPOCH);
+    unconsumed_rows[0]["usdcSize"] = json!("4.212e-7");
+    rows.as_array_mut()
+        .unwrap()
+        .push(unconsumed_rows[0].clone());
+    let mut gamma: Value = serde_json::from_slice(&recorded.gamma).unwrap();
+    let unconsumed_gamma: Value = serde_json::from_slice(&unconsumed.gamma).unwrap();
+    gamma
+        .as_array_mut()
+        .unwrap()
+        .push(unconsumed_gamma[0].clone());
+    let anomaly = Recorded {
+        activity: serde_json::to_vec(&rows).unwrap(),
+        gamma: serde_json::to_vec(&gamma).unwrap(),
+        ..recorded.clone()
+    };
+    h.poll_source(&anomaly, None, at()).await;
+    let drops = h.paper.wallet_scope_drops(&wallet(), EPOCH).unwrap();
+    assert_eq!(drops.len(), 2);
+    assert_eq!(drops[0].cause, "unrepresentable_activity_row");
+    assert_eq!(drops[0].scope_id, recorded.admission.market.condition_id.0);
+    assert_eq!(h.terminal(&recorded), before);
+    assert_eq!(h.paper.entry_gate_result(&recorded.id).unwrap(), gate);
+    assert_eq!(h.paper.gate_history().unwrap(), history);
+    assert!(h.paper.leader_positions().unwrap().is_empty());
+    assert!(
+        h.paper
+            .scope_is_dropped(
+                &wallet(),
+                &unconsumed.admission.market.condition_id.0,
+                None,
+                unconsumed.epoch,
+            )
+            .unwrap()
+    );
+    h.restart_frames().await;
+    assert_eq!(h.terminal(&recorded), before);
+    assert_eq!(h.paper.entry_gate_result(&recorded.id).unwrap(), gate);
+    assert_eq!(h.paper.gate_history().unwrap(), history);
+    replay_decision_pending(&h.terminal(&recorded)).unwrap();
+    let later = h.rest_counterpart(&unconsumed, |row| {
+        row["transactionHash"] = json!("0xnew-frame-in-dropped-scope");
+    });
+    h.hooks
+        .financial_clock_unix
+        .store(EPOCH + 1, Ordering::SeqCst);
+    h.empty_frontier(EPOCH).await;
+    let admitted_at = at() + time::Duration::seconds(1);
+    h.attempt(&later, admitted_at);
+    let frontiers: pe_service::frame_admission::FrontierCollection =
+        serde_json::from_value(h.paper.feed_history_frontiers().unwrap()).unwrap();
+    assert!(frontiers.frontiers.iter().any(|frontier| {
+        frontier.wallet == wallet()
+            && frontier.current(
+                admitted_at,
+                admitted_at,
+                h.health.lock().unwrap().poll_round_stale_secs,
+                None,
+            )
+    }));
+    let market = pe_core_types::MarketId(pe_core_types::VenueMarketId(
+        later.admission.market.condition_id.0.clone(),
+    ));
+    assert!(
+        h.paper
+            .market_history_record(&wallet(), &market)
+            .unwrap()
+            .is_none()
+    );
+    assert!(h.paper.entry_gate_result(&later.id).unwrap().is_none());
+    let fills = h.paper.list_fills().unwrap();
+    // Without the REST drop this is a fresh, positive-share BUY Entry in a new market:
+    // history is unconsumed, the wallet is ready, the frontier is current, and admission
+    // evidence is valid. The first frame's consumed market cannot explain this refusal.
+    let receipt = h.append_frame(&later, |_| {}).await;
+    h.control
+        .as_ref()
+        .unwrap()
+        .send(OrchestratorControl::ActivityFrameDecision { receipt })
+        .await
+        .unwrap();
+    h.boot_barrier_readonly().await;
+    assert!(h.paper.decision_pending_for(&later.id).unwrap().is_none());
+    assert!(h.paper.entry_gate_result(&later.id).unwrap().is_none());
+    assert!(
+        h.paper
+            .market_history_record(&wallet(), &market)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(h.paper.gate_history().unwrap(), history);
+    assert_eq!(h.paper.decision_pending_history().unwrap(), [before]);
+    assert_eq!(h.prepared_count(), 1);
+    assert_eq!(h.paper.list_fills().unwrap(), fills);
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{report:?}");
+    assert_eq!(report.replay.fills, 1);
+}
+
+/// A frame already admitted or staged retains its authority but dispatch observes the new drop.
+#[tokio::test(start_paused = true)]
+async fn frame_rest_anomaly_before_dispatch_preserves_authority_and_stops_paper_submission() {
+    use pe_service::orchestrator::FrameCrashBoundary;
+    for boundary in [FrameCrashBoundary::FrameCommit, FrameCrashBoundary::Staging] {
+        let mut h = Harness::new().await;
+        let recorded = h.record(1).await;
+        h.arm();
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        *h.hooks.frame_crash_boundary.lock().unwrap() = Some(boundary);
+        let receipt = h.append_frame(&recorded, |_| {}).await;
+        h.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::ActivityFrameDecision { receipt })
+            .await
+            .unwrap();
+        assert!(h.task.take().unwrap().await.unwrap().is_err());
+        h.stop().await;
+        let before = h.terminal(&recorded);
+        let staged = (boundary == FrameCrashBoundary::Staging).then(|| {
+            h.paper
+                .pending_dispatch_seeds()
+                .unwrap()
+                .remove(0)
+                .dispatch_id
+        });
+        let gate = h.paper.entry_gate_result(&recorded.id).unwrap();
+        let history = h.paper.gate_history().unwrap();
+        let mut rows: Value = serde_json::from_slice(&recorded.activity).unwrap();
+        rows[0]["usdcSize"] = json!("4.212e-7");
+        h.commit_anomaly_drop(&serde_json::to_vec(&rows).unwrap())
+            .await;
+        assert_eq!(
+            h.terminal(&recorded).frozen_inputs_json,
+            before.frozen_inputs_json
+        );
+        h.hooks.age_clock.lock().unwrap().clear();
+        h.hooks.admission_artifacts.lock().unwrap().clear();
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.boot_barrier().await;
+        let terminal = h.terminal(&recorded);
+        assert_eq!(terminal.frozen_inputs_json, before.frozen_inputs_json);
+        assert_eq!(
+            terminal.terminal_disposition.as_deref(),
+            Some("no_copy:scope_dropped_before_dispatch"),
+            "{boundary:?}: {terminal:?}"
+        );
+        assert_eq!(h.paper.entry_gate_result(&recorded.id).unwrap(), gate);
+        assert_eq!(h.paper.gate_history().unwrap(), history);
+        assert_eq!(h.prepared_count(), 0);
+        assert!(h.paper.list_fills().unwrap().is_empty());
+        if let Some(dispatch_id) = staged {
+            let seed = h.paper.dispatch_seed(&dispatch_id).unwrap().unwrap();
+            assert_eq!(
+                seed.paper_outcome.as_deref(),
+                Some("no_fill:scope_dropped_before_dispatch")
+            );
+        } else {
+            assert!(!h.paper.dispatch_seeds_exist().unwrap());
+        }
+        replay_decision_pending(&terminal).unwrap();
+        h.stop().await;
+    }
+}
+
+impl Harness {
+    async fn commit_anomaly_drop(&self, payload: &[u8]) {
+        self.paper.record_scope_drop_boundary(EPOCH).unwrap();
+        let page = self
+            .source
+            .append(EnvelopeIn {
+                source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                schema_version: pe_service::trade_poller::ACTIVITY_POLL_ANOMALY_PAGE_SCHEMA_VERSION,
+                parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                observed_at: SourceTimestamp(at()),
+                received_at: ReceivedAt(at()),
+                content_type: ContentType::Json,
+                payload: payload.to_vec(),
+            })
+            .await
+            .unwrap();
+        let (read, anomalies) =
+            support::producer_shaped_anomaly_read(wallet(), payload, EPOCH, EPOCH, page);
+        for anomaly in &anomalies {
+            self.paper
+                .record_market_group(&anomaly.condition_id.as_ref().unwrap().0, "")
+                .unwrap();
+        }
+        let commitment = self
+            .source
+            .append(EnvelopeIn {
+                source_id: SourceId(
+                    pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned(),
+                ),
+                schema_version: pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+                parser_version: pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+                observed_at: SourceTimestamp(at()),
+                received_at: ReceivedAt(at()),
+                content_type: ContentType::Json,
+                payload: read.commitment_payload.clone(),
+            })
+            .await
+            .unwrap();
+        let mut context = support::read_context(&read, commitment, EPOCH);
+        let pages =
+            serde_json::from_str::<Value>(&read.decision_inputs_json).unwrap()["pages"].clone();
+        context.verified_read = Some(Arc::new(
+            pe_service::bucket_commit::verified_read_for_routing(
+                commitment,
+                wallet(),
+                EPOCH,
+                std::slice::from_ref(&read.page),
+                &serde_json::from_value::<Vec<_>>(pages).unwrap(),
+                &self.index,
+            )
+            .unwrap(),
+        ));
+        let mut engine = BucketCommitEngine::load(
+            self.paper.clone(),
+            build_leader_ledger(&self.paper).unwrap(),
+        )
+        .unwrap()
+        .with_source_receipt_index(self.index.clone());
+        engine
+            .commit(
+                pe_service::bucket_commit::ReconciliationBucket {
+                    wallet: wallet(),
+                    source_epoch: EPOCH,
+                    aggregates: read.aggregates,
+                    anomalies,
+                },
+                &context,
+                FrozenDecisionBasis {
+                    win_rate_p: self.probability,
+                    bankroll: CASH,
+                },
+            )
+            .unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn retired_rest_anomaly_releases_fallback_barrier_and_copies_later_healthy_buy() {
+    let mut h = Harness::new().await;
+    let original = h.record(1).await;
+    let healthy = h.record(2).await;
+    h.start_frames();
+    let receipt = h.deliver_frame(&original, |_| {}).await;
+    assert!(
+        h.paper
+            .decision_pending_for(&original.id)
+            .unwrap()
+            .is_none()
+    );
+    h.assert_frame_barrier(Some(&[receipt])).await;
+    let mut rows: Value = serde_json::from_slice(&original.activity).unwrap();
+    rows[0]["usdcSize"] = json!("4.212e-7");
+    let anomaly = Recorded {
+        activity: serde_json::to_string(&rows)
+            .unwrap()
+            .replace("\"4.212e-7\"", "4.212e-7")
+            .into_bytes(),
+        ..original.clone()
+    };
+    h.paper
+        .record_market_group(&original.admission.market.condition_id.0, "")
+        .unwrap();
+    h.poll_source(&anomaly, None, at()).await;
+    assert!(h.paper.activity_observation_retired(receipt).unwrap());
+    assert!(
+        h.paper
+            .decision_pending_for(&original.id)
+            .unwrap()
+            .is_none()
+    );
+    h.assert_frame_barrier(Some(&[])).await;
+    let later = at() + time::Duration::seconds(1);
+    let mut healthy = h.rest_counterpart(&healthy, |row| row["timestamp"] = json!(EPOCH + 1));
+    healthy.epoch = EPOCH + 1;
+    h.hooks
+        .financial_clock_unix
+        .store(EPOCH + 1, Ordering::SeqCst);
+    h.attempt(&healthy, later);
+    h.poll_source(&healthy, None, later).await;
+    assert_eq!(
+        h.terminal(&healthy).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    assert_eq!(h.prepared_count(), 1);
+    assert_eq!(h.paper.list_fills().unwrap().len(), 1);
+    let terminal = h.terminal(&healthy);
+    h.restart_frames().await;
+    assert_eq!(h.terminal(&healthy), terminal);
+    h.assert_frame_barrier(Some(&[])).await;
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{report:?}");
+    assert_eq!(report.replay.fills, 1);
+}

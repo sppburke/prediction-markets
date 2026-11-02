@@ -4994,6 +4994,7 @@ fn produced_decision_continuation(
         observation_provenance: HashMap::from([(source_trade_id.clone(), provenance)]),
         no_copy_dispositions: HashMap::new(),
         identity_overrides: HashMap::new(),
+        scope_tokens: HashMap::new(),
         identity_unresolved: HashSet::new(),
         restamp_twins: Default::default(),
         history_status: Some(pe_paper_state::WalletHistoryStatusRecord {
@@ -5076,7 +5077,7 @@ fn produced_observation_index(
     }
     .url("https://data-api.polymarket.com");
     let raw_hash = bound.raw_payload_hash.to_hex().to_string();
-    let page = pe_source_polymarket_public::ReconciliationPageEvidence {
+    let mut page = pe_source_polymarket_public::ReconciliationPageEvidence {
         anomalies: Vec::new(),
         request_url: request_url.clone(),
         bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
@@ -5100,9 +5101,21 @@ fn produced_observation_index(
         received_at: bound.received_at.clone(),
         transport: pe_source_polymarket_public::ActivityTransport::Replay,
     };
-    let window =
-        pe_source_polymarket_public::parse_activity_response(&bound.payload, wallet, &context)
-            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    let (generation, acceptance) = crate::bucket_commit::activity_page_generation(
+        &bound.source_id.0,
+        bound.schema_version,
+        bound.parser_version,
+        &bound.content_type,
+    )
+    .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    let window = pe_source_polymarket_public::parse_activity_response_with_acceptance(
+        &bound.payload,
+        wallet,
+        &context,
+        acceptance,
+    )
+    .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    page.anomalies = window.anomalies.clone();
     let aggregate = window
         .aggregates()
         .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?
@@ -5124,17 +5137,16 @@ fn produced_observation_index(
     );
     let continuation = continuation?;
     // This legacy log harness retains historical schema-2 page envelopes.
-    let continuation =
-        if bound.schema_version == pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION {
-            DecisionContinuationV3::new(
-                continuation.facts,
-                continuation.observed_source_receipt,
-                continuation.page_occurrences,
-                None,
-            )
-        } else {
-            continuation
-        };
+    let continuation = if generation == crate::bucket_commit::PageGeneration::Historical {
+        DecisionContinuationV3::new(
+            continuation.facts,
+            continuation.observed_source_receipt,
+            continuation.page_occurrences,
+            None,
+        )
+    } else {
+        continuation
+    };
     Ok(HashMap::from([(source_trade_id, (continuation, None))]))
 }
 
@@ -12464,6 +12476,7 @@ mod tests {
                     raw.facts.provenance,
                 )]),
                 no_copy_dispositions: HashMap::new(),
+                scope_tokens: HashMap::new(),
                 identity_overrides: if corrected {
                     HashMap::from([(
                         source_trade_id.clone(),
@@ -20875,6 +20888,177 @@ mod tests {
                 }
             }
         }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn local_activity_anomaly_drop_stops_approved_live_submission() {
+        let app = Router::new().route("/positions", get(empty_positions));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut snapshot = armed_snapshot("acct");
+        snapshot.fetched_at_unix = Some(now.unix_timestamp());
+        let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
+        state.config.data_base_url = format!("http://{address}");
+        state.clock = Arc::new(move || now);
+        let (pending, prepared) = stage_recoverable_approved_with_copy_policy(
+            &mut state,
+            now,
+            None,
+            true,
+            Some(crate::bucket_commit::PaperFreshnessPolicy {
+                activity_ws_enabled: true,
+                copy_latency_budget_secs: 120,
+            }),
+            1,
+            None,
+        )
+        .await;
+        let condition = pending.admission.economic.market.condition_id.0.clone();
+        db.record_market_group(&condition, "").unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!([{
+            "proxyWallet":WalletAddress([0xaa;20]), "timestamp":now.unix_timestamp(),
+            "conditionId":condition, "type":"TRADE", "transactionHash":"local-anomaly",
+            "size":"1", "usdcSize":"4.212e-7", "price":"0.5", "side":"BUY",
+            "asset":"asset", "outcomeIndex":0, "outcome":"Yes", "isCombo":false,
+        }]))
+        .unwrap();
+        let page = pe_source_polymarket_public::parse_activity_response_with_acceptance(
+            &payload,
+            WalletAddress([0xaa; 20]),
+            &pe_source_polymarket_public::ActivityParseContext {
+                source_id: SourceId(crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                observed_at: SourceTimestamp(now),
+                received_at: ReceivedAt(now),
+                transport: pe_source_polymarket_public::ActivityTransport::Rest,
+            },
+            pe_source_polymarket_public::ActivityRowAcceptance::StrictWithAnomalies,
+        )
+        .unwrap();
+        let evidence = pe_source_polymarket_public::ReconciliationPageEvidence {
+            request_url: "fixture".to_owned(),
+            bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
+                start: None,
+                end: now.unix_timestamp(),
+            }),
+            partition: None,
+            offset: 0,
+            row_count: 1,
+            canonical_page_hash: pe_source_polymarket_public::canonical_page_hash(&payload)
+                .unwrap(),
+            raw_page_hash: blake3::hash(&payload).to_hex().to_string(),
+            received_at: ReceivedAt(now),
+            schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+            anomalies: page.anomalies.clone(),
+        };
+        let context = crate::bucket_commit::BucketDecisionContext {
+            verified_read: None,
+            applied_configuration: state.config.runtime_config.snapshot().as_ref().clone(),
+            decision_inputs_json:
+                serde_json::json!({"fixed_end":now.unix_timestamp(),"pages":[evidence]}).to_string(),
+            page_occurrences: Vec::new(),
+            observed_source_receipts: HashMap::new(),
+            reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),
+            read_commitment: None,
+            signal_config: pe_copy_signal_engine::SignalConfig::default(),
+            copy_eligible: false,
+            bracket_commit: true,
+            recorded_at_unix: now.unix_timestamp(),
+            observation_provenance: HashMap::new(),
+            no_copy_dispositions: HashMap::new(),
+            identity_overrides: HashMap::new(),
+            scope_tokens: HashMap::new(),
+            identity_unresolved: Default::default(),
+            restamp_twins: Default::default(),
+            history_status: None,
+        };
+        let mut engine = crate::bucket_commit::BucketCommitEngine::load(
+            db.clone(),
+            crate::paper_recovery::build_leader_ledger(&db).unwrap(),
+        )
+        .unwrap();
+        engine
+            .commit(
+                crate::bucket_commit::ReconciliationBucket {
+                    wallet: WalletAddress([0xaa; 20]),
+                    source_epoch: now.unix_timestamp(),
+                    aggregates: Vec::new(),
+                    anomalies: page.anomalies,
+                },
+                &context,
+                crate::bucket_commit::FrozenDecisionBasis {
+                    win_rate_p: pe_core_types::Probability::ZERO,
+                    bankroll: Decimal::ZERO,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            db.wallet_scope_drops(&WalletAddress([0xaa; 20]), now.unix_timestamp())
+                .unwrap()[0]
+                .cause,
+            "unrepresentable_activity_row"
+        );
+        let current_account_state =
+            venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
+        let account_binding = account_binding_fixture(
+            &pending.account_id,
+            "0x1111111111111111111111111111111111111111",
+        );
+        let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+        let posts = Arc::new(AtomicUsize::new(0));
+        let venue = RecoveryPostVenue {
+            client: reqwest::Client::new(),
+            order_url: String::new(),
+            prepared,
+            observed_at: now,
+            prepare_clock_millis: None,
+            prepare_advance_millis: 0,
+            post_attempts: Some(posts.clone()),
+            post_deadlines: None,
+            account_state: Some(current_account_state.clone()),
+            prepare_barrier: None,
+            prepare_release: None,
+        };
+        let result = resume_approved_with_venue(
+            &mut state,
+            &target,
+            pending,
+            RecoveryExecutionState {
+                mode: LiveModeSnapshot {
+                    requested: LiveControlMode::LiveTiny,
+                    effective: LiveControlMode::LiveTiny,
+                },
+                account_state: current_account_state,
+                binding: CredentialBindingIdentity {
+                    version: 1,
+                    key_id: "key".to_owned(),
+                },
+            },
+            Some(now + time::Duration::seconds(120)),
+            &RecoveryVenueContext {
+                venue: &venue,
+                account_binding: &account_binding,
+                custody_wallet: "0x1111111111111111111111111111111111111111",
+            },
+            || now,
+        )
+        .await
+        .unwrap();
+        assert!(!result);
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+        assert_eq!(target.state, "terminal");
+        assert_eq!(
+            target.terminal_reason.as_deref(),
+            Some("scope_dropped_before_post")
+        );
+        let events = replay_live_account(&state, &AccountId::new("acct").unwrap()).unwrap();
+        assert_eq!(events.iter().filter(|event| matches!(&event.payload, LiveJournalPayload::OrderPreparationFailed(audit) if audit.failure == pe_execution_core::LiveOrderPreparationFailure::PrePostScopeDropped)).count(), 1);
         server.abort();
     }
 

@@ -10,7 +10,7 @@
 )]
 
 #[path = "mod.rs"]
-mod support;
+pub mod support;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -2083,6 +2083,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
                 )]),
                 no_copy_dispositions: HashMap::new(),
                 identity_overrides: HashMap::new(),
+                scope_tokens: HashMap::new(),
                 identity_unresolved: Default::default(),
                 restamp_twins: Default::default(),
                 history_status: Some(WalletHistoryStatusRecord {
@@ -2097,7 +2098,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
             let financial_commit_started = Instant::now();
             control_tx
                 .send(OrchestratorControl::CommitActivityBucket {
-                    aggregates: vec![aggregate],
+                    aggregates: vec![aggregate].into(),
                     context: Arc::new(context),
                     committed,
                 })
@@ -3328,7 +3329,7 @@ impl BracketFinancialHarness {
         let (committed, ack) = oneshot::channel();
         self.control
             .send(OrchestratorControl::CommitActivityBucket {
-                aggregates: read.aggregates,
+                aggregates: read.aggregates.into(),
                 context: Arc::new(context),
                 committed,
             })
@@ -3397,7 +3398,7 @@ impl BracketFinancialHarness {
         let (committed, ack) = oneshot::channel();
         self.control
             .send(OrchestratorControl::CommitActivityBucket {
-                aggregates: read.aggregates,
+                aggregates: read.aggregates.into(),
                 context: Arc::new(context),
                 committed,
             })
@@ -3438,7 +3439,7 @@ impl BracketFinancialHarness {
         let (committed, ack) = oneshot::channel();
         self.control
             .send(OrchestratorControl::CommitActivityBucket {
-                aggregates: read.aggregates,
+                aggregates: read.aggregates.into(),
                 context: Arc::new(context),
                 committed,
             })

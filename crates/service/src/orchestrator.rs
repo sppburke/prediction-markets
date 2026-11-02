@@ -1933,7 +1933,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     // (#544 review round 3): capture is linearized against a
                     // concurrent refresh, and later watchlist/bankroll moves
                     // cannot change what a resumed continuation decides.
-                    let (frozen_basis, policy) = self.freeze_decision_basis(&aggregates);
+                    let (frozen_basis, policy) = self.freeze_decision_basis(&aggregates.aggregates);
                     let result = self.bucket_engine.commit_with_freshness_policy(
                         aggregates,
                         context.as_ref(),
@@ -1954,7 +1954,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     // Scenario/unit construction may omit the production writer lock;
                     // those harnesses have no competing membership writer to
                     // linearize the basis capture against.
-                    let (frozen_basis, policy) = self.freeze_decision_basis(&aggregates);
+                    let (frozen_basis, policy) = self.freeze_decision_basis(&aggregates.aggregates);
                     let result = self.bucket_engine.commit_with_freshness_policy(
                         aggregates,
                         context.as_ref(),

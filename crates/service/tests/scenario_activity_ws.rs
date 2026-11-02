@@ -1727,7 +1727,7 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
     control_tx
         .send(
             pe_service::orchestrator_control::OrchestratorControl::CommitActivityBucket {
-                aggregates,
+                aggregates: aggregates.into(),
                 context: Arc::new(BucketDecisionContext {
                     verified_read: None,
                     applied_configuration: runtime,
@@ -1751,6 +1751,7 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
                     )]),
                     no_copy_dispositions: HashMap::new(),
                     identity_overrides: HashMap::new(),
+                    scope_tokens: HashMap::new(),
                     identity_unresolved: HashSet::new(),
                     restamp_twins: Default::default(),
                     history_status: None,
@@ -2073,7 +2074,7 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
     control_tx
         .send(
             pe_service::orchestrator_control::OrchestratorControl::CommitActivityBucket {
-                aggregates,
+                aggregates: aggregates.into(),
                 context: Arc::new(BucketDecisionContext {
                     verified_read: None,
                     applied_configuration: runtime,
@@ -2097,6 +2098,7 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
                     )]),
                     no_copy_dispositions: HashMap::new(),
                     identity_overrides: HashMap::new(),
+                    scope_tokens: HashMap::new(),
                     identity_unresolved: HashSet::new(),
                     restamp_twins: Default::default(),
                     history_status: None,

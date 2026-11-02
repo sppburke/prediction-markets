@@ -7284,6 +7284,7 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
             "scenario-return",
             sink.clone(),
             resolver,
+            state.clone(),
         )
         .with_clock(Arc::new(move || now));
         let preparer = AdmissionPreparer::with_validator(tx.clone(), state.clone(), validator);

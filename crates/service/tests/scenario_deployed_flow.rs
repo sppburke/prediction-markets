@@ -42,8 +42,9 @@ async fn deployed_flow_replays_exactly_and_qualifies() {
 mod rollout;
 mod support;
 
-/// PASS: real-process imports, local scope anomalies and retained revisions preserve healthy
-/// copying and survive restart with identical state; sealed CLI replay reproduces the run.
+/// PASS: the real process admits an unrepresentable activity row with a local drop and copies
+/// that wallet's later healthy-market BUY. Imports, local anomalies and retained revisions survive
+/// restart with identical state; sealed CLI replay reproduces the run exactly.
 #[tokio::test]
 async fn paper_service_scope_drops_restart_and_replay() {
     rollout::scope_drops().await;

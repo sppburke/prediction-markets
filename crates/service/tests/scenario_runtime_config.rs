@@ -525,7 +525,7 @@ async fn in_process_bucket_continuation_uses_its_frozen_config() {
     let (committed, acknowledgement) = oneshot::channel();
     control_tx
         .send(OrchestratorControl::CommitActivityBucket {
-            aggregates: read.aggregates,
+            aggregates: read.aggregates.into(),
             context: Arc::new(context),
             committed,
         })
@@ -786,7 +786,7 @@ async fn dynamic_continuation_load_failure_stops_the_orchestrator() {
     let (committed, acknowledgement) = oneshot::channel();
     control
         .send(OrchestratorControl::CommitActivityBucket {
-            aggregates: read.aggregates,
+            aggregates: read.aggregates.into(),
             context: Arc::new(context),
             committed,
         })

@@ -26,19 +26,21 @@ use pe_paper_state::{
 use pe_position_ledger::{
     AppliedEffect, DropCause, LedgerEffect, LedgerEffectDocumentError, LedgerError, LedgerMutation,
     MarketLookup, PositionLedger, Scope, ScopeKind, ScopeLookups, SecondRecord, SecondVerdict,
-    TradeDecision, WalletFenceCause, classify_complete_second, classify_scoped_second,
-    resolve_problem_scope,
+    TradeDecision, WalletFenceCause, classify_complete_second, resolve_problem_scope,
 };
 use pe_source_polymarket_public::{
     ACTIVITY_MAX_OFFSET, ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate,
-    ActivityAggregationError, ActivityParseContext, ActivityTransport, ActivityType,
-    NormalizedActivity, PolymarketEndpoint, RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence,
-    aggregate_activity_rows, canonical_page_hash, parse_activity_response,
-    parse_activity_trade_observation,
+    ActivityAggregationError, ActivityParseContext, ActivityRowAcceptance, ActivityRowAnomaly,
+    ActivityTransport, ActivityType, NormalizedActivity, PolymarketEndpoint,
+    RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence, aggregate_activity_rows,
+    canonical_page_hash, parse_activity_trade_observation,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+#[cfg(test)]
+use pe_source_polymarket_public::parse_activity_response;
 
 use crate::entry_gate::{CopyEntryGate, CopyEntryGateConfig};
 use crate::position_seeder::{AnchorInstall, ledger_capture};
@@ -95,6 +97,74 @@ impl PaperFreshnessPolicy {
     }
 }
 
+/// Complete activity for one wallet and source second, including non-executable evidence.
+#[derive(Debug, Clone)]
+pub struct ReconciliationBucket {
+    pub wallet: WalletAddress,
+    pub source_epoch: i64,
+    pub aggregates: Vec<ActivityAggregate>,
+    pub anomalies: Vec<ActivityRowAnomaly>,
+}
+
+impl ReconciliationBucket {
+    pub fn from_read(
+        wallet: WalletAddress,
+        read: &pe_source_polymarket_public::CompleteActivityRead,
+    ) -> Result<Vec<Self>, pe_source_polymarket_public::ActivityReadError> {
+        let mut buckets = BTreeMap::new();
+        for aggregates in read.buckets()? {
+            let Some(first) = aggregates.first() else {
+                continue;
+            };
+            let source_epoch = first.source_time.0.unix_timestamp();
+            buckets.insert(
+                source_epoch,
+                Self {
+                    wallet,
+                    source_epoch,
+                    aggregates,
+                    anomalies: Vec::new(),
+                },
+            );
+        }
+        for anomaly in &read.anomalies {
+            let source_epoch = anomaly.source_time.0.unix_timestamp();
+            buckets
+                .entry(source_epoch)
+                .or_insert_with(|| Self {
+                    wallet,
+                    source_epoch,
+                    aggregates: Vec::new(),
+                    anomalies: Vec::new(),
+                })
+                .anomalies
+                .push(anomaly.clone());
+        }
+        Ok(buckets.into_values().collect())
+    }
+}
+
+/// Aggregate-only input; an empty vector yields an empty bucket that `commit` rejects as `Empty`.
+impl From<Vec<ActivityAggregate>> for ReconciliationBucket {
+    fn from(aggregates: Vec<ActivityAggregate>) -> Self {
+        let (wallet, source_epoch) = aggregates
+            .first()
+            .map(|first| {
+                (
+                    first.group_id.components().wallet,
+                    first.source_time.0.unix_timestamp(),
+                )
+            })
+            .unwrap_or((WalletAddress([0; 20]), 0));
+        Self {
+            wallet,
+            source_epoch,
+            aggregates,
+            anomalies: Vec::new(),
+        }
+    }
+}
+
 /// Decision inputs already read before the atomic bucket commit.
 #[derive(Debug, Clone)]
 pub struct BucketDecisionContext {
@@ -123,6 +193,8 @@ pub struct BucketDecisionContext {
     pub no_copy_dispositions: HashMap<SourceTradeId, NoCopyDisposition>,
     /// Venue-verified identities keyed by the immutable raw activity group.
     pub identity_overrides: HashMap<SourceTradeId, IdentityOverride>,
+    /// Token identities established by the same recorded metadata acquisition as aggregate identities.
+    pub scope_tokens: HashMap<PolymarketTokenId, IdentityOverride>,
     /// Groups whose token identity could not be established by venue metadata.
     pub identity_unresolved: HashSet<SourceTradeId>,
     /// Unseen outcome restamps whose unattributed member rows reproduce a recorded group.
@@ -445,11 +517,13 @@ struct CompleteActivityReadWire {
 
 struct CompleteActivitySegment {
     rows: Vec<pe_source_polymarket_public::NormalizedActivity>,
+    anomalies: Vec<ActivityRowAnomaly>,
     children: Vec<(Option<i64>, i64)>,
 }
 
 // Retained only for one observation operation or shared read.
 struct VerifiedActivityRead {
+    anomalies: Vec<ActivityRowAnomaly>,
     aggregates: Vec<ActivityAggregate>,
     commitment: Option<ActivityReadCommitment>,
     bindings: VerifiedObservationBindings,
@@ -1178,18 +1252,19 @@ impl ActivityReadVerification<'_> {
             Ok(source)
         };
         let lookup = &mut cached_lookup;
-        let rows = self.reconstruct_rich_activity_read(fixed_end, pages, lookup)?;
+        let (rows, anomalies) = self.reconstruct_rich_activity_read(fixed_end, pages, lookup)?;
         let aggregates = aggregate_activity_rows(&rows).map_err(|error| {
             complete_activity_read_error(format!(
                 "complete activity read aggregate failed: {error}"
             ))
         })?;
         let bindings = if let Some(commitment) = &commitment {
-            self.verify_observation_bindings(commitment, &rows, &aggregates, lookup)?
+            self.verify_observation_bindings(commitment, &rows, &anomalies, &aggregates, lookup)?
         } else {
             VerifiedObservationBindings::default()
         };
         Ok(VerifiedActivityRead {
+            anomalies,
             aggregates,
             commitment,
             bindings,
@@ -1334,6 +1409,7 @@ impl ActivityReadVerification<'_> {
         &self,
         commitment: &ActivityReadCommitment,
         rows: &[NormalizedActivity],
+        anomalies: &[ActivityRowAnomaly],
         aggregates: &[ActivityAggregate],
         lookup: &mut L,
     ) -> Result<VerifiedObservationBindings, CompleteActivityReadError>
@@ -1569,6 +1645,9 @@ impl ActivityReadVerification<'_> {
                 if candidates.len() != 1
                     || candidates[0].group_id != target.group_id
                     || original.asset.is_none()
+                    || anomalies
+                        .iter()
+                        .any(|anomaly| anomaly_matches_observation(anomaly, original))
                 {
                     return Err(complete_activity_read_error(
                         "binding history identity is absent or ambiguous",
@@ -1727,7 +1806,7 @@ impl ActivityReadVerification<'_> {
         fixed_end: i64,
         pages: &[ReconciliationPageEvidence],
         lookup: &mut L,
-    ) -> Result<Vec<pe_source_polymarket_public::NormalizedActivity>, CompleteActivityReadError>
+    ) -> Result<(Vec<NormalizedActivity>, Vec<ActivityRowAnomaly>), CompleteActivityReadError>
     where
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
@@ -1816,6 +1895,7 @@ impl ActivityReadVerification<'_> {
                 ));
             }
             let mut segment_rows = Vec::new();
+            let mut segment_anomalies = Vec::new();
             for (occurrence, page) in pages {
                 let source = complete_activity_page(occurrence, self.version, lookup)?;
                 let actual_canonical_hash =
@@ -1834,23 +1914,36 @@ impl ActivityReadVerification<'_> {
                     self.wallet,
                     "complete activity read page parse failed",
                 )?;
-                if u32::try_from(window.rows.len()).ok() != Some(page.row_count)
-                    || window.rows.iter().any(|row| {
-                        let timestamp = row.source_time.0.unix_timestamp();
-                        timestamp > end || start.is_some_and(|start| timestamp <= start)
-                    })
+                if u32::try_from(window.rows.len() + window.anomalies.len()).ok()
+                    != Some(page.row_count)
+                    || window.anomalies != page.anomalies
+                    || window
+                        .rows
+                        .iter()
+                        .map(|row| &row.source_time)
+                        .chain(window.anomalies.iter().map(|anomaly| &anomaly.source_time))
+                        .any(|source_time| {
+                            let timestamp = source_time.0.unix_timestamp();
+                            timestamp > end || start.is_some_and(|start| timestamp <= start)
+                        })
                 {
                     return Err(complete_activity_read_error(
                         "complete activity read page differs from its bounds/count",
                     ));
                 }
                 segment_rows.extend(window.rows);
+                segment_anomalies.extend(window.anomalies);
             }
 
             let children = if saturated {
                 let boundary = segment_rows
                     .iter()
                     .map(|row| row.source_time.0.unix_timestamp())
+                    .chain(
+                        segment_anomalies
+                            .iter()
+                            .map(|anomaly| anomaly.source_time.0.unix_timestamp()),
+                    )
                     .min()
                     .ok_or_else(|| {
                         complete_activity_read_error(
@@ -1884,17 +1977,23 @@ impl ActivityReadVerification<'_> {
                 (start, end),
                 CompleteActivitySegment {
                     rows: segment_rows,
+                    anomalies: segment_anomalies,
                     children,
                 },
             );
         }
 
         validate_complete_activity_segment_graph(fixed_end, &segments)?;
-        Ok(segments
+        let mut rows = Vec::new();
+        let mut anomalies = Vec::new();
+        for segment in segments
             .into_values()
             .filter(|segment| segment.children.is_empty())
-            .flat_map(|segment| segment.rows)
-            .collect())
+        {
+            rows.extend(segment.rows);
+            anomalies.extend(segment.anomalies);
+        }
+        Ok((rows, anomalies))
     }
 }
 
@@ -1995,7 +2094,7 @@ impl DecisionContinuationV3 {
                 envelope.parser_version,
                 &envelope.content_type,
             )
-            .is_ok_and(|generation| generation.matches_continuation(self.version))
+            .is_ok_and(|(generation, _)| generation.matches_continuation(self.version))
                 || envelope.raw_payload_hash.to_hex().as_str() != page.raw_hash
             {
                 return Err(DecisionContinuationError::SourceReceiptMismatch {
@@ -2166,7 +2265,7 @@ pub(crate) fn activity_page_generation(
     schema_version: u32,
     parser_version: u32,
     content_type: &ContentType,
-) -> Result<PageGeneration, CompleteActivityReadError> {
+) -> Result<(PageGeneration, ActivityRowAcceptance), CompleteActivityReadError> {
     if source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
         || parser_version != ACTIVITY_PARSER_VERSION
         || *content_type != ContentType::Json
@@ -2176,8 +2275,18 @@ pub(crate) fn activity_page_generation(
         ));
     }
     match schema_version {
-        ACTIVITY_SCHEMA_VERSION => Ok(PageGeneration::Historical),
-        crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION => Ok(PageGeneration::Committed),
+        ACTIVITY_SCHEMA_VERSION => Ok((PageGeneration::Historical, ActivityRowAcceptance::Strict)),
+        crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION => {
+            Ok((PageGeneration::Committed, ActivityRowAcceptance::Strict))
+        }
+        crate::trade_poller::ACTIVITY_POLL_ANOMALY_PAGE_SCHEMA_VERSION => Ok((
+            PageGeneration::Committed,
+            ActivityRowAcceptance::StrictWithAnomalies,
+        )),
+        crate::trade_poller::ACTIVITY_HISTORICAL_ANOMALY_PAGE_SCHEMA_VERSION => Ok((
+            PageGeneration::Historical,
+            ActivityRowAcceptance::StrictWithAnomalies,
+        )),
         _ => Err(complete_activity_read_error(
             "complete activity read page has the wrong source contract",
         )),
@@ -2446,8 +2555,30 @@ pub struct VerifiedCommitment {
     pub(crate) full_history: bool,
     pub(crate) transaction_aggregates: HashMap<String, Vec<usize>>,
     pub(crate) binding_indices: HashMap<(pe_core_types::EventSeq, blake3::Hash), usize>,
+    pub(crate) anomalies: Vec<ActivityRowAnomaly>,
+    pub(crate) anomaly_counterparts: Vec<AnomalyCounterpart>,
     pub(crate) aggregates: Vec<ActivityAggregate>,
     pub(crate) identities: HashMap<SourceTradeId, MarketOutcomeId>,
+}
+
+/// An in-memory, non-executable counterpart selection. The bucket owner authenticates it
+/// against the complete read and stream receipt before committing its exact retirement.
+#[derive(Debug, Clone)]
+pub(crate) struct AnomalyCounterpart {
+    pub(crate) stream_receipt: AppendReceipt,
+    pub(crate) stream_group_id: SourceTradeId,
+    pub(crate) anomaly: ActivityRowAnomaly,
+}
+
+pub(crate) fn anomaly_matches_observation(
+    anomaly: &ActivityRowAnomaly,
+    original: &pe_source_polymarket_public::SourceActivityGroupComponents,
+) -> bool {
+    anomaly.wallet == original.wallet
+        && anomaly.activity_type == original.activity_type
+        && anomaly.transaction_hash == original.transaction_hash
+        && anomaly.asset == original.asset
+        && anomaly.side == original.side
 }
 
 fn index_bindings(
@@ -2533,6 +2664,8 @@ pub fn verified_read_for_routing(
             .commitment
             .and_then(|commitment| commitment.bindings)
             .unwrap_or_default(),
+        anomalies: read.anomalies,
+        anomaly_counterparts: Vec::new(),
         aggregates: read.aggregates,
         restamp_pairs: read.bindings.restamp_pairs,
         identities: read.bindings.identities,
@@ -2603,6 +2736,8 @@ fn verified_commitment_bindings_at_depth(
             binding_indices: HashMap::new(),
             transaction_aggregates: HashMap::new(),
             aggregates: Vec::new(),
+            anomalies: Vec::new(),
+            anomaly_counterparts: Vec::new(),
             identities: HashMap::new(),
         });
     }
@@ -2655,6 +2790,8 @@ fn verified_commitment_bindings_at_depth(
                 .is_some_and(|bounds| bounds.start == Some(0) && bounds.end == commitment.fixed_end)
         }),
         transaction_aggregates: index_transactions(&read.aggregates),
+        anomalies: read.anomalies,
+        anomaly_counterparts: Vec::new(),
         aggregates: read.aggregates,
     })
 }
@@ -2705,7 +2842,7 @@ where
             "complete activity read page receipt lookup failed: {error}"
         ))
     })?;
-    let generation = activity_page_generation(
+    let (generation, _) = activity_page_generation(
         &source.source_id,
         source.schema_version,
         source.parser_version,
@@ -2792,12 +2929,18 @@ pub(crate) fn verify_binding_identity(
         })
 }
 
-fn parse_complete_activity_page(
+pub(crate) fn parse_complete_activity_page(
     source: &CompleteActivityPage,
     wallet: WalletAddress,
     error_context: &str,
 ) -> Result<pe_source_polymarket_public::NormalizedActivityWindow, CompleteActivityReadError> {
-    parse_activity_response(
+    let (_, acceptance) = activity_page_generation(
+        &source.source_id,
+        source.schema_version,
+        source.parser_version,
+        &source.content_type,
+    )?;
+    pe_source_polymarket_public::parse_activity_response_with_acceptance(
         &source.payload,
         wallet,
         &ActivityParseContext {
@@ -2806,6 +2949,7 @@ fn parse_complete_activity_page(
             received_at: source.received_at.clone(),
             transport: ActivityTransport::Replay,
         },
+        acceptance,
     )
     .map_err(|error| complete_activity_read_error(format!("{error_context}: {error}")))
 }
@@ -3328,6 +3472,7 @@ pub(crate) mod continuation_validation_tests {
             observation_provenance: HashMap::new(),
             no_copy_dispositions: HashMap::new(),
             identity_overrides: HashMap::new(),
+            scope_tokens: HashMap::new(),
             identity_unresolved: HashSet::new(),
             restamp_twins: Default::default(),
             history_status: Some(WalletHistoryStatusRecord {
@@ -3820,13 +3965,34 @@ impl BucketCommitEngine {
             Some(stale)
                 if !group_disposed && stale.retention_epoch != Some(index.retention_epoch()) =>
             {
-                let mut fresh =
+                let mut fresh = if !stale
+                    .anomaly_counterparts
+                    .iter()
+                    .any(|counterpart| counterpart.stream_receipt == receipt)
+                {
                     verified_commitment_bindings_with_lookup(stale.receipt, &mut |receipt| {
                         index
                             .source_envelope(receipt)
                             .map(CompleteActivityPage::from)
                     })
-                    .map_err(|error| error.to_string())?;
+                } else {
+                    let frontier = stale
+                        .frontier
+                        .as_ref()
+                        .ok_or_else(|| "anomaly read frontier missing".to_owned())?;
+                    verified_read_for_routing(
+                        stale.receipt,
+                        stale.wallet,
+                        frontier.fixed_end,
+                        &frontier.page_occurrences,
+                        &frontier.pages,
+                        index,
+                    )
+                }
+                .map_err(|error| error.to_string())?;
+                fresh
+                    .anomaly_counterparts
+                    .clone_from(&stale.anomaly_counterparts);
                 fresh.retention_epoch = Some(index.retention_epoch());
                 reauthenticated = fresh;
                 Some(&reauthenticated)
@@ -4715,7 +4881,7 @@ impl BucketCommitEngine {
     /// discarded before any classification, gate, or financial work.
     pub fn commit(
         &mut self,
-        aggregates: Vec<ActivityAggregate>,
+        aggregates: impl Into<ReconciliationBucket>,
         context: &BucketDecisionContext,
         frozen_basis: FrozenDecisionBasis,
     ) -> Result<BucketCommitResult, BucketCommitError> {
@@ -4725,11 +4891,20 @@ impl BucketCommitEngine {
     /// Commit current decisions with the policy captured by the orchestrator at the bucket boundary.
     pub fn commit_with_freshness_policy(
         &mut self,
-        mut aggregates: Vec<ActivityAggregate>,
+        bucket: impl Into<ReconciliationBucket>,
         context: &BucketDecisionContext,
         frozen_basis: FrozenDecisionBasis,
         paper_freshness_policy: Option<PaperFreshnessPolicy>,
     ) -> Result<BucketCommitResult, BucketCommitError> {
+        let ReconciliationBucket {
+            wallet,
+            source_epoch,
+            mut aggregates,
+            anomalies,
+        } = bucket.into();
+        if aggregates.is_empty() && anomalies.is_empty() {
+            return Err(BucketCommitError::Empty);
+        }
         let mut context = context.clone();
         // Without a source index there is no retention boundary to compare against.
         if let Some(read) = context.verified_read.as_ref()
@@ -4737,13 +4912,29 @@ impl BucketCommitEngine {
             && read.retention_epoch != Some(index.retention_epoch())
         {
             let epoch = index.retention_epoch();
-            let mut fresh =
+            let mut fresh = if anomalies.is_empty() {
                 verified_commitment_bindings_with_lookup(read.receipt, &mut |receipt| {
                     index
                         .source_envelope(receipt)
                         .map(CompleteActivityPage::from)
                 })
-                .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+            } else {
+                let frontier = read.frontier.as_ref().ok_or_else(|| {
+                    BucketCommitError::Invariant("anomaly read frontier missing".to_owned())
+                })?;
+                verified_read_for_routing(
+                    read.receipt,
+                    read.wallet,
+                    frontier.fixed_end,
+                    &frontier.page_occurrences,
+                    &frontier.pages,
+                    index,
+                )
+            }
+            .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+            fresh
+                .anomaly_counterparts
+                .clone_from(&read.anomaly_counterparts);
             if index.retention_epoch() != epoch {
                 return Err(BucketCommitError::Invariant(
                     "retention epoch changed during decision verification".to_owned(),
@@ -4755,6 +4946,14 @@ impl BucketCommitEngine {
         if let Some(read) = context.verified_read.as_ref()
             && (context.read_commitment
                 != Some(ActivityReadCommitmentReceipt::BindingsV2(read.receipt))
+                || wallet != read.wallet
+                || anomalies
+                    .iter()
+                    .any(|anomaly| !read.anomalies.contains(anomaly))
+                || read.anomaly_counterparts.iter().any(|counterpart| {
+                    counterpart.anomaly.source_time.0.unix_timestamp() == source_epoch
+                        && !anomalies.contains(&counterpart.anomaly)
+                })
                 || aggregates
                     .iter()
                     .any(|aggregate| aggregate.group_id.components().wallet != read.wallet))
@@ -4830,12 +5029,12 @@ impl BucketCommitEngine {
             }
         }
         let context = &context;
-        let first = aggregates.first().ok_or(BucketCommitError::Empty)?;
-        let wallet = first.group_id.components().wallet;
-        let source_epoch = first.source_time.0.unix_timestamp();
+
         if aggregates.iter().any(|aggregate| {
             aggregate.group_id.components().wallet != wallet
                 || aggregate.source_time.0.unix_timestamp() != source_epoch
+        }) || anomalies.iter().any(|anomaly| {
+            anomaly.wallet != wallet || anomaly.source_time.0.unix_timestamp() != source_epoch
         }) {
             return Err(BucketCommitError::MixedBucket);
         }
@@ -4919,7 +5118,8 @@ impl BucketCommitEngine {
         let AmbiguityEffects {
             drops: mut scope_drops,
             retirements: observation_retirements,
-        } = ambiguity_effects(context, wallet)?;
+        } = self.observation_effects(context, wallet, source_epoch)?;
+        let mut anomaly_drops = Vec::new();
         let changed: Vec<_> = aggregates
             .iter()
             .zip(&durable)
@@ -4932,7 +5132,8 @@ impl BucketCommitEngine {
             })
             .map(|(aggregate, _)| aggregate.group_id.key().clone())
             .collect();
-        if self.fences.contains(&wallet)
+        if anomalies.is_empty()
+            && self.fences.contains(&wallet)
             && let Some(trigger) = changed
                 .iter()
                 .find(|id| !context.identity_unresolved.contains(*id))
@@ -4944,6 +5145,7 @@ impl BucketCommitEngine {
                 wallet,
                 source_epoch,
                 (WalletFenceCause::RevisedAggregate, trigger.clone()),
+                anomaly_drops,
                 context,
             );
         }
@@ -4966,6 +5168,65 @@ impl BucketCommitEngine {
                 _ => true,
             });
             lookups.check(true)?;
+        }
+        if !anomalies.is_empty() {
+            let dropped = durable_drops
+                .iter()
+                .map(|drop| Scope {
+                    kind: if drop.scope_kind == "event" {
+                        ScopeKind::Event
+                    } else {
+                        ScopeKind::Market
+                    },
+                    id: drop.scope_id.clone(),
+                })
+                .collect();
+            // Resolve non-executable evidence before any all-stored or coverage shortcut.
+            let anomaly_second = pe_position_ledger::classify_scoped_second_with_anomalies(
+                complete_read_entry_policy(current_paper_version(complete_read_version(
+                    context.read_commitment,
+                ))),
+                &self.ledger,
+                wallet,
+                source_epoch,
+                &[],
+                &anomalies,
+                &dropped,
+                false,
+                context.reconstruction_quality,
+                &context.signal_config,
+                true,
+                &|_| false,
+                &lookups,
+            )?;
+            lookups.check(true)?;
+            for problem in anomaly_second.problems {
+                anomaly_drops.push(anomaly_scope_drop_record(
+                    wallet,
+                    source_epoch,
+                    context.recorded_at_unix,
+                    &problem,
+                    &anomalies,
+                    &correlation_inputs,
+                )?);
+            }
+        }
+        if !anomalies.is_empty()
+            && self.fences.contains(&wallet)
+            && let Some(trigger) = changed
+                .iter()
+                .find(|id| !context.identity_unresolved.contains(*id))
+                .or_else(|| changed.first())
+        {
+            return self.commit_changed_bucket_fence(
+                &aggregates,
+                &durable,
+                wallet,
+                source_epoch,
+                (WalletFenceCause::RevisedAggregate, trigger.clone()),
+                anomaly_drops,
+                context,
+            );
         }
         let seen = durable.iter().filter(|state| state.is_some()).count();
         if seen == aggregates.len() && changed.is_empty() {
@@ -4998,11 +5259,19 @@ impl BucketCommitEngine {
                     wallet,
                     source_epoch,
                     coverage.anchor_seq.is_some(),
-                    Vec::new(),
+                    anomaly_drops,
                     context,
                 );
             }
-            if !observation_retirements.is_empty() {
+            let new_work = !observation_retirements.is_empty()
+                || (!anomalies.is_empty()
+                    && (!anomaly_drops.is_empty()
+                        || self
+                            .paper_state
+                            .cursor(&wallet)?
+                            .is_none_or(|cursor| cursor < source_epoch)));
+            if new_work {
+                scope_drops.extend(anomaly_drops);
                 let bucket = ActivityBucketCommit {
                     scope_drops,
                     observation_retirements,
@@ -5031,10 +5300,11 @@ impl BucketCommitEngine {
                 dispositions: BTreeMap::new(),
                 pending: Vec::new(),
                 newly_fenced: None,
-                already_committed: true,
+                already_committed: anomalies.is_empty() || !new_work,
             });
         }
-        if observation_retirements.is_empty()
+        if anomalies.is_empty()
+            && observation_retirements.is_empty()
             && changed.is_empty()
             && aggregates
                 .iter()
@@ -5092,6 +5362,7 @@ impl BucketCommitEngine {
                 &recordable_mutations,
                 wallet,
                 source_epoch,
+                anomaly_drops,
                 context,
             );
         }
@@ -5115,7 +5386,7 @@ impl BucketCommitEngine {
                 wallet,
                 source_epoch,
                 false,
-                Vec::new(),
+                anomaly_drops,
                 context,
             );
         }
@@ -5128,7 +5399,7 @@ impl BucketCommitEngine {
                     wallet,
                     source_epoch,
                     coverage.anchor_seq.is_some(),
-                    Vec::new(),
+                    anomaly_drops,
                     context,
                 );
             }
@@ -5145,6 +5416,7 @@ impl BucketCommitEngine {
                     wallet,
                     source_epoch,
                     (WalletFenceCause::LateEqualSecondGroup, trigger),
+                    anomaly_drops,
                     context,
                 );
             }
@@ -5160,6 +5432,7 @@ impl BucketCommitEngine {
                         source_epoch,
                         error.fence_cause(),
                         aggregate.group_id.key().clone(),
+                        anomaly_drops,
                         context,
                     );
                 }
@@ -5169,6 +5442,7 @@ impl BucketCommitEngine {
                 &recordable_mutations,
                 wallet,
                 source_epoch,
+                anomaly_drops,
                 context,
             );
         }
@@ -5326,13 +5600,15 @@ impl BucketCommitEngine {
             })
             .collect::<Vec<_>>();
         let classify = |drops: &BTreeSet<Scope>, certified| {
-            classify_scoped_second(
+            pe_position_ledger::classify_scoped_second_with_anomalies(
                 complete_read_entry_policy(current_paper_version(complete_read_version(
                     context.read_commitment,
                 ))),
                 &self.ledger,
                 wallet,
+                source_epoch,
                 &classification_records,
+                &anomalies,
                 drops,
                 certified,
                 context.reconstruction_quality,
@@ -5364,6 +5640,7 @@ impl BucketCommitEngine {
                 || has_problem(without_drops),
         )?;
         if covered && changed.is_empty() {
+            scope_drops.extend(anomaly_drops);
             let covered_mutations = recordable_mutations
                 .iter()
                 .map(|mutation| {
@@ -5397,6 +5674,7 @@ impl BucketCommitEngine {
                         wallet,
                         source_epoch,
                         (error.fence_cause(), mutation_error_id(&error)),
+                        anomaly_drops,
                         context,
                     );
                 }
@@ -5406,6 +5684,7 @@ impl BucketCommitEngine {
                     source_epoch,
                     error.fence_cause(),
                     mutation_error_id(&error),
+                    anomaly_drops,
                     context,
                 );
             }
@@ -5430,14 +5709,25 @@ impl BucketCommitEngine {
             tracing::warn!(wallet = %wallet, source_trade_id = %id, activity_type = kind.as_str(), "wallet scope problem ignored");
         }
         for problem in &scoped.problems {
-            scope_drops.push(scope_drop_record(
-                wallet,
-                source_epoch,
-                context.recorded_at_unix,
-                problem.scope.clone(),
-                drop_cause_string(problem.cause),
-                &problem.trigger,
-            )?);
+            scope_drops.push(if problem.cause == DropCause::Unrepresentable {
+                anomaly_scope_drop_record(
+                    wallet,
+                    source_epoch,
+                    context.recorded_at_unix,
+                    problem,
+                    &anomalies,
+                    &decision_inputs,
+                )?
+            } else {
+                scope_drop_record(
+                    wallet,
+                    source_epoch,
+                    context.recorded_at_unix,
+                    problem.scope.clone(),
+                    drop_cause_string(problem.cause),
+                    &problem.trigger,
+                )?
+            });
         }
         let mutations = scoped.apply;
         let trade_decisions = scoped.decisions;
@@ -5456,6 +5746,7 @@ impl BucketCommitEngine {
                         wallet,
                         source_epoch,
                         (error.fence_cause(), mutation_error_id(&error)),
+                        anomaly_drops,
                         context,
                     );
                 }
@@ -5465,6 +5756,7 @@ impl BucketCommitEngine {
                     source_epoch,
                     error.fence_cause(),
                     mutation_error_id(&error),
+                    anomaly_drops,
                     context,
                 );
             }
@@ -5722,18 +6014,86 @@ impl BucketCommitEngine {
         })
     }
 
+    fn observation_effects(
+        &self,
+        context: &BucketDecisionContext,
+        wallet: WalletAddress,
+        source_epoch: i64,
+    ) -> Result<AmbiguityEffects, BucketCommitError> {
+        let mut effects = ambiguity_effects(context, wallet)?;
+        let Some(read) = &context.verified_read else {
+            return Ok(effects);
+        };
+        for counterpart in read.anomaly_counterparts.iter().filter(|counterpart| {
+            counterpart.anomaly.source_time.0.unix_timestamp() == source_epoch
+        }) {
+            let index = self.frame_source_index.as_ref().ok_or_else(|| {
+                BucketCommitError::Invariant("anomaly counterpart source index missing".to_owned())
+            })?;
+            let source = index
+                .source_envelope(counterpart.stream_receipt)
+                .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+            if source.source_id.0 != crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
+                || source.schema_version != ACTIVITY_SCHEMA_VERSION
+                || source.parser_version != ACTIVITY_PARSER_VERSION
+                || source.content_type != ContentType::Json
+                || counterpart.stream_receipt.sequence >= read.receipt.sequence
+            {
+                return Err(BucketCommitError::Invariant(
+                    "anomaly counterpart stream contract differs".to_owned(),
+                ));
+            }
+            let observation = parse_activity_trade_observation(&source.payload)
+                .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+            let original = observation.group_id.components();
+            if read.wallet != wallet
+                || observation.wallet != wallet
+                || observation.group_id.key() != &counterpart.stream_group_id
+                || !anomaly_matches_observation(&counterpart.anomaly, original)
+                || !read.anomalies.contains(&counterpart.anomaly)
+                || read
+                    .anomalies
+                    .iter()
+                    .filter(|anomaly| anomaly_matches_observation(anomaly, original))
+                    .count()
+                    != 1
+                || read.aggregates.iter().any(|aggregate| {
+                    let candidate = aggregate.group_id.components();
+                    candidate.wallet == original.wallet
+                        && candidate.activity_type == original.activity_type
+                        && candidate.transaction_hash == original.transaction_hash
+                        && candidate.asset == original.asset
+                        && candidate.side == original.side
+                })
+            {
+                return Err(BucketCommitError::Invariant(
+                    "anomaly counterpart is absent or ambiguous".to_owned(),
+                ));
+            }
+            if !self
+                .paper_state
+                .activity_observation_retired(counterpart.stream_receipt)?
+            {
+                effects.retirements.push((counterpart.stream_receipt, true));
+            }
+        }
+        Ok(effects)
+    }
+
     fn commit_late_group_reanchor(
         &mut self,
         aggregates: &[ActivityAggregate],
         resolved_mutations: &[LedgerMutation],
         wallet: WalletAddress,
         source_epoch: i64,
+        anomaly_drops: Vec<WalletScopeDrop>,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
         let AmbiguityEffects {
-            drops: scope_drops,
+            drops: mut scope_drops,
             retirements: observation_retirements,
-        } = ambiguity_effects(context, wallet)?;
+        } = self.observation_effects(context, wallet, source_epoch)?;
+        scope_drops.extend(anomaly_drops);
         const DISPOSITION: &str = "reanchor_required_late_group";
         let trigger = aggregates
             .iter()
@@ -5900,7 +6260,9 @@ impl BucketCommitEngine {
         self.paper_state
             .commit_activity_bucket(&ActivityBucketCommit {
                 scope_drops: scope_drops.clone(),
-                observation_retirements: ambiguity_effects(context, wallet)?.retirements,
+                observation_retirements: self
+                    .observation_effects(context, wallet, source_epoch)?
+                    .retirements,
                 unfenced_revisions: Vec::new(),
                 scope_drop_boundary_unix: None,
                 wallet,
@@ -6056,6 +6418,7 @@ impl BucketCommitEngine {
         (gate_results, history, outcomes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_fence(
         &mut self,
         aggregates: &[ActivityAggregate],
@@ -6063,12 +6426,14 @@ impl BucketCommitEngine {
         source_epoch: i64,
         cause: WalletFenceCause,
         trigger: SourceTradeId,
+        anomaly_drops: Vec<WalletScopeDrop>,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
         let AmbiguityEffects {
-            drops: scope_drops,
+            drops: mut scope_drops,
             retirements: observation_retirements,
-        } = ambiguity_effects(context, wallet)?;
+        } = self.observation_effects(context, wallet, source_epoch)?;
+        scope_drops.extend(anomaly_drops);
         let proof = json!({"bucket_epoch": source_epoch, "cause": cause.as_str()});
         let mut dispositions = BTreeMap::new();
         let mut records = Vec::with_capacity(aggregates.len());
@@ -6144,6 +6509,7 @@ impl BucketCommitEngine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_changed_bucket_fence(
         &mut self,
         aggregates: &[ActivityAggregate],
@@ -6151,12 +6517,14 @@ impl BucketCommitEngine {
         wallet: WalletAddress,
         source_epoch: i64,
         fence: (WalletFenceCause, SourceTradeId),
+        anomaly_drops: Vec<WalletScopeDrop>,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
         let AmbiguityEffects {
-            drops: scope_drops,
+            drops: mut scope_drops,
             retirements: observation_retirements,
-        } = ambiguity_effects(context, wallet)?;
+        } = self.observation_effects(context, wallet, source_epoch)?;
+        scope_drops.extend(anomaly_drops);
         let (cause, trigger) = fence;
         let already_fenced = self.fences.contains(&wallet);
         let proof_json =
@@ -6262,12 +6630,14 @@ impl BucketCommitEngine {
         mutations: &[LedgerMutation],
         wallet: WalletAddress,
         source_epoch: i64,
+        anomaly_drops: Vec<WalletScopeDrop>,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
         let AmbiguityEffects {
-            drops: scope_drops,
+            drops: mut scope_drops,
             retirements: observation_retirements,
-        } = ambiguity_effects(context, wallet)?;
+        } = self.observation_effects(context, wallet, source_epoch)?;
+        scope_drops.extend(anomaly_drops);
         let known: Vec<_> = mutations
             .iter()
             .filter(|mutation| {
@@ -6457,6 +6827,13 @@ impl ScopeLookups for NotingScopeLookups<'_> {
     }
 
     fn token_market(&self, token_id: &str) -> Option<String> {
+        if let Some(identity) = self
+            .context
+            .scope_tokens
+            .get(&PolymarketTokenId(token_id.to_owned()))
+        {
+            return Some(identity.verified.market().to_string());
+        }
         self.aggregates.iter().find_map(|aggregate| {
             let parts = aggregate.group_id.components();
             if parts.asset.as_ref().is_none_or(|token| token.0 != token_id)
@@ -6554,6 +6931,47 @@ fn ambiguity_effects(
         retirements.push((observation.receipt, true));
     }
     Ok(AmbiguityEffects { drops, retirements })
+}
+
+fn anomaly_scope_drop_record(
+    wallet: WalletAddress,
+    second: i64,
+    recorded_at_unix: i64,
+    problem: &pe_position_ledger::ScopeProblem,
+    anomalies: &[ActivityRowAnomaly],
+    inputs: &Value,
+) -> Result<WalletScopeDrop, BucketCommitError> {
+    let anomaly = anomalies
+        .iter()
+        .find(|anomaly| {
+            pe_position_ledger::activity_row_anomaly_trigger(anomaly) == problem.trigger
+        })
+        .ok_or_else(|| BucketCommitError::Invariant("anomaly trigger missing".to_owned()))?;
+    let pages: CompleteActivityReadWire = serde_json::from_value(inputs.clone())?;
+    let pages = pages.pages.as_deref().unwrap_or_default();
+    let page = pages
+        .iter()
+        .find(|page| {
+            page.anomalies.contains(anomaly)
+                && !pages.iter().any(|other| {
+                    other.bounds == page.bounds
+                        && other.offset == ACTIVITY_MAX_OFFSET
+                        && other.row_count == RECONCILIATION_PAGE_LIMIT
+                })
+        })
+        .ok_or_else(|| BucketCommitError::Invariant("anomaly page proof missing".to_owned()))?;
+    let mut drop = scope_drop_record(
+        wallet,
+        second,
+        recorded_at_unix,
+        problem.scope.clone(),
+        drop_cause_string(problem.cause),
+        &problem.trigger,
+    )?;
+    drop.proof_json = serde_json::to_string(
+        &json!({"page_raw_hash":page.raw_page_hash,"page_row_index":anomaly.row_index,"raw_row_hash":anomaly.raw_row_hash,"kind":anomaly.kind}),
+    )?;
+    Ok(drop)
 }
 
 fn scope_drop_record(
@@ -8151,6 +8569,7 @@ pub(crate) mod continuation_v3_tests {
             observation_provenance: HashMap::new(),
             no_copy_dispositions: HashMap::new(),
             identity_overrides: HashMap::new(),
+            scope_tokens: HashMap::new(),
             identity_unresolved: HashSet::new(),
             restamp_twins: HashSet::new(),
             history_status: None,
@@ -8301,6 +8720,87 @@ pub(crate) mod continuation_v3_tests {
                 ));
             } else {
                 assert!(result.unwrap_err().contains("erased"), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_binding_verification_counts_anomalies_only_without_an_exact_aggregate() {
+        for case in ["corrected", "opposite_side", "exact"] {
+            let fixture = binding_fixture(if case == "exact" { "exact" } else { "valid" });
+            let continuation = &fixture.continuation;
+            let receipt = continuation.read_commitment.unwrap();
+            let mut pages: Vec<ReconciliationPageEvidence> =
+                serde_json::from_value(continuation.facts.decision_inputs["pages"].clone())
+                    .unwrap();
+            let page_receipt = continuation.page_occurrences[0].receipt;
+            let mut page =
+                CompleteActivityPage::from(fixture.index.source_envelope(page_receipt).unwrap());
+            let mut rows: Vec<Value> = serde_json::from_slice(&page.payload).unwrap();
+            let mut anomaly = rows[0].clone();
+            anomaly["usdcSize"] = json!("4.212e-7");
+            if case == "opposite_side" {
+                anomaly["side"] = json!("SELL");
+            }
+            rows.push(anomaly);
+            page.payload = serde_json::to_vec(&rows).unwrap();
+            page.schema_version = crate::trade_poller::ACTIVITY_POLL_ANOMALY_PAGE_SCHEMA_VERSION;
+            let parsed =
+                parse_complete_activity_page(&page, continuation.facts.wallet, "fixture").unwrap();
+            pages[0].row_count = 2;
+            pages[0].raw_page_hash = blake3::hash(&page.payload).to_hex().to_string();
+            pages[0].canonical_page_hash = canonical_page_hash(&page.payload).unwrap();
+            pages[0].anomalies = parsed.anomalies;
+            let mut occurrences = continuation.page_occurrences.clone();
+            occurrences[0].raw_hash = pages[0].raw_page_hash.clone();
+            let mut commitment =
+                CompleteActivityPage::from(fixture.index.source_envelope(receipt).unwrap());
+            let mut bindings =
+                serde_json::from_slice::<ActivityReadCommitment>(&commitment.payload)
+                    .unwrap()
+                    .bindings
+                    .unwrap();
+            bindings[0].page_raw_hash = pages[0].raw_page_hash.clone();
+            commitment.payload = activity_read_commitment_payload_v2(
+                continuation.facts.wallet,
+                100,
+                &occurrences,
+                &pages,
+                &bindings,
+            )
+            .unwrap();
+            let inputs = json!({"fixed_end":100,"pages":pages});
+            let verifier = ActivityReadVerification {
+                version: 7,
+                counterpart_depth: 0,
+                binding_filter: None,
+                wallet: continuation.facts.wallet,
+                decision_inputs: &inputs,
+                page_occurrences: &occurrences,
+                read_commitment: Some(receipt),
+            };
+            let result = verifier.reconstruct_verified_activity_read(&mut |requested| {
+                if requested == receipt {
+                    Ok(commitment.clone())
+                } else if requested == page_receipt {
+                    Ok(page.clone())
+                } else {
+                    fixture
+                        .index
+                        .source_envelope(requested)
+                        .map(CompleteActivityPage::from)
+                }
+            });
+            if case == "corrected" {
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("binding history identity is absent or ambiguous")
+                );
+            } else {
+                assert!(result.is_ok(), "{case}: {:?}", result.err());
             }
         }
     }
@@ -8703,6 +9203,7 @@ pub(crate) mod continuation_v3_tests {
                 TradeProvenance::ActivityWs,
             )]),
             no_copy_dispositions: HashMap::new(),
+            scope_tokens: HashMap::new(),
             identity_overrides: if fixture
                 .aggregate
                 .group_id
@@ -9574,6 +10075,7 @@ mod activity_exemption_tests {
             observation_provenance: HashMap::new(),
             no_copy_dispositions: HashMap::new(),
             identity_overrides: HashMap::new(),
+            scope_tokens: HashMap::new(),
             identity_unresolved: HashSet::new(),
             restamp_twins: HashSet::new(),
             history_status: None,
@@ -9624,6 +10126,7 @@ mod activity_exemption_tests {
                 100,
                 WalletFenceCause::Overflow,
                 trigger,
+                Vec::new(),
                 &context(),
             )
             .unwrap();
@@ -9632,6 +10135,80 @@ mod activity_exemption_tests {
         assert!(engine.is_fenced(&wallet));
         assert!(engine.ledger().position(&wallet).is_none());
         assert!(paper.wallet_scope_drops(&wallet, 100).unwrap().is_empty());
+        assert_eq!(paper.scope_drop_boundary_unix().unwrap(), None);
+    }
+
+    #[test]
+    fn fenced_covered_bucket_retires_ambiguity_without_persisting_a_drop() {
+        let (_dir, paper, mut engine) = fixture();
+        let record = group("TRADE", "covered", 100, 0, false, "0xa1");
+        let wallet = record.group_id.components().wallet;
+        let id = record.group_id.key().clone();
+        paper
+            .install_anchors(&[AnchorInstallRecord {
+                wallet,
+                balances: Vec::new(),
+                activity_cutoff_unix: 100,
+                anchored_at_unix: 100,
+                ledger_hash_after: "empty".to_owned(),
+                positions_proof_hash: "empty".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "fixture".to_owned(),
+                history_status: None,
+                proof_json: "{}".to_owned(),
+                recorded_at_unix: 100,
+                repaired_history: Vec::new(),
+                expected_fence: None,
+            }])
+            .unwrap();
+        let fenced = group("TRADE", "fence", 99, 0, false, "0xa2");
+        engine
+            .commit_fence(
+                std::slice::from_ref(&fenced),
+                wallet,
+                99,
+                WalletFenceCause::Overflow,
+                fenced.group_id.key().clone(),
+                Vec::new(),
+                &context(),
+            )
+            .unwrap();
+        let receipt = AppendReceipt {
+            sequence: pe_core_types::EventSeq(10),
+            this_hash: blake3::hash(b"ambiguous observation"),
+        };
+        let mut ctx = context();
+        ctx.decision_inputs_json = serde_json::to_string(&json!({
+            "ambiguous_observations": [AmbiguousObservation {
+                group_id: SourceTradeId("ambiguous".to_owned()),
+                receipt,
+                source_epoch: 100,
+                candidates: vec![(id.clone(), 100)],
+                market_id: Some("0xa1".to_owned()),
+            }]
+        }))
+        .unwrap();
+        assert!(paper.wallet_scope_drops(&wallet, 100).unwrap().is_empty());
+        assert!(paper.activity_group_state(&id).unwrap().is_none());
+        let result = engine.commit(vec![record], &ctx, basis()).unwrap();
+        assert_eq!(result.dispositions[&id.0], "anchor_covered_late");
+        assert!(!result.already_committed);
+        assert!(result.pending.is_empty());
+        assert_eq!(result.newly_fenced, None);
+        assert!(paper.wallet_scope_drops(&wallet, 100).unwrap().is_empty());
+        assert!(paper.activity_observation_unbound_retired(receipt).unwrap());
+        assert_eq!(paper.cursor(&wallet).unwrap(), Some(100));
+        assert!(engine.is_fenced(&wallet));
+        assert!(paper.leader_positions().unwrap().is_empty());
+        assert!(paper.open_decision_pending().unwrap().is_empty());
+        assert!(paper.entry_gate_result(&id).unwrap().is_none());
+        assert_eq!(
+            paper.gate_history().unwrap(),
+            HashMap::from([(
+                wallet,
+                HashSet::from([MarketId(VenueMarketId("0xa1".to_owned()))]),
+            )])
+        );
         assert_eq!(paper.scope_drop_boundary_unix().unwrap(), None);
     }
 
@@ -10425,5 +11002,526 @@ mod activity_exemption_tests {
         let result = engine.commit(vec![unknown], &context(), basis()).unwrap();
         assert_eq!(result.dispositions[&id.0], "raw_only");
         assert!(!paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod anomaly_page_tests {
+    use super::*;
+
+    fn source(schema: u32, anomalous: bool) -> CompleteActivityPage {
+        let now = time::OffsetDateTime::from_unix_timestamp(101).unwrap();
+        CompleteActivityPage {
+            source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned(),
+            schema_version: schema, parser_version: ACTIVITY_PARSER_VERSION, content_type: ContentType::Json,
+            observed_at: SourceTimestamp(now), received_at: ReceivedAt(now),
+            payload: serde_json::to_vec(&json!([{
+                "proxyWallet":WalletAddress([0xaa;20]), "timestamp":100, "type":"TRADE", "transactionHash":"0xtest",
+                "conditionId":"0xca", "asset":"asset-a", "side":"BUY", "isCombo":false,
+                "outcomeIndex":0, "outcome":"Yes", "price":if anomalous {"2"} else {"0.5"}, "size":"1", "usdcSize":"1"
+            }])).unwrap(),
+        }
+    }
+
+    #[test]
+    fn anomaly_retirement_authenticates_receipt_candidates_and_retained_empty_binding_read() {
+        use pe_event_log::{EnvelopeIn, Reader, Writer};
+        for case in [
+            "valid",
+            "wrong_receipt",
+            "wrong_group",
+            "opposite_side",
+            "ambiguous",
+            "exact_aggregate",
+            "retained",
+            "erased_page",
+            "erased_stream",
+            "erased_commitment",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("anomaly.log");
+            let wallet = WalletAddress([0xaa; 20]);
+            let at = time::OffsetDateTime::from_unix_timestamp(101).unwrap();
+            let mut writer = Writer::open(&path).unwrap();
+            let mut append = |source_id: &str, schema_version, parser_version, payload| {
+                writer
+                    .append_synced(EnvelopeIn {
+                        source_id: SourceId(source_id.to_owned()),
+                        schema_version,
+                        parser_version,
+                        observed_at: SourceTimestamp(at),
+                        received_at: ReceivedAt(at),
+                        content_type: ContentType::Json,
+                        payload,
+                    })
+                    .unwrap()
+            };
+            let healthy: Vec<Value> = serde_json::from_slice(&source(3, false).payload).unwrap();
+            let stream = append(
+                crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+                ACTIVITY_SCHEMA_VERSION,
+                ACTIVITY_PARSER_VERSION,
+                serde_json::to_vec(&healthy[0]).unwrap(),
+            );
+            let observation =
+                parse_activity_trade_observation(&serde_json::to_vec(&healthy[0]).unwrap())
+                    .unwrap();
+            let mut rows = healthy.clone();
+            rows[0]["usdcSize"] = json!("4.212e-7");
+            if case == "opposite_side" {
+                rows[0]["side"] = json!("SELL");
+            }
+            if case == "ambiguous" {
+                rows.push(rows[0].clone());
+            }
+            if case == "exact_aggregate" {
+                rows.push(healthy[0].clone());
+            }
+            let payload = serde_json::to_vec(&rows).unwrap();
+            let mut page_source = source(
+                crate::trade_poller::ACTIVITY_POLL_ANOMALY_PAGE_SCHEMA_VERSION,
+                true,
+            );
+            page_source.payload = payload.clone();
+            let parsed = parse_complete_activity_page(&page_source, wallet, "fixture").unwrap();
+            let page = append(
+                &page_source.source_id,
+                page_source.schema_version,
+                page_source.parser_version,
+                payload.clone(),
+            );
+            let request_url = PolymarketEndpoint::UserPositionActivityPage {
+                user: wallet.to_string(),
+                end: 101,
+                start: None,
+                offset: 0,
+            }
+            .url("https://example.test");
+            let evidence = ReconciliationPageEvidence {
+                request_url: request_url.clone(),
+                bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
+                    start: None,
+                    end: 101,
+                }),
+                partition: None,
+                offset: 0,
+                row_count: u32::try_from(rows.len()).unwrap(),
+                canonical_page_hash: canonical_page_hash(&payload).unwrap(),
+                raw_page_hash: blake3::hash(&payload).to_hex().to_string(),
+                received_at: ReceivedAt(at),
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                parser_version: ACTIVITY_PARSER_VERSION,
+                anomalies: parsed.anomalies.clone(),
+            };
+            let occurrence = PageOccurrence {
+                request_url,
+                raw_hash: evidence.raw_page_hash.clone(),
+                receipt: page,
+            };
+            let commitment_payload = activity_read_commitment_payload_v2(
+                wallet,
+                101,
+                std::slice::from_ref(&occurrence),
+                std::slice::from_ref(&evidence),
+                &[],
+            )
+            .unwrap();
+            assert!(
+                serde_json::from_slice::<ActivityReadCommitment>(&commitment_payload)
+                    .unwrap()
+                    .read_proof
+                    .is_none()
+            );
+            let commitment = append(
+                ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+                ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+                ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+                commitment_payload,
+            );
+            append("suffix", 1, 1, b"{}".to_vec());
+            drop(writer);
+            let index = SourceReceiptIndex::replay(&path).unwrap();
+            let mut read = verified_read_for_routing(
+                commitment,
+                wallet,
+                101,
+                std::slice::from_ref(&occurrence),
+                std::slice::from_ref(&evidence),
+                &index,
+            )
+            .unwrap();
+            read.anomaly_counterparts.push(AnomalyCounterpart {
+                stream_receipt: if case == "wrong_receipt" {
+                    page
+                } else {
+                    stream
+                },
+                stream_group_id: if case == "wrong_group" {
+                    SourceTradeId("different".to_owned())
+                } else {
+                    observation.group_id.key().clone()
+                },
+                anomaly: parsed.anomalies[0].clone(),
+            });
+            if case == "retained" || case.starts_with("erased_") {
+                let frames = Reader::replay_with_offsets(&path)
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect::<Vec<_>>();
+                let suffix = frames.last().unwrap();
+                let erased = match case {
+                    "erased_page" => Some(page),
+                    "erased_stream" => Some(stream),
+                    "erased_commitment" => Some(commitment),
+                    _ => None,
+                };
+                let authority = pe_event_log::RetentionAuthority {
+                    format_version: 1,
+                    epoch: 1,
+                    advanced_at: 101,
+                    boundary: pe_event_log::RetentionBoundary {
+                        sequence: suffix.1,
+                        offset: suffix.0,
+                    },
+                    chain_head: suffix.2.prev_hash,
+                    pins: frames
+                        .iter()
+                        .filter(|(_, sequence, _)| {
+                            *sequence < suffix.1
+                                && erased.is_none_or(|receipt| receipt.sequence != *sequence)
+                        })
+                        .map(|(offset, sequence, frame)| pe_event_log::RetentionPin {
+                            sequence: *sequence,
+                            offset: *offset,
+                            hash: frame.this_hash,
+                            predecessor_hash: frame.prev_hash,
+                            reducer: false,
+                            wallet: None,
+                        })
+                        .collect(),
+                    retained_tail: (&index.current_tail_binding().unwrap()).into(),
+                    feed: Vec::new(),
+                };
+                authority.write(&path).unwrap();
+                index.write_receipt_sidecar_for_test().unwrap();
+                index.install_retention(authority).unwrap();
+            }
+            let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            paper.record_market_group("0xca", "").unwrap();
+            let mut engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new())
+                .unwrap()
+                .with_source_receipt_index(index);
+            let context = BucketDecisionContext {
+                verified_read: Some(Arc::new(read)),
+                applied_configuration: synthetic_legacy17_runtime_config(),
+                decision_inputs_json: json!({"fixed_end":101,"pages":[evidence]}).to_string(),
+                page_occurrences: vec![occurrence],
+                observed_source_receipts: HashMap::new(),
+                reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                read_commitment: Some(ActivityReadCommitmentReceipt::BindingsV2(commitment)),
+                signal_config: SignalConfig::default(),
+                copy_eligible: true,
+                bracket_commit: false,
+                recorded_at_unix: 101,
+                observation_provenance: HashMap::new(),
+                no_copy_dispositions: HashMap::new(),
+                identity_overrides: HashMap::new(),
+                scope_tokens: HashMap::new(),
+                identity_unresolved: HashSet::new(),
+                restamp_twins: HashSet::new(),
+                history_status: None,
+            };
+            let bucket = ReconciliationBucket {
+                wallet,
+                source_epoch: 100,
+                aggregates: Vec::new(),
+                anomalies: parsed.anomalies,
+            };
+            let basis = FrozenDecisionBasis {
+                win_rate_p: Probability::ZERO,
+                bankroll: Decimal::ZERO,
+            };
+            let result = engine.commit(bucket.clone(), &context, basis);
+            if matches!(case, "valid" | "retained") {
+                assert!(!result.unwrap().already_committed);
+                assert!(paper.activity_observation_retired(stream).unwrap());
+                assert_eq!(paper.wallet_scope_drops(&wallet, 101).unwrap().len(), 1);
+                engine
+                    .retire_observation(
+                        stream,
+                        observation.group_id.key(),
+                        true,
+                        context.verified_read.as_deref(),
+                    )
+                    .unwrap();
+                assert!(
+                    engine
+                        .commit(bucket, &context, basis)
+                        .unwrap()
+                        .already_committed
+                );
+            } else {
+                let error = result.unwrap_err().to_string();
+                if case.starts_with("erased_") {
+                    assert!(error.contains("erased"), "{case}: {error}");
+                }
+                assert!(
+                    !paper.activity_observation_retired(stream).unwrap(),
+                    "{case}"
+                );
+                assert!(
+                    paper.wallet_scope_drops(&wallet, 101).unwrap().is_empty(),
+                    "{case}"
+                );
+                assert_eq!(paper.cursor(&wallet).unwrap(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn page_generation_preserves_legacy_failures_and_dispatches_anomaly_modes() {
+        for (schema, generation, acceptance) in [
+            (2, PageGeneration::Historical, ActivityRowAcceptance::Strict),
+            (3, PageGeneration::Committed, ActivityRowAcceptance::Strict),
+            (
+                4,
+                PageGeneration::Committed,
+                ActivityRowAcceptance::StrictWithAnomalies,
+            ),
+            (
+                5,
+                PageGeneration::Historical,
+                ActivityRowAcceptance::StrictWithAnomalies,
+            ),
+        ] {
+            for anomalous in [false, true] {
+                let page = source(schema, anomalous);
+                assert_eq!(
+                    activity_page_generation(
+                        &page.source_id,
+                        schema,
+                        page.parser_version,
+                        &page.content_type
+                    )
+                    .unwrap(),
+                    (generation, acceptance)
+                );
+                let parsed = parse_complete_activity_page(&page, WalletAddress([0xaa; 20]), "test");
+                if anomalous && schema < 4 {
+                    assert!(parsed.is_err());
+                } else {
+                    let parsed = parsed.unwrap();
+                    assert_eq!(parsed.rows.len(), usize::from(!anomalous));
+                    assert_eq!(parsed.anomalies.len(), usize::from(anomalous));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_schema_read_reconstructs_accepted_rows_and_authenticates_anomaly_evidence() {
+        let wallet = WalletAddress([0xaa; 20]);
+        let healthy = source(3, false);
+        let anomaly = source(4, true);
+        let sources = [healthy, anomaly];
+        let mut pages = Vec::new();
+        let mut occurrences = Vec::new();
+        for (offset, source) in sources.iter().enumerate() {
+            let parsed = parse_complete_activity_page(source, wallet, "test").unwrap();
+            let request_url = PolymarketEndpoint::UserPositionActivityPage {
+                user: wallet.to_string(),
+                end: 101,
+                start: Some(1),
+                offset: u32::try_from(offset).unwrap() * RECONCILIATION_PAGE_LIMIT,
+            }
+            .url("https://example.test");
+            let receipt = AppendReceipt {
+                sequence: pe_core_types::EventSeq(u64::try_from(offset).unwrap() + 1),
+                this_hash: blake3::hash(&source.payload),
+            };
+            occurrences.push(PageOccurrence {
+                request_url: request_url.clone(),
+                raw_hash: blake3::hash(&source.payload).to_hex().to_string(),
+                receipt,
+            });
+            pages.push(ReconciliationPageEvidence {
+                request_url,
+                bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
+                    start: Some(0),
+                    end: 101,
+                }),
+                partition: None,
+                offset: u32::try_from(offset).unwrap() * RECONCILIATION_PAGE_LIMIT,
+                row_count: 1,
+                canonical_page_hash: canonical_page_hash(&source.payload).unwrap(),
+                raw_page_hash: blake3::hash(&source.payload).to_hex().to_string(),
+                received_at: source.received_at.clone(),
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                parser_version: ACTIVITY_PARSER_VERSION,
+                anomalies: parsed.anomalies,
+            });
+        }
+        let mut sources = sources;
+        let row: Value = serde_json::from_slice::<Vec<Value>>(&sources[0].payload)
+            .unwrap()
+            .remove(0);
+        sources[0].payload = serde_json::to_vec(&vec![
+            row;
+            usize::try_from(RECONCILIATION_PAGE_LIMIT)
+                .unwrap()
+        ])
+        .unwrap();
+        pages[0].row_count = RECONCILIATION_PAGE_LIMIT;
+        pages[0].canonical_page_hash = canonical_page_hash(&sources[0].payload).unwrap();
+        pages[0].raw_page_hash = blake3::hash(&sources[0].payload).to_hex().to_string();
+        occurrences[0].raw_hash = pages[0].raw_page_hash.clone();
+        let inputs = json!({"fixed_end":101, "pages":pages});
+        let verifier = ActivityReadVerification {
+            version: 7,
+            counterpart_depth: 0,
+            binding_filter: None,
+            wallet,
+            decision_inputs: &inputs,
+            page_occurrences: &occurrences,
+            read_commitment: None,
+        };
+        let (rows, anomalies) = verifier
+            .reconstruct_rich_activity_read(101, &pages, &mut |receipt: AppendReceipt| {
+                Ok::<_, String>(sources[usize::try_from(receipt.sequence.0 - 1).unwrap()].clone())
+            })
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            usize::try_from(RECONCILIATION_PAGE_LIMIT).unwrap()
+        );
+        assert_eq!(anomalies.len(), 1);
+        let mut tampered = pages.clone();
+        tampered[1].anomalies[0].row_index += 1;
+        assert!(
+            verifier
+                .reconstruct_rich_activity_read(101, &tampered, &mut |receipt: AppendReceipt| Ok::<
+                    _,
+                    String,
+                >(
+                    sources[usize::try_from(receipt.sequence.0 - 1).unwrap()].clone()
+                ))
+                .is_err()
+        );
+    }
+    #[test]
+    fn anomaly_split_minimum_is_authenticated_and_only_terminal_anomalies_survive_replay() {
+        for historical in [false, true] {
+            let wallet = WalletAddress([0xaa; 20]);
+            let mut occurrences = Vec::new();
+            let mut pages = Vec::new();
+            let mut sources = Vec::new();
+            let mut add_page = |start: Option<i64>, end, offset, payload: Vec<u8>, schema| {
+                let mut page = source(schema, false);
+                page.payload = payload;
+                let parsed = parse_complete_activity_page(&page, wallet, "fixture").unwrap();
+                let request_url = PolymarketEndpoint::UserPositionActivityPage {
+                    user: wallet.to_string(),
+                    end,
+                    start: start.map(|start: i64| start + 1),
+                    offset,
+                }
+                .url("https://example.test");
+                let raw_hash = blake3::hash(&page.payload).to_hex().to_string();
+                let receipt = AppendReceipt {
+                    sequence: pe_core_types::EventSeq(u64::try_from(sources.len()).unwrap() + 1),
+                    this_hash: blake3::hash(&page.payload),
+                };
+                occurrences.push(PageOccurrence {
+                    request_url: request_url.clone(),
+                    raw_hash: raw_hash.clone(),
+                    receipt,
+                });
+                pages.push(ReconciliationPageEvidence {
+                    request_url,
+                    bounds: Some(pe_source_polymarket_public::ActivityRequestBounds { start, end }),
+                    partition: None,
+                    offset,
+                    row_count: u32::try_from(parsed.rows.len() + parsed.anomalies.len()).unwrap(),
+                    canonical_page_hash: canonical_page_hash(&page.payload).unwrap(),
+                    raw_page_hash: raw_hash,
+                    received_at: page.received_at.clone(),
+                    schema_version: ACTIVITY_SCHEMA_VERSION,
+                    parser_version: ACTIVITY_PARSER_VERSION,
+                    anomalies: parsed.anomalies,
+                });
+                sources.push(page);
+            };
+            let healthy: Value = serde_json::from_slice::<Vec<Value>>(&source(3, false).payload)
+                .unwrap()
+                .remove(0);
+            let mut anomaly = healthy.clone();
+            anomaly["timestamp"] = json!(99);
+            anomaly["price"] = json!("2");
+            let healthy_schema = if historical { 2 } else { 3 };
+            let anomaly_schema = if historical { 5 } else { 4 };
+            for offset in (0..=ACTIVITY_MAX_OFFSET)
+                .step_by(usize::try_from(RECONCILIATION_PAGE_LIMIT).unwrap())
+            {
+                let mut rows =
+                    vec![healthy.clone(); usize::try_from(RECONCILIATION_PAGE_LIMIT).unwrap()];
+                rows[0] = anomaly.clone();
+                add_page(
+                    Some(0),
+                    102,
+                    offset,
+                    serde_json::to_vec(&rows).unwrap(),
+                    anomaly_schema,
+                );
+            }
+            add_page(
+                Some(99),
+                102,
+                0,
+                serde_json::to_vec(&[healthy]).unwrap(),
+                healthy_schema,
+            );
+            add_page(
+                Some(98),
+                99,
+                0,
+                serde_json::to_vec(&[anomaly]).unwrap(),
+                anomaly_schema,
+            );
+            add_page(Some(0), 98, 0, b"[]".to_vec(), healthy_schema);
+            let inputs = json!({"fixed_end":102,"pages":pages});
+            let verifier = ActivityReadVerification {
+                version: if historical { 3 } else { 7 },
+                counterpart_depth: 0,
+                binding_filter: None,
+                wallet,
+                decision_inputs: &inputs,
+                page_occurrences: &occurrences,
+                read_commitment: None,
+            };
+            let (rows, anomalies) = verifier
+                .reconstruct_rich_activity_read(102, &pages, &mut |receipt: AppendReceipt| {
+                    Ok::<_, String>(
+                        sources[usize::try_from(receipt.sequence.0 - 1).unwrap()].clone(),
+                    )
+                })
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(anomalies.len(), 1);
+            assert_eq!(anomalies[0].source_time.0.unix_timestamp(), 99);
+            let mut invalid = pages.clone();
+            invalid.last_mut().unwrap().anomalies = anomalies;
+            assert!(
+                verifier
+                    .reconstruct_rich_activity_read(
+                        102,
+                        &invalid,
+                        &mut |receipt: AppendReceipt| Ok::<_, String>(
+                            sources[usize::try_from(receipt.sequence.0 - 1).unwrap()].clone()
+                        )
+                    )
+                    .is_err()
+            );
+        }
     }
 }

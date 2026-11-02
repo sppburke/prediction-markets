@@ -1798,13 +1798,26 @@ do not change the owner's requested mode.
 
 ## Rollback
 
-**#823 scope drops:** before `meta` `scope_drop_boundary_unix` exists, the previous binary is a
-rollback target subject to every prerequisite below: it ignores the new table, membership values,
-group keys and import markers. The first `scope_dropped` disposition, revision retained without a
-fence or live `PrePostScopeDropped` record records that key atomically with, or before, the write.
-Afterwards preserve state and fix forward. Before reversing the ordinary [Procedure](#procedure)'s
-swap, hold the deploy lock, disable/stop and drain, clear the process census, then run this check
-against the exact installed paper-state path (shown in the working directory as `paper_state.db`):
+**#823 scope drops and #822 activity anomalies:** installed-mode rollback requires an absent
+`meta` `scope_drop_boundary_unix` and every prerequisite below. The previous binary ignores the
+additive table, membership values, group keys and import markers. Existing writers record the key
+atomically with the first `scope_dropped` disposition or revision retained without a fence, or
+durably before a live `PrePostScopeDropped` append. Two additional writers, the poller's
+`RecordingFetcher` and migration boot's `DurableRecordingFetcher`, complete
+`PaperStateDb::record_scope_drop_boundary` before their first
+[anomaly-schema page append](_GLOSSARY.md#non-executable-activity-row-anomalies-822); a failed marker
+write prevents the append and read. Healthy reads create no new boundary and never reopen an
+existing one. Afterwards preserve state and fix forward.
+
+Migration writes the marker into `migration_boot.active_main`, which remains the side database
+until installation. Before installation the existing
+[#544 migration phase/log gate](#544-database-paper-boundary-and-site-activation-lane) requires
+forward recovery; absence in the fixed main does not permit rollback. After installation the
+installed-state SQL check below sees the preserved marker.
+
+Before reversing the ordinary [Procedure](#procedure)'s swap, hold the deploy lock, disable/stop
+and drain, clear the process census, then run this unchanged check against the exact installed
+paper-state path (shown in the working directory as `paper_state.db`):
 
 ```bash
 set -euo pipefail

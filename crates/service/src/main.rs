@@ -1069,6 +1069,7 @@ async fn run() -> Result<()> {
             source_log_generation,
             Arc::clone(&boot_source_log),
             Arc::clone(&asset_identity),
+            Arc::clone(&paper_state),
         )
     } else {
         CausalPositionValidator::new(

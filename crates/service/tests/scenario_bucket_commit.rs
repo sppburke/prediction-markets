@@ -113,7 +113,7 @@ impl CommitFixtureRead for BucketCommitEngine {
         );
         assert_eq!(read.aggregates.len(), groups.len());
         // Preserve caller order so permutation scenarios still exercise the engine's ordering.
-        let aggregates = groups
+        let aggregates: Vec<_> = groups
             .iter()
             .map(|group| {
                 let parsed = read
@@ -267,6 +267,7 @@ fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
         observation_provenance: HashMap::new(),
         no_copy_dispositions: HashMap::new(),
         identity_overrides: HashMap::new(),
+        scope_tokens: HashMap::new(),
         identity_unresolved: Default::default(),
         restamp_twins: Default::default(),
         history_status: complete_history.then(|| WalletHistoryStatusRecord {
@@ -3273,7 +3274,7 @@ async fn corrected_continuation_identity_validates_across_consumers() {
     control
         .send(
             pe_service::orchestrator_control::OrchestratorControl::CommitActivityBucket {
-                aggregates: read.aggregates,
+                aggregates: read.aggregates.into(),
                 context: Arc::new(context),
                 committed,
             },
@@ -4499,5 +4500,212 @@ fn pre_anchor_event_drop_excludes_new_sibling_and_admits_another_market() {
     assert_eq!(
         replay_wallet_ledger(&paper, wallet()).unwrap().snapshots(),
         engine.ledger().snapshots()
+    );
+}
+
+#[test]
+fn anomaly_only_seconds_commit_drops_and_cursors_once_across_restart_and_history_shortcuts() {
+    use pe_service::bucket_commit::{BucketCommitError, ReconciliationBucket};
+    use pe_source_polymarket_public::{
+        ActivityRequestBounds, ActivityRowAcceptance, CompleteActivityRead,
+        ReconciliationPageEvidence, canonical_page_hash, parse_activity_response_with_acceptance,
+    };
+    for history in ["fresh", "covered", "all_stored"] {
+        for resolved in [false, true] {
+            let (dir, paper, mut engine) = fresh();
+            if history != "fresh" {
+                paper.set_cursor(&wallet(), 0).unwrap();
+                install_anchor(
+                    &mut engine,
+                    &paper,
+                    if history == "covered" { 200 } else { 0 },
+                    Vec::new(),
+                    0,
+                );
+            }
+            let stored = position_row("TRADE", "0xstored", MARKET_B, 0, "BUY", "1", "0.5", 100);
+            let aggregates = if history == "all_stored" {
+                engine
+                    .commit_read(vec![stored.clone()], &context(100, true), zero_basis())
+                    .unwrap();
+                vec![stored.aggregate]
+            } else {
+                Vec::new()
+            };
+            let mut row = json!({"proxyWallet":wallet(), "timestamp":100, "type":"TRADE", "transactionHash":"0xanomaly", "price":"2", "size":"1", "usdcSize":"1", "side":"BUY", "isCombo":false, "outcomeIndex":0, "outcome":"Yes"});
+            row["conditionId"] = json!("unknown-condition");
+            row["asset"] = json!("missing-asset");
+            if resolved {
+                row["conditionId"] = json!("0xcd");
+            }
+            let payload = serde_json::to_vec(&[row]).unwrap();
+            let now = time::OffsetDateTime::from_unix_timestamp(110).unwrap();
+            let window = parse_activity_response_with_acceptance(
+                &payload,
+                wallet(),
+                &pe_source_polymarket_public::ActivityParseContext {
+                    source_id: pe_core_types::SourceId("test".to_owned()),
+                    observed_at: pe_core_types::SourceTimestamp(now),
+                    received_at: pe_core_types::ReceivedAt(now),
+                    transport: pe_source_polymarket_public::ActivityTransport::Rest,
+                },
+                ActivityRowAcceptance::StrictWithAnomalies,
+            )
+            .unwrap();
+            let read = CompleteActivityRead {
+                requested_wallet: wallet(),
+                fixed_end: 110,
+                rows: Vec::new(),
+                anomalies: window.anomalies.clone(),
+                pages: vec![ReconciliationPageEvidence {
+                    request_url: "test".to_owned(),
+                    bounds: Some(ActivityRequestBounds {
+                        start: Some(0),
+                        end: 110,
+                    }),
+                    partition: None,
+                    offset: 0,
+                    row_count: 1,
+                    canonical_page_hash: canonical_page_hash(&payload).unwrap(),
+                    raw_page_hash: blake3::hash(&payload).to_hex().to_string(),
+                    received_at: pe_core_types::ReceivedAt(now),
+                    schema_version: 2,
+                    parser_version: 2,
+                    anomalies: window.anomalies,
+                }],
+            };
+            let bucket = ReconciliationBucket {
+                wallet: wallet(),
+                source_epoch: 100,
+                aggregates,
+                anomalies: read.anomalies.clone(),
+            };
+            let mut ctx = context(100, true);
+            ctx.bracket_commit = true;
+            ctx.copy_eligible = false;
+            ctx.decision_inputs_json = json!({"fixed_end":110,"pages":read.pages}).to_string();
+            let before_cursor = paper.cursor(&wallet()).unwrap();
+            if resolved {
+                // The condition is syntactically canonical and has no recorded membership.
+                let bucket = bucket.clone();
+                let mut pages = read.pages.clone();
+                pages[0].anomalies = bucket.anomalies.clone();
+                ctx.decision_inputs_json = json!({"fixed_end":110,"pages":pages}).to_string();
+                assert!(
+                    matches!(engine.commit(bucket.clone(), &ctx, zero_basis()), Err(BucketCommitError::MembershipRequired(markets)) if markets == ["0xcd"])
+                );
+                assert_eq!(paper.cursor(&wallet()).unwrap(), before_cursor);
+                assert!(paper.wallet_scope_drops(&wallet(), 100).unwrap().is_empty());
+                paper.record_market_group("0xcd", "").unwrap();
+                let first = engine.commit(bucket.clone(), &ctx, zero_basis()).unwrap();
+                assert!(!first.already_committed);
+                assert!(first.pending.is_empty());
+                let drops = paper.wallet_scope_drops(&wallet(), 100).unwrap();
+                assert_eq!(drops.len(), 1);
+                assert_eq!(drops[0].cause, "unrepresentable_activity_row");
+                drop(engine);
+                let mut restarted =
+                    BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap())
+                        .unwrap();
+                let repeat = restarted.commit(bucket, &ctx, zero_basis()).unwrap();
+                assert!(repeat.already_committed);
+                assert_eq!(paper.wallet_scope_drops(&wallet(), 100).unwrap(), drops);
+            } else {
+                let first = engine.commit(bucket.clone(), &ctx, zero_basis()).unwrap();
+                assert!(first.pending.is_empty());
+                assert!(first.dispositions.is_empty());
+                drop(engine);
+                let reopened = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+                let mut restarted = BucketCommitEngine::load(
+                    reopened.clone(),
+                    build_leader_ledger(&reopened).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    restarted
+                        .commit(bucket, &ctx, zero_basis())
+                        .unwrap()
+                        .already_committed
+                );
+                assert!(
+                    reopened
+                        .wallet_scope_drops(&wallet(), 100)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            assert!(paper.cursor(&wallet()).unwrap().unwrap() >= 100);
+            assert!(
+                paper.open_decision_pending().unwrap().len()
+                    <= usize::from(history == "all_stored")
+            );
+        }
+    }
+}
+
+#[test]
+fn later_anomaly_second_keeps_existing_decisions_and_healthy_bucket_results() {
+    let (_dir, paper, mut engine) = fresh_anchored();
+    let original = position_row(
+        "TRADE",
+        "0xprior-decision",
+        MARKET_A,
+        0,
+        "BUY",
+        "1",
+        "0.5",
+        100,
+    );
+    let original_id = original.group_id.key().clone();
+    engine
+        .commit_read(vec![original.clone()], &context(100, true), zero_basis())
+        .unwrap();
+    let before = paper.decision_pending_for(&original_id).unwrap().unwrap();
+    let gate = paper.entry_gate_result(&original_id).unwrap();
+    let history = paper.gate_history().unwrap();
+    let mut rows = original.rows.clone();
+    rows[0]["usdcSize"] = json!("4.212e-7");
+    let payload = serde_json::to_vec(&rows).unwrap();
+    let (read, anomalies) = support::producer_shaped_anomaly_read(
+        wallet(),
+        &payload,
+        100,
+        120,
+        support::scenario_receipt(10),
+    );
+    let mut ctx = context(100, true);
+    ctx.decision_inputs_json = read.decision_inputs_json;
+    let bucket = pe_service::bucket_commit::ReconciliationBucket {
+        wallet: wallet(),
+        source_epoch: 100,
+        aggregates: Vec::new(),
+        anomalies,
+    };
+    let result = engine.commit(bucket.clone(), &ctx, zero_basis()).unwrap();
+    assert!(result.dispositions.is_empty());
+    assert!(result.pending.is_empty());
+    assert_eq!(
+        paper.decision_pending_for(&original_id).unwrap().unwrap(),
+        before
+    );
+    assert_eq!(paper.entry_gate_result(&original_id).unwrap(), gate);
+    assert_eq!(paper.gate_history().unwrap(), history);
+    assert!(
+        engine
+            .commit(bucket, &ctx, zero_basis())
+            .unwrap()
+            .already_committed
+    );
+    let healthy = position_row("TRADE", "0xhealthy", MARKET_B, 0, "BUY", "2", "0.5", 101);
+    let healthy_id = healthy.group_id.key().clone();
+    let result = engine
+        .commit_read(vec![healthy], &context(101, true), zero_basis())
+        .unwrap();
+    assert_eq!(result.pending, [healthy_id]);
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 1_000_000);
+    assert_eq!(state(&engine, MARKET_B, 0).atomic(), 2_000_000);
+    assert_eq!(
+        paper.decision_pending_for(&original_id).unwrap().unwrap(),
+        before
     );
 }
