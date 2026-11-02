@@ -14079,6 +14079,13 @@ async fn real_wrapper_unfinished_format_two_root_publishes_only_its_successor() 
     real_wrapper_publications(PublicationScenario::LegacyRoot).await;
 }
 
+// PASS: committed anomaly receipts survive an interrupted identity-five bulk root
+// byte-for-byte; the real wrapper seals it and prepares classifier-seven scope drops.
+#[tokio::test]
+async fn real_wrapper_interrupted_identity_five_root_preserves_anomaly_receipts() {
+    real_wrapper_publications(PublicationScenario::InterruptedAnomalyRoot).await;
+}
+
 // PASS: installed history damage after retirement fails the pass; explicit repair publishes.
 // Post-pass certificate/receipt damage refuses re-finalize; abandonment/restaging publishes the successor.
 // Deleting a drop trigger after retirement keeps its original scope and second through publication.
@@ -14127,6 +14134,7 @@ enum PublicationScenario {
     Recovery,
     Unrepresentable,
     Anomalies,
+    InterruptedAnomalyRoot,
     NonArray,
     Collision,
     Deferred,
@@ -14140,11 +14148,16 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
             | PublicationScenario::LegacyRoot
             | PublicationScenario::Unrepresentable
             | PublicationScenario::Anomalies
+            | PublicationScenario::InterruptedAnomalyRoot
             | PublicationScenario::NonArray
             | PublicationScenario::Collision
             | PublicationScenario::ParticipantHold
     );
-    let anomalies = scenario == PublicationScenario::Anomalies;
+    let anomalies = matches!(
+        scenario,
+        PublicationScenario::Anomalies | PublicationScenario::InterruptedAnomalyRoot
+    );
+    let interrupted_anomaly_root = scenario == PublicationScenario::InterruptedAnomalyRoot;
     let legacy_root = scenario == PublicationScenario::LegacyRoot;
     let recovery = scenario == PublicationScenario::Recovery;
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -14410,7 +14423,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
     .unwrap();
     std::fs::write(dir.path().join(".env"), format!(
         "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_CATEGORIES='[\"OVERALL\"]'\nPE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER={}\nPE_RANKER_ENGINE=duck\nPE_RANK_MARKET_SERIES=7:btc-up-or-down-15m\nWIN_END={}\n",
-        dir.path().join("watchlist.json").display(), if matches!(scenario, PublicationScenario::Unrepresentable | PublicationScenario::Anomalies) { "prepare" } else { "1" }, time::OffsetDateTime::from_unix_timestamp(now - 86_400).unwrap().date())).unwrap();
+        dir.path().join("watchlist.json").display(), if scenario == PublicationScenario::Unrepresentable || anomalies { "prepare" } else { "1" }, time::OffsetDateTime::from_unix_timestamp(now - 86_400).unwrap().date())).unwrap();
     if scenario == PublicationScenario::ParticipantHold {
         let path = dir.path().join(".env");
         let mut settings = std::fs::read_to_string(&path).unwrap();
@@ -14507,6 +14520,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         scenario,
         PublicationScenario::Unrepresentable
             | PublicationScenario::Anomalies
+            | PublicationScenario::InterruptedAnomalyRoot
             | PublicationScenario::NonArray
             | PublicationScenario::Collision
             | PublicationScenario::Deferred
@@ -14605,6 +14619,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
             venue.stop();
             return;
         }
+        let mut interrupted_root = None;
         let mut source = DatasetFetcher {
             rows: activity_rows.lock().unwrap().clone(),
             ..Default::default()
@@ -14772,13 +14787,30 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 }
                 source.rows.push(row);
             }
-            collection_admit(&side, 1, now - 120, &[]).await;
+            if interrupted_anomaly_root {
+                pe_bootstrap::cache_migration::populate_activity_bulk_root_v2_with_clock(
+                    &collection_config(&side),
+                    &fixed,
+                    None,
+                    &HistoryV3StopFetcher,
+                    "https://data.example",
+                    || Ok(now - 120),
+                    now - 119,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            } else {
+                collection_admit(&side, 1, now - 120, &[]).await;
+            }
             if anomalies {
                 assert_eq!(fresh_record(&side)["version"], 5);
                 assert!(stored_receipt_proofs(&Connection::open(&side).unwrap(), 1).is_empty());
                 *activity_rows.lock().unwrap() = source.rows.clone();
             } else {
                 freeze_identity_four(&side);
+                // The wrapper's identity-5 successor re-reads these wallets from the venue.
+                *activity_rows.lock().unwrap() = source.rows.clone();
             }
             let fetcher = WrapperActivityFixture {
                 source,
@@ -14786,46 +14818,101 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 walk_wallet: Some(WALLET_D.to_owned()),
                 end: now - 120,
             };
-            collection_run(
-                &side,
-                &fetcher,
-                now - 120,
-                Arc::new(std::sync::atomic::AtomicU64::new(if anomalies {
-                    1_995_001
-                } else {
-                    0
-                })),
-                None,
-            )
-            .await
-            .unwrap();
-            let no_windows = collection_proof(&side, 1, WALLET_C);
-            let proved = collection_proof(&side, 1, WALLET_D);
-            if anomalies {
-                assert_eq!(no_windows["acquisition"]["disposition"], "complete");
-                assert_eq!(proved["acquisition"]["disposition"], "excluded");
-                assert!(
-                    proved["pages"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|p| p.get("anomalies").is_some())
-                );
-            } else {
+            if interrupted_anomaly_root {
+                let identity = fresh_record(&side);
+                // Commit only these wallets through the real writer, leaving the
+                // other root wallets and its seal for the resumed wrapper.
+                for wallet in [WALLET_C, WALLET_D] {
+                    let read =
+                        pe_source_polymarket_public::fetch_complete_activity_with_acceptance(
+                            &fetcher.source,
+                            "https://data.example",
+                            WalletAddress::from_hex(wallet).unwrap(),
+                            Some(0),
+                            now - 120,
+                            pe_source_polymarket_public::ActivityRowAcceptance::Acquisition4,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(!read.anomalies.is_empty());
+                    let aggregates = read.buckets().unwrap().into_iter().flatten().collect();
+                    pe_bootstrap::cache_migration::commit_activity_batch_for_test(
+                        &mut Connection::open(&side).unwrap(),
+                        wallet.to_owned(),
+                        read.pages,
+                        aggregates,
+                    )
+                    .unwrap();
+                    assert!(
+                        collection_proof(&side, 1, wallet)["pages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|page| page.get("anomalies").is_some())
+                    );
+                }
+                assert_eq!(count(&side, "PRAGMA user_version"), -2);
                 assert_eq!(
-                    no_windows["acquisition"]["aggregation_status"],
-                    "not_attempted"
+                    count(&side, "SELECT COUNT(*) FROM activity_coverage_manifests_v2"),
+                    0
                 );
+                assert_eq!(
+                    count(
+                        &side,
+                        "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2"
+                    ),
+                    2
+                );
+                assert!(identity["wallets"].as_array().unwrap().len() > 2);
+                assert!(data.join("eval-results/rank_and_push.cycle").is_file());
+                assert!(out.join("cache_stage.json").is_file());
+                assert!(!request.exists());
+                interrupted_root = Some((
+                    identity,
+                    query_values(
+                        &side,
+                        "SELECT * FROM activity_wallet_coverage_staging_v2 ORDER BY wallet_hex",
+                    ),
+                ));
+            } else {
+                collection_run(
+                    &side,
+                    &fetcher,
+                    now - 120,
+                    Arc::new(std::sync::atomic::AtomicU64::new(if anomalies {
+                        1_995_001
+                    } else {
+                        0
+                    })),
+                    None,
+                )
+                .await
+                .unwrap();
+                let no_windows = collection_proof(&side, 1, WALLET_C);
+                let proved = collection_proof(&side, 1, WALLET_D);
+                if anomalies {
+                    assert_eq!(no_windows["acquisition"]["disposition"], "complete");
+                    assert_eq!(proved["acquisition"]["disposition"], "excluded");
+                    assert!(
+                        proved["pages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|p| p.get("anomalies").is_some())
+                    );
+                } else {
+                    assert_eq!(
+                        no_windows["acquisition"]["aggregation_status"],
+                        "not_attempted"
+                    );
+                }
+                assert_eq!(proved["acquisition"]["aggregation_status"], "complete");
+                assert_eq!(proved["acquisition"]["fetched_source_row_count"], 4999);
             }
-            assert_eq!(proved["acquisition"]["aggregation_status"], "complete");
-            assert_eq!(proved["acquisition"]["fetched_source_row_count"], 4999);
         }
         let before = requests.lock().unwrap().len();
         let output = run_wrapper();
-        let expected = if matches!(
-            scenario,
-            PublicationScenario::Unrepresentable | PublicationScenario::Anomalies
-        ) {
+        let expected = if scenario == PublicationScenario::Unrepresentable || anomalies {
             Some(2)
         } else {
             Some(0)
@@ -14833,22 +14920,51 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         assert_eq!(output.status.code(), expected, "{output:?}");
         assert!(request.exists());
         let identity = fresh_record(
-            if matches!(
-                scenario,
-                PublicationScenario::Unrepresentable | PublicationScenario::Anomalies
-            ) {
+            if scenario == PublicationScenario::Unrepresentable || anomalies {
                 &side
             } else {
                 &fixed
             },
         );
         let expected_generation = match scenario {
-            PublicationScenario::Unrepresentable => 1,
+            // The sealed frozen identity-4 head admits its identity-5 successor (#822).
+            PublicationScenario::Unrepresentable => 2,
             PublicationScenario::Anomalies => 2,
+            PublicationScenario::InterruptedAnomalyRoot => 1,
             _ => 3,
         };
         assert_eq!(identity["generation"], expected_generation);
+        if let Some((original_identity, receipts)) = interrupted_root {
+            assert_eq!(identity["version"], 5);
+            assert_eq!(identity["digest"], original_identity["digest"]);
+            assert_eq!(identity, original_identity);
+            assert_eq!(count(&side, "PRAGMA user_version"), 2);
+            assert_eq!(
+                count(
+                    &side,
+                    "SELECT COUNT(*) FROM activity_coverage_manifests_v2 WHERE generation = 1"
+                ),
+                1
+            );
+            assert_eq!(receipts, query_values(&side, &format!(
+                "SELECT * FROM activity_wallet_coverage_staging_v2
+                 WHERE generation = 1 AND wallet_hex IN ('{WALLET_C}', '{WALLET_D}') ORDER BY wallet_hex"
+            )));
+            assert!(
+                requests.lock().unwrap()[before..]
+                    .iter()
+                    .any(|line| line.contains("/activity?"))
+            );
+            assert!(
+                !requests.lock().unwrap()[before..]
+                    .iter()
+                    .any(|line| line.contains("/activity?")
+                        && (line.contains(WALLET_C) || line.contains(WALLET_D)))
+            );
+        }
         if scenario == PublicationScenario::Unrepresentable {
+            // The frozen acquisition-3 head still names its exclusions without holding,
+            // then the identity-5 successor re-reads both wallets under acquisition 4.
             let report = String::from_utf8_lossy(&output.stderr);
             for (wallet, reason) in [
                 (WALLET_C, "activity row has invalid price"),
@@ -14859,12 +14975,25 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                     "{report}"
                 );
                 assert!(report.contains(reason), "{report}");
+                assert!(
+                    requests.lock().unwrap()[before..]
+                        .iter()
+                        .any(|line| line.contains("/activity?") && line.contains(wallet))
+                );
+                let successor = collection_proof(&side, 2, wallet);
+                assert_eq!(successor["acquisition"]["version"], 4, "{successor}");
+                assert!(
+                    successor["pages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|page| page.get("anomalies").is_some()),
+                    "{successor}"
+                );
             }
-            assert!(
-                !requests.lock().unwrap()[before..]
-                    .iter()
-                    .any(|line| line.contains("/activity?"))
-            );
+            assert_eq!(identity["version"], 5);
+            let saved: Value = serde_json::from_slice(&std::fs::read(&request).unwrap()).unwrap();
+            assert_eq!(saved["batch"]["classifier_version"], 7);
             assert_eq!(sha256_file(&fixed).unwrap(), fixed_hash);
             assert!(batches.lock().unwrap().is_empty());
         } else if anomalies {
@@ -14908,10 +15037,12 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                     .iter()
                     .any(|a| a["wallet_hex"] == WALLET_C && a["condition_id"] == "0xdead")
             );
-            assert_eq!(
-                collection_proof(&side, 2, WALLET_D)["acquisition"]["mode"],
-                "incremental"
-            );
+            if !interrupted_anomaly_root {
+                assert_eq!(
+                    collection_proof(&side, 2, WALLET_D)["acquisition"]["mode"],
+                    "incremental"
+                );
+            }
             assert_eq!(
                 collection_proof(&side, 1, WALLET_D)["acquisition"]["version"],
                 4

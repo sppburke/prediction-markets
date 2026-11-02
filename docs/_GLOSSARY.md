@@ -1460,7 +1460,9 @@ Unrepresentable prices, outcome mappings and exact decimals become non-executabl
 beside normalized rows. Page evidence retains them under `read_sha256`, omitting `anomalies` when
 empty. Raw receipt source-row counts and held-row reservations include anomalies; fetched aggregate
 digests, counts and certified history counts remain aggregate-only. Only terminal windows contribute
-rows or anomalies; saturated probe pages retain authenticated evidence without contributing twice.
+rows or anomalies. Forge's identity-5 walk discards a saturated probe entirely before reading terminal
+windows. Where saturated-segment page evidence exists (the shared splitting reader), its anomalies
+are evidence only and never count or classify.
 An anomaly-only acquisition can have positive raw source rows, zero aggregates and the empty
 aggregate digest. Other parse failures retain the existing exclusion/hold behavior.
 
@@ -1469,9 +1471,12 @@ wallet's **effective anomaly set**. This set comes from a root-to-head receipt w
 replacement rules as aggregate history: full reads and clearing repairs reset it; incremental
 parts, committed proved partials and their successors add; exclusions without partials add nothing;
 infra exclusions preserve it. The anomaly walk never uses the certificate shortcut. Thus an anomaly
-unresolved in an earlier cycle is retried against later bound market/token evidence. The added cost
-is one receipt-chain/page-evidence walk per available wallet and memory proportional to its effective
-anomalies; no additional aggregate-history scan or anomaly table is introduced.
+unresolved in an earlier cycle is retried against later bound market/token evidence. Archived receipt
+verification records a transient set of wallets with anomaly evidence. Wallets absent from that set
+skip the anomaly walk when their unarchived receipts also have no anomaly evidence; wallets with
+evidence retain the full walk. Effective anomaly queries require a proof of the whole chain.
+Memory is proportional to the wallet set and effective anomalies; no additional aggregate-history
+scan or anomaly table is introduced.
 
 Ordered seconds merge aggregates and anomalies, including anomaly-only seconds, while preserving
 whole seconds across projection chunks. The shared anomaly classifier creates cumulative

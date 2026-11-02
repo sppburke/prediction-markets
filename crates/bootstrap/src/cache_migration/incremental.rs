@@ -1039,6 +1039,9 @@ pub(super) struct HistoryProof {
     records: BTreeMap<u64, (FreshCollectionIdentity, Option<ActivityCoverageManifestV2>)>,
     links: BTreeMap<u64, String>,
     continuations: BTreeMap<String, (ActivityReadMode, i64)>,
+    anomaly_wallets: BTreeSet<String>,
+    unarchived_generations: BTreeSet<u64>,
+    complete_chain: bool,
 }
 
 impl HistoryProof {
@@ -1060,23 +1063,32 @@ impl HistoryProof {
         let mut records = BTreeMap::new();
         let mut links = BTreeMap::new();
         let mut continuations = BTreeMap::new();
+        let mut anomaly_wallets = BTreeSet::new();
+        let mut unarchived_generations = BTreeSet::new();
         let mut identity = head.clone();
-        loop {
+        let complete_chain = loop {
             let manifest = stored_activity_manifest(connection, identity.generation)?;
             if let Some(manifest) = &manifest {
                 links.insert(identity.generation, manifest_link(manifest, &identity)?);
                 verify_archived_identity(connection, identity.generation, &identity, true)?;
                 verify_historical_receipts_with(connection, manifest, &identity, |receipt| {
+                    if identity.version == 5
+                        && receipt.pages.iter().any(|page| !page.anomalies.is_empty())
+                    {
+                        anomaly_wallets.insert(receipt.wallet_hex.clone());
+                    }
                     if Some(identity.generation) == head.base_generation
                         && let Some(continuation) = receipt.continuation()
                     {
                         continuations.insert(receipt.wallet_hex.clone(), continuation);
                     }
                 })?;
+            } else {
+                unarchived_generations.insert(identity.generation);
             }
             records.insert(identity.generation, (identity.clone(), manifest));
             let Some(base) = identity.base_generation else {
-                break;
+                break true;
             };
             let prior =
                 generation_identity(connection, base)?.ok_or_else(|| BootstrapError::Invalid {
@@ -1093,14 +1105,17 @@ impl HistoryProof {
                 return invalid("history chain manifest commitment mismatch".to_owned());
             }
             if verified(prior.generation) {
-                break;
+                break false;
             }
             identity = prior;
-        }
+        };
         Ok(Self {
             records,
             links,
             continuations,
+            anomaly_wallets,
+            unarchived_generations,
+            complete_chain,
         })
     }
 
@@ -1149,14 +1164,40 @@ impl HistoryProof {
         Ok(())
     }
 
-    /// Certificates contain cumulative drops, not anomaly payloads. Always walk
-    /// from the root so formerly unresolved evidence can resolve in a later cycle.
+    /// Certificates contain cumulative drops, not anomaly payloads. Wallets with
+    /// evidence walk from the root so formerly unresolved anomalies can resolve.
     pub(super) fn effective_anomalies(
         &self,
         connection: &Connection,
         wallet: &str,
         through: u64,
     ) -> Result<Vec<pe_source_polymarket_public::ActivityRowAnomaly>, BootstrapError> {
+        if !self.complete_chain {
+            return invalid("effective anomalies require a complete history chain".to_owned());
+        }
+        // Archived receipts were decoded once during load. Only unarchived
+        // records need a lookup to prove an otherwise anomaly-free wallet empty.
+        if !self.anomaly_wallets.contains(wallet) {
+            let mut unarchived_anomalies = false;
+            for generation in self.unarchived_generations.range(..=through) {
+                let identity = self.identity(*generation).ok_or(BootstrapError::Internal)?;
+                if identity.version == 5
+                    && identity
+                        .wallets
+                        .binary_search_by(|w| w.as_str().cmp(wallet))
+                        .is_ok()
+                {
+                    let receipt = receipt_for_identity(connection, identity, wallet)?;
+                    if receipt.pages.iter().any(|page| !page.anomalies.is_empty()) {
+                        unarchived_anomalies = true;
+                        break;
+                    }
+                }
+            }
+            if !unarchived_anomalies {
+                return Ok(Vec::new());
+            }
+        }
         let mut anomalies = Vec::new();
         // Earlier contracts carry no anomalies. Skip that empty prefix's page
         // decoding, using the full authenticated chain, never a certificate.
@@ -2355,4 +2396,234 @@ pub(super) fn log_writer_settings(connection: &Connection) -> Result<(), Bootstr
         "activity writer effective SQLite settings"
     );
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "a broken fixture must fail its test")]
+mod tests {
+    use super::super::activity_fixtures::{complete_receipt, wallet_hex};
+    use super::*;
+    use pe_source_polymarket_public::{ActivityRowAcceptance, FixtureFetcher, PolymarketEndpoint};
+
+    /// Three archived full reads and an unarchived head, with real page proofs.
+    async fn anomaly_history(
+        archived_anomaly: bool,
+        head_anomaly: bool,
+    ) -> (Connection, FreshCollectionIdentity) {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(V2_SCHEMA).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE activity_wallet_coverage_staging_v2 ADD COLUMN acquisition_json TEXT;
+             ALTER TABLE activity_coverage_manifests_v2 ADD COLUMN collection_identity_json TEXT",
+            )
+            .unwrap();
+        let wallets = vec![wallet_hex(1), wallet_hex(2)];
+        let mut base = None;
+        for generation in 1..=4 {
+            let end = 100 * i64::try_from(generation).unwrap();
+            let identity = FreshCollectionIdentity::new(
+                generation,
+                end,
+                wallets.clone(),
+                base.as_ref()
+                    .map(|(identity, manifest)| (identity, manifest)),
+                wallets.clone(),
+                Vec::new(),
+                Vec::new(),
+                aggregate_digest(&[]).unwrap(),
+            )
+            .unwrap();
+            let mut receipts = Vec::new();
+            for wallet in &wallets {
+                let anomaly = wallet == &wallets[0]
+                    && ((generation == 1 && archived_anomaly) || (generation == 4 && head_anomaly));
+                let rows = if anomaly {
+                    serde_json::json!([{"proxyWallet":wallet,"timestamp":end,
+                        "type":"TRADE","transactionHash":"anomaly","conditionId":"0xa",
+                        "asset":"100","side":"BUY","outcomeIndex":0,"outcome":"Yes",
+                        "price":"3","size":"1","usdcSize":"1"}])
+                } else {
+                    serde_json::json!([])
+                };
+                let url = PolymarketEndpoint::UserPositionActivityPage {
+                    user: wallet.clone(),
+                    end,
+                    start: Some(1),
+                    offset: 0,
+                }
+                .url("https://data.example");
+                let fetcher =
+                    FixtureFetcher::new(HashMap::from([(url, serde_json::to_vec(&rows).unwrap())]));
+                let read = fetch_activity_window_semantic_with_acceptance(
+                    &fetcher,
+                    "https://data.example",
+                    WalletAddress::from_hex(wallet).unwrap(),
+                    0,
+                    end,
+                    ActivityRowAcceptance::Acquisition4,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let mut receipt = complete_receipt(wallet, &[], end);
+                receipt.pages = read.pages;
+                receipt.source_row_count = u64::from(anomaly);
+                let acquisition = receipt.acquisition.as_mut().unwrap();
+                acquisition.version = 4;
+                acquisition.fetched_source_row_count = receipt.source_row_count;
+                acquisition.read_sha256 = read_digest(wallet, &receipt.pages, acquisition).unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO activity_wallet_coverage_staging_v2
+                     (generation, wallet_hex, reference_sha256, fixed_end_unix, page_evidence_json,
+                      ordered_aggregate_digest, source_row_count, aggregate_count, schema_version,
+                      parser_version, completed_at_unix, acquisition_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 2, 2, ?4, ?8)",
+                        params![
+                            generation,
+                            wallet,
+                            identity.digest,
+                            end,
+                            canonical_json(&receipt.pages).unwrap(),
+                            receipt.ordered_aggregate_digest,
+                            receipt.source_row_count,
+                            canonical_json(&receipt.acquisition).unwrap()
+                        ],
+                    )
+                    .unwrap();
+                receipts.push(receipt);
+            }
+            if generation == 4 {
+                return (connection, identity);
+            }
+            let mut digest = ReceiptSetDigest::new(generation, &identity.digest, end).unwrap();
+            let mut fetched = JsonArrayDigest::new();
+            for receipt in &receipts {
+                digest.push(receipt).unwrap();
+                fetched.push(&receipt.ordered_aggregate_digest).unwrap();
+            }
+            let manifest = ActivityCoverageManifestV2 {
+                generation,
+                reference_sha256: identity.digest.clone(),
+                wallet_count: 2,
+                receipt_set_digest: digest.finish(),
+                aggregate_digest: fetched.finish(),
+                source_row_count: receipts
+                    .iter()
+                    .map(|receipt| receipt.source_row_count)
+                    .sum(),
+                group_count: 0,
+                source_bounds: Value::Null,
+                cursors: receipt_marker_v2(),
+                page_hashes: Vec::new(),
+                completed_at_unix: end + 1,
+                schema_version: 2,
+                parser_version: 2,
+            };
+            let transaction = connection.transaction().unwrap();
+            record_completed_manifest(&transaction, &manifest).unwrap();
+            archive_identity(&transaction, generation, &identity).unwrap();
+            transaction.commit().unwrap();
+            base = Some((identity, manifest));
+        }
+        unreachable!("the fourth generation returns the unarchived head")
+    }
+
+    #[tokio::test]
+    async fn anomaly_free_wallet_skips_archived_receipt_reads() {
+        let (connection, head) = anomaly_history(false, false).await;
+        let proof = HistoryProof::load(&connection, &head).unwrap();
+        assert!(proof.anomaly_wallets.is_empty());
+        // Damage after loading isolates the effective walk from initial authentication.
+        connection
+            .execute(
+                "UPDATE activity_wallet_coverage_staging_v2 SET page_evidence_json = 'damaged'
+             WHERE generation < 4",
+                [],
+            )
+            .unwrap();
+        for wallet in &head.wallets {
+            for through in [3, 4] {
+                assert!(
+                    proof
+                        .effective_anomalies(&connection, wallet, through)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            // The old per-generation walk would decode the damaged archived receipt.
+            assert!(
+                proof
+                    .for_each_history_part(&connection, wallet, 0, 4, |_, _, _| Ok(()))
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unarchived_head_anomaly_is_in_the_effective_set() {
+        let (connection, head) = anomaly_history(false, true).await;
+        let proof = HistoryProof::load(&connection, &head).unwrap();
+        let wallet = &head.wallets[0];
+        assert!(proof.anomaly_wallets.is_empty());
+        assert!(
+            proof
+                .effective_anomalies(&connection, wallet, 3)
+                .unwrap()
+                .is_empty()
+        );
+        let expected =
+            receipt_anomalies(&receipt_for_identity(&connection, &head, wallet).unwrap()).unwrap();
+        assert_eq!(expected.len(), 1);
+        assert_eq!(
+            proof.effective_anomalies(&connection, wallet, 4).unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn archived_anomaly_keeps_the_walk_and_full_replacement_rules() {
+        let (connection, head) = anomaly_history(true, false).await;
+        let proof = HistoryProof::load(&connection, &head).unwrap();
+        let wallet = &head.wallets[0];
+        assert!(proof.anomaly_wallets.contains(wallet));
+        assert_eq!(
+            proof
+                .effective_anomalies(&connection, wallet, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            proof
+                .effective_anomalies(&connection, wallet, 4)
+                .unwrap()
+                .is_empty()
+        );
+        connection
+            .execute(
+                "UPDATE activity_wallet_coverage_staging_v2 SET page_evidence_json = 'damaged'
+             WHERE generation = 1 AND wallet_hex = ?1",
+                [wallet],
+            )
+            .unwrap();
+        assert!(proof.effective_anomalies(&connection, wallet, 4).is_err());
+    }
+
+    #[tokio::test]
+    async fn shortened_history_proof_refuses_effective_anomalies() {
+        let (connection, head) = anomaly_history(false, false).await;
+        let proof =
+            HistoryProof::load_until(&connection, &head, |generation| generation == 3).unwrap();
+        assert!(!proof.complete_chain);
+        let error = proof
+            .effective_anomalies(&connection, &head.wallets[0], 4)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("effective anomalies require a complete history chain")
+        );
+    }
 }
