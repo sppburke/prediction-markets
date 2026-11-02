@@ -2612,7 +2612,8 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
 
     @staticmethod
     def _excluded_receipt(reason, **changes):
-        proof = dict(version=3, disposition="excluded", exclusion_reason="acquisition_failure",
+        # The fake's default identity 5 collects acquisition 4; legacy identity-4 cases pass version=3.
+        proof = dict(version=4, disposition="excluded", exclusion_reason="acquisition_failure",
                      aggregation_status="not_attempted", start_exclusive=0, fixed_end_unix=100)
         proof.update(changes)
         return ["0x" + "a" * 40, reason, proof]
@@ -2700,22 +2701,34 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
                 self.assertEqual(resumed.returncode, 2, resumed.stdout + resumed.stderr)
                 self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
 
-    def test_unrepresentable_exclusions_are_listed_and_prepare_without_a_successor(self):
+    def test_unrepresentable_exclusions_are_listed_under_identity_four_and_held_under_identity_five(self):
         from rank_cycle_manifest import (UNREPRESENTABLE_PRICE, UNREPRESENTABLE_MAPPING,
                                          UNREPRESENTABLE_DECIMAL, ACTIVITY_RESPONSE_JSON)
         reasons = (UNREPRESENTABLE_PRICE + " 3.2: out of range", UNREPRESENTABLE_MAPPING,
                    ACTIVITY_RESPONSE_JSON + " row 1: 4.212e-7 " + UNREPRESENTABLE_DECIMAL)
         for proved in (False, True):
             for reason in reasons:
-                with self.subTest(proved=proved, reason=reason):
+                status = "complete" if proved else "not_attempted"
+                with self.subTest(proved=proved, reason=reason, identity=4):
+                    # #821: an identity-4 (acquisition-3) exclusion is named; identity 5 then re-reads it (#822).
                     self.tearDown(); self.setUp()
                     self._prepare_incremental_fixture(two_file=True)
-                    receipt = self._excluded_receipt(reason, aggregation_status="complete" if proved else "not_attempted")
-                    result = self._run(exit_env={"STUB_EXCLUSIONS_1": json.dumps([receipt])})
+                    receipt = self._excluded_receipt(reason, version=3, aggregation_status=status)
+                    result = self._run(exit_env={"STUB_IDENTITY_VERSION_1": "4", "STUB_EXCLUSIONS_1": json.dumps([receipt])})
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", result.stdout)
-                    self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), 1)
+                    lines = self._bootstrap_lines("cache-populate-activity-v2")
+                    self.assertEqual(len(lines), 2)
+                    self.assertIn("--fresh-generation 2", lines[1])
                     self.assertIn("[unrepresentable-row] 0x" + "a" * 40 + ": " + reason, result.stderr)
+                with self.subTest(proved=proved, reason=reason, identity=5):
+                    # Acquisition 4 keeps such rows as anomalies, so a remaining exclusion holds.
+                    self.tearDown(); self.setUp()
+                    self._prepare_incremental_fixture(two_file=True)
+                    receipt = self._excluded_receipt(reason, aggregation_status=status)
+                    result = self._run(exit_env={"STUB_EXCLUSIONS_1": json.dumps([receipt])})
+                    self._assert_candidate_held(result, "0x" + "a" * 40 + ": " + reason)
+                    self.assertNotIn("[unrepresentable-row]", result.stderr)
 
     def test_stale_initial_head_gets_one_top_up_then_prepares(self):
         fixed = self._prepare_incremental_fixture()
