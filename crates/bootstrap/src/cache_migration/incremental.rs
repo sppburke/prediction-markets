@@ -113,34 +113,25 @@ impl HistoryChain {
                 source_rows: certificate.source_row_count,
             });
         }
-        for (_, (identity, manifest)) in proof.records.range((
-            std::ops::Bound::Excluded(certified_generation),
-            std::ops::Bound::Included(through_generation),
-        )) {
-            if identity
-                .wallets
-                .binary_search_by(|w| w.as_str().cmp(wallet))
-                .is_err()
-            {
-                continue;
-            }
-            let receipt = match manifest {
-                Some(manifest) => predecessor_receipt(connection, manifest, identity, wallet)?,
-                None => receipt_for_identity(connection, identity, wallet)?,
-            };
-            let repair = identity.repair_wallets.as_ref().is_some_and(|repairs| {
-                repairs.binary_search_by(|w| w.as_str().cmp(wallet)).is_ok()
-            });
-            if repair && receipt.excluded() && !receipt.partial() && !receipt.infra_excluded() {
-                chain.parts.clear();
-                chain.parts.push(HistoryPart {
-                    start: 0,
-                    end: identity.fixed_end_unix,
-                    digest: aggregate_digest(&[])?,
-                    count: 0,
-                    source_rows: 0,
-                });
-            } else if !receipt.excluded() || receipt.partial() {
+        proof.for_each_history_part(
+            connection,
+            wallet,
+            certified_generation,
+            through_generation,
+            |identity, receipt, reset| {
+                if reset {
+                    chain.parts.clear();
+                }
+                let Some(receipt) = receipt else {
+                    chain.parts.push(HistoryPart {
+                        start: 0,
+                        end: identity.fixed_end_unix,
+                        digest: aggregate_digest(&[])?,
+                        count: 0,
+                        source_rows: 0,
+                    });
+                    return Ok(());
+                };
                 let acquisition =
                     receipt
                         .acquisition
@@ -148,14 +139,12 @@ impl HistoryChain {
                         .ok_or_else(|| BootstrapError::Invalid {
                             message: format!("receipt chain acquisition missing for {wallet}"),
                         })?;
-                if acquisition.mode == ActivityReadMode::Full {
-                    chain.parts.clear();
-                } else if chain.parts.is_empty() {
+                if acquisition.mode != ActivityReadMode::Full && chain.parts.is_empty() {
                     return invalid(format!(
                         "incremental receipt chain has no history proof for {wallet}"
                     ));
                 }
-                let (digest, count, source_rows) = if acquisition.version == 3 {
+                let (digest, count, source_rows) = if matches!(acquisition.version, 3 | 4) {
                     (
                         acquisition
                             .fetched_aggregate_digest
@@ -164,11 +153,11 @@ impl HistoryChain {
                         acquisition
                             .fetched_aggregate_count
                             .ok_or(BootstrapError::Internal)?,
-                        acquisition.fetched_source_row_count,
+                        normalized_fetched_source_rows(receipt)?,
                     )
                 } else if acquisition.mode == ActivityReadMode::Full {
                     (
-                        receipt.ordered_aggregate_digest,
+                        receipt.ordered_aggregate_digest.clone(),
                         receipt.aggregate_count,
                         receipt.source_row_count,
                     )
@@ -191,8 +180,9 @@ impl HistoryChain {
                     count,
                     source_rows,
                 });
-            }
-        }
+                Ok(())
+            },
+        )?;
         Ok(chain)
     }
 
@@ -532,7 +522,7 @@ impl CollectionProof {
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?
             == CACHE_SCHEMA_VERSION_BULK_ROOT;
         let mut large_certified_wallets = BTreeSet::new();
-        let history = if identity.version == 4 {
+        let history = if identity.history_format_three() {
             verify_history_certificates(connection)?;
             large_certified_wallets = connection.prepare(
                 "SELECT wallet_hex FROM activity_wallet_history_v3 WHERE source_row_count >= 5500",
@@ -663,7 +653,7 @@ impl CollectionProof {
         wallet: &str,
         carried: bool,
     ) -> Result<Option<ActivityPredecessor>, BootstrapError> {
-        if self.identity.version == 4 {
+        if self.identity.history_format_three() {
             return self.certified_predecessor(connection, wallet, carried);
         }
         let Some((manifest, identity)) = &self.base else {
@@ -793,16 +783,16 @@ impl CollectionProof {
             return invalid("activity deferral disagrees with frozen identity".to_owned());
         }
         let carried = complete && acquisition.mode == ActivityReadMode::Incremental;
-        if acquisition.version != if self.identity.version == 4 { 3 } else { 2 }
+        if acquisition.version != self.identity.acquisition_version()
             || acquisition.mode != self.mode(&receipt.wallet_hex)
             || acquisition.start_exclusive != self.start(&receipt.wallet_hex)
             || (acquisition.fixed_end_unix != self.identity.fixed_end_unix
-                && (acquisition.version != 3
+                && (!matches!(acquisition.version, 3 | 4)
                     || acquisition.aggregation_status == AggregationStatus::NotAttempted
                     || complete))
             || acquisition.fixed_end_unix > self.identity.fixed_end_unix
             || acquisition.fixed_end_unix <= acquisition.start_exclusive
-            || (self.identity.version != 4
+            || (!self.identity.history_format_three()
                 && acquisition.predecessor
                     != self.predecessor(connection, &receipt.wallet_hex, carried)?)
         {
@@ -811,7 +801,7 @@ impl CollectionProof {
                 receipt.wallet_hex
             ));
         }
-        if self.identity.version == 4 {
+        if self.identity.history_format_three() {
             // Authenticate the immutable snapshot's links, never regenerate it
             // from a certificate finalization may already have advanced.
             if let Some(base) = &acquisition.predecessor {
@@ -840,19 +830,24 @@ impl CollectionProof {
         if acquisition.mode == ActivityReadMode::Incremental && acquisition.predecessor.is_none() {
             return invalid("incremental wallet has no predecessor receipt".to_owned());
         }
-        let rows = if acquisition.aggregation_status == AggregationStatus::NotAttempted {
+        let read = if acquisition.aggregation_status == AggregationStatus::NotAttempted {
             if !receipt.pages.is_empty() {
                 return invalid("failed acquisition cannot claim page evidence".to_owned());
             }
-            0
+            PageRead::default()
         } else {
             validate_pages(
                 &receipt.wallet_hex,
                 &receipt.pages,
                 acquisition.start_exclusive,
                 acquisition.fixed_end_unix,
+                acquisition.version == 4,
             )?
         };
+        let rows = read.rows;
+        let normalized_rows = rows
+            .checked_sub(u64::try_from(read.anomalies.len()).map_err(|_| BootstrapError::Internal)?)
+            .ok_or(BootstrapError::Internal)?;
         if rows != acquisition.fetched_source_row_count
             || read_digest(&receipt.wallet_hex, &receipt.pages, acquisition)?
                 != acquisition.read_sha256
@@ -874,8 +869,8 @@ impl CollectionProof {
                         .ok_or_else(|| BootstrapError::Invalid {
                             message: "fetched count missing".to_owned(),
                         })?;
-                if count > rows
-                    || (count == 0) != (rows == 0)
+                if count > normalized_rows
+                    || (count == 0) != (normalized_rows == 0)
                     || (count == 0 && *digest != aggregate_digest(&[])?)
                 {
                     return invalid("invalid fetched aggregate count shape".to_owned());
@@ -930,7 +925,7 @@ impl CollectionProof {
                     "complete history counts do not equal carried plus fetched".to_owned(),
                 );
             }
-            if acquisition.version == 3
+            if matches!(acquisition.version, 3 | 4)
                 && Some(&receipt.ordered_aggregate_digest)
                     != acquisition.fetched_aggregate_digest.as_ref()
             {
@@ -1032,7 +1027,7 @@ fn verify_historical_receipts_with(
         || groups != manifest.group_count
         || source_rows != manifest.source_row_count
         || digest.finish() != manifest.receipt_set_digest
-        || (identity.version == 4 && fetched.finish() != manifest.aggregate_digest)
+        || (identity.history_format_three() && fetched.finish() != manifest.aggregate_digest)
     {
         return invalid("historical receipt-set commitment mismatch".to_owned());
     }
@@ -1107,6 +1102,102 @@ impl HistoryProof {
             links,
             continuations,
         })
+    }
+
+    /// Both aggregate commitments and anomalies use these replacement rules.
+    /// A clearing repair emits a reset with no part; infra exclusions preserve.
+    fn for_each_history_part(
+        &self,
+        connection: &Connection,
+        wallet: &str,
+        after: u64,
+        through: u64,
+        mut observe: impl FnMut(
+            &FreshCollectionIdentity,
+            Option<&ActivityWalletReceiptProof>,
+            bool,
+        ) -> Result<(), BootstrapError>,
+    ) -> Result<(), BootstrapError> {
+        for (_, (identity, manifest)) in self.records.range((
+            std::ops::Bound::Excluded(after),
+            std::ops::Bound::Included(through),
+        )) {
+            if identity
+                .wallets
+                .binary_search_by(|w| w.as_str().cmp(wallet))
+                .is_err()
+            {
+                continue;
+            }
+            let receipt = match manifest {
+                Some(manifest) => predecessor_receipt(connection, manifest, identity, wallet)?,
+                None => receipt_for_identity(connection, identity, wallet)?,
+            };
+            let repair = identity.repair_wallets.as_ref().is_some_and(|repairs| {
+                repairs.binary_search_by(|w| w.as_str().cmp(wallet)).is_ok()
+            });
+            if repair && receipt.excluded() && !receipt.partial() && !receipt.infra_excluded() {
+                observe(identity, None, true)?;
+            } else if !receipt.excluded() || receipt.partial() {
+                let full = receipt
+                    .acquisition
+                    .as_ref()
+                    .is_none_or(|a| a.mode == ActivityReadMode::Full);
+                observe(identity, Some(&receipt), full)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Certificates contain cumulative drops, not anomaly payloads. Always walk
+    /// from the root so formerly unresolved evidence can resolve in a later cycle.
+    pub(super) fn effective_anomalies(
+        &self,
+        connection: &Connection,
+        wallet: &str,
+        through: u64,
+    ) -> Result<Vec<pe_source_polymarket_public::ActivityRowAnomaly>, BootstrapError> {
+        let mut anomalies = Vec::new();
+        // Earlier contracts carry no anomalies. Skip that empty prefix's page
+        // decoding, using the full authenticated chain, never a certificate.
+        let after = self
+            .records
+            .range(..=through)
+            .find_map(|(generation, (identity, _))| {
+                (identity.version == 5).then_some(generation.saturating_sub(1))
+            })
+            .unwrap_or(through);
+        self.for_each_history_part(
+            connection,
+            wallet,
+            after,
+            through,
+            |identity, receipt, reset| {
+                if reset {
+                    anomalies.clear();
+                }
+                if let Some(receipt) = receipt {
+                    let acquisition = receipt.acquisition.as_ref();
+                    if acquisition.is_some_and(|a| a.version != identity.acquisition_version()) {
+                        return invalid(format!(
+                            "activity acquisition identity mismatch for {wallet}"
+                        ));
+                    }
+                    if identity.version == 5 {
+                        anomalies.extend(receipt_anomalies(receipt)?);
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        anomalies.sort_by(|a, b| {
+            (a.source_time.0, &a.raw_row_hash, a.row_index).cmp(&(
+                b.source_time.0,
+                &b.raw_row_hash,
+                b.row_index,
+            ))
+        });
+        Ok(anomalies)
     }
 
     fn identity(&self, generation: u64) -> Option<&FreshCollectionIdentity> {
@@ -1210,6 +1301,17 @@ pub(super) fn decode_receipt(
             .map(|json| serde_json::from_str(&json))
             .transpose()?,
     };
+    if version >= 2
+        && receipt
+            .acquisition
+            .as_ref()
+            .is_some_and(|a| !matches!((version, a.version), (2 | 3, 2) | (4, 3) | (5, 4)))
+    {
+        return invalid(format!(
+            "activity acquisition identity mismatch for {}",
+            receipt.wallet_hex
+        ));
+    }
     if row.get::<_, String>(1)? != reference
         || row.get::<_, i64>(2)? != end
         || receipt.schema_version != ACTIVITY_SCHEMA_VERSION
@@ -1218,7 +1320,13 @@ pub(super) fn decode_receipt(
             p.schema_version != ACTIVITY_SCHEMA_VERSION
                 || p.parser_version != ACTIVITY_PARSER_VERSION
         })
-        || (receipt.aggregate_count == 0 && receipt.source_row_count != 0)
+        || (receipt.aggregate_count == 0
+            && receipt.source_row_count != 0
+            && !(version == 5
+                && receipt.acquisition.as_ref().is_some_and(|a| a.version == 4)
+                && normalized_fetched_source_rows(&receipt)? == 0))
+        || (receipt.pages.iter().any(|page| !page.anomalies.is_empty())
+            && !(version == 5 && receipt.acquisition.as_ref().is_some_and(|a| a.version == 4)))
         || (receipt.exclusion_reason.is_some() && receipt.aggregate_count != 0)
         || (version >= 2) != receipt.acquisition.is_some()
     {
@@ -1260,12 +1368,19 @@ fn read_digest(
 
 // Saturated probe pages remain committed but their rows are not admitted twice.
 // Only terminal, unsaturated windows contribute to the fetched row total.
+#[derive(Default)]
+struct PageRead {
+    rows: u64,
+    anomalies: Vec<pe_source_polymarket_public::ActivityRowAnomaly>,
+}
+
 fn validate_pages(
     wallet: &str,
     pages: &[ReconciliationPageEvidence],
     start: i64,
     end: i64,
-) -> Result<u64, BootstrapError> {
+    allow_anomalies: bool,
+) -> Result<PageRead, BootstrapError> {
     use pe_source_polymarket_public::{ACTIVITY_MAX_OFFSET, RECONCILIATION_PAGE_LIMIT};
     let mut windows = BTreeMap::<(i64, i64), Vec<&ReconciliationPageEvidence>>::new();
     for page in pages {
@@ -1283,6 +1398,21 @@ fn validate_pages(
             || page.offset > ACTIVITY_MAX_OFFSET
         {
             return invalid("activity page is outside the frozen read window".to_owned());
+        }
+        let mut indices = BTreeSet::new();
+        for anomaly in &page.anomalies {
+            let second = anomaly.source_time.0.unix_timestamp();
+            if !allow_anomalies
+                || anomaly.wallet.to_string() != wallet
+                || second <= lo
+                || second > bounds.end
+                || anomaly.row_index
+                    >= usize::try_from(page.row_count).map_err(|_| BootstrapError::Internal)?
+                || !indices.insert(anomaly.row_index)
+            {
+                return invalid("activity anomaly is outside its page proof".to_owned());
+            }
+            validate_hex_sha256(&anomaly.raw_row_hash, "activity anomaly raw row hash")?;
         }
         validate_hex_sha256(&page.raw_page_hash, "raw page hash")?;
         validate_hex_sha256(&page.canonical_page_hash, "canonical page hash")?;
@@ -1325,25 +1455,100 @@ fn validate_pages(
         }
         let last = pages.last().ok_or(BootstrapError::Internal)?;
         if last.row_count < RECONCILIATION_PAGE_LIMIT {
-            leaves.push((lo, hi, rows));
+            leaves.push((
+                lo,
+                hi,
+                rows,
+                pages
+                    .into_iter()
+                    .flat_map(|page| page.anomalies.clone())
+                    .collect::<Vec<_>>(),
+            ));
         } else if last.offset != ACTIVITY_MAX_OFFSET {
             return invalid("activity page proof has no terminal page".to_owned());
         }
     }
-    leaves.sort_unstable();
+    leaves.sort_unstable_by_key(|(lo, hi, _, _)| (*lo, *hi));
     let mut cursor = start;
-    let mut rows = 0;
-    for (lo, hi, count) in leaves {
+    let mut read = PageRead::default();
+    for (lo, hi, count, anomalies) in leaves {
         if lo != cursor {
             return invalid("activity terminal windows have a gap or overlap".to_owned());
         }
         cursor = hi;
-        rows = checked_activity_count(rows, count)?;
+        read.rows = checked_activity_count(read.rows, count)?;
+        read.anomalies.extend(anomalies);
     }
     if cursor != end {
         return invalid("activity terminal windows do not reach fixed end".to_owned());
     }
-    Ok(rows)
+    Ok(read)
+}
+
+/// Only terminal windows contribute executable history or anomaly problems. The
+/// read commitment authenticates probe evidence too, even though it is discarded.
+fn receipt_anomalies(
+    receipt: &ActivityWalletReceiptProof,
+) -> Result<Vec<pe_source_polymarket_public::ActivityRowAnomaly>, BootstrapError> {
+    let Some(acquisition) = &receipt.acquisition else {
+        return Ok(Vec::new());
+    };
+    if acquisition.version != 4 {
+        return Ok(Vec::new());
+    }
+    let read = if acquisition.aggregation_status == AggregationStatus::NotAttempted {
+        if !receipt.pages.is_empty() {
+            return invalid("failed acquisition cannot claim page evidence".to_owned());
+        }
+        PageRead::default()
+    } else {
+        validate_pages(
+            &receipt.wallet_hex,
+            &receipt.pages,
+            acquisition.start_exclusive,
+            acquisition.fixed_end_unix,
+            true,
+        )?
+    };
+    if read.rows != acquisition.fetched_source_row_count
+        || read_digest(&receipt.wallet_hex, &receipt.pages, acquisition)? != acquisition.read_sha256
+    {
+        return invalid("activity read commitment mismatch".to_owned());
+    }
+    Ok(read.anomalies)
+}
+
+fn normalized_fetched_source_rows(
+    receipt: &ActivityWalletReceiptProof,
+) -> Result<u64, BootstrapError> {
+    let acquisition = receipt
+        .acquisition
+        .as_ref()
+        .ok_or(BootstrapError::Internal)?;
+    acquisition
+        .fetched_source_row_count
+        .checked_sub(
+            u64::try_from(receipt_anomalies(receipt)?.len())
+                .map_err(|_| BootstrapError::Internal)?,
+        )
+        .ok_or_else(|| BootstrapError::Invalid {
+            message: "anomaly count exceeds fetched source rows".to_owned(),
+        })
+}
+
+#[cfg(feature = "scenario")]
+pub(super) fn count_terminal_anomalies(
+    wallet: &str,
+    pages: &[ReconciliationPageEvidence],
+    start: i64,
+    end: i64,
+) -> Result<u64, BootstrapError> {
+    u64::try_from(
+        validate_pages(wallet, pages, start, end, true)?
+            .anomalies
+            .len(),
+    )
+    .map_err(|_| BootstrapError::Internal)
 }
 
 pub(super) fn verify_archived_identity(
@@ -1470,6 +1675,7 @@ impl<'receipt> AcquisitionPartition<'receipt> {
         let (fetched_count, fetched_source) = (self.fetched_count, self.fetched_source);
         validate_partitions(
             acquisition,
+            normalized_fetched_source_rows(self.receipt)?,
             carried,
             fetched,
             (carried_count, carried_source),
@@ -1480,6 +1686,7 @@ impl<'receipt> AcquisitionPartition<'receipt> {
 
 fn validate_partitions(
     acquisition: &ActivityAcquisition,
+    normalized_source_rows: u64,
     carried: JsonArrayDigest,
     fetched: JsonArrayDigest,
     (carried_count, carried_source): (u64, u64),
@@ -1497,7 +1704,7 @@ fn validate_partitions(
     }
     if Some(fetched.finish()) != acquisition.fetched_aggregate_digest
         || Some(fetched_count) != acquisition.fetched_aggregate_count
-        || fetched_source != acquisition.fetched_source_row_count
+        || fetched_source != normalized_source_rows
     {
         return invalid("fetched history does not reproduce acquisition receipt".to_owned());
     }
@@ -1570,7 +1777,7 @@ fn check_collisions(
     if proof.bulk_root {
         return Ok(false);
     }
-    if proof.identity.version == 4 {
+    if proof.identity.history_format_three() {
         if proof.mode(&completion.wallet_hex) == ActivityReadMode::Full {
             return Ok(false);
         }
@@ -1638,7 +1845,7 @@ pub(super) fn commit_incremental_wallet(
             }
         }
     }
-    if proof.identity.version == 4 {
+    if proof.identity.history_format_three() {
         commit_history_wallet(scan, connection, proof, completed_at, completion)
     } else {
         (
@@ -1879,7 +2086,7 @@ fn commit_history_wallet(
             !excluded && mode == ActivityReadMode::Incremental,
         )?;
         let mut acquisition = ActivityAcquisition {
-            version: 3,
+            version: identity.acquisition_version(),
             mode: mode.clone(),
             start_exclusive: proof.start(wallet),
             fixed_end_unix: completion.acquired_end,

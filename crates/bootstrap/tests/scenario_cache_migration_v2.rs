@@ -65,16 +65,16 @@ fn finalize_cache_v2(
         .flatten();
     let three = raw
         .and_then(|json| serde_json::from_str::<Value>(&json).ok())
-        .is_some_and(|identity| identity["version"] == 4);
+        .is_some_and(|identity| matches!(identity["version"].as_u64(), Some(4 | 5)));
     drop(connection);
     if !three || stage.is_none() {
         return finalize_cache_v2_unbound(path, stage, now);
     }
     finalize_cache_v2_unbound(path, None, now)?;
     let connection = Connection::open(path)?;
-    let (count, digest, raw): (u64, String, String) = connection.query_row(
-        "SELECT ranker_projection_count, ranker_projection_digest, ranker_projection_inputs_json FROM cache_v2_migration_state", [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    let (count, digest, raw, classifier): (u64, String, String, u32) = connection.query_row(
+        "SELECT ranker_projection_count, ranker_projection_digest, ranker_projection_inputs_json, ranker_classifier_version FROM cache_v2_migration_state", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
     let inputs: Value = serde_json::from_str(&raw)?;
     let payout_count: u64 =
@@ -95,7 +95,7 @@ fn finalize_cache_v2(
         &manifest,
         serde_json::to_vec(&serde_json::json!({
             "version": 3, "activity_scope": "projection_spool", "tables": tables,
-            "projection": {"count": count, "digest": digest, "classifier_version": 6, "oracle_version": 6,
+            "projection": {"count": count, "digest": digest, "classifier_version": classifier, "oracle_version": 6,
                 "activity_generation": inputs["activity_generation"], "spool_sha256": inputs["projection_spool"]["sha256"]}
         }))?,
     )?;
@@ -245,7 +245,15 @@ fn write_pending_publication(
     if evidence.exists() {
         activation["stage_evidence_sha256"] = Value::String(sha256_file(&evidence).unwrap());
     }
-    let batch = serde_json::json!({"config_hash": null, "classifier_version": 6});
+    let classifier: u32 = Connection::open(expected_installed)
+        .unwrap()
+        .query_row(
+            "SELECT ranker_classifier_version FROM cache_v2_migration_state",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let batch = serde_json::json!({"config_hash": null, "classifier_version": classifier});
     let end: i64 = Connection::open(expected_installed)
         .unwrap()
         .query_row(
@@ -1487,7 +1495,7 @@ async fn projection_admits_only_order_independent_first_entries() {
         ]
     );
     assert_eq!(stage.ranker_projection_count, 2);
-    assert_eq!(stage.ranker_classifier_version, 6);
+    assert_eq!(stage.ranker_classifier_version, 7);
 }
 
 /// PASS: known-condition anchor redemptions are no-ops, including beside an entry
@@ -1853,7 +1861,7 @@ async fn redemption_noops_and_verified_identity_shape_the_projection() {
     .map(|(wallet, tx)| (wallet.to_owned(), tx.to_owned()));
     assert_eq!(projected, expected);
     assert_eq!(stage.ranker_projection_count, 19);
-    assert_eq!(stage.ranker_classifier_version, 6);
+    assert_eq!(stage.ranker_classifier_version, 7);
     // The unresolved market's token order and venue page still bind the inputs.
     for (name, sql) in [
         (
@@ -2113,7 +2121,7 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
 const CLASSIFIER_FIXED_END: i64 = 1_800_000_000;
 
 async fn retained_classifier_activity(dir: &TempDir, side: &std::path::Path) -> std::path::PathBuf {
-    retained_classifier_activity_at_version(dir, side, 6).await
+    retained_classifier_activity_at_version(dir, side, 7).await
 }
 
 async fn retained_classifier_activity_at_version(
@@ -2128,7 +2136,7 @@ async fn retained_classifier_activity_at_version(
     let frozen = write_frozen_reference(dir, fixed_end - 10, vec![WALLET.to_owned()]);
     let row = |kind: &str, id: &str, market: &str, epoch: i64| {
         serde_json::json!({
-            "proxyWallet": WALLET, "type": kind, "conditionId": if classifier_version == 6 { fixture_market(market) } else { market.to_owned() }, "asset": "123",
+            "proxyWallet": WALLET, "type": kind, "conditionId": if matches!(classifier_version, 6 | 7) { fixture_market(market) } else { market.to_owned() }, "asset": "123",
             "outcome": "Yes", "side": "BUY", "size": if kind == "CONVERSION" { "0" } else { "1" },
             "usdcSize": if kind == "CONVERSION" { "0" } else { "0.5" }, "price": "0.5",
             "timestamp": epoch, "transactionHash": id, "outcomeIndex": "0",
@@ -2138,7 +2146,7 @@ async fn retained_classifier_activity_at_version(
         row("TRADE", "0xlater-b", "0xlater-b", fixed_end - 1),
         row("TRADE", "0xlater-a", "0xlater-a", fixed_end - 2),
     ];
-    if matches!(classifier_version, 2 | 6) {
+    if matches!(classifier_version, 2 | 6 | 7) {
         rows.extend(
             (0..5).map(|index| row("TRADE", &format!("0xwide-{index}"), "0xwide", fixed_end - 3)),
         );
@@ -2148,9 +2156,13 @@ async fn retained_classifier_activity_at_version(
     let url = format!(
         "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={fixed_end}"
     );
-    if classifier_version == 6 {
-        // Change 2: current-classifier fixtures start with identity four.
+    if matches!(classifier_version, 6 | 7) {
+        // Format-three fixtures select their recorded contract before collection.
         verify_frozen_payload_v1(side, &frozen, fixed_end + 1).unwrap();
+        collection_admit(side, 7, fixed_end, &[]).await;
+        if classifier_version == 6 {
+            freeze_identity_four(side);
+        }
         populate_activity_fresh_v2(
             side,
             &FixtureFetcher::new(HashMap::from([(
@@ -2179,7 +2191,7 @@ async fn retained_classifier_activity_at_version(
     }
     let markets = ["0xlater-a", "0xlater-b"].map(|market| {
         serde_json::json!({
-            "condition_id": if classifier_version == 6 { fixture_market(market) } else { market.to_owned() }, "active": true, "closed": true,
+            "condition_id": if matches!(classifier_version, 6 | 7) { fixture_market(market) } else { market.to_owned() }, "active": true, "closed": true,
             "end_date_iso": "2027-01-16T00:00:00Z", "is_50_50_outcome": false,
             "tokens": [{"token_id":"123","outcome":"Yes","price":1,"winner":true},
                        {"token_id":"456","outcome":"No","price":0,"winner":false}],
@@ -2199,7 +2211,7 @@ async fn retained_classifier_activity_at_version(
     if classifier_version == 1 {
         install_legacy_receipt_manifest(side, 7);
     }
-    if classifier_version != 6 {
+    if !matches!(classifier_version, 6 | 7) {
         seed_historical_format_two(side, classifier_version, fixed_end + 2);
     }
     let stage = finalize_cache_v2(
@@ -2695,7 +2707,7 @@ async fn classifier_v2_rebuilds_retained_activity_without_recollection() {
             stage.ranker_classifier_version,
             stage.ranker_projection_count
         ),
-        (6, 2)
+        (7, 2)
     );
     assert_eq!(
         stage.ranker_projection_digest,
@@ -3481,7 +3493,7 @@ async fn refinalization_resumes_after_commit_before_stage_receipt() {
                 ))
             )
             .unwrap(),
-        (6, 2, "finalized".to_owned())
+        (7, 2, "finalized".to_owned())
     );
     drop(connection);
     let stage_path = dir.path().join("resumed-stage.json");
@@ -3513,7 +3525,7 @@ async fn refinalization_resumes_after_commit_before_stage_receipt() {
     assert_eq!(stage.cache_sha256, sha256_file(&side).unwrap());
     let receipt: Value = serde_json::from_slice(&std::fs::read(stage_path).unwrap()).unwrap();
     assert_eq!(receipt["cache_sha256"], stage.cache_sha256);
-    assert_eq!(receipt["ranker_classifier_version"], 6);
+    assert_eq!(receipt["ranker_classifier_version"], 7);
     assert_eq!(retained_activity_rows(&side), retained);
     let no_reads = DatasetFetcher::default();
     populate_activity_fresh_v2(
@@ -3531,7 +3543,7 @@ async fn refinalization_resumes_after_commit_before_stage_receipt() {
 
 #[tokio::test]
 async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
-    for historical in [1, 3] {
+    for historical in [1, 3, 6] {
         upgrade_activation_preserves_prior_cache(historical).await;
     }
 }
@@ -3548,6 +3560,10 @@ async fn upgrade_activation_preserves_prior_cache(historical: u32) {
     let prior_hash = sha256_file(&fixed).unwrap();
     let prior_bytes = std::fs::read(&fixed).unwrap();
     let prior_rows = retained_activity_rows(&fixed);
+    let prior_summary = query_values(
+        &fixed,
+        "SELECT ranker_classifier_version, ranker_projection_count, ranker_projection_digest FROM cache_v2_migration_state",
+    );
     let prior_projection = classifier_projection_rows(&fixed);
     assert_eq!(prior_projection.len(), 2);
     assert!(
@@ -3565,7 +3581,7 @@ async fn upgrade_activation_preserves_prior_cache(historical: u32) {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(stage.ranker_classifier_version, 6);
+    assert_eq!(stage.ranker_classifier_version, 7);
     assert_eq!(stage.ranker_projection_count, 2);
     let upgraded_bytes = std::fs::read(&side).unwrap();
     let upgraded_rows = retained_activity_rows(&side);
@@ -3575,7 +3591,7 @@ async fn upgrade_activation_preserves_prior_cache(historical: u32) {
         ranker_projection_digest FROM cache_v2_migration_state",
     );
     let upgraded_projection = classifier_projection_rows(&side);
-    assert!(upgraded_projection.iter().all(|row| row.2 == 6));
+    assert!(upgraded_projection.iter().all(|row| row.2 == 7));
     let request = CacheActivationRequest {
         stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
@@ -3595,10 +3611,21 @@ async fn upgrade_activation_preserves_prior_cache(historical: u32) {
         retained_activity_rows(&request.prior_cache_backup_path),
         prior_rows
     );
-    assert_eq!(
-        classifier_projection_rows(&request.prior_cache_backup_path),
-        prior_projection
-    );
+    if historical <= 3 {
+        assert_eq!(
+            classifier_projection_rows(&request.prior_cache_backup_path),
+            prior_projection
+        );
+    } else {
+        // Format-three backups authenticate their recorded summary without a retired spool.
+        assert_eq!(
+            query_values(
+                &request.prior_cache_backup_path,
+                "SELECT ranker_classifier_version, ranker_projection_count, ranker_projection_digest FROM cache_v2_migration_state"
+            ),
+            prior_summary
+        );
+    }
     assert_eq!(
         std::fs::read(&request.prior_cache_backup_path).unwrap(),
         prior_bytes
@@ -3685,7 +3712,7 @@ async fn upgrade_activation_preserves_prior_cache(historical: u32) {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(fresh_stage.ranker_classifier_version, 6);
+    assert_eq!(fresh_stage.ranker_classifier_version, 7);
     let fresh_rows = retained_activity_rows(&fresh_side);
     let fresh_request = CacheActivationRequest {
         stage_evidence_sha256: None,
@@ -4392,7 +4419,7 @@ async fn fresh_generation_on_initial_base_binds_the_union_and_certifies_without_
 
     let record = fresh_record(&side);
     // Decision 9: newly admitted roots use history format three.
-    assert_eq!(record["version"], 4);
+    assert_eq!(record["version"], 5);
     assert_eq!(record["generation"], 1);
     assert_eq!(record["fixed_end_unix"], FRESH_END);
     assert_eq!(
@@ -4438,7 +4465,7 @@ async fn fresh_generation_on_initial_base_binds_the_union_and_certifies_without_
     assert_eq!(
         count(
             &side,
-            "SELECT COUNT(*) FROM ranker_entries_v2 WHERE classifier_version = 6"
+            "SELECT COUNT(*) FROM ranker_entries_v2 WHERE classifier_version = 7"
         ),
         0 // Change 3: format three writes its five projected entries to the spool.
     );
@@ -5714,7 +5741,7 @@ async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only
     .unwrap()
     .unwrap();
     assert_eq!(stage.activity_coverage_generation, 2);
-    assert_eq!(stage.ranker_classifier_version, 6);
+    assert_eq!(stage.ranker_classifier_version, 7);
 
     // The fresh-identity prior validates as the historical fixed cache and is
     // preserved byte for byte by activation.
@@ -5803,6 +5830,8 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_parsed() {
     let manifest = write_build_manifest(&dir, &side);
     migrate_cache_v2(&side, &manifest).unwrap();
 
+    collection_admit(&side, 1, FRESH_END, &[]).await;
+    freeze_identity_four(&side);
     let manifest = populate_activity_fresh_v2(
         &side,
         &UnparseableWalletFetcher,
@@ -7437,7 +7466,7 @@ fn install_legacy_receipt_manifest(path: &std::path::Path, generation: i64) {
             |row| row.get::<_, Option<i64>>(0),
         )
         .unwrap()
-        .is_some_and(|version| matches!(version, 2 | 4))
+        .is_some_and(|version| matches!(version, 2 | 4 | 5))
     {
         convert_root_to_v1(path);
     }
@@ -7503,7 +7532,7 @@ fn reference_unfused_projection(
     use pe_position_ledger::{LedgerEffect, classify_complete_historical_second};
     use pe_source_polymarket_public::{ActivityAggregate, ClobToken};
     use std::collections::BTreeSet;
-    const RANKER_CLASSIFIER_VERSION: u32 = 6;
+    const RANKER_CLASSIFIER_VERSION: u32 = 7;
     let payout_markets = transaction
         .prepare(
             "SELECT market_id, tokens_json, raw_page_sha256, end_date_unix,
@@ -7938,7 +7967,7 @@ fn finalize_against_unfused_reference(
     drop(connection);
     if raw
         .and_then(|json| serde_json::from_str::<Value>(&json).ok())
-        .is_some_and(|identity| identity["version"] == 4)
+        .is_some_and(|identity| matches!(identity["version"].as_u64(), Some(4 | 5)))
     {
         let expected = reference_scoped_rows(path);
         let stage = finalize_cache_v2(path, Some(stage_path), finalized_at)
@@ -10401,7 +10430,7 @@ async fn incremental_receipt_resume_validates_new_metadata_without_loading_compl
     for (index, change) in [
         "NULL",
         "'{}'",
-        "json_set(acquisition_json, '$.version', 4)",
+        "json_set(acquisition_json, '$.version', 5)",
         "json_set(acquisition_json, '$.start_exclusive', 0)",
         "json_set(acquisition_json, '$.fixed_end_unix', 9)",
         "json_set(acquisition_json, '$.mode', 'full')",
@@ -10552,7 +10581,7 @@ async fn incremental_authentic_v1_resume_and_old_reader_proof_boundary() {
     .unwrap();
     assert_eq!(successor.cursors["version"], 2);
     // Decision 9: a historical root transitions before classifier-six finalization.
-    assert_eq!(fresh_record(&side)["version"], 4);
+    assert_eq!(fresh_record(&side)["version"], 5);
     assert_eq!(
         fresh_record(&side)["deferred_wallets"],
         serde_json::json!([])
@@ -11294,7 +11323,7 @@ async fn acquisition_failure_authentic_649_resume_preserves_proofs_and_recovers_
         ],
         ..Default::default()
     };
-    source.rows[1]["price"] = Value::from("3.1968021978");
+    source.rows[1]["side"] = Value::from("invalid");
     populate_activity_fresh_v2(
         &side,
         &source,
@@ -11339,7 +11368,7 @@ async fn acquisition_failure_authentic_649_resume_preserves_proofs_and_recovers_
         before[1]["exclusion_reason"]
             .as_str()
             .unwrap()
-            .contains("price")
+            .contains("side")
     );
     assert_eq!(before[1]["pages"], serde_json::json!([]));
     let identity = fresh_record(&side);
@@ -11368,7 +11397,7 @@ async fn acquisition_failure_authentic_649_resume_preserves_proofs_and_recovers_
         }))
     );
     drop(connection);
-    source.rows[1]["price"] = Value::from("0.500000");
+    source.rows[1]["side"] = Value::from("BUY");
     for embedded in [false, true] {
         let next = dir.path().join(format!("649-next-{embedded}.db"));
         std::fs::copy(&side, &next).unwrap();
@@ -11463,7 +11492,7 @@ async fn acquisition_failure_keeps_retained_history_excluded_until_incremental_r
     source
         .rows
         .push(dataset_row(WALLET, "0xc", "bad", "BUY", FRESH_END + 1));
-    source.rows[2]["price"] = Value::from("3.1968021978");
+    source.rows[2]["side"] = Value::from("invalid");
     let excluded = populate_activity_fresh_v2(
         &side,
         &source,
@@ -11572,7 +11601,7 @@ async fn acquisition_failure_keeps_retained_history_excluded_until_incremental_r
     .unwrap()
     .unwrap();
     assert_python_consumer_parity(&excluded_full, &side);
-    source.rows[2]["price"] = Value::from("0.500000");
+    source.rows[2]["side"] = Value::from("BUY");
     source.calls.lock().unwrap().clear();
     populate_activity_fresh_v2(
         &side,
@@ -13385,7 +13414,7 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
     history_v3_collect(&side, &source, 2, FRESH_END + 10, &[])
         .await
         .unwrap();
-    assert_eq!(fresh_record(&side)["version"], 4);
+    assert_eq!(fresh_record(&side)["version"], 5);
     assert_eq!(
         fresh_record(&side)["deferred_wallets"],
         serde_json::json!([])
@@ -13796,7 +13825,7 @@ async fn incremental_interrupted_v2_resume_preserves_identity_and_receipts() {
     .await
     .unwrap();
     // Decision 9: the resumed historical head admits an identity-four successor.
-    assert_eq!(fresh_record(&side)["version"], 4);
+    assert_eq!(fresh_record(&side)["version"], 5);
     let archive: String = conn
         .query_row(
             "SELECT collection_identity_json FROM activity_coverage_manifests_v2 WHERE generation = 2",
@@ -14064,6 +14093,7 @@ async fn real_wrapper_repair_and_record_recovery_publish_after_backup_retirement
 #[tokio::test]
 async fn real_wrapper_unrepresentable_exclusions_prepare_but_non_array_holds() {
     real_wrapper_publications(PublicationScenario::Unrepresentable).await;
+    real_wrapper_publications(PublicationScenario::Anomalies).await;
     real_wrapper_publications(PublicationScenario::NonArray).await;
 }
 
@@ -14096,6 +14126,7 @@ enum PublicationScenario {
     LegacyRoot,
     Recovery,
     Unrepresentable,
+    Anomalies,
     NonArray,
     Collision,
     Deferred,
@@ -14108,10 +14139,12 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         PublicationScenario::BulkRoot
             | PublicationScenario::LegacyRoot
             | PublicationScenario::Unrepresentable
+            | PublicationScenario::Anomalies
             | PublicationScenario::NonArray
             | PublicationScenario::Collision
             | PublicationScenario::ParticipantHold
     );
+    let anomalies = scenario == PublicationScenario::Anomalies;
     let legacy_root = scenario == PublicationScenario::LegacyRoot;
     let recovery = scenario == PublicationScenario::Recovery;
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -14377,7 +14410,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
     .unwrap();
     std::fs::write(dir.path().join(".env"), format!(
         "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_CATEGORIES='[\"OVERALL\"]'\nPE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER={}\nPE_RANKER_ENGINE=duck\nPE_RANK_MARKET_SERIES=7:btc-up-or-down-15m\nWIN_END={}\n",
-        dir.path().join("watchlist.json").display(), if scenario == PublicationScenario::Unrepresentable { "prepare" } else { "1" }, time::OffsetDateTime::from_unix_timestamp(now - 86_400).unwrap().date())).unwrap();
+        dir.path().join("watchlist.json").display(), if matches!(scenario, PublicationScenario::Unrepresentable | PublicationScenario::Anomalies) { "prepare" } else { "1" }, time::OffsetDateTime::from_unix_timestamp(now - 86_400).unwrap().date())).unwrap();
     if scenario == PublicationScenario::ParticipantHold {
         let path = dir.path().join(".env");
         let mut settings = std::fs::read_to_string(&path).unwrap();
@@ -14473,6 +14506,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
     if matches!(
         scenario,
         PublicationScenario::Unrepresentable
+            | PublicationScenario::Anomalies
             | PublicationScenario::NonArray
             | PublicationScenario::Collision
             | PublicationScenario::Deferred
@@ -14686,6 +14720,40 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
             admit_dataset_wallet(&side, WALLET_D);
             let mut bad = dataset_row(WALLET_C, "0xa", "bad-price", "BUY", now - 300);
             bad["price"] = Value::from("3.1968021978");
+            if anomalies {
+                bad["conditionId"] = Value::from("0xfa");
+                bad["asset"] = Value::from("8000");
+                let healthy = source
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        row["proxyWallet"] == WALLET
+                            && row["transactionHash"].as_str().unwrap().contains("-entry-")
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(healthy.len(), 20);
+                for wallet in [WALLET_C, WALLET_D] {
+                    for row in &healthy {
+                        let mut row = row.clone();
+                        row["proxyWallet"] = Value::from(wallet);
+                        source.rows.push(row);
+                    }
+                }
+                let mut recent = dataset_row(WALLET_C, "0xfb", "healthy-recent", "BUY", now - 200);
+                recent["asset"] = Value::from("8100");
+                source.rows.push(recent);
+                let mut decimal = bad.clone();
+                decimal["price"] = Value::from("0.5");
+                decimal["usdcSize"] = Value::from("4.212e-7");
+                decimal["transactionHash"] = Value::from("decimal");
+                decimal["timestamp"] = Value::from(now - 299);
+                let mut unknown = decimal.clone();
+                unknown["conditionId"] = Value::from("0xdead");
+                unknown["asset"] = Value::from("99999");
+                unknown["transactionHash"] = Value::from("unresolved");
+                source.rows.extend([decimal, unknown]);
+            }
             source.rows.push(bad);
             for index in 0..6000 {
                 let mut row = dataset_row(
@@ -14695,12 +14763,23 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                     "BUY",
                     now - 20_000 + i64::from(index),
                 );
-                if index == 5500 {
+                if anomalies {
+                    row["conditionId"] = Value::from("0xfa");
+                    row["asset"] = Value::from("8000");
+                }
+                if index == if anomalies { 100 } else { 5500 } {
                     row["outcomeIndex"] = Value::from("unmappable");
                 }
                 source.rows.push(row);
             }
             collection_admit(&side, 1, now - 120, &[]).await;
+            if anomalies {
+                assert_eq!(fresh_record(&side)["version"], 5);
+                assert!(stored_receipt_proofs(&Connection::open(&side).unwrap(), 1).is_empty());
+                *activity_rows.lock().unwrap() = source.rows.clone();
+            } else {
+                freeze_identity_four(&side);
+            }
             let fetcher = WrapperActivityFixture {
                 source,
                 overrides: BTreeMap::new(),
@@ -14711,36 +14790,61 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 &side,
                 &fetcher,
                 now - 120,
-                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(std::sync::atomic::AtomicU64::new(if anomalies {
+                    1_995_001
+                } else {
+                    0
+                })),
                 None,
             )
             .await
             .unwrap();
             let no_windows = collection_proof(&side, 1, WALLET_C);
             let proved = collection_proof(&side, 1, WALLET_D);
-            assert_eq!(
-                no_windows["acquisition"]["aggregation_status"],
-                "not_attempted"
-            );
+            if anomalies {
+                assert_eq!(no_windows["acquisition"]["disposition"], "complete");
+                assert_eq!(proved["acquisition"]["disposition"], "excluded");
+                assert!(
+                    proved["pages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|p| p.get("anomalies").is_some())
+                );
+            } else {
+                assert_eq!(
+                    no_windows["acquisition"]["aggregation_status"],
+                    "not_attempted"
+                );
+            }
             assert_eq!(proved["acquisition"]["aggregation_status"], "complete");
             assert_eq!(proved["acquisition"]["fetched_source_row_count"], 4999);
         }
         let before = requests.lock().unwrap().len();
         let output = run_wrapper();
-        let expected = if scenario == PublicationScenario::Unrepresentable {
+        let expected = if matches!(
+            scenario,
+            PublicationScenario::Unrepresentable | PublicationScenario::Anomalies
+        ) {
             Some(2)
         } else {
             Some(0)
         };
         assert_eq!(output.status.code(), expected, "{output:?}");
         assert!(request.exists());
-        let identity = fresh_record(if scenario == PublicationScenario::Unrepresentable {
-            &side
-        } else {
-            &fixed
-        });
+        let identity = fresh_record(
+            if matches!(
+                scenario,
+                PublicationScenario::Unrepresentable | PublicationScenario::Anomalies
+            ) {
+                &side
+            } else {
+                &fixed
+            },
+        );
         let expected_generation = match scenario {
             PublicationScenario::Unrepresentable => 1,
+            PublicationScenario::Anomalies => 2,
             _ => 3,
         };
         assert_eq!(identity["generation"], expected_generation);
@@ -14760,6 +14864,57 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 !requests.lock().unwrap()[before..]
                     .iter()
                     .any(|line| line.contains("/activity?"))
+            );
+            assert_eq!(sha256_file(&fixed).unwrap(), fixed_hash);
+            assert!(batches.lock().unwrap().is_empty());
+        } else if anomalies {
+            let saved: Value = serde_json::from_slice(&std::fs::read(&request).unwrap()).unwrap();
+            assert_eq!(saved["batch"]["classifier_version"], 7);
+            for wallet in [WALLET_C, WALLET_D] {
+                let entry = saved["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["wallet_hex"] == wallet)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "wallet {wallet}: request={saved}; stdout={}; stderr={}",
+                            String::from_utf8_lossy(&output.stdout),
+                            String::from_utf8_lossy(&output.stderr)
+                        )
+                    });
+                assert_eq!(entry["survives"], true);
+                assert!(
+                    entry["scope_drops"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|d| d["cause"] == "unrepresentable" && d["scope_id"] == "0xfa")
+                );
+            }
+            let logs = String::from_utf8_lossy(&output.stdout).to_string()
+                + &String::from_utf8_lossy(&output.stderr);
+            let report = logs
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|log| log["fields"]["message"] == "scoped classifier verified pass finalized")
+                .unwrap();
+            let report: Value =
+                serde_json::from_str(report["fields"]["report"].as_str().unwrap()).unwrap();
+            assert!(
+                report["unresolved_anomalies"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a["wallet_hex"] == WALLET_C && a["condition_id"] == "0xdead")
+            );
+            assert_eq!(
+                collection_proof(&side, 2, WALLET_D)["acquisition"]["mode"],
+                "incremental"
+            );
+            assert_eq!(
+                collection_proof(&side, 1, WALLET_D)["acquisition"]["version"],
+                4
             );
             assert_eq!(sha256_file(&fixed).unwrap(), fixed_hash);
             assert!(batches.lock().unwrap().is_empty());
@@ -14969,7 +15124,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         let stdout = String::from_utf8(output.stdout).unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(
-            stderr.contains("classifier 6 verified pass finalized"),
+            stderr.contains("scoped classifier verified pass finalized"),
             "{stderr}"
         );
         assert!(stderr.contains("ignored_by_activity_type"), "{stderr}");
@@ -14978,7 +15133,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
             .lines()
             .chain(stderr.lines())
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|log| log["fields"]["message"] == "classifier 6 verified pass finalized")
+            .filter(|log| log["fields"]["message"] == "scoped classifier verified pass finalized")
             .map(|log| serde_json::from_str(log["fields"]["report"].as_str().unwrap()).unwrap())
             .collect();
         assert_eq!(reports.len(), 1);
@@ -15029,11 +15184,11 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                     &fixed,
                     "SELECT ranker_classifier_version FROM cache_v2_migration_state"
                 ),
-                6
+                7
             );
         }
         // Decision 9: each new cycle freezes collection identity 4.
-        assert_eq!(identity["version"], 4);
+        assert_eq!(identity["version"], 5);
         let new_requests = requests.lock().unwrap()[before..].to_vec();
         let quiet_requested = new_requests
             .iter()
@@ -15068,7 +15223,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         assert_eq!(batch["p_entries"].as_array().unwrap().len(), 1);
         assert_eq!(batch["p_entries"][0]["wallet_hex"], WALLET);
         assert_eq!(batch["p_entries"][0]["survives"], true);
-        assert_eq!(batch["p_batch"]["classifier_version"], 6);
+        assert_eq!(batch["p_batch"]["classifier_version"], 7);
         let saved: Value = serde_json::from_slice(
             &std::fs::read(out.join("ranking_publish_request.json")).unwrap(),
         )
@@ -15344,6 +15499,8 @@ async fn unrepresentable_parser_text_matches_receipt_reasons_and_wrapper_constan
         .unwrap_err();
         let dir = TempDir::new().unwrap();
         let side = dataset_candidate(&dir, "parser.db", &[]);
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        freeze_identity_four(&side);
         populate_activity_fresh_v2(
             &side,
             &FixtureFetcher::new(HashMap::from([(activity_url(WALLET, FRESH_END), body)])),
@@ -15619,6 +15776,19 @@ impl FixtureVenue {
 
 // ── #739: format-three history and admission ────────────────────────────────
 
+fn freeze_identity_four(side: &std::path::Path) {
+    let mut identity = fresh_record(side);
+    identity["version"] = Value::from(4);
+    identity.as_object_mut().unwrap().remove("digest");
+    identity["digest"] = Value::from(whole_json_digest(&identity));
+    history_v3_damage_connection(side)
+        .execute(
+            "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1",
+            [identity.to_string()],
+        )
+        .unwrap();
+}
+
 fn history_v3_freeze_legacy_root(side: &std::path::Path, wallets: &[&str]) {
     history_v3_freeze_legacy_root_at(side, wallets, 1, FRESH_END);
 }
@@ -15718,7 +15888,7 @@ fn history_v3_wallet_count(side: &std::path::Path) -> i64 {
 
 fn history_v3_bad_row(epoch: i64) -> Value {
     let mut row = dataset_row(WALLET, "0xa", "bad-price", "BUY", epoch);
-    row["price"] = Value::from("3");
+    row["side"] = Value::from("invalid");
     row
 }
 
@@ -15760,7 +15930,7 @@ async fn history_v3_transition_is_atomic_resumable_and_certifies_empty_complete_
         .await
         .unwrap();
     let identity = fresh_record(&side);
-    assert_eq!(identity["version"], 4);
+    assert_eq!(identity["version"], 5);
     assert_eq!(identity["repair_wallets"], serde_json::json!([]));
     assert_eq!(
         count(
@@ -15797,7 +15967,7 @@ async fn history_v3_incremental_history_keeps_insertion_provenance_and_fetched_r
     assert_eq!(generation_rows(&side, 2), 1);
     assert_eq!(history_v3_wallet_count(&side), 2);
     let proof = stored_receipt_proofs(&Connection::open(&side).unwrap(), 2).remove(0);
-    assert_eq!(proof["acquisition"]["version"], 3);
+    assert_eq!(proof["acquisition"]["version"], 4);
     assert_eq!(proof["aggregate_count"], 1);
     assert_eq!(proof["acquisition"]["predecessor"]["aggregate_count"], 1);
     source
@@ -16449,7 +16619,7 @@ async fn history_v3_root_is_format_three_and_receipt_universe_survives_before_fi
         .await
         .unwrap();
     let identity = fresh_record(&side);
-    assert_eq!(identity["version"], 4);
+    assert_eq!(identity["version"], 5);
     assert!(identity["base_generation"].is_null());
     assert!(identity["base_manifest_sha256"].is_null());
     assert_eq!(identity["start_exclusive"], 0);
@@ -16752,7 +16922,7 @@ async fn history_v3_transition_verifies_each_earlier_record_chain_once_for_all_e
     assert_eq!(verified.len(), 1, "{verified:?}");
     assert_eq!(verified[0]["fields"]["generation"], 2);
     assert_eq!(verified[0]["fields"]["verified"], "[1, 2]");
-    assert_eq!(fresh_record(&side)["version"], 4);
+    assert_eq!(fresh_record(&side)["version"], 5);
     assert_eq!(
         count(
             &side,
@@ -17068,8 +17238,7 @@ async fn history_v3_interrupted_restore_requires_matching_final_stage_record_in_
         let h0 = sha256_file(&fixed).unwrap();
         stage_cache_cycle_v2(&fixed, &prior, &side, None, None).unwrap();
         migrate_cache_v2(&side, &write_build_manifest(&dir, &side)).unwrap();
-        let mut problem = projection_v3_row("0xe", "restore-conversion", FRESH_END - 1);
-        problem["type"] = Value::from("CONVERSION");
+        let problem = forge_822_anomaly(0, FRESH_END - 1);
         let source = DatasetFetcher {
             rows: vec![problem, projection_v3_row("0xb", "a", FRESH_END)],
             ..Default::default()
@@ -17088,12 +17257,12 @@ async fn history_v3_interrupted_restore_requires_matching_final_stage_record_in_
         let (publication, pending) =
             write_pending_publication(&dir, "restore-three", &side, &fixed, &fixed, &displaced);
         let request: Value = serde_json::from_slice(&std::fs::read(&publication).unwrap()).unwrap();
-        assert_eq!(request["batch"]["classifier_version"], 6);
+        assert_eq!(request["batch"]["classifier_version"], 7);
         assert_eq!(request["entries"][0]["history_through_unix"], FRESH_END);
         assert_eq!(
             request["entries"][0]["scope_drops"],
             serde_json::json!([
-            {"scope_kind":"event","scope_id":"0xe","dropped_at_unix":FRESH_END - 1,"cause":"conversion"}])
+            {"scope_kind":"market","scope_id":"0xa","dropped_at_unix":FRESH_END - 1,"cause":"unrepresentable"}])
         );
         std::fs::write(
             side.with_extension("restore.json"),
@@ -17186,11 +17355,11 @@ async fn history_v3_interrupted_restore_requires_matching_final_stage_record_in_
 }
 
 #[tokio::test]
-async fn history_v3_bulk_root_freezes_format_three_and_resumes_under_acquisition_three() {
+async fn history_v3_bulk_root_freezes_identity_five_and_resumes_under_acquisition_four() {
     let fixture = BulkRootFixture::new();
     fixture.admit().await;
     let frozen = fresh_record(&fixture.side);
-    assert_eq!(frozen["version"], 4);
+    assert_eq!(frozen["version"], 5);
     assert_eq!(frozen["repair_wallets"], serde_json::json!([]));
     assert_eq!(
         digests::certificate_digest(&Connection::open(&fixture.side).unwrap()).unwrap(),
@@ -17202,7 +17371,7 @@ async fn history_v3_bulk_root_freezes_format_three_and_resumes_under_acquisition
     assert_eq!(count(&fixture.side, "PRAGMA user_version"), 2);
     assert_eq!(fresh_record(&fixture.side), frozen);
     for receipt in stored_receipt_proofs(&Connection::open(&fixture.side).unwrap(), 1) {
-        assert_eq!(receipt["acquisition"]["version"], 3);
+        assert_eq!(receipt["acquisition"]["version"], 4);
         assert_eq!(receipt["acquisition"]["mode"], "full");
         assert!(receipt["acquisition"]["predecessor"].is_null());
     }
@@ -17239,7 +17408,7 @@ async fn history_v3_unfinished_identity_two_bulk_root_seals_unchanged_then_trans
     history_v3_collect(&fixture.side, &source, 2, FRESH_END + 1, &[])
         .await
         .unwrap();
-    assert_eq!(fresh_record(&fixture.side)["version"], 4);
+    assert_eq!(fresh_record(&fixture.side)["version"], 5);
     assert_eq!(
         count(
             &fixture.side,
@@ -17325,7 +17494,7 @@ async fn projection_v3_finalize_refinalize_successor_full_topup_and_cumulative_d
     history_v3_collect(&side, &source, 1, FRESH_END, &[])
         .await
         .unwrap();
-    assert_eq!(fresh_record(&side)["version"], 4);
+    assert_eq!(fresh_record(&side)["version"], 5);
     projection_v3_payouts(&side);
     finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
     assert_eq!(count(&side, "SELECT COUNT(*) FROM ranker_entries_v2"), 0);
@@ -17591,7 +17760,7 @@ async fn projection_v3_hex_trade_sample_attributes_the_later_canonical_buy() {
     let report = pe_bootstrap::cache_migration::measure_classifier_v6_sample(&side).unwrap();
     assert_eq!(sha256_file(&side).unwrap(), before);
     assert_eq!(report["wallets"], 1);
-    assert_eq!(report["classifier_6_entries"], 0);
+    assert_eq!(report["classifier_7_entries"], 0);
     // Decision 1: the prefixed row lacks bound payout eligibility; classifier five still scores the later canonical BUY.
     assert_eq!(report["classifier_5_entries"], 1);
     assert_eq!(report["differences"].as_array().unwrap().len(), 1);
@@ -17811,7 +17980,7 @@ fn reference_scoped_rows(path: &std::path::Path) -> Vec<Value> {
                     .find(|aggregate| aggregate.group_id.key() == &decision.source_trade_id)
                     .unwrap();
                 selected.push(serde_json::json!({"activity_generation":identity["generation"],
-                    "asset":aggregate.group_id.components().asset.as_ref().unwrap().0,"classifier_version":6,
+                    "asset":aggregate.group_id.components().asset.as_ref().unwrap().0,"classifier_version":7,
                     "condition_id":decision.market_id.to_string(),"end_date_unix":end,"outcome_id":decision.outcome_id.0,
                     "payout_vector_json":vector,"price_weighted_share_amount_str":aggregate.price_weighted_share_sum.0.to_string(),
                     "share_amount_str":aggregate.share_sum.to_decimal().to_string(),"side":"buy","source_time_unix":time,
@@ -18060,7 +18229,7 @@ async fn projection_v3_excluded_older_certificate_cannot_supply_publisher_freshn
 }
 
 #[tokio::test]
-async fn projection_v3_sample_refuses_an_untraceable_certified_drop() {
+async fn frozen_classifier_six_sample_refuses_an_untraceable_certified_drop() {
     let dir = TempDir::new().unwrap();
     let wallet = format!("0x{}00", "11".repeat(19));
     let side = dataset_candidate(&dir, "untraceable.db", &[&wallet]);
@@ -18071,6 +18240,8 @@ async fn projection_v3_sample_refuses_an_untraceable_certified_drop() {
         rows: vec![conversion],
         ..Default::default()
     };
+    collection_admit(&side, 1, FRESH_END, &[]).await;
+    freeze_identity_four(&side);
     history_v3_collect(&side, &source, 1, FRESH_END, &[])
         .await
         .unwrap();
@@ -18083,6 +18254,8 @@ async fn projection_v3_sample_refuses_an_untraceable_certified_drop() {
         ..Default::default()
     };
     // Decision 1: full replacement keeps the certified drop after its trigger disappears.
+    collection_admit(&side, 2, FRESH_END + 1, std::slice::from_ref(&wallet)).await;
+    freeze_identity_four(&side);
     history_v3_collect(&side, &source, 2, FRESH_END + 1, &[wallet])
         .await
         .unwrap();
@@ -18387,7 +18560,7 @@ async fn collection_766_exclude(side: &std::path::Path, generation: u64, end: i6
 
 fn collection_766_assert_automatic_proved_full(side: &std::path::Path) {
     let identity = fresh_record(side);
-    assert_eq!(identity["version"], 4);
+    assert_eq!(identity["version"], 5);
     assert!(
         identity["full_read_wallets"]
             .as_array()
@@ -19242,7 +19415,7 @@ async fn collection_766_unchanged_repair_and_incremental_keep_their_commit_paths
         };
         collection_admit(&side, generation, FRESH_END + 2, &repairs).await;
         let identity = fresh_record(&side);
-        assert_eq!(identity["version"], 4);
+        assert_eq!(identity["version"], 5);
         assert_eq!(
             identity["repair_wallets"]
                 .as_array()
@@ -19379,7 +19552,7 @@ async fn collection_766_repair_partial_still_replaces_every_stored_row() {
     let rows = collection_rows(WALLET, 6000);
     let side = collection_766_seed_full(&dir, rows.clone()).await;
     collection_admit(&side, 3, FRESH_END + 2, &[WALLET.to_owned()]).await;
-    assert_eq!(fresh_record(&side)["version"], 4);
+    assert_eq!(fresh_record(&side)["version"], 5);
     assert_eq!(
         fresh_record(&side)["repair_wallets"],
         serde_json::json!([WALLET])
@@ -19428,7 +19601,7 @@ async fn collection_766_no_proof_full_and_bulk_root_still_insert_every_fetched_r
         } else {
             collection_admit(&fixture.side, 1, FRESH_END, &[]).await;
         }
-        assert_eq!(fresh_record(&fixture.side)["version"], 4);
+        assert_eq!(fresh_record(&fixture.side)["version"], 5);
         assert_eq!(fresh_record(&fixture.side)["base_generation"], Value::Null);
         assert_eq!(
             fresh_record(&fixture.side)["repair_wallets"],
@@ -22022,6 +22195,7 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
         };
         let fixed_end = now - 120;
         collection_admit(&side, 1, fixed_end, &[]).await;
+        freeze_identity_four(&side);
         // The injected count leaves one 4,999-row proved window available. The
         // 17,000-row wallet exceeds that pool; small competitors still finish.
         let baseline = 2_000_000 - 4_999;
@@ -22515,6 +22689,8 @@ async fn whole_market_cache_keeps_main_projection_and_digests() {
         rows: [history(WALLET), history(WALLET_B)].concat(),
         ..Default::default()
     };
+    collection_admit(&cache, 1, FRESH_END, &[]).await;
+    freeze_identity_four(&cache);
     history_v3_collect(&cache, &fetcher, 1, FRESH_END, &[])
         .await
         .unwrap();
@@ -22557,5 +22733,587 @@ async fn whole_market_cache_keeps_main_projection_and_digests() {
             ],
         }),
         "{actual}"
+    );
+}
+
+// #822: the current contract retains non-executable evidence; frozen 4/3/6
+// fixtures above continue exercising the original exclusions and byte encodings.
+fn forge_822_anomaly(kind: usize, epoch: i64) -> Value {
+    let mut row = projection_v3_row("0xa", &format!("anomaly-{kind}-{epoch}"), epoch);
+    let (field, value) = match kind {
+        0 => ("price", "3.1968021978"),
+        1 => ("outcomeIndex", "unmappable"),
+        _ => ("usdcSize", "4.212e-7"),
+    };
+    row[field] = Value::from(value);
+    row
+}
+
+fn forge_822_drops(side: &std::path::Path, wallet: &str) -> Value {
+    let json: String = Connection::open(side)
+        .unwrap()
+        .query_row(
+            "SELECT scope_drops_json FROM activity_wallet_history_v3 WHERE wallet_hex = ?1",
+            [wallet],
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_str(&json).unwrap()
+}
+
+#[tokio::test]
+async fn forge_822_all_kinds_mixed_pages_anomaly_only_and_tampered_commitment() {
+    for kind in 0..3 {
+        for only in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let side = dataset_candidate(&dir, "anomaly.db", &[]);
+            let mut rows = vec![forge_822_anomaly(kind, FRESH_END - 2)];
+            if !only {
+                rows.push(projection_v3_row("0xa", "beside", FRESH_END - 2));
+                rows.push(projection_v3_row("0xb", "healthy", FRESH_END));
+                for index in 0..501 {
+                    let mut row = projection_v3_row(
+                        "0xb",
+                        &format!("zero-{index}"),
+                        FRESH_END - 1000 + index,
+                    );
+                    row["size"] = Value::from("0");
+                    row["usdcSize"] = Value::from("0");
+                    rows.push(row);
+                }
+            }
+            let source = DatasetFetcher {
+                rows,
+                ..Default::default()
+            };
+            let manifest = history_v3_collect(&side, &source, 1, FRESH_END, &[])
+                .await
+                .unwrap();
+            assert_eq!(fresh_record(&side)["version"], 5);
+            let proof = collection_proof(&side, 1, WALLET);
+            assert_eq!(proof["acquisition"]["version"], 4);
+            assert_eq!(proof["acquisition"]["disposition"], "complete");
+            assert_eq!(proof["source_row_count"], source.rows.len());
+            assert_eq!(
+                manifest.source_row_count,
+                u64::try_from(source.rows.len()).unwrap()
+            );
+            assert_eq!(proof["aggregate_count"], source.rows.len() - 1);
+            let anomalies = proof["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|page| page["anomalies"].as_array().into_iter().flatten())
+                .collect::<Vec<_>>();
+            assert_eq!(anomalies.len(), 1);
+            assert_eq!(
+                anomalies[0]["kind"],
+                [
+                    "price_out_of_range",
+                    "unmapped_outcome",
+                    "unrepresentable_decimal"
+                ][kind]
+            );
+            if only {
+                assert_eq!(
+                    proof["ordered_aggregate_digest"],
+                    whole_json_digest(&serde_json::json!([]))
+                );
+            }
+            source.calls.lock().unwrap().clear();
+            history_v3_collect(&side, &source, 1, FRESH_END + 99, &[])
+                .await
+                .unwrap();
+            assert!(source.calls.lock().unwrap().is_empty());
+            projection_v3_payouts(&side);
+            let report =
+                pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_chunk_for_test(
+                    &side,
+                    FRESH_END + 1,
+                    1,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.drops_by_cause["unrepresentable"], 1);
+            assert!(report.unresolved_anomalies.is_empty());
+            assert_eq!(projection_v3_rows(&side).len(), usize::from(!only));
+            assert_eq!(
+                forge_822_drops(&side, WALLET),
+                serde_json::json!([
+                    {"cause":"unrepresentable","dropped_at_unix":FRESH_END-2,"scope_id":"0xa","scope_kind":"market"}
+                ])
+            );
+            assert_eq!(
+                count(
+                    &side,
+                    "SELECT source_row_count FROM activity_wallet_history_v3"
+                ),
+                i64::try_from(source.rows.len() - 1).unwrap()
+            );
+            let mut tampered = proof.clone();
+            let page = tampered["pages"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|page| page.get("anomalies").is_some())
+                .unwrap();
+            page["anomalies"][0]["field"] = Value::from("size");
+            // Reseal the outer manifest to isolate the independent read commitment.
+            collection_reseal_receipt(&side, &tampered);
+            let error = history_v3_collect(&side, &DatasetFetcher::default(), 1, FRESH_END, &[])
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("activity read commitment mismatch"),
+                "{error}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn forge_822_unresolved_anomaly_replays_before_certificate_when_evidence_arrives() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "late-evidence.db", &[]);
+    let mut anomaly = forge_822_anomaly(2, FRESH_END - 2);
+    anomaly["asset"] = Value::from("99999");
+    let source = DatasetFetcher {
+        rows: vec![anomaly, projection_v3_row("0xb", "healthy", FRESH_END - 2)],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    let mut payouts = vec![
+        serde_json::json!({"condition_id":"0xb","closed":true,"is_50_50_outcome":false,
+        "end_date_iso":"2027-01-16T00:00:00Z","tokens":[{"token_id":"200","outcome":"Yes","price":"1","winner":true},
+        {"token_id":"201","outcome":"No","price":"0","winner":false}]}),
+    ];
+    publication_payouts(&side, &payouts, FRESH_END);
+    let report = pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_chunk_for_test(
+        &side,
+        FRESH_END + 1,
+        1,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.ignored_by_activity_type["TRADE"], 1);
+    assert_eq!(report.unresolved_anomalies.len(), 1);
+    let wire = serde_json::to_value(&report).unwrap();
+    assert_eq!(wire["unresolved_anomalies"][0]["wallet_hex"], WALLET);
+    assert_eq!(
+        wire["unresolved_anomalies"][0]["source_time_unix"],
+        FRESH_END - 2
+    );
+    assert_eq!(
+        projection_v3_rows(&side).len(),
+        1,
+        "unresolved problems do not unscore healthy entries"
+    );
+    assert_eq!(forge_822_drops(&side, WALLET), serde_json::json!([]));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    assert_eq!(collection_proof(&side, 2, WALLET)["source_row_count"], 0);
+    payouts.push(serde_json::json!({"condition_id":"0xa","closed":true,"is_50_50_outcome":false,
+        "end_date_iso":"2027-01-16T00:00:00Z","tokens":[{"token_id":"100","outcome":"Yes","price":"1","winner":true},
+        {"token_id":"101","outcome":"No","price":"0","winner":false}]}));
+    publication_payouts(&side, &payouts, FRESH_END + 1);
+    let report = pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_chunk_for_test(
+        &side,
+        FRESH_END + 2,
+        1,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(report.unresolved_anomalies.is_empty());
+    assert_eq!(report.drops_by_cause["unrepresentable"], 1);
+    assert!(projection_v3_rows(&side).is_empty());
+    assert_eq!(
+        forge_822_drops(&side, WALLET)[0]["dropped_at_unix"],
+        FRESH_END - 2
+    );
+    // A full repair replaces the anomaly set, while the certified drop survives.
+    let healthy = DatasetFetcher {
+        rows: vec![projection_v3_row("0xb", "healthy", FRESH_END - 2)],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &healthy, 3, FRESH_END + 2, &[WALLET.to_owned()])
+        .await
+        .unwrap();
+    publication_payouts(&side, &payouts, FRESH_END + 2);
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 3).unwrap();
+    assert_eq!(
+        forge_822_drops(&side, WALLET)[0]["cause"],
+        "unrepresentable"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn forge_822_partial_anomalies_held_rows_and_successor_equal_uninterrupted() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "partial-anomalies.db", &[]);
+    let full = dataset_candidate(&dir, "full-anomalies.db", &[]);
+    let mut rows = collection_rows(WALLET, 6000);
+    rows[100]["price"] = Value::from("3");
+    rows[4999]["outcomeIndex"] = Value::from("unmappable"); // Ascending lookup must accept an anomaly.
+    rows[5500]["usdcSize"] = Value::from("4.212e-7");
+    let source = CollectionDataset::new(rows, 1);
+    collection_admit(&side, 1, FRESH_END, &[]).await;
+    let held = Arc::new(std::sync::atomic::AtomicU64::new(1_995_001));
+    collection_run(&side, &source, FRESH_END, Arc::clone(&held), None)
+        .await
+        .unwrap();
+    assert_eq!(held.load(Ordering::SeqCst), 1_995_001);
+    let partial = collection_proof(&side, 1, WALLET);
+    assert_eq!(partial["acquisition"]["fetched_source_row_count"], 4999);
+    assert_eq!(partial["acquisition"]["fetched_aggregate_count"], 4998);
+    assert_eq!(partial["acquisition"]["disposition"], "excluded");
+    history_v3_collect(&side, &source.source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    history_v3_collect(&full, &source.source, 1, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    for path in [&side, &full] {
+        dataset_payouts(path, &source.source.rows).await;
+        finalize_cache_v2_unbound(path, None, FRESH_END + 2).unwrap();
+    }
+    assert_eq!(
+        forge_822_drops(&side, WALLET),
+        forge_822_drops(&full, WALLET)
+    );
+    assert_eq!(
+        forge_822_drops(&side, WALLET)[0]["cause"],
+        "unrepresentable"
+    );
+    assert_eq!(
+        collection_decoded_history(&side),
+        collection_decoded_history(&full)
+    );
+}
+
+#[tokio::test]
+async fn forge_822_frozen_four_root_seals_before_five_and_keeps_receipt_bytes() {
+    let fixture = BulkRootFixture::new();
+    fixture.admit().await;
+    freeze_identity_four(&fixture.side);
+    let frozen = fresh_record(&fixture.side);
+    let raw = frozen.to_string();
+    let refused = history_v3_collect(&fixture.side, &bulk_source(), 2, FRESH_END + 1, &[])
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("resume"), "{refused}");
+    fixture.collect(&bulk_source()).await.unwrap();
+    assert_eq!(fresh_record(&fixture.side).to_string(), raw);
+    let proofs = stored_receipt_proofs(&Connection::open(&fixture.side).unwrap(), 1);
+    assert!(proofs.iter().all(|p| {
+        p["acquisition"]["version"] == 3
+            && p["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|page| page.get("anomalies").is_none())
+    }));
+    let before = query_values(
+        &fixture.side,
+        "SELECT page_evidence_json, acquisition_json FROM activity_wallet_coverage_staging_v2 ORDER BY wallet_hex",
+    );
+    fixture.collect(&HistoryV3StopFetcher).await.unwrap();
+    history_v3_collect(&fixture.side, &bulk_source(), 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    assert_eq!(fresh_record(&fixture.side)["version"], 5);
+    assert_eq!(
+        before,
+        query_values(
+            &fixture.side,
+            "SELECT page_evidence_json, acquisition_json FROM activity_wallet_coverage_staging_v2 WHERE generation = 1 ORDER BY wallet_hex"
+        )
+    );
+}
+
+#[tokio::test]
+async fn forge_822_measurement_replays_anomaly_drop_and_unresolved_anomaly() {
+    let dir = TempDir::new().unwrap();
+    let wallet = format!("0x{}00", "11".repeat(19));
+    let side = dataset_candidate(&dir, "sample-anomaly.db", &[&wallet]);
+    let mut unknown = forge_822_anomaly(2, FRESH_END - 1);
+    unknown["conditionId"] = Value::from("0xdead");
+    unknown["asset"] = Value::from("99999");
+    let mut rows = vec![
+        forge_822_anomaly(0, FRESH_END - 2),
+        unknown,
+        projection_v3_row("0xa", "blocked", FRESH_END),
+        projection_v3_row("0xb", "healthy", FRESH_END),
+    ];
+    for row in &mut rows {
+        row["proxyWallet"] = Value::from(wallet.clone());
+    }
+    let source = DatasetFetcher {
+        rows,
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&side);
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+    let before = sha256_file(&side).unwrap();
+    let report = pe_bootstrap::cache_migration::measure_classifier_v6_sample(&side).unwrap();
+    assert_eq!(sha256_file(&side).unwrap(), before);
+    assert_eq!(report["classifier_version"], 7);
+    assert_eq!(report["classifier_7_entries"], 1);
+    assert_eq!(report["unresolved_anomalies"].as_array().unwrap().len(), 1);
+    assert!(report["differences"].as_array().unwrap().iter().any(|d| {
+        d["cause"] == "unrepresentable"
+            && d["trigger"]
+                .as_str()
+                .unwrap()
+                .starts_with(pe_position_ledger::ACTIVITY_ROW_ANOMALY_NAMESPACE)
+    }));
+}
+
+#[tokio::test]
+async fn forge_822_saturated_probe_keeps_anomalies_only_in_terminal_history() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "saturated.db", &[]);
+    let mut rows = collection_rows(WALLET, 6000);
+    rows[5500]["price"] = Value::from("3");
+    let source = DatasetFetcher {
+        rows,
+        ..Default::default()
+    };
+    collection_admit(&side, 1, FRESH_END, &[]).await;
+    let mut read = pe_source_polymarket_public::fetch_complete_activity_with_acceptance(
+        &source,
+        "https://data.example",
+        WalletAddress::from_hex(WALLET).unwrap(),
+        Some(0),
+        FRESH_END,
+        pe_source_polymarket_public::ActivityRowAcceptance::Acquisition4,
+    )
+    .await
+    .unwrap();
+    assert_eq!(read.rows.len(), 5999);
+    assert_eq!(read.anomalies.len(), 1);
+    assert!(read.pages.iter().map(|p| p.anomalies.len()).sum::<usize>() > 1);
+    for page in &mut read.pages {
+        page.received_at =
+            ReceivedAt(time::OffsetDateTime::from_unix_timestamp(FRESH_END).unwrap());
+    }
+    let aggregates = read.buckets().unwrap().into_iter().flatten().collect();
+    pe_bootstrap::cache_migration::commit_activity_batch_for_test(
+        &mut Connection::open(&side).unwrap(),
+        WALLET.to_owned(),
+        read.pages,
+        aggregates,
+    )
+    .unwrap();
+    let manifest = history_v3_collect(&side, &DatasetFetcher::default(), 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    assert_eq!(manifest.source_row_count, 6000);
+    dataset_payouts(&side, &source.rows).await;
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+    assert_eq!(forge_822_drops(&side, WALLET).as_array().unwrap().len(), 1);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT source_row_count FROM activity_wallet_history_v3"
+        ),
+        5999
+    );
+}
+
+#[tokio::test]
+async fn forge_822_exact_identity_acquisition_classifier_pairs_are_required() {
+    for (identity, acquisition) in [(5, 3), (5, 5), (4, 4), (4, 2)] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "pair.db", &[]);
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        if identity == 4 {
+            freeze_identity_four(&side);
+        }
+        let source = DatasetFetcher {
+            rows: vec![projection_v3_row("0xb", "healthy", FRESH_END)],
+            ..Default::default()
+        };
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        let mut proof = collection_proof(&side, 1, WALLET);
+        proof["acquisition"]["version"] = Value::from(acquisition);
+        collection_read_commitment(&mut proof);
+        collection_reseal_receipt(&side, &proof);
+        let error = history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("activity acquisition identity mismatch"),
+            "{identity}/{acquisition}: {error}"
+        );
+    }
+    for identity in [4, 5] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "classifier-pair.db", &[]);
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        if identity == 4 {
+            freeze_identity_four(&side);
+        }
+        history_v3_collect(&side, &DatasetFetcher::default(), 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        projection_v3_payouts(&side);
+        finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+        history_v3_damage_connection(&side)
+            .execute(
+                "UPDATE cache_v2_migration_state SET ranker_classifier_version = ?1",
+                [if identity == 4 { 7 } else { 6 }],
+            )
+            .unwrap();
+        let seeds = dir.path().join("pair-seeds.txt");
+        std::fs::write(&seeds, format!("{WALLET}\n")).unwrap();
+        let error = pe_bootstrap::cache_migration::SeedPlan::read(&seeds, &side)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(error.to_string().contains("classifier"), "{error}");
+        assert!(
+            finalize_cache_v2_unbound(&side, None, FRESH_END + 2)
+                .unwrap_err()
+                .to_string()
+                .contains("classifier")
+        );
+    }
+}
+
+#[tokio::test]
+async fn forge_822_full_replacement_clears_unresolved_anomalies_with_unchanged_aggregates() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "replacement-anomalies.db", &[]);
+    let mut anomaly = forge_822_anomaly(0, FRESH_END - 2);
+    anomaly["asset"] = Value::from("99999");
+    let healthy = projection_v3_row("0xb", "healthy", FRESH_END);
+    let source = DatasetFetcher {
+        rows: vec![anomaly, healthy.clone()],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    let payout = serde_json::json!({"condition_id":"0xb","closed":true,"is_50_50_outcome":false,
+        "end_date_iso":"2027-01-16T00:00:00Z","tokens":[{"token_id":"200","outcome":"Yes","price":"1","winner":true},
+        {"token_id":"201","outcome":"No","price":"0","winner":false}]});
+    publication_payouts(&side, &[payout], FRESH_END);
+    let report = pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_chunk_for_test(
+        &side,
+        FRESH_END + 1,
+        1,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.unresolved_anomalies.len(), 1);
+    // Failed aggregation preserves history, but requires the next read in full.
+    let mut bad = DatasetFetcher {
+        rows: vec![
+            projection_v3_row("0xb", "duplicate", FRESH_END + 1),
+            projection_v3_row("0xb", "duplicate", FRESH_END + 2),
+        ],
+        ..Default::default()
+    };
+    bad.rows[1]["size"] = Value::from("2");
+    history_v3_collect(&side, &bad, 2, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        collection_proof(&side, 2, WALLET)["acquisition"]["aggregation_status"],
+        "failed"
+    );
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 3).unwrap();
+    let before = query_values(&side, "SELECT * FROM activity_groups_v2");
+    let replacement = DatasetFetcher {
+        rows: vec![healthy],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &replacement, 3, FRESH_END + 3, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        collection_proof(&side, 3, WALLET)["acquisition"]["mode"],
+        "full"
+    );
+    assert_eq!(
+        before,
+        query_values(&side, "SELECT * FROM activity_groups_v2")
+    );
+    projection_v3_payouts(&side); // The removed anomaly would now resolve.
+    let report = pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_chunk_for_test(
+        &side,
+        FRESH_END + 4,
+        1,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(report.unresolved_anomalies.is_empty());
+    assert_eq!(forge_822_drops(&side, WALLET), serde_json::json!([]));
+    assert_eq!(projection_v3_rows(&side).len(), 1);
+}
+
+#[tokio::test]
+async fn forge_822_seed_carries_unrepresentable_drop_without_trigger_rows() {
+    let dir = TempDir::new().unwrap();
+    let wallet = format!("0x{}00", "11".repeat(19));
+    let old = dataset_candidate(&dir, "old-anomaly.db", &[&wallet]);
+    let mut anomaly = forge_822_anomaly(0, FRESH_END - 2);
+    anomaly["proxyWallet"] = Value::from(wallet.clone());
+    let source = DatasetFetcher {
+        rows: vec![anomaly],
+        ..Default::default()
+    };
+    history_v3_collect(&old, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&old);
+    finalize_cache_v2_unbound(&old, None, FRESH_END + 1).unwrap();
+    let drops = forge_822_drops(&old, &wallet);
+    let seeds = dir.path().join("seeds.txt");
+    std::fs::write(&seeds, format!("{wallet}\n")).unwrap();
+    let fresh = dir.path().join("fresh-anomaly.db");
+    let config = BootstrapConfig {
+        cache_path: fresh.clone(),
+        ..Default::default()
+    };
+    pe_bootstrap::cache_migration::SeedPlan::read(&seeds, &old)
+        .unwrap()
+        .init(&config)
+        .unwrap();
+    migrate_cache_v2(&fresh, &write_build_manifest(&dir, &fresh)).unwrap();
+    let mut healthy = DatasetFetcher {
+        rows: vec![
+            projection_v3_row("0xa", "blocked", FRESH_END),
+            projection_v3_row("0xb", "healthy", FRESH_END),
+        ],
+        ..Default::default()
+    };
+    for row in &mut healthy.rows {
+        row["proxyWallet"] = Value::from(wallet.clone());
+    }
+    history_v3_collect(&fresh, &healthy, 1, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&fresh);
+    finalize_cache_v2_unbound(&fresh, None, FRESH_END + 2).unwrap();
+    assert_eq!(forge_822_drops(&fresh, &wallet), drops);
+    assert_eq!(projection_v3_rows(&fresh).len(), 1);
+    assert_eq!(projection_v3_rows(&fresh)[0]["condition_id"], "0xb");
+    let report = pe_bootstrap::cache_migration::measure_classifier_v6_sample(&fresh).unwrap();
+    assert_eq!(report["classifier_7_entries"], 1);
+    assert_eq!(
+        report["differences_by_rule"]["certified_cumulative_scope_drop"],
+        1
     );
 }

@@ -1,12 +1,14 @@
 //! Read-only AC1 sample, adapted from the classifier-five wallet harness.
 
 use super::projection_v3::{
-    BoundPayouts, ScopeDrop, classify_loaded_wallet, recorded_inputs, spool_path, verify_spool,
+    BoundPayouts, ScopeDrop, classify_loaded_wallet, historical_seconds, recorded_inputs,
+    spool_path, verify_spool,
 };
 use super::*;
 use pe_position_ledger::{
     DropCause, MarketLookup, ScopeKind, ScopeLookups, ScopeProblem, SecondRecord,
-    classify_scoped_historical_second,
+    activity_row_anomaly_trigger, classify_scoped_historical_second,
+    classify_scoped_historical_second_with_anomalies,
 };
 use std::io::BufRead as _;
 
@@ -16,8 +18,17 @@ pub(super) fn run(cache_path: &Path) -> Result<Value, BootstrapError> {
     let transaction = connection.unchecked_transaction()?;
     verify_history_certificates(&transaction)?;
     let identity = fresh_collection_record(&transaction)?.ok_or(BootstrapError::Internal)?;
-    if identity.version != 4 {
+    if !identity.history_format_three() {
         return invalid("classifier sample requires history format three".to_owned());
+    }
+    let classifier_version = identity.classifier_version()?;
+    let recorded_classifier: i64 = transaction.query_row(
+        "SELECT ranker_classifier_version FROM cache_v2_migration_state",
+        [],
+        |row| row.get(0),
+    )?;
+    if recorded_classifier != i64::from(classifier_version) {
+        return invalid("classifier sample recorded contract mismatch".to_owned());
     }
     let inputs = recorded_inputs(&transaction)?;
     let count: i64 = transaction.query_row(
@@ -52,6 +63,7 @@ pub(super) fn run(cache_path: &Path) -> Result<Value, BootstrapError> {
     let mut differences = Vec::new();
     let mut by_rule = BTreeMap::<String, u64>::new();
     let mut by_cause = BTreeMap::<String, u64>::new();
+    let mut unresolved_anomalies = Vec::new();
     aggregate_scan::scoped(|scan| {
         for wallet in identity
             .wallets
@@ -97,7 +109,19 @@ pub(super) fn run(cache_path: &Path) -> Result<Value, BootstrapError> {
                 .collect();
             let baseline =
                 super::classify_loaded_wallet(wallet, &aggregates, &payout.tokens, quality)?;
-            let classified = classify_loaded_wallet(certificate.clone(), &aggregates, &payout)?;
+            let anomalies = if classifier_version == 7 {
+                proof.effective_anomalies(&transaction, wallet, identity.generation)?
+            } else {
+                Vec::new()
+            };
+            let classified = classify_loaded_wallet(
+                certificate.clone(),
+                &aggregates,
+                &payout,
+                classifier_version,
+                anomalies.clone(),
+            )?;
+            unresolved_anomalies.extend(classified.unresolved_anomalies);
             if classified.certificate.scope_drops_json != certificate.scope_drops_json {
                 return invalid(format!("sample certificate drops differ for {wallet}"));
             }
@@ -134,7 +158,7 @@ pub(super) fn run(cache_path: &Path) -> Result<Value, BootstrapError> {
                     .get(&market.0)
                     .ok_or(BootstrapError::Internal)?;
                 let expected = serde_json::json!({"activity_generation":identity.generation,"asset":asset.0,
-                    "classifier_version":6,"condition_id":market.0,"end_date_unix":end,
+                    "classifier_version":classifier_version,"condition_id":market.0,"end_date_unix":end,
                     "outcome_id":u16::try_from(outcome).map_err(|_| BootstrapError::Internal)?,"payout_vector_json":vector,
                     "price_weighted_share_amount_str":aggregate.price_weighted_share_sum.0.to_string(),
                     "share_amount_str":aggregate.share_sum.to_decimal().to_string(),"side":"buy",
@@ -168,7 +192,15 @@ pub(super) fn run(cache_path: &Path) -> Result<Value, BootstrapError> {
             let trace = if ids == baseline {
                 None
             } else {
-                let trace = trace_rules(wallet, &aggregates, &payout, &drops, quality)?;
+                let trace = trace_rules(
+                    wallet,
+                    &aggregates,
+                    &anomalies,
+                    &payout,
+                    &drops,
+                    quality,
+                    classifier_version,
+                )?;
                 if trace
                     .baseline_ids
                     .iter()
@@ -193,6 +225,8 @@ pub(super) fn run(cache_path: &Path) -> Result<Value, BootstrapError> {
                 let time = aggregate.source_time.0.unix_timestamp();
                 let explanation = difference_rule(
                     &aggregates,
+                    &anomalies,
+                    classifier_version,
                     aggregate,
                     &drops,
                     trace.as_ref().ok_or(BootstrapError::Internal)?,
@@ -212,10 +246,18 @@ pub(super) fn run(cache_path: &Path) -> Result<Value, BootstrapError> {
                     let count = by_cause.entry(key).or_default();
                     *count = checked_activity_count(*count, 1)?;
                 }
-                differences.push(serde_json::json!({"wallet_hex":wallet,"source_trade_id":id,
+                let mut difference = serde_json::json!({"wallet_hex":wallet,"source_trade_id":id,
                     "source_time_unix":time,"rule":explanation.rule,"trigger":explanation.trigger,
                     "cause":explanation.cause,"scope":explanation.scope,
-                    "selected_v6":ids.contains(id)}));
+                    "selected_v6":ids.contains(id)});
+                if classifier_version == 7 {
+                    difference
+                        .as_object_mut()
+                        .ok_or(BootstrapError::Internal)?
+                        .remove("selected_v6");
+                    difference["selected_v7"] = serde_json::json!(ids.contains(id));
+                }
+                differences.push(difference);
             }
             wallets = checked_activity_count(wallets, 1)?;
             groups = checked_activity_count(
@@ -234,12 +276,22 @@ pub(super) fn run(cache_path: &Path) -> Result<Value, BootstrapError> {
         Ok(())
     })?;
     transaction.rollback()?;
-    Ok(
-        serde_json::json!({"pid":std::process::id(),"wallets":wallets,"aggregates":groups,
+    let mut report = serde_json::json!({"pid":std::process::id(),"wallets":wallets,"aggregates":groups,
         "classifier_6_entries":selected,"classifier_5_entries":baseline_count,"differences":differences,
         "differences_by_rule":by_rule,"differences_by_cause":by_cause,
-        "elapsed_ms":started.elapsed().as_millis()}),
-    )
+        "elapsed_ms":started.elapsed().as_millis()});
+    if classifier_version == 7 {
+        report
+            .as_object_mut()
+            .ok_or(BootstrapError::Internal)?
+            .remove("classifier_6_entries");
+        report["classifier_version"] = serde_json::json!(classifier_version);
+        report["classifier_7_entries"] = serde_json::json!(selected);
+        if !unresolved_anomalies.is_empty() {
+            report["unresolved_anomalies"] = serde_json::to_value(unresolved_anomalies)?;
+        }
+    }
+    Ok(report)
 }
 
 #[derive(Clone)]
@@ -260,12 +312,15 @@ struct RuleTrace {
 
 // The diagnostic replay delegates both verdicts to their existing owners. The
 // unchanged classifier-five harness above remains the selected-ID authority.
+#[allow(clippy::too_many_arguments)]
 fn trace_rules(
     wallet_hex: &str,
     aggregates: &[ActivityAggregate],
+    anomalies: &[pe_source_polymarket_public::ActivityRowAnomaly],
     payout: &BoundPayouts,
     drops: &[ScopeDrop],
     quality: ReconstructionQuality,
+    classifier_version: u32,
 ) -> Result<RuleTrace, BootstrapError> {
     let wallet = WalletAddress::from_hex(wallet_hex).map_err(|error| BootstrapError::Invalid {
         message: error.to_string(),
@@ -282,8 +337,7 @@ fn trace_rules(
     let mut baseline_positions = HashMap::new();
     let mut history = HashSet::new();
     let mut baseline_history = HashSet::new();
-    for second in aggregates.chunk_by(|a, b| a.source_time == b.source_time) {
-        let at = second[0].source_time.0.unix_timestamp();
+    for (at, second, anomalies) in historical_seconds(aggregates, anomalies) {
         let records: Vec<_> = second
             .iter()
             .map(|aggregate| SecondRecord {
@@ -321,16 +375,31 @@ fn trace_rules(
             .collect();
         // A drop is inclusive during application. Excluding its starting second
         // here lets the same owner identify its actual trigger for the report.
-        let discovered = classify_scoped_historical_second(
-            &ledger,
-            wallet,
-            &records,
-            &earlier,
-            false,
-            quality,
-            &|market| history.contains(&market.to_string()),
-            payout,
-        )
+        let discovered = if classifier_version == 7 {
+            classify_scoped_historical_second_with_anomalies(
+                &ledger,
+                wallet,
+                at,
+                &records,
+                anomalies,
+                &earlier,
+                false,
+                quality,
+                &|market| history.contains(&market.to_string()),
+                payout,
+            )
+        } else {
+            classify_scoped_historical_second(
+                &ledger,
+                wallet,
+                &records,
+                &earlier,
+                false,
+                quality,
+                &|market| history.contains(&market.to_string()),
+                payout,
+            )
+        }
         .map_err(|error| BootstrapError::Invalid {
             message: error.to_string(),
         })?;
@@ -345,16 +414,31 @@ fn trace_rules(
             .filter(|drop| drop.dropped_at_unix <= at)
             .map(ScopeDrop::scope)
             .collect();
-        let classified = classify_scoped_historical_second(
-            &ledger,
-            wallet,
-            &records,
-            &inclusive,
-            drops.iter().any(|drop| drop.dropped_at_unix == at),
-            quality,
-            &|market| history.contains(&market.to_string()),
-            payout,
-        )
+        let classified = if classifier_version == 7 {
+            classify_scoped_historical_second_with_anomalies(
+                &ledger,
+                wallet,
+                at,
+                &records,
+                anomalies,
+                &inclusive,
+                drops.iter().any(|drop| drop.dropped_at_unix == at),
+                quality,
+                &|market| history.contains(&market.to_string()),
+                payout,
+            )
+        } else {
+            classify_scoped_historical_second(
+                &ledger,
+                wallet,
+                &records,
+                &inclusive,
+                drops.iter().any(|drop| drop.dropped_at_unix == at),
+                quality,
+                &|market| history.contains(&market.to_string()),
+                payout,
+            )
+        }
         .map_err(|error| BootstrapError::Invalid {
             message: error.to_string(),
         })?;
@@ -550,6 +634,8 @@ fn missing_mapping(aggregate: &ActivityAggregate) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn difference_rule(
     aggregates: &[ActivityAggregate],
+    anomalies: &[pe_source_polymarket_public::ActivityRowAnomaly],
+    classifier_version: u32,
     selected: &ActivityAggregate,
     drops: &[ScopeDrop],
     trace: &RuleTrace,
@@ -584,30 +670,42 @@ fn difference_rule(
             })
             .or_else(|| drops.iter().find(|drop| drop.dropped_at_unix == time));
         if let Some(drop) = drop {
-            let problem = trace
-                .problems
-                .iter()
-                .find(|(at, problem)| {
-                    *at == drop.dropped_at_unix
-                        && problem.scope == drop.scope()
-                        && problem.cause == drop.cause
+            let problem = trace.problems.iter().find(|(at, problem)| {
+                *at == drop.dropped_at_unix
+                    && problem.scope == drop.scope()
+                    && problem.cause == drop.cause
+            });
+            let Some(problem) = problem else {
+                if classifier_version == 7 {
+                    // Repairs and seeds retain certified drops after their source
+                    // trigger leaves effective history. Name that authenticated
+                    // certificate fact instead of inventing an activity trigger.
+                    return Ok(Explanation {
+                        rule: "certified_cumulative_scope_drop",
+                        trigger: canonical_json(drop)?,
+                        cause: Some(drop.cause),
+                        scope: Some(drop.scope()),
+                    });
+                }
+                return invalid(format!(
+                    "unexplained certified-drop trigger for {id}: {} at {}",
+                    drop.scope_id, drop.dropped_at_unix
+                ));
+            };
+            let trigger = by_id.get(problem.1.trigger.0.as_str()).copied();
+            if trigger.is_none()
+                && !anomalies.iter().any(|anomaly| {
+                    activity_row_anomaly_trigger(anomaly) == problem.1.trigger
+                        && drop.cause == DropCause::Unrepresentable
                 })
-                .ok_or_else(|| BootstrapError::Invalid {
-                    message: format!(
-                        "unexplained certified-drop trigger for {id}: {} at {}",
-                        drop.scope_id, drop.dropped_at_unix
-                    ),
-                })?;
-            let trigger = by_id
-                .get(problem.1.trigger.0.as_str())
-                .copied()
-                .ok_or(BootstrapError::Internal)?;
+            {
+                return invalid(format!(
+                    "sample drop trigger has no authenticated evidence for {id}"
+                ));
+            }
             let noncanonical = drop.cause == DropCause::Unmapped
                 && trigger
-                    .group_id
-                    .components()
-                    .condition_id
-                    .as_ref()
+                    .and_then(|a| a.group_id.components().condition_id.as_ref())
                     .is_some_and(|id| {
                         !id.0.starts_with("0x")
                             || id.0[2..]
