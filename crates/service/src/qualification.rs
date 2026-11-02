@@ -14757,6 +14757,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn anomaly_counterpart_retirement_adds_no_qualification_decision_identity() {
+        let (healthy, mut observations) = single_read_fixture(1, "0xca", "BUY", true);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.db");
+        let state = PaperStateDb::open(&path).unwrap();
+        store_read_decision(&state, &healthy, "decision_pending", true);
+        let before = decision_rows_from_source_observations(
+            &state,
+            &prefix_at(None),
+            &prefix_at(Some(2)),
+            &observations,
+        )
+        .unwrap();
+        let mut row = activity_row(
+            "0xcb",
+            "asset-b",
+            "1",
+            "0.5",
+            "0xanomalous-counterpart",
+            100,
+        );
+        row["timestamp"] = serde_json::json!(100);
+        row["outcomeIndex"] = serde_json::json!(0);
+        let stream_payload = serde_json::to_vec(&row).unwrap();
+        parse_activity_trade_observation(&stream_payload).unwrap();
+        let mut stream = activity_observation(3, &stream_payload);
+        stream.source_id = crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned();
+        let receipt = stream.receipt;
+        observations.insert(3, stream);
+        row["usdcSize"] = serde_json::json!("4.212e-7");
+        row["conditionId"] = serde_json::json!("0xcc");
+        let mut page = activity_observation(4, &activity_payload(vec![row]));
+        page.schema_version = crate::trade_poller::ACTIVITY_POLL_ANOMALY_PAGE_SCHEMA_VERSION;
+        observations.insert(4, page);
+        state.retire_activity_observation(receipt, true).unwrap();
+        drop(state);
+        let state = PaperStateDb::open(&path).unwrap();
+        assert!(state.activity_observation_unbound_retired(receipt).unwrap());
+        let selected = decision_rows_from_source_observations(
+            &state,
+            &prefix_at(None),
+            &prefix_at(Some(4)),
+            &observations,
+        )
+        .unwrap();
+        assert_eq!(selected.rows, before.rows);
+        assert_eq!(selected.in_prefix, before.in_prefix);
+        assert_eq!(
+            source_trade_universe(EventSeq(4), &observations)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     fn assert_selection_results_equal(
         map: Result<SelectedDecisionRows, QualificationError>,
         indexed: Result<(SelectedDecisionRows, TailBinding), QualificationError>,

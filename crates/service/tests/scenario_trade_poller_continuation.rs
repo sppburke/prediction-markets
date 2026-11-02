@@ -906,6 +906,7 @@ enum ControlCompletion {
 type BoundaryReply = Option<Result<(), DailyBoundaryError>>;
 
 struct RunningPoll {
+    source_receipts: pe_service::risk_inputs::SourceReceiptIndex,
     crash_boundary: Arc<Mutex<Option<pe_service::trade_poller::ReconciliationCrashBoundary>>>,
     health: pe_service::health::SharedHealth,
     anchor_ack_gate: Arc<tokio::sync::Semaphore>,
@@ -1423,7 +1424,7 @@ fn start_recorded_poller_with_membership(
         preparer,
     )
     .with_crash_boundary(crash_boundary.clone())
-    .with_source_receipt_index(receipts)
+    .with_source_receipt_index(receipts.clone())
     .with_clock(Arc::new(move || {
         OffsetDateTime::from_unix_timestamp(clock.load(Ordering::SeqCst)).unwrap()
     }))
@@ -1469,6 +1470,7 @@ fn start_recorded_poller_with_membership(
     }));
     (
         RunningPoll {
+            source_receipts: receipts,
             crash_boundary,
             health,
             anchor_ack_gate,
@@ -7628,4 +7630,741 @@ async fn anomaly_only_poller_acquires_cold_membership_and_commits_event_drop_onc
         );
         server.abort();
     }
+}
+
+/// Unique anomaly counterparts use the REST clock without releasing independent barriers.
+/// Their exact receipts, including unresolved outcomes, stay retired after reopening.
+#[tokio::test(start_paused = true)]
+async fn anomaly_counterparts_retire_exact_receipts_and_preserve_unmatched_ordering() {
+    for kind in ["decimal", "price", "numeric_outcome", "outcome"] {
+        for delta in [-1, 1] {
+            for corrected in [false, true] {
+                for resolved in [false, true] {
+                    for coverage in ["fresh", "covered", "all_stored"] {
+                        let dir =
+                            tempfile::tempdir_in(std::env::var("PASS_SCRATCH").unwrap()).unwrap();
+                        let (mut running, paper) = start_recorded_poller_with_membership(
+                            &dir,
+                            &[wallet()],
+                            true,
+                            false,
+                            None,
+                            None,
+                            120,
+                            None,
+                        );
+                        let stored = activity_row(
+                            "TRADE",
+                            "stored-sell",
+                            MARKET_A,
+                            "SELL",
+                            "0",
+                            "asset-a",
+                            EPOCH - 5 + delta,
+                        );
+                        if coverage == "covered" {
+                            cover_recorded_groups(&paper, EPOCH - 1);
+                        }
+                        let initial = if coverage == "all_stored" {
+                            vec![stored.clone()]
+                        } else {
+                            Vec::new()
+                        };
+                        running
+                            .requests
+                            .recv()
+                            .await
+                            .unwrap()
+                            .respond
+                            .send(serde_json::to_vec(&initial).unwrap())
+                            .unwrap();
+                        running.round_completed().await;
+                        let frontier = paper.feed_history_frontiers().unwrap();
+                        running.coordinator_gate.lock().unwrap().0 = true;
+                        let mut observed = stream_row(wallet(), "decimal-counterpart", EPOCH - 5);
+                        if !resolved {
+                            observed["conditionId"] = json!("unknown-condition");
+                            observed["asset"] = json!("missing-asset");
+                        }
+                        let receipt = running.observe(observed.clone()).await;
+                        let unmatched_row = activity_row(
+                            "TRADE",
+                            "unmatched-anomaly-neighbor",
+                            MARKET_A,
+                            "SELL",
+                            "0",
+                            "asset-a",
+                            EPOCH - 1,
+                        );
+                        let unmatched = running.observe_with(unmatched_row.clone(), false).await;
+                        let waker = {
+                            let mut gate = running.coordinator_gate.lock().unwrap();
+                            gate.0 = false;
+                            gate.1.take()
+                        };
+                        if let Some(waker) = waker {
+                            waker.wake();
+                        }
+                        let mut anomaly = observed;
+                        anomaly["timestamp"] = json!(EPOCH - 5 + delta);
+                        match kind {
+                            "decimal" => anomaly["usdcSize"] = json!("4.212e-7"),
+                            "price" => anomaly["price"] = json!("3.1968021978"),
+                            "numeric_outcome" => anomaly["outcomeIndex"] = json!(65536),
+                            "outcome" => anomaly["outcomeIndex"] = json!("invalid"),
+                            _ => unreachable!(),
+                        }
+                        if corrected && resolved {
+                            anomaly["conditionId"] = json!(MARKET_A);
+                        }
+                        let healthy = activity_row(
+                            "TRADE",
+                            "healthy-after-anomaly",
+                            "0xcc",
+                            "BUY",
+                            "1",
+                            "asset-c",
+                            EPOCH,
+                        );
+                        let healthy_id = aggregate(healthy.clone()).group_id.key().clone();
+                        let mut rows = vec![healthy, anomaly];
+                        if coverage == "all_stored" {
+                            rows.push(stored);
+                        }
+                        running
+                            .requests
+                            .recv()
+                            .await
+                            .unwrap()
+                            .respond
+                            .send(serde_json::to_vec(&rows).unwrap())
+                            .unwrap();
+                        running.completed(wallet()).await;
+                        assert!(
+                            paper.activity_observation_retired(receipt).unwrap(),
+                            "{delta}/{corrected}/{resolved}/{coverage}"
+                        );
+                        assert!(paper.activity_observation_unbound_retired(receipt).unwrap());
+                        assert!(!paper.activity_observation_retired(unmatched).unwrap());
+                        assert!(paper.decision_pending_for(&healthy_id).unwrap().is_none());
+                        assert_eq!(paper.feed_history_frontiers().unwrap(), frontier);
+                        assert_eq!(
+                            paper.wallet_scope_drops(&wallet(), EPOCH).unwrap().len(),
+                            usize::from(resolved)
+                        );
+                        rows.push(unmatched_row);
+                        running
+                            .requests
+                            .recv()
+                            .await
+                            .unwrap()
+                            .respond
+                            .send(serde_json::to_vec(&rows).unwrap())
+                            .unwrap();
+                        running.completed(wallet()).await;
+                        let commits = running.finish().await;
+                        assert!(paper.decision_pending_for(&healthy_id).unwrap().is_some());
+                        assert!(
+                            paper
+                                .activity_group_state(
+                                    aggregate(rows.last().unwrap().clone()).group_id.key()
+                                )
+                                .unwrap()
+                                .is_some()
+                        );
+                        assert!(
+                            commits
+                                .iter()
+                                .filter(|(_, _, result)| result.source_epoch == EPOCH - 5 + delta)
+                                .all(|(_, context, _)| context.observed_source_receipts.is_empty())
+                        );
+                        assert!(
+                            pe_service::trade_poller::rebuild_reconciliation_obligations(
+                                &dir.path().join("source.log"),
+                                &paper
+                            )
+                            .unwrap()
+                            .is_empty()
+                        );
+                        let (mut restarted, reopened) = start_recorded_poller_with_membership(
+                            &dir,
+                            &[wallet()],
+                            true,
+                            false,
+                            None,
+                            None,
+                            120,
+                            None,
+                        );
+                        restarted
+                            .requests
+                            .recv()
+                            .await
+                            .unwrap()
+                            .respond
+                            .send(serde_json::to_vec(&rows).unwrap())
+                            .unwrap();
+                        restarted.round_completed().await;
+                        let repeated = restarted.finish().await;
+                        assert!(
+                            repeated
+                                .iter()
+                                .all(|(_, _, result)| result.already_committed)
+                        );
+                        assert!(reopened.activity_observation_retired(receipt).unwrap());
+                        assert_eq!(
+                            reopened.decision_pending_history().unwrap(),
+                            paper.decision_pending_history().unwrap()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Exact aggregate identity wins; opposite sides are distinct; multiple aggregate/anomaly
+/// candidates use the existing non-executable ambiguity policy.
+#[tokio::test(start_paused = true)]
+async fn anomaly_correlation_keeps_exact_identity_side_and_ambiguity_policy() {
+    for case in [
+        "exact",
+        "opposite_side",
+        "two_anomalies",
+        "aggregate_and_anomaly",
+    ] {
+        let dir = tempfile::tempdir_in(std::env::var("PASS_SCRATCH").unwrap()).unwrap();
+        let (mut running, paper) = start_recorded_poller_with_membership(
+            &dir,
+            &[wallet()],
+            true,
+            false,
+            None,
+            None,
+            120,
+            None,
+        );
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(b"[]".to_vec())
+            .unwrap();
+        running.round_completed().await;
+        let mut observation = stream_row(wallet(), "candidate-policy", EPOCH - 5);
+        if case == "aggregate_and_anomaly" {
+            observation["conditionId"] = json!("incorrect-stamp");
+        }
+        let receipt = running.observe(observation.clone()).await;
+        let mut anomaly = stream_row(wallet(), "candidate-policy", EPOCH - 4);
+        anomaly["usdcSize"] = json!("4.212e-7");
+        let mut rows = vec![anomaly.clone()];
+        match case {
+            "exact" => rows.push(observation),
+            "opposite_side" => {
+                rows[0]["side"] = json!("SELL");
+            }
+            "two_anomalies" => {
+                anomaly["timestamp"] = json!(EPOCH - 3);
+                rows.push(anomaly.clone());
+            }
+            "aggregate_and_anomaly" => {
+                rows.push(stream_row(wallet(), "candidate-policy", EPOCH - 3))
+            }
+            _ => unreachable!(),
+        }
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(serde_json::to_vec(&rows).unwrap())
+            .unwrap();
+        running.completed(wallet()).await;
+        if case == "opposite_side" {
+            assert!(!paper.activity_observation_retired(receipt).unwrap());
+            assert_eq!(paper.cursor(&wallet()).unwrap(), Some(EPOCH - 10));
+            rows.push(anomaly);
+            running
+                .requests
+                .recv()
+                .await
+                .unwrap()
+                .respond
+                .send(serde_json::to_vec(&rows).unwrap())
+                .unwrap();
+            running.completed(wallet()).await;
+        }
+        let commits = running.finish().await;
+        if case == "exact" {
+            let id = aggregate(stream_row(wallet(), "candidate-policy", EPOCH - 5))
+                .group_id
+                .key()
+                .clone();
+            assert!(paper.decision_pending_for(&id).unwrap().is_some());
+            assert!(
+                commits
+                    .iter()
+                    .any(|(_, context, _)| context.observed_source_receipts.get(&id)
+                        == Some(&receipt))
+            );
+        } else {
+            assert!(paper.decision_pending_history().unwrap().is_empty());
+            assert!(paper.activity_observation_retired(receipt).unwrap());
+            let drops = paper.wallet_scope_drops(&wallet(), EPOCH).unwrap();
+            assert_eq!(drops.len(), 1);
+            assert_eq!(
+                drops[0].dropped_at_epoch,
+                if case == "opposite_side" {
+                    EPOCH - 4
+                } else {
+                    EPOCH - 5
+                }
+            );
+        }
+        assert!(
+            pe_service::trade_poller::rebuild_reconciliation_obligations(
+                &dir.path().join("source.log"),
+                &paper
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn anomaly_counterpart_failure_and_crashes_keep_atomic_retirement() {
+    use pe_service::trade_poller::ReconciliationCrashBoundary;
+    for crash in [
+        None,
+        Some(ReconciliationCrashBoundary::Commitment),
+        Some(ReconciliationCrashBoundary::Bucket),
+    ] {
+        let dir = tempfile::tempdir_in(std::env::var("PASS_SCRATCH").unwrap()).unwrap();
+        let (mut running, paper) = start_recorded_poller_with_membership(
+            &dir,
+            &[wallet()],
+            true,
+            false,
+            None,
+            None,
+            120,
+            None,
+        );
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(b"[]".to_vec())
+            .unwrap();
+        running.round_completed().await;
+        *running.crash_boundary.lock().unwrap() = crash;
+        let observed = stream_row(wallet(), "atomic-anomaly", EPOCH - 5);
+        let receipt = running.observe(observed.clone()).await;
+        let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+        if crash.is_none() {
+            connection.execute_batch("CREATE TRIGGER fail_anomaly_retirement BEFORE INSERT ON meta WHEN NEW.key LIKE 'retired_activity_observation:%' BEGIN SELECT RAISE(FAIL, 'injected anomaly retirement failure'); END;").unwrap();
+        }
+        let mut anomaly = observed;
+        anomaly["usdcSize"] = json!("4.212e-7");
+        let payload = serde_json::to_vec(&[anomaly]).unwrap();
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(payload.clone())
+            .unwrap();
+        assert!(running.poller.await.unwrap().is_err());
+        drop(running.source);
+        drop(running.triggers);
+        running.ingest.await.unwrap();
+        running.control.await.unwrap();
+        let committed = crash == Some(ReconciliationCrashBoundary::Bucket);
+        assert_eq!(
+            paper.activity_observation_retired(receipt).unwrap(),
+            committed
+        );
+        assert_eq!(
+            paper.wallet_scope_drops(&wallet(), EPOCH).unwrap().len(),
+            usize::from(committed)
+        );
+        assert_eq!(
+            paper.cursor(&wallet()).unwrap(),
+            Some(if committed { EPOCH - 5 } else { EPOCH - 10 })
+        );
+        assert_eq!(
+            pe_service::trade_poller::rebuild_reconciliation_obligations(
+                &dir.path().join("source.log"),
+                &paper
+            )
+            .unwrap()
+            .is_empty(),
+            committed
+        );
+        if crash.is_none() {
+            connection
+                .execute_batch("DROP TRIGGER fail_anomaly_retirement;")
+                .unwrap();
+        }
+        drop(connection);
+        drop(paper);
+        let (mut restarted, reopened) = start_recorded_poller_with_membership(
+            &dir,
+            &[wallet()],
+            true,
+            false,
+            None,
+            None,
+            120,
+            None,
+        );
+        restarted
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(payload)
+            .unwrap();
+        restarted.completed(wallet()).await;
+        restarted.round_completed().await;
+        assert!(reopened.activity_observation_retired(receipt).unwrap());
+        assert_eq!(
+            reopened.wallet_scope_drops(&wallet(), EPOCH).unwrap().len(),
+            1
+        );
+        assert!(reopened.decision_pending_history().unwrap().is_empty());
+        assert!(
+            restarted.requests.try_recv().is_err(),
+            "retired anomaly cannot re-arm urgent retries"
+        );
+        restarted.finish().await;
+    }
+}
+
+/// A proofless empty-binding commitment is rebuilt from the retained frontier after an
+/// epoch advance between atomic commit and acknowledgement, then filters the receipt on boot.
+#[tokio::test(start_paused = true)]
+async fn anomaly_only_empty_binding_retirement_reauthenticates_after_retention_and_restart() {
+    let dir = tempfile::tempdir_in(std::env::var("PASS_SCRATCH").unwrap()).unwrap();
+    let (mut running, paper) = start_recorded_poller_with_membership(
+        &dir,
+        &[wallet()],
+        true,
+        false,
+        None,
+        None,
+        120,
+        None,
+    );
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let observed = stream_row(wallet(), "retained-anomaly", EPOCH - 5);
+    let receipt = running.observe(observed.clone()).await;
+    let gate = running.bucket_ack_gate.clone();
+    let held = gate.acquire().await.unwrap();
+    let mut anomaly = observed;
+    anomaly["usdcSize"] = json!("4.212e-7");
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[anomaly.clone()]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        running.controls.recv().await.unwrap(),
+        ControlCompletion::BucketCommitted
+    ));
+    assert!(paper.activity_observation_retired(receipt).unwrap());
+    assert!(running.held.borrow().receipts.contains(&receipt));
+    let commitment_envelope = source_frames(&dir.path().join("source.log"))
+        .into_iter()
+        .find(|frame| {
+            frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+                && frame.seq.0 > receipt.sequence.0
+        })
+        .unwrap();
+    let commitment = pe_event_log::AppendReceipt {
+        sequence: commitment_envelope.seq,
+        this_hash: commitment_envelope.this_hash,
+    };
+    let payload: pe_service::bucket_commit::ActivityReadCommitment =
+        serde_json::from_slice(&commitment_envelope.payload).unwrap();
+    assert!(payload.bindings.unwrap().is_empty());
+    assert!(payload.read_proof.is_none());
+    let before = running.source_receipts.read_verification_count(commitment);
+    running
+        .source
+        .append(pe_event_log::EnvelopeIn {
+            source_id: SourceId("retention-suffix".to_owned()),
+            schema_version: 1,
+            parser_version: 1,
+            observed_at: SourceTimestamp(OffsetDateTime::from_unix_timestamp(EPOCH).unwrap()),
+            received_at: ReceivedAt(OffsetDateTime::from_unix_timestamp(EPOCH).unwrap()),
+            content_type: pe_event_log::ContentType::Json,
+            payload: b"{}".to_vec(),
+        })
+        .await
+        .unwrap();
+    let path = dir.path().join("source.log");
+    let frames = pe_event_log::Reader::replay_with_offsets(&path)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let suffix = frames.last().unwrap();
+    let tail = pe_event_log::Scanner::verify(&path).unwrap();
+    let authority = pe_event_log::RetentionAuthority {
+        format_version: 1,
+        epoch: 1,
+        advanced_at: EPOCH,
+        boundary: pe_event_log::RetentionBoundary {
+            sequence: suffix.1,
+            offset: suffix.0,
+        },
+        chain_head: suffix.2.prev_hash,
+        pins: frames
+            .iter()
+            .filter(|(_, sequence, _)| *sequence < suffix.1)
+            .map(|(offset, sequence, frame)| pe_event_log::RetentionPin {
+                sequence: *sequence,
+                offset: *offset,
+                hash: frame.this_hash,
+                predecessor_hash: frame.prev_hash,
+                reducer: true,
+                wallet: None,
+            })
+            .collect(),
+        retained_tail: (&tail).into(),
+        feed: Vec::new(),
+    };
+    authority.write(&path).unwrap();
+    let receipts = frames
+        .iter()
+        .flat_map(|(offset, sequence, frame)| {
+            pe_event_log::ReceiptRecord {
+                receipt: pe_event_log::AppendReceipt {
+                    sequence: *sequence,
+                    this_hash: frame.this_hash,
+                },
+                received_millis: i64::try_from(
+                    frame.received_at.0.unix_timestamp_nanos() / 1_000_000,
+                )
+                .unwrap(),
+                byte_offset: Some(*offset),
+            }
+            .encode()
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(
+        pe_service::source_checkpoint::receipts_path(&path),
+        receipts,
+    )
+    .unwrap();
+    running
+        .source_receipts
+        .install_retention(authority)
+        .unwrap();
+    drop(held);
+    running.completed(wallet()).await;
+    assert!(
+        running.source_receipts.read_verification_count(commitment) >= before + 2,
+        "retirement and frontier must each reconstruct under the new epoch"
+    );
+    assert!(paper.activity_observation_retired(receipt).unwrap());
+    assert!(!running.held.borrow().receipts.contains(&receipt));
+    running.finish().await;
+    let (mut restarted, reopened) = start_recorded_poller_with_membership(
+        &dir,
+        &[wallet()],
+        true,
+        false,
+        None,
+        None,
+        120,
+        None,
+    );
+    restarted
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[anomaly]).unwrap())
+        .unwrap();
+    restarted.round_completed().await;
+    assert!(reopened.activity_observation_retired(receipt).unwrap());
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(&path, &reopened)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        restarted
+            .finish()
+            .await
+            .iter()
+            .all(|(_, _, result)| result.already_committed)
+    );
+}
+
+#[tokio::test]
+async fn anomaly_counterpart_membership_retry_keeps_receipt_until_atomic_commit() {
+    use axum::{Json, Router, routing::get};
+    let dir = tempfile::tempdir_in(std::env::var("PASS_SCRATCH").unwrap()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server_calls = calls.clone();
+    let (requested, mut requests) = mpsc::channel(1);
+    let app = Router::new().route(
+        "/markets/0xcd",
+        get(move || {
+            let calls = server_calls.clone();
+            let requested = requested.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let (release, released) = oneshot::channel();
+                requested.send(release).await.unwrap();
+                released.await.unwrap();
+                Json(json!({"condition_id":"0xcd","neg_risk":false}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let fetcher = Arc::new(
+        pe_source_polymarket_public::ReqwestFetcher::new(reqwest::Client::new())
+            .with_max_retries(0)
+            .with_min_interval_ms(0),
+    );
+    let membership = Some((base, fetcher));
+    let (mut running, paper) = start_recorded_poller_with_membership(
+        &dir,
+        &[wallet()],
+        true,
+        false,
+        None,
+        None,
+        120,
+        membership.clone(),
+    );
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let observation = activity_row(
+        "TRADE",
+        "cold-membership-anomaly",
+        "0xcd",
+        "BUY",
+        "1",
+        "missing-asset",
+        EPOCH - 5,
+    );
+    let receipt = running.observe(observation.clone()).await;
+    let mut anomaly = observation;
+    anomaly["usdcSize"] = json!("4.212e-7");
+    let payload = serde_json::to_vec(&[anomaly]).unwrap();
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(payload.clone())
+        .unwrap();
+    let release = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!paper.activity_observation_retired(receipt).unwrap());
+    assert!(
+        paper
+            .wallet_scope_drops(&wallet(), EPOCH)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(paper.cursor(&wallet()).unwrap(), Some(EPOCH - 10));
+    assert!(running.held.borrow().receipts.contains(&receipt));
+    release.send(()).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        running.completed(wallet()),
+    )
+    .await
+    .unwrap();
+    let commits = running.finish().await;
+    assert_eq!(commits.len(), 1);
+    assert!(commits[0].0.is_empty());
+    assert!(paper.activity_observation_retired(receipt).unwrap());
+    assert_eq!(
+        paper.wallet_scope_drops(&wallet(), EPOCH).unwrap()[0].scope_id,
+        "0xcd"
+    );
+    assert!(paper.decision_pending_history().unwrap().is_empty());
+    let (mut restarted, reopened) = start_recorded_poller_with_membership(
+        &dir,
+        &[wallet()],
+        true,
+        false,
+        None,
+        None,
+        120,
+        membership,
+    );
+    restarted
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(payload)
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        restarted.round_completed(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        restarted
+            .finish()
+            .await
+            .iter()
+            .all(|(_, _, result)| result.already_committed)
+    );
+    assert!(reopened.activity_observation_retired(receipt).unwrap());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            &reopened
+        )
+        .unwrap()
+        .is_empty()
+    );
+    server.abort();
 }

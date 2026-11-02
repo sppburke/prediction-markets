@@ -1338,3 +1338,77 @@ impl RetentionLogs {
             .unwrap()
     }
 }
+
+/// One terminal anomaly-aware page, retaining the producer's ordinary commitment contract.
+pub fn producer_shaped_anomaly_read(
+    wallet: WalletAddress,
+    payload: &[u8],
+    fixed_end: i64,
+    received_unix: i64,
+    page_receipt: AppendReceipt,
+) -> (
+    ProducerShapedRead,
+    Vec<pe_source_polymarket_public::ActivityRowAnomaly>,
+) {
+    let received_at = ReceivedAt(time::OffsetDateTime::from_unix_timestamp(received_unix).unwrap());
+    let parsed = pe_source_polymarket_public::parse_activity_response_with_acceptance(
+        payload,
+        wallet,
+        &ActivityParseContext {
+            source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+            observed_at: SourceTimestamp(received_at.0),
+            received_at: received_at.clone(),
+            transport: ActivityTransport::Rest,
+        },
+        pe_source_polymarket_public::ActivityRowAcceptance::StrictWithAnomalies,
+    )
+    .unwrap();
+    let request_url = pe_source_polymarket_public::PolymarketEndpoint::UserPositionActivityPage {
+        user: wallet.to_string(),
+        end: fixed_end,
+        start: None,
+        offset: 0,
+    }
+    .url("https://data-api.polymarket.com");
+    let raw_hash = blake3::hash(payload).to_hex().to_string();
+    let evidence = ReconciliationPageEvidence {
+        request_url: request_url.clone(),
+        bounds: Some(ActivityRequestBounds {
+            start: None,
+            end: fixed_end,
+        }),
+        partition: None,
+        offset: 0,
+        row_count: u32::try_from(parsed.rows.len() + parsed.anomalies.len()).unwrap(),
+        canonical_page_hash: canonical_page_hash(payload).unwrap(),
+        raw_page_hash: raw_hash.clone(),
+        received_at,
+        schema_version: ACTIVITY_SCHEMA_VERSION,
+        parser_version: ACTIVITY_PARSER_VERSION,
+        anomalies: parsed.anomalies.clone(),
+    };
+    let page = PageOccurrence {
+        request_url,
+        raw_hash,
+        receipt: page_receipt,
+    };
+    let commitment_payload = pe_service::bucket_commit::activity_read_commitment_payload_v2(
+        wallet,
+        fixed_end,
+        std::slice::from_ref(&page),
+        std::slice::from_ref(&evidence),
+        &[],
+    )
+    .unwrap();
+    (
+        ProducerShapedRead {
+            aggregates: parsed.aggregates().unwrap(),
+            decision_inputs_json: serde_json::json!({"fixed_end":fixed_end,"pages":[evidence]})
+                .to_string(),
+            page,
+            commitment_payload,
+            commitment_version: 2,
+        },
+        parsed.anomalies,
+    )
+}

@@ -46,9 +46,9 @@ use crate::activity_ingest::{
 use crate::asset_identity::{AssetIdentityResolver, IdentityProvenance};
 use crate::bucket_commit::{
     ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
-    ACTIVITY_READ_COMMITMENT_SOURCE_ID, AmbiguousObservation, BucketCommitError,
-    BucketCommitResult, BucketDecisionContext, IdentityOverride, ObservationBinding,
-    PageOccurrence, activity_read_commitment_payload_v2, joined_read_pages,
+    ACTIVITY_READ_COMMITMENT_SOURCE_ID, AmbiguousObservation, AnomalyCounterpart,
+    BucketCommitError, BucketCommitResult, BucketDecisionContext, IdentityOverride,
+    ObservationBinding, PageOccurrence, activity_read_commitment_payload_v2, joined_read_pages,
 };
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
@@ -2342,17 +2342,17 @@ impl WalletOperation {
         let index = self.source_receipts.as_ref().ok_or_else(|| {
             ReconciliationError::Binding("source receipt index missing".to_owned())
         })?;
-        let verified = std::sync::Arc::new(
-            crate::bucket_commit::verified_read_for_routing(
-                read_commitment,
-                wallet,
-                fixed_end,
-                &page_occurrences,
-                &activity.pages,
-                index,
-            )
-            .map_err(|error| ReconciliationError::Binding(error.to_string()))?,
-        );
+        let mut verified = crate::bucket_commit::verified_read_for_routing(
+            read_commitment,
+            wallet,
+            fixed_end,
+            &page_occurrences,
+            &activity.pages,
+            index,
+        )
+        .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
+        verified.anomaly_counterparts = correlation.anomaly_counterparts.clone();
+        let verified = Arc::new(verified);
         for matched in &correlation.matched {
             if let Some(obligation) = selected
                 .get_mut(&matched.epoch)
@@ -2620,6 +2620,7 @@ impl WalletOperation {
             .map(|aggregate| (aggregate.group_id.key(), *aggregate))
             .collect::<HashMap<_, _>>();
         let mut target_pages = HashMap::new();
+        let mut anomalies = Vec::new();
         for (occurrence_index, (occurrence, evidence)) in joined_read_pages(occurrences, pages)
             .map_err(|error| ReconciliationError::Binding(error.to_string()))?
             .into_iter()
@@ -2641,6 +2642,7 @@ impl WalletOperation {
                 "poller correlation page parse failed",
             )
             .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
+            anomalies.extend(page.anomalies);
             for row in page.rows {
                 let group = row
                     .group_id()
@@ -2699,6 +2701,16 @@ impl WalletOperation {
                         .collect::<Vec<_>>()
                 };
                 crate::bucket_commit::collapse_restamp_pairs(&mut candidates, &restamp_pairs);
+                let anomaly_candidates = if by_group.contains_key(&obligation.group_id) {
+                    Vec::new()
+                } else {
+                    anomalies
+                        .iter()
+                        .filter(|anomaly| {
+                            crate::bucket_commit::anomaly_matches_observation(anomaly, original)
+                        })
+                        .collect::<Vec<_>>()
+                };
                 let provenance = if by_group.contains_key(&obligation.group_id) {
                     None
                 } else {
@@ -2712,7 +2724,7 @@ impl WalletOperation {
                         })
                         .cloned()
                 };
-                if candidates.len() > 1
+                if candidates.len() + anomaly_candidates.len() > 1
                     || candidates
                         .iter()
                         .any(|candidate| first_seen.contains_key(candidate.group_id.key()))
@@ -2722,6 +2734,15 @@ impl WalletOperation {
                         .find_map(|candidate| {
                             identities.iter().find_map(|identity| {
                                 identity.overrides.get(candidate.group_id.key())
+                            })
+                        })
+                        .or_else(|| {
+                            anomaly_candidates.iter().find_map(|anomaly| {
+                                anomaly.asset.as_ref().and_then(|asset| {
+                                    identities
+                                        .iter()
+                                        .find_map(|identity| identity.scope_tokens.get(asset))
+                                })
                             })
                         })
                         .map(|identity| identity.verified.market().to_string())
@@ -2754,8 +2775,22 @@ impl WalletOperation {
                                     candidate.source_time.0.unix_timestamp(),
                                 )
                             })
+                            .chain(anomaly_candidates.iter().map(|anomaly| {
+                                (
+                                    pe_position_ledger::activity_row_anomaly_trigger(anomaly),
+                                    anomaly.source_time.0.unix_timestamp(),
+                                )
+                            }))
                             .collect(),
                         market_id,
+                    });
+                    continue;
+                }
+                if let [anomaly] = anomaly_candidates.as_slice() {
+                    result.anomaly_counterparts.push(AnomalyCounterpart {
+                        stream_receipt: obligation.receipt,
+                        stream_group_id: obligation.group_id.clone(),
+                        anomaly: (*anomaly).clone(),
                     });
                     continue;
                 }
@@ -3213,6 +3248,7 @@ async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
 #[derive(Default)]
 struct Correlation {
     matched: Vec<MatchedObservation>,
+    anomaly_counterparts: Vec<AnomalyCounterpart>,
     unmatched_epoch: Option<i64>,
     unmatched: Vec<(i64, SourceTradeId)>,
     ambiguous: Vec<AmbiguousObservation>,

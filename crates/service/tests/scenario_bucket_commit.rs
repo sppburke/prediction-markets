@@ -4642,3 +4642,70 @@ fn anomaly_only_seconds_commit_drops_and_cursors_once_across_restart_and_history
         }
     }
 }
+
+#[test]
+fn later_anomaly_second_keeps_existing_decisions_and_healthy_bucket_results() {
+    let (_dir, paper, mut engine) = fresh_anchored();
+    let original = position_row(
+        "TRADE",
+        "0xprior-decision",
+        MARKET_A,
+        0,
+        "BUY",
+        "1",
+        "0.5",
+        100,
+    );
+    let original_id = original.group_id.key().clone();
+    engine
+        .commit_read(vec![original.clone()], &context(100, true), zero_basis())
+        .unwrap();
+    let before = paper.decision_pending_for(&original_id).unwrap().unwrap();
+    let gate = paper.entry_gate_result(&original_id).unwrap();
+    let history = paper.gate_history().unwrap();
+    let mut rows = original.rows.clone();
+    rows[0]["usdcSize"] = json!("4.212e-7");
+    let payload = serde_json::to_vec(&rows).unwrap();
+    let (read, anomalies) = support::producer_shaped_anomaly_read(
+        wallet(),
+        &payload,
+        100,
+        120,
+        support::scenario_receipt(10),
+    );
+    let mut ctx = context(100, true);
+    ctx.decision_inputs_json = read.decision_inputs_json;
+    let bucket = pe_service::bucket_commit::ReconciliationBucket {
+        wallet: wallet(),
+        source_epoch: 100,
+        aggregates: Vec::new(),
+        anomalies,
+    };
+    let result = engine.commit(bucket.clone(), &ctx, zero_basis()).unwrap();
+    assert!(result.dispositions.is_empty());
+    assert!(result.pending.is_empty());
+    assert_eq!(
+        paper.decision_pending_for(&original_id).unwrap().unwrap(),
+        before
+    );
+    assert_eq!(paper.entry_gate_result(&original_id).unwrap(), gate);
+    assert_eq!(paper.gate_history().unwrap(), history);
+    assert!(
+        engine
+            .commit(bucket, &ctx, zero_basis())
+            .unwrap()
+            .already_committed
+    );
+    let healthy = position_row("TRADE", "0xhealthy", MARKET_B, 0, "BUY", "2", "0.5", 101);
+    let healthy_id = healthy.group_id.key().clone();
+    let result = engine
+        .commit_read(vec![healthy], &context(101, true), zero_basis())
+        .unwrap();
+    assert_eq!(result.pending, [healthy_id]);
+    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 1_000_000);
+    assert_eq!(state(&engine, MARKET_B, 0).atomic(), 2_000_000);
+    assert_eq!(
+        paper.decision_pending_for(&original_id).unwrap().unwrap(),
+        before
+    );
+}
