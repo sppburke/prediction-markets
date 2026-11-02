@@ -2003,6 +2003,7 @@ mod tests {
                 receipt,
             };
             let evidence = ReconciliationPageEvidence {
+                anomalies: Vec::new(),
                 request_url: page.request_url.clone(),
                 bounds: Some(ActivityRequestBounds {
                     start: None,

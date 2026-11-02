@@ -1534,3 +1534,443 @@ async fn semantic_read_matches_the_default_read_without_row_provenance() {
         row.raw_row_json.is_empty() && row.raw_row_hash.is_empty() && row.source_id.0.is_empty()
     }));
 }
+
+fn anomalous_row(timestamp: i64, transaction: &str) -> Value {
+    let mut row = activity_row(timestamp, transaction.to_owned(), ASSET.to_owned(), 0);
+    row["price"] = json!("1.1");
+    row
+}
+
+#[tokio::test]
+async fn anomaly_modes_count_mixed_pages_and_preserve_provenance() {
+    use pe_source_polymarket_public::{
+        ActivityRowAnomalyKind, fetch_complete_activity_with_acceptance,
+        parse_activity_response_with_acceptance,
+    };
+    for (field, value, kind) in [
+        (
+            "price",
+            json!("1.1"),
+            ActivityRowAnomalyKind::PriceOutOfRange,
+        ),
+        (
+            "outcomeIndex",
+            json!(65536),
+            ActivityRowAnomalyKind::UnmappedOutcome,
+        ),
+        (
+            "usdcSize",
+            json!("4.212e-7"),
+            ActivityRowAnomalyKind::UnrepresentableDecimal,
+        ),
+    ] {
+        let mut bad = activity_row(50, "0xanomaly".to_owned(), ASSET.to_owned(), 0);
+        bad[field] = value;
+        let mut first = (0..499)
+            .map(|index| activity_row(60, format!("0xvalid{index}"), ASSET.to_owned(), 0))
+            .collect::<Vec<_>>();
+        first.push(bad.clone());
+        let first_raw = serde_json::to_vec(&first).unwrap();
+        let second = vec![activity_row(
+            40,
+            "0xother-page".to_owned(),
+            ASSET.to_owned(),
+            0,
+        )];
+        let api = FixtureFetcher::new(HashMap::from([
+            (activity_url(None, 100, 0), first_raw.clone()),
+            (
+                activity_url(None, 100, 500),
+                serde_json::to_vec(&second).unwrap(),
+            ),
+        ]));
+        for mode in [
+            ActivityRowAcceptance::Strict,
+            ActivityRowAcceptance::Acquisition3,
+        ] {
+            let expected =
+                parse_activity_response_with_acceptance(&first_raw, wallet(), &context(), mode)
+                    .unwrap_err();
+            assert!(
+                matches!(fetch_complete_activity_with_acceptance(&api, BASE, wallet(), None, 100, mode).await, Err(ActivityReadError::Parse(error)) if error == expected)
+            );
+        }
+        for mode in [
+            ActivityRowAcceptance::StrictWithAnomalies,
+            ActivityRowAcceptance::Acquisition4,
+        ] {
+            let read =
+                fetch_complete_activity_with_acceptance(&api, BASE, wallet(), None, 100, mode)
+                    .await
+                    .unwrap();
+            assert_eq!(read.rows.len(), 500);
+            assert_eq!(read.anomalies.len(), 1);
+            assert_eq!(read.anomalies[0].kind, kind);
+            assert_eq!(
+                read.pages
+                    .iter()
+                    .map(|page| page.row_count)
+                    .collect::<Vec<_>>(),
+                [500, 1]
+            );
+            assert_eq!(read.pages[0].anomalies, read.anomalies);
+            assert_eq!(
+                read.pages[0].raw_page_hash,
+                blake3::hash(&first_raw).to_hex().to_string()
+            );
+            assert_eq!(
+                read.pages[0].canonical_page_hash,
+                pe_source_polymarket_public::canonical_page_hash(&first_raw).unwrap()
+            );
+            assert_eq!(
+                read.buckets().unwrap().iter().map(Vec::len).sum::<usize>(),
+                500
+            );
+            assert!(
+                read.rows
+                    .iter()
+                    .all(|row| !row.raw_row_json.is_empty() && !row.raw_row_hash.is_empty())
+            );
+            let semantic = fetch_complete_activity_semantic(&api, BASE, wallet(), None, 100, mode)
+                .await
+                .unwrap();
+            assert_eq!(semantic.anomalies, read.anomalies);
+            assert!(semantic.rows.iter().all(|row| row.raw_row_hash.is_empty()));
+            let wire = serde_json::to_vec(&read.pages[0]).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<pe_source_polymarket_public::ReconciliationPageEvidence>(
+                    &wire
+                )
+                .unwrap(),
+                read.pages[0]
+            );
+            let legacy_wire = serde_json::to_value(&read.pages[1]).unwrap();
+            assert!(legacy_wire.get("anomalies").is_none());
+            assert!(
+                serde_json::from_value::<pe_source_polymarket_public::ReconciliationPageEvidence>(
+                    legacy_wire
+                )
+                .unwrap()
+                .anomalies
+                .is_empty()
+            );
+            first.push(bad.clone());
+            let oversized = FixtureFetcher::new(HashMap::from([(
+                activity_url(None, 100, 0),
+                serde_json::to_vec(&first).unwrap(),
+            )]));
+            first.pop();
+            assert!(matches!(
+                fetch_complete_activity_with_acceptance(
+                    &oversized,
+                    BASE,
+                    wallet(),
+                    None,
+                    100,
+                    mode
+                )
+                .await,
+                Err(ActivityReadError::PageTooLarge {
+                    row_count: 501,
+                    limit: 500
+                })
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn anomaly_only_short_pages_and_ascending_lookups_obey_bounds() {
+    use pe_source_polymarket_public::{
+        activity_window_end_with_acceptance, fetch_activity_window_semantic_with_acceptance,
+        fetch_complete_activity_with_acceptance,
+    };
+    let lookup_url = PolymarketEndpoint::UserPositionActivityWindowEnd {
+        user: WALLET.to_owned(),
+        start: 1,
+        end: 100,
+    }
+    .url(BASE);
+    for mode in [
+        ActivityRowAcceptance::StrictWithAnomalies,
+        ActivityRowAcceptance::Acquisition4,
+    ] {
+        let bad = anomalous_row(50, "0xanomaly");
+        let raw = serde_json::to_vec(&vec![bad.clone()]).unwrap();
+        let api = FixtureFetcher::new(HashMap::from([
+            (activity_url(Some(0), 100, 0), raw.clone()),
+            (lookup_url.clone(), raw),
+        ]));
+        let read =
+            fetch_complete_activity_with_acceptance(&api, BASE, wallet(), Some(0), 100, mode)
+                .await
+                .unwrap();
+        assert!(read.rows.is_empty());
+        assert!(read.buckets().unwrap().is_empty());
+        assert_eq!(read.anomalies.len(), 1);
+        assert_eq!(read.pages[0].row_count, 1);
+        assert_eq!(
+            activity_window_end_with_acceptance(&api, BASE, wallet(), 0, 100, mode)
+                .await
+                .unwrap(),
+            49
+        );
+        assert_eq!(
+            fetch_activity_window_semantic_with_acceptance(&api, BASE, wallet(), 0, 100, mode)
+                .await
+                .unwrap()
+                .unwrap()
+                .anomalies,
+            read.anomalies
+        );
+        let two = FixtureFetcher::new(HashMap::from([(
+            lookup_url.clone(),
+            serde_json::to_vec(&vec![bad.clone(), bad]).unwrap(),
+        )]));
+        assert!(matches!(
+            activity_window_end_with_acceptance(&two, BASE, wallet(), 0, 100, mode).await,
+            Err(ActivityReadError::PageTooLarge {
+                row_count: 2,
+                limit: 1
+            })
+        ));
+        for second in [0, 101] {
+            let raw = serde_json::to_vec(&vec![anomalous_row(second, "0xoutside")]).unwrap();
+            let api = FixtureFetcher::new(HashMap::from([
+                (lookup_url.clone(), raw.clone()),
+                (activity_url(Some(0), 100, 0), raw),
+            ]));
+            assert!(
+                matches!(activity_window_end_with_acceptance(&api, BASE, wallet(), 0, 100, mode).await, Err(ActivityReadError::RowOutsideBounds { timestamp, .. }) if timestamp == second)
+            );
+            assert!(
+                matches!(fetch_complete_activity_with_acceptance(&api, BASE, wallet(), Some(0), 100, mode).await, Err(ActivityReadError::RowOutsideBounds { timestamp, .. }) if timestamp == second)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn anomaly_numeric_range_is_checked_by_every_reader() {
+    use pe_source_polymarket_public::{
+        activity_window_end_with_acceptance, fetch_complete_activity_with_acceptance,
+    };
+    let lookup_url = PolymarketEndpoint::UserPositionActivityWindowEnd {
+        user: WALLET.to_owned(),
+        start: 1,
+        end: 100,
+    }
+    .url(BASE);
+    for mode in [
+        ActivityRowAcceptance::StrictWithAnomalies,
+        ActivityRowAcceptance::Acquisition4,
+    ] {
+        for token in ["1e400", "\"1e400\""] {
+            let row = serde_json::to_string(&anomalous_row(50, "0xrange"))
+                .unwrap()
+                .replace("\"price\":\"1.1\"", &format!("\"price\":{token}"));
+            let raw = format!("[{row}]").into_bytes();
+            let api = FixtureFetcher::new(HashMap::from([
+                (lookup_url.clone(), raw.clone()),
+                (activity_url(Some(0), 100, 0), raw),
+            ]));
+            let end = activity_window_end_with_acceptance(&api, BASE, wallet(), 0, 100, mode).await;
+            let read =
+                fetch_complete_activity_with_acceptance(&api, BASE, wallet(), Some(0), 100, mode)
+                    .await;
+            if token.starts_with('"') {
+                assert_eq!(end.unwrap(), 49);
+                assert_eq!(read.unwrap().anomalies.len(), 1);
+            } else {
+                assert!(matches!(end, Err(ActivityReadError::Parse(_))));
+                assert!(matches!(read, Err(ActivityReadError::Parse(_))));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn anomaly_split_minimum_keeps_saturated_evidence_without_admitting_parent_rows() {
+    use pe_source_polymarket_public::fetch_complete_activity_with_acceptance;
+    let bad = anomalous_row(50, "0xanomaly");
+    let valid = activity_row(70, "0xvalid".to_owned(), ASSET.to_owned(), 0);
+    let mut parent = vec![valid.clone(); 499];
+    parent.push(bad.clone());
+    let mut responses = HashMap::new();
+    for offset in (0..=ACTIVITY_MAX_OFFSET).step_by(500) {
+        responses.insert(
+            activity_url(Some(0), 100, offset),
+            serde_json::to_vec(&parent).unwrap(),
+        );
+    }
+    responses.insert(activity_url(Some(0), 49, 0), b"[]".to_vec());
+    responses.insert(
+        activity_url(Some(49), 50, 0),
+        serde_json::to_vec(&vec![bad]).unwrap(),
+    );
+    responses.insert(
+        activity_url(Some(50), 100, 0),
+        serde_json::to_vec(&vec![valid]).unwrap(),
+    );
+    let api = FixtureFetcher::new(responses);
+    for mode in [
+        ActivityRowAcceptance::StrictWithAnomalies,
+        ActivityRowAcceptance::Acquisition4,
+    ] {
+        let read =
+            fetch_complete_activity_with_acceptance(&api, BASE, wallet(), Some(0), 100, mode)
+                .await
+                .unwrap();
+        assert_eq!(read.rows.len(), 1);
+        assert_eq!(read.anomalies.len(), 1);
+        assert_eq!(read.anomalies[0].row_index, 0);
+        assert_eq!(
+            read.pages
+                .iter()
+                .map(|page| page.anomalies.len())
+                .sum::<usize>(),
+            12
+        );
+        assert_eq!(
+            read.pages
+                .iter()
+                .filter(|page| page.row_count == 500)
+                .count(),
+            11
+        );
+        assert!(
+            read.pages
+                .iter()
+                .filter(|page| page.row_count == 500)
+                .all(|page| page.anomalies[0].row_index == 499)
+        );
+    }
+}
+
+#[tokio::test]
+async fn anomaly_only_saturated_terminal_second_is_incomplete() {
+    use pe_source_polymarket_public::{
+        fetch_activity_window_semantic_with_acceptance, fetch_complete_activity_with_acceptance,
+    };
+    let api = InclusiveActivityApi::new(vec![anomalous_row(50, "0xanomaly"); 5500]);
+    for mode in [
+        ActivityRowAcceptance::StrictWithAnomalies,
+        ActivityRowAcceptance::Acquisition4,
+    ] {
+        assert!(matches!(
+            fetch_complete_activity_with_acceptance(&api, BASE, wallet(), Some(49), 50, mode).await,
+            Err(ActivityReadError::SaturatedTerminalSecond {
+                end: 50,
+                offset: 5000
+            })
+        ));
+        assert!(matches!(
+            fetch_activity_window_semantic_with_acceptance(&api, BASE, wallet(), 49, 50, mode)
+                .await,
+            Err(ActivityReadError::SaturatedTerminalSecond {
+                end: 50,
+                offset: 5000
+            })
+        ));
+        assert!(
+            fetch_activity_window_semantic_with_acceptance(&api, BASE, wallet(), 0, 100, mode)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn anomaly_mapping_uses_classification_and_metadata_without_outcome_stamps() {
+    use pe_source_polymarket_public::fetch_complete_activity_with_acceptance;
+    for combo in [false, true] {
+        let mut bad = anomalous_row(50, "0xanomaly");
+        bad["isCombo"] = json!(combo);
+        let read = fetch_complete_activity_with_acceptance(
+            &activity_fixture(bad.clone()),
+            BASE,
+            wallet(),
+            None,
+            100,
+            ActivityRowAcceptance::StrictWithAnomalies,
+        )
+        .await
+        .unwrap();
+        let mut mapping = ActivityAssetMapping::from_rows_with_anomalies(&[], &read.anomalies);
+        assert_eq!(read.asset_mapping().unwrap(), mapping);
+        let asset = PolymarketTokenId(ASSET.to_owned());
+        assert_eq!(mapping.tokens().collect::<Vec<_>>(), [&asset]);
+        assert!(mapping.identity(&asset).is_none());
+        assert!(mapping.unresolved()[&asset].is_empty());
+        let verified = VerifiedTokenIdentity {
+            condition_id: PolymarketConditionId(CONDITION.to_owned()),
+            outcome: OutcomeId(1),
+            evidence_hash: "metadata".to_owned(),
+        };
+        mapping.apply_verified(&asset, &verified).unwrap();
+        assert_eq!(
+            mapping.identity(&asset).unwrap().classification,
+            if combo {
+                PositionClassification::Combo
+            } else {
+                PositionClassification::Ordinary
+            }
+        );
+        let mut opposite = read.anomalies[0].clone();
+        opposite.is_combo = !combo;
+        let mut conflict_read = read.clone();
+        conflict_read.anomalies.push(opposite);
+        let constructor =
+            ActivityAssetMapping::from_rows_with_anomalies(&[], &conflict_read.anomalies);
+        assert_eq!(conflict_read.asset_mapping().unwrap(), constructor);
+        let mut conflict = conflict_read.asset_mapping().unwrap();
+        assert!(matches!(
+            conflict.apply_verified(&asset, &verified),
+            Err(PositionReadError::MixedActivityClassification { .. })
+        ));
+        for kind in ["SPLIT", "MERGE"] {
+            bad["type"] = json!(kind);
+            bad["conditionId"] = json!(CONDITION);
+            bad.as_object_mut().unwrap().remove("asset");
+            let read = fetch_complete_activity_with_acceptance(
+                &activity_fixture(bad.clone()),
+                BASE,
+                wallet(),
+                None,
+                100,
+                ActivityRowAcceptance::StrictWithAnomalies,
+            )
+            .await
+            .unwrap();
+            let mut mapping = read.asset_mapping().unwrap();
+            assert_eq!(
+                mapping,
+                ActivityAssetMapping::from_rows_with_anomalies(&[], &read.anomalies)
+            );
+            assert_eq!(
+                mapping.split_merge_conditions().collect::<Vec<_>>(),
+                [&verified.condition_id]
+            );
+            mapping
+                .insert_verified_split_merge(&verified.condition_id, asset.clone(), &verified)
+                .unwrap();
+            let positions = FixtureFetcher::new(HashMap::from([
+                (position_url(PositionPartition::NotRedeemable, 0), serde_json::to_vec(&vec![json!({"proxyWallet": WALLET, "asset": ASSET, "conditionId": CONDITION, "outcomeIndex": 1, "size": "1", "negativeRisk": false})]).unwrap()),
+                (position_url(PositionPartition::Redeemable, 0), b"[]".to_vec()),
+            ]));
+            let held = fetch_complete_positions(&positions, BASE, wallet(), &mapping)
+                .await
+                .unwrap();
+            assert_eq!(held.positions.len(), 1);
+            assert_eq!(
+                held.positions[0].classification,
+                if combo {
+                    PositionClassification::Combo
+                } else {
+                    PositionClassification::Ordinary
+                }
+            );
+        }
+    }
+}

@@ -3255,6 +3255,7 @@ pub(crate) mod continuation_validation_tests {
         .url("https://data-api.polymarket.com");
         let raw_hash = blake3::hash(&payload).to_hex().to_string();
         let pages = vec![ReconciliationPageEvidence {
+            anomalies: Vec::new(),
             request_url: request_url.clone(),
             bounds: Some(ActivityRequestBounds {
                 start: None,
@@ -6511,6 +6512,7 @@ fn drop_cause_string(cause: DropCause) -> &'static str {
         DropCause::UnknownCondition => "reanchor_required_redemption",
         DropCause::UnknownType => WalletFenceCause::UnknownEffect.as_str(),
         DropCause::Unmapped => WalletFenceCause::InvalidMapping.as_str(),
+        DropCause::Unrepresentable => "unrepresentable_activity_row",
     }
 }
 
@@ -6817,6 +6819,7 @@ pub(crate) mod continuation_v3_tests {
                 receipt,
             },
             ReconciliationPageEvidence {
+                anomalies: Vec::new(),
                 request_url,
                 bounds: Some(pe_source_polymarket_public::ActivityRequestBounds { start, end }),
                 partition: None,
@@ -6844,6 +6847,7 @@ pub(crate) mod continuation_v3_tests {
             .iter()
             .enumerate()
             .map(|(index, occurrence)| ReconciliationPageEvidence {
+                anomalies: Vec::new(),
                 request_url: occurrence.request_url.clone(),
                 bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
                     start: Some(fixed_end.saturating_sub(1)),

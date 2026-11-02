@@ -3740,6 +3740,7 @@ mod tests {
         end: i64,
     ) -> pe_source_polymarket_public::ReconciliationPageEvidence {
         pe_source_polymarket_public::ReconciliationPageEvidence {
+            anomalies: Vec::new(),
             request_url: url.to_owned(),
             bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
                 start: Some(end - 1),

@@ -18,7 +18,7 @@ use pe_core_types::{
     LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, ReconstructionQuality, ShareAmount,
     Side, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_source_polymarket_public::{ActivityAggregate, ActivityType};
+use pe_source_polymarket_public::{ActivityAggregate, ActivityRowAnomaly, ActivityType};
 
 /// One exact, reconciled position effect derived from a complete activity group (#544).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1175,6 +1175,7 @@ pub enum DropCause {
     UnknownCondition,
     UnknownType,
     Unmapped,
+    Unrepresentable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1234,6 +1235,62 @@ pub fn classify_scoped_second(
     has_market: &dyn Fn(&MarketId) -> bool,
     lookups: &dyn ScopeLookups,
 ) -> Result<ScopedSecond, LedgerError> {
+    classify_scoped_second_with_anomalies(
+        entry_policy,
+        ledger,
+        wallet,
+        records
+            .first()
+            .map_or(0, |record| record.aggregate.source_time.0.unix_timestamp()),
+        records,
+        &[],
+        dropped,
+        certified_problem_second,
+        reconstruction_quality,
+        signal_config,
+        history_complete,
+        has_market,
+        lookups,
+    )
+}
+
+/// Evidence-id namespace for non-executable activity rows, separate from group identity.
+pub const ACTIVITY_ROW_ANOMALY_NAMESPACE: &str = "activity-row-anomaly:v1:";
+
+/// Derive an anomaly's evidence trigger from its exact raw-row hash.
+#[must_use]
+pub fn activity_row_anomaly_trigger(anomaly: &ActivityRowAnomaly) -> SourceTradeId {
+    SourceTradeId(format!(
+        "{ACTIVITY_ROW_ANOMALY_NAMESPACE}{}",
+        anomaly.raw_row_hash
+    ))
+}
+
+/// Classify a wallet-second including anomalies, even when there are no aggregates.
+/// Every anomaly must match `wallet` and `source_second`.
+#[allow(clippy::too_many_arguments)]
+pub fn classify_scoped_second_with_anomalies(
+    entry_policy: SameSecondEntryPolicy,
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    source_second: i64,
+    records: &[SecondRecord<'_>],
+    anomalies: &[ActivityRowAnomaly],
+    dropped: &BTreeSet<Scope>,
+    certified_problem_second: bool,
+    reconstruction_quality: ReconstructionQuality,
+    signal_config: &SignalConfig,
+    history_complete: bool,
+    has_market: &dyn Fn(&MarketId) -> bool,
+    lookups: &dyn ScopeLookups,
+) -> Result<ScopedSecond, LedgerError> {
+    for anomaly in anomalies {
+        if anomaly.wallet != wallet || anomaly.source_time.0.unix_timestamp() != source_second {
+            return Err(LedgerError::InvalidMapping {
+                source_trade_id: activity_row_anomaly_trigger(anomaly),
+            });
+        }
+    }
     let mut ordered = records.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| {
         left.aggregate
@@ -1244,6 +1301,16 @@ pub fn classify_scoped_second(
     });
     let mut problems = BTreeMap::<Scope, ScopeProblem>::new();
     let mut ignored = Vec::new();
+    for anomaly in anomalies {
+        let trigger = activity_row_anomaly_trigger(anomaly);
+        if let Some(scope) = resolve_anomaly_scope(anomaly, lookups) {
+            if !scope_is_dropped(&scope, dropped, lookups) {
+                record_scope_problem(&mut problems, scope, DropCause::Unrepresentable, &trigger);
+            }
+        } else {
+            ignored.push((trigger, anomaly.activity_type.clone()));
+        }
+    }
     let mut mutations = Vec::new();
     let mut consumed = BTreeMap::new();
     let mut effective_records = HashMap::new();
@@ -1444,6 +1511,37 @@ pub fn classify_scoped_historical_second(
     )
 }
 
+/// Historical classification including non-executable anomaly evidence.
+#[allow(clippy::too_many_arguments)]
+pub fn classify_scoped_historical_second_with_anomalies(
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    source_second: i64,
+    records: &[SecondRecord<'_>],
+    anomalies: &[ActivityRowAnomaly],
+    dropped: &BTreeSet<Scope>,
+    certified_problem_second: bool,
+    reconstruction_quality: ReconstructionQuality,
+    has_market: &dyn Fn(&MarketId) -> bool,
+    lookups: &dyn ScopeLookups,
+) -> Result<ScopedSecond, LedgerError> {
+    classify_scoped_second_with_anomalies(
+        SameSecondEntryPolicy::HomogeneousPieces,
+        ledger,
+        wallet,
+        source_second,
+        records,
+        anomalies,
+        dropped,
+        certified_problem_second,
+        reconstruction_quality,
+        &SignalConfig::default(),
+        true,
+        has_market,
+        lookups,
+    )
+}
+
 fn canonical_scope_id(id: &str) -> bool {
     id.strip_prefix("0x").is_some_and(|hex| {
         !hex.is_empty()
@@ -1460,10 +1558,39 @@ pub fn resolve_problem_scope(
     lookups: &dyn ScopeLookups,
 ) -> Option<Scope> {
     let components = aggregate.group_id.components();
-    let event_cause = matches!(cause, DropCause::Conversion | DropCause::UnknownType);
-    let condition = components
-        .condition_id
-        .as_ref()
+    resolve_scope(
+        &components.activity_type,
+        components.condition_id.as_ref(),
+        components.asset.as_ref(),
+        cause,
+        lookups,
+    )
+}
+
+/// Resolve an anomaly from its condition, then its verified token evidence.
+pub fn resolve_anomaly_scope(
+    anomaly: &ActivityRowAnomaly,
+    lookups: &dyn ScopeLookups,
+) -> Option<Scope> {
+    resolve_scope(
+        &anomaly.activity_type,
+        anomaly.condition_id.as_ref(),
+        anomaly.asset.as_ref(),
+        DropCause::Unrepresentable,
+        lookups,
+    )
+}
+
+fn resolve_scope(
+    activity_type: &ActivityType,
+    condition: Option<&pe_core_types::PolymarketConditionId>,
+    asset: Option<&pe_core_types::PolymarketTokenId>,
+    cause: DropCause,
+    lookups: &dyn ScopeLookups,
+) -> Option<Scope> {
+    let event_cause = matches!(cause, DropCause::Conversion | DropCause::UnknownType)
+        || (cause == DropCause::Unrepresentable && activity_type.requires_wallet_fence());
+    let condition = condition
         .map(|condition| {
             let lowercase = condition.0.to_ascii_lowercase();
             lowercase
@@ -1494,10 +1621,7 @@ pub fn resolve_problem_scope(
             MarketLookup::Unknown => {}
         }
     }
-    let market = components
-        .asset
-        .as_ref()
-        .and_then(|token| lookups.token_market(&token.0))?;
+    let market = asset.and_then(|token| lookups.token_market(&token.0))?;
     let scope = match lookups.market(&market) {
         MarketLookup::Grouped(group) if event_cause => Scope {
             kind: ScopeKind::Event,
@@ -2025,6 +2149,25 @@ mod tests {
             }
             assert_eq!(problems[&scope].cause, DropCause::Underflow);
             assert_eq!(problems[&scope].trigger, trigger);
+        }
+    }
+
+    #[test]
+    fn unrepresentable_cause_uses_wire_order_for_equal_triggers() {
+        let scope = Scope {
+            kind: ScopeKind::Market,
+            id: "0xaaa".to_owned(),
+        };
+        let trigger = SourceTradeId("anomaly-trigger".to_owned());
+        for causes in [
+            [DropCause::Unmapped, DropCause::Unrepresentable],
+            [DropCause::Unrepresentable, DropCause::Unmapped],
+        ] {
+            let mut problems = BTreeMap::new();
+            for cause in causes {
+                record_scope_problem(&mut problems, scope.clone(), cause, &trigger);
+            }
+            assert_eq!(problems[&scope].cause, DropCause::Unmapped);
         }
     }
 
