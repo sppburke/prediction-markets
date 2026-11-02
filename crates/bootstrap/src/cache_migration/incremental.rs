@@ -1493,7 +1493,9 @@ fn receipt_anomalies(
     let Some(acquisition) = &receipt.acquisition else {
         return Ok(Vec::new());
     };
-    if acquisition.version != 4 {
+    // Nearly every receipt has no anomaly evidence: skip re-validating its pages
+    // and read commitment, which receipt validation already authenticated.
+    if acquisition.version != 4 || receipt.pages.iter().all(|page| page.anomalies.is_empty()) {
         return Ok(Vec::new());
     }
     let read = if acquisition.aggregation_status == AggregationStatus::NotAttempted {
