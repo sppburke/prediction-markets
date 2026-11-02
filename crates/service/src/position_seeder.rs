@@ -23,12 +23,10 @@ use pe_position_ledger::LedgerEffect;
 use pe_position_ledger::PositionLedger;
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAssetMapping, ActivityParseContext,
-    ActivityParseError, ActivityReadError, ActivityRowAcceptance, ActivityTransport,
-    ActivityValidationError, CompleteActivityRead, CompletePositionsRead, PositionClassification,
-    PositionReadError, ReconciliationFetcher, ReqwestFetcher,
-    fetch_complete_activity_with_acceptance, fetch_complete_positions,
-    parse_activity_response_with_acceptance,
+    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAssetMapping, ActivityParseError,
+    ActivityReadError, ActivityRowAcceptance, ActivityValidationError, CompleteActivityRead,
+    CompletePositionsRead, PositionClassification, PositionReadError, ReconciliationFetcher,
+    ReqwestFetcher, fetch_complete_activity_with_acceptance, fetch_complete_positions,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -2034,29 +2032,21 @@ impl ReconciliationFetcher for DurableRecordingFetcher {
         Box::pin(async move {
             let payload = self.inner.fetch(url).await?;
             let received_at = time::OffsetDateTime::now_utc();
-            let anomalous = reqwest::Url::parse(url)
-                .ok()
-                .filter(|url| url.path() == "/activity")
-                .and_then(|url| {
-                    url.query_pairs()
-                        .find(|(key, _)| key == "user")
-                        .map(|(_, value)| value.into_owned())
-                })
-                .and_then(|user| WalletAddress::from_hex(&user).ok())
-                .is_some_and(|wallet| {
-                    parse_activity_response_with_acceptance(
+            let anomalous = reqwest::Url::parse(url).ok().is_some_and(|url| {
+                let wallet = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "user")
+                    .map(|(_, value)| value.into_owned())
+                    .and_then(|user| WalletAddress::from_hex(&user).ok());
+                wallet.is_some_and(|wallet| {
+                    crate::trade_poller::activity_request_has_anomalies(
+                        &url,
                         &payload,
                         wallet,
-                        &ActivityParseContext {
-                            source_id: SourceId(ACTIVITY_POLL_SOURCE_ID.to_owned()),
-                            observed_at: SourceTimestamp(received_at),
-                            received_at: ReceivedAt(received_at),
-                            transport: ActivityTransport::Rest,
-                        },
-                        ActivityRowAcceptance::StrictWithAnomalies,
+                        received_at,
                     )
-                    .is_ok_and(|page| !page.anomalies.is_empty())
-                });
+                })
+            });
             if anomalous {
                 pe_event_log::run_blocking(|| {
                     self.paper_state
@@ -3052,6 +3042,8 @@ mod anomaly_recording_tests {
             "marker_failure",
             "append_failure",
             "success",
+            "prefixed_success",
+            "prefixed_positions",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("paper.db");
@@ -3081,21 +3073,28 @@ mod anomaly_recording_tests {
                 sink: sink.clone(),
                 paper_state: paper.clone(),
             };
-            let endpoint = if case == "positions" {
+            let endpoint = if matches!(case, "positions" | "prefixed_positions") {
                 "positions"
             } else {
                 "activity"
             };
+            let prefix = if case.starts_with("prefixed_") {
+                "api/v1/"
+            } else {
+                ""
+            };
             let result = fetcher
-                .fetch(&format!("https://example.test/{endpoint}?user={wallet}"))
+                .fetch(&format!(
+                    "https://example.test/{prefix}{endpoint}?user={wallet}"
+                ))
                 .await;
             assert_eq!(
                 result.is_err(),
                 matches!(case, "marker_failure" | "append_failure"),
                 "{case}"
             );
-            let boundary =
-                matches!(case, "append_failure" | "success") || case.ends_with("_existing");
+            let boundary = matches!(case, "append_failure" | "success" | "prefixed_success")
+                || case.ends_with("_existing");
             assert_eq!(
                 paper.scope_drop_boundary_unix().unwrap().is_some(),
                 boundary,
@@ -3110,7 +3109,7 @@ mod anomaly_recording_tests {
             } else {
                 assert_eq!(
                     frames[0].schema_version,
-                    if case == "success" {
+                    if matches!(case, "success" | "prefixed_success") {
                         5
                     } else {
                         ACTIVITY_SCHEMA_VERSION

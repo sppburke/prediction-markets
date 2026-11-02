@@ -2315,7 +2315,7 @@ impl WalletOperation {
             &restamp_twins,
             &buckets
                 .iter()
-                .flat_map(|bucket| bucket.iter())
+                .flat_map(|bucket| bucket.aggregates.iter())
                 .collect::<Vec<_>>(),
             &identities,
             &page_occurrences,
@@ -2464,12 +2464,13 @@ impl WalletOperation {
                 &frontier.pages,
                 &frontier.page_occurrences,
                 read.receipt,
-                &bucket,
+                &bucket.aggregates,
                 identities,
                 &correlation.matched,
             )?;
             context.verified_read = Some(read.clone());
             context.restamp_twins = bucket
+                .aggregates
                 .iter()
                 .map(|aggregate| aggregate.group_id.key())
                 .filter(|group| restamp_twins.contains(*group))
@@ -2958,6 +2959,7 @@ impl WalletOperation {
         bucket: &crate::bucket_commit::ReconciliationBucket,
     ) -> Result<BucketIdentities, ReconciliationError> {
         let tokens = bucket
+            .aggregates
             .iter()
             .filter(|aggregate| !raw_only_combo(aggregate))
             .filter_map(|aggregate| aggregate.group_id.components().asset.clone())
@@ -3041,7 +3043,7 @@ impl WalletOperation {
             provenance: resolved.provenance,
             ..BucketIdentities::default()
         };
-        for aggregate in bucket {
+        for aggregate in &bucket.aggregates {
             if raw_only_combo(aggregate) {
                 continue;
             }
@@ -3323,6 +3325,27 @@ fn identity_unresolved_disposition(
     }
 }
 
+pub(crate) fn activity_request_has_anomalies(
+    url: &reqwest::Url,
+    payload: &[u8],
+    wallet: WalletAddress,
+    received_at: OffsetDateTime,
+) -> bool {
+    url.path().ends_with("/activity")
+        && pe_source_polymarket_public::parse_activity_response_with_acceptance(
+            payload,
+            wallet,
+            &pe_source_polymarket_public::ActivityParseContext {
+                source_id: SourceId(ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                observed_at: SourceTimestamp(received_at),
+                received_at: ReceivedAt(received_at),
+                transport: pe_source_polymarket_public::ActivityTransport::Rest,
+            },
+            ActivityRowAcceptance::StrictWithAnomalies,
+        )
+        .is_ok_and(|page| !page.anomalies.is_empty())
+}
+
 struct RecordingFetcher {
     wallet: WalletAddress,
     paper_state: Arc<PaperStateDb>,
@@ -3356,19 +3379,9 @@ impl ReconciliationFetcher for RecordingFetcher {
         Box::pin(async move {
             let payload = self.inner.fetch(url).await?;
             let received_at = (self.now)();
-            let anomalous = reqwest::Url::parse(url).is_ok_and(|url| url.path() == "/activity")
-                && pe_source_polymarket_public::parse_activity_response_with_acceptance(
-                    &payload,
-                    self.wallet,
-                    &pe_source_polymarket_public::ActivityParseContext {
-                        source_id: SourceId(ACTIVITY_POLL_SOURCE_ID.to_owned()),
-                        observed_at: SourceTimestamp(received_at),
-                        received_at: ReceivedAt(received_at),
-                        transport: pe_source_polymarket_public::ActivityTransport::Rest,
-                    },
-                    ActivityRowAcceptance::StrictWithAnomalies,
-                )
-                .is_ok_and(|page| !page.anomalies.is_empty());
+            let anomalous = reqwest::Url::parse(url).is_ok_and(|url| {
+                activity_request_has_anomalies(&url, &payload, self.wallet, received_at)
+            });
             if anomalous {
                 pe_event_log::run_blocking(|| {
                     self.paper_state
@@ -4633,6 +4646,8 @@ mod anomaly_recording_tests {
             "marker_failure",
             "append_failure",
             "success",
+            "prefixed_success",
+            "prefixed_positions",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("paper.db");
@@ -4666,21 +4681,28 @@ mod anomaly_recording_tests {
                 occurrences: Arc::new(Mutex::new(Vec::new())),
                 now: Arc::new(|| OffsetDateTime::from_unix_timestamp(101).unwrap()),
             };
-            let endpoint = if case == "positions" {
+            let endpoint = if matches!(case, "positions" | "prefixed_positions") {
                 "positions"
             } else {
                 "activity"
             };
+            let prefix = if case.starts_with("prefixed_") {
+                "api/v1/"
+            } else {
+                ""
+            };
             let result = fetcher
-                .fetch(&format!("https://example.test/{endpoint}?user={wallet}"))
+                .fetch(&format!(
+                    "https://example.test/{prefix}{endpoint}?user={wallet}"
+                ))
                 .await;
             assert_eq!(
                 result.is_err(),
                 matches!(case, "marker_failure" | "append_failure"),
                 "{case}"
             );
-            let boundary =
-                matches!(case, "append_failure" | "success") || case.ends_with("_existing");
+            let boundary = matches!(case, "append_failure" | "success" | "prefixed_success")
+                || case.ends_with("_existing");
             assert_eq!(
                 paper.scope_drop_boundary_unix().unwrap().is_some(),
                 boundary,
@@ -4695,7 +4717,7 @@ mod anomaly_recording_tests {
             } else {
                 assert_eq!(
                     frames[0].schema_version,
-                    if case == "success" {
+                    if matches!(case, "success" | "prefixed_success") {
                         4
                     } else {
                         ACTIVITY_POLL_PAGE_SCHEMA_VERSION

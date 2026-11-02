@@ -144,6 +144,7 @@ impl ReconciliationBucket {
     }
 }
 
+/// Aggregate-only input; an empty vector yields an empty bucket that `commit` rejects as `Empty`.
 impl From<Vec<ActivityAggregate>> for ReconciliationBucket {
     fn from(aggregates: Vec<ActivityAggregate>) -> Self {
         let (wallet, source_epoch) = aggregates
@@ -161,21 +162,6 @@ impl From<Vec<ActivityAggregate>> for ReconciliationBucket {
             aggregates,
             anomalies: Vec::new(),
         }
-    }
-}
-
-impl<'a> IntoIterator for &'a ReconciliationBucket {
-    type Item = &'a ActivityAggregate;
-    type IntoIter = std::slice::Iter<'a, ActivityAggregate>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.aggregates.iter()
-    }
-}
-
-impl std::ops::Deref for ReconciliationBucket {
-    type Target = [ActivityAggregate];
-    fn deref(&self) -> &Self::Target {
-        &self.aggregates
     }
 }
 
@@ -5077,6 +5063,7 @@ impl BucketCommitEngine {
             drops: mut scope_drops,
             retirements: observation_retirements,
         } = ambiguity_effects(context, wallet)?;
+        let mut anomaly_drops = Vec::new();
         let changed: Vec<_> = aggregates
             .iter()
             .zip(&durable)
@@ -5102,7 +5089,7 @@ impl BucketCommitEngine {
                 wallet,
                 source_epoch,
                 (WalletFenceCause::RevisedAggregate, trigger.clone()),
-                scope_drops,
+                anomaly_drops,
                 context,
             );
         }
@@ -5157,7 +5144,7 @@ impl BucketCommitEngine {
         )?;
         lookups.check(!anomalies.is_empty())?;
         for problem in anomaly_second.problems {
-            scope_drops.push(anomaly_scope_drop_record(
+            anomaly_drops.push(anomaly_scope_drop_record(
                 wallet,
                 source_epoch,
                 context.recorded_at_unix,
@@ -5179,7 +5166,7 @@ impl BucketCommitEngine {
                 wallet,
                 source_epoch,
                 (WalletFenceCause::RevisedAggregate, trigger.clone()),
-                scope_drops,
+                anomaly_drops,
                 context,
             );
         }
@@ -5214,18 +5201,19 @@ impl BucketCommitEngine {
                     wallet,
                     source_epoch,
                     coverage.anchor_seq.is_some(),
-                    scope_drops,
+                    anomaly_drops,
                     context,
                 );
             }
-            let new_work = !scope_drops.is_empty()
-                || !observation_retirements.is_empty()
+            let new_work = !observation_retirements.is_empty()
                 || (!anomalies.is_empty()
-                    && self
-                        .paper_state
-                        .cursor(&wallet)?
-                        .is_none_or(|cursor| cursor < source_epoch));
+                    && (!anomaly_drops.is_empty()
+                        || self
+                            .paper_state
+                            .cursor(&wallet)?
+                            .is_none_or(|cursor| cursor < source_epoch)));
             if new_work {
+                scope_drops.extend(anomaly_drops);
                 let bucket = ActivityBucketCommit {
                     scope_drops,
                     observation_retirements,
@@ -5258,7 +5246,6 @@ impl BucketCommitEngine {
             });
         }
         if anomalies.is_empty()
-            && scope_drops.is_empty()
             && observation_retirements.is_empty()
             && changed.is_empty()
             && aggregates
@@ -5317,7 +5304,7 @@ impl BucketCommitEngine {
                 &recordable_mutations,
                 wallet,
                 source_epoch,
-                scope_drops,
+                anomaly_drops,
                 context,
             );
         }
@@ -5329,9 +5316,7 @@ impl BucketCommitEngine {
                 .paper_state
                 .last_activity_group_epoch(&wallet)?
                 .is_some_and(|last| last >= source_epoch);
-        if anomalies.is_empty()
-            && scope_drops.is_empty()
-            && observation_retirements.is_empty()
+        if observation_retirements.is_empty()
             && covered
             && coverage.anchor_seq.is_none()
             && changed.is_empty()
@@ -5343,7 +5328,7 @@ impl BucketCommitEngine {
                 wallet,
                 source_epoch,
                 false,
-                Vec::new(),
+                anomaly_drops,
                 context,
             );
         }
@@ -5356,7 +5341,7 @@ impl BucketCommitEngine {
                     wallet,
                     source_epoch,
                     coverage.anchor_seq.is_some(),
-                    scope_drops,
+                    anomaly_drops,
                     context,
                 );
             }
@@ -5373,7 +5358,7 @@ impl BucketCommitEngine {
                     wallet,
                     source_epoch,
                     (WalletFenceCause::LateEqualSecondGroup, trigger),
-                    scope_drops,
+                    anomaly_drops,
                     context,
                 );
             }
@@ -5389,7 +5374,7 @@ impl BucketCommitEngine {
                         source_epoch,
                         error.fence_cause(),
                         aggregate.group_id.key().clone(),
-                        scope_drops,
+                        anomaly_drops,
                         context,
                     );
                 }
@@ -5399,7 +5384,7 @@ impl BucketCommitEngine {
                 &recordable_mutations,
                 wallet,
                 source_epoch,
-                scope_drops,
+                anomaly_drops,
                 context,
             );
         }
@@ -5419,18 +5404,10 @@ impl BucketCommitEngine {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        // New anomaly scopes join the ordinary classifier below so it owns the combined verdict.
-        for drop in scope_drops
-            .iter()
-            .filter(|drop| drop.cause != "unrepresentable_activity_row")
-        {
+        for drop in &scope_drops {
             starts
                 .entry(Scope {
-                    kind: if drop.scope_kind == "event" {
-                        ScopeKind::Event
-                    } else {
-                        ScopeKind::Market
-                    },
+                    kind: ScopeKind::Market,
                     id: drop.scope_id.clone(),
                 })
                 .and_modify(|start| *start = (*start).min(drop.dropped_at_epoch))
@@ -5605,6 +5582,7 @@ impl BucketCommitEngine {
                 || has_problem(without_drops),
         )?;
         if covered && changed.is_empty() {
+            scope_drops.extend(anomaly_drops);
             let covered_mutations = recordable_mutations
                 .iter()
                 .map(|mutation| {
@@ -5638,7 +5616,7 @@ impl BucketCommitEngine {
                         wallet,
                         source_epoch,
                         (error.fence_cause(), mutation_error_id(&error)),
-                        scope_drops,
+                        anomaly_drops,
                         context,
                     );
                 }
@@ -5648,7 +5626,7 @@ impl BucketCommitEngine {
                     source_epoch,
                     error.fence_cause(),
                     mutation_error_id(&error),
-                    scope_drops,
+                    anomaly_drops,
                     context,
                 );
             }
@@ -5672,7 +5650,6 @@ impl BucketCommitEngine {
         for (id, kind) in &scoped.ignored {
             tracing::warn!(wallet = %wallet, source_trade_id = %id, activity_type = kind.as_str(), "wallet scope problem ignored");
         }
-        scope_drops.retain(|drop| drop.cause != "unrepresentable_activity_row");
         for problem in &scoped.problems {
             scope_drops.push(if problem.cause == DropCause::Unrepresentable {
                 anomaly_scope_drop_record(
@@ -5711,7 +5688,7 @@ impl BucketCommitEngine {
                         wallet,
                         source_epoch,
                         (error.fence_cause(), mutation_error_id(&error)),
-                        scope_drops,
+                        anomaly_drops,
                         context,
                     );
                 }
@@ -5721,7 +5698,7 @@ impl BucketCommitEngine {
                     source_epoch,
                     error.fence_cause(),
                     mutation_error_id(&error),
-                    scope_drops,
+                    anomaly_drops,
                     context,
                 );
             }
@@ -5985,13 +5962,14 @@ impl BucketCommitEngine {
         resolved_mutations: &[LedgerMutation],
         wallet: WalletAddress,
         source_epoch: i64,
-        scope_drops: Vec<WalletScopeDrop>,
+        anomaly_drops: Vec<WalletScopeDrop>,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
         let AmbiguityEffects {
-            drops: _,
+            drops: mut scope_drops,
             retirements: observation_retirements,
         } = ambiguity_effects(context, wallet)?;
+        scope_drops.extend(anomaly_drops);
         const DISPOSITION: &str = "reanchor_required_late_group";
         let trigger = aggregates
             .iter()
@@ -6322,13 +6300,14 @@ impl BucketCommitEngine {
         source_epoch: i64,
         cause: WalletFenceCause,
         trigger: SourceTradeId,
-        scope_drops: Vec<WalletScopeDrop>,
+        anomaly_drops: Vec<WalletScopeDrop>,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
         let AmbiguityEffects {
-            drops: _,
+            drops: mut scope_drops,
             retirements: observation_retirements,
         } = ambiguity_effects(context, wallet)?;
+        scope_drops.extend(anomaly_drops);
         let proof = json!({"bucket_epoch": source_epoch, "cause": cause.as_str()});
         let mut dispositions = BTreeMap::new();
         let mut records = Vec::with_capacity(aggregates.len());
@@ -6412,13 +6391,14 @@ impl BucketCommitEngine {
         wallet: WalletAddress,
         source_epoch: i64,
         fence: (WalletFenceCause, SourceTradeId),
-        scope_drops: Vec<WalletScopeDrop>,
+        anomaly_drops: Vec<WalletScopeDrop>,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
         let AmbiguityEffects {
-            drops: _,
+            drops: mut scope_drops,
             retirements: observation_retirements,
         } = ambiguity_effects(context, wallet)?;
+        scope_drops.extend(anomaly_drops);
         let (cause, trigger) = fence;
         let already_fenced = self.fences.contains(&wallet);
         let proof_json =
@@ -6524,13 +6504,14 @@ impl BucketCommitEngine {
         mutations: &[LedgerMutation],
         wallet: WalletAddress,
         source_epoch: i64,
-        scope_drops: Vec<WalletScopeDrop>,
+        anomaly_drops: Vec<WalletScopeDrop>,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
         let AmbiguityEffects {
-            drops: _,
+            drops: mut scope_drops,
             retirements: observation_retirements,
         } = ambiguity_effects(context, wallet)?;
+        scope_drops.extend(anomaly_drops);
         let known: Vec<_> = mutations
             .iter()
             .filter(|mutation| {
@@ -9947,6 +9928,80 @@ mod activity_exemption_tests {
         assert!(engine.is_fenced(&wallet));
         assert!(engine.ledger().position(&wallet).is_none());
         assert!(paper.wallet_scope_drops(&wallet, 100).unwrap().is_empty());
+        assert_eq!(paper.scope_drop_boundary_unix().unwrap(), None);
+    }
+
+    #[test]
+    fn fenced_covered_bucket_retires_ambiguity_without_persisting_a_drop() {
+        let (_dir, paper, mut engine) = fixture();
+        let record = group("TRADE", "covered", 100, 0, false, "0xa1");
+        let wallet = record.group_id.components().wallet;
+        let id = record.group_id.key().clone();
+        paper
+            .install_anchors(&[AnchorInstallRecord {
+                wallet,
+                balances: Vec::new(),
+                activity_cutoff_unix: 100,
+                anchored_at_unix: 100,
+                ledger_hash_after: "empty".to_owned(),
+                positions_proof_hash: "empty".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "fixture".to_owned(),
+                history_status: None,
+                proof_json: "{}".to_owned(),
+                recorded_at_unix: 100,
+                repaired_history: Vec::new(),
+                expected_fence: None,
+            }])
+            .unwrap();
+        let fenced = group("TRADE", "fence", 99, 0, false, "0xa2");
+        engine
+            .commit_fence(
+                std::slice::from_ref(&fenced),
+                wallet,
+                99,
+                WalletFenceCause::Overflow,
+                fenced.group_id.key().clone(),
+                Vec::new(),
+                &context(),
+            )
+            .unwrap();
+        let receipt = AppendReceipt {
+            sequence: pe_core_types::EventSeq(10),
+            this_hash: blake3::hash(b"ambiguous observation"),
+        };
+        let mut ctx = context();
+        ctx.decision_inputs_json = serde_json::to_string(&json!({
+            "ambiguous_observations": [AmbiguousObservation {
+                group_id: SourceTradeId("ambiguous".to_owned()),
+                receipt,
+                source_epoch: 100,
+                candidates: vec![(id.clone(), 100)],
+                market_id: Some("0xa1".to_owned()),
+            }]
+        }))
+        .unwrap();
+        assert!(paper.wallet_scope_drops(&wallet, 100).unwrap().is_empty());
+        assert!(paper.activity_group_state(&id).unwrap().is_none());
+        let result = engine.commit(vec![record], &ctx, basis()).unwrap();
+        assert_eq!(result.dispositions[&id.0], "anchor_covered_late");
+        assert!(!result.already_committed);
+        assert!(result.pending.is_empty());
+        assert_eq!(result.newly_fenced, None);
+        assert!(paper.wallet_scope_drops(&wallet, 100).unwrap().is_empty());
+        assert!(paper.activity_observation_unbound_retired(receipt).unwrap());
+        assert_eq!(paper.cursor(&wallet).unwrap(), Some(100));
+        assert!(engine.is_fenced(&wallet));
+        assert!(paper.leader_positions().unwrap().is_empty());
+        assert!(paper.open_decision_pending().unwrap().is_empty());
+        assert!(paper.entry_gate_result(&id).unwrap().is_none());
+        assert_eq!(
+            paper.gate_history().unwrap(),
+            HashMap::from([(
+                wallet,
+                HashSet::from([MarketId(VenueMarketId("0xa1".to_owned()))]),
+            )])
+        );
         assert_eq!(paper.scope_drop_boundary_unix().unwrap(), None);
     }
 

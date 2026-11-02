@@ -14620,6 +14620,143 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mixed_schema_anomaly_read_preserves_healthy_selection_and_decision_keys() {
+        let (first, first_observations) = single_read_fixture(1, "0xca", "BUY", false);
+        let (second, second_observations) = single_read_fixture(2, "0xcb", "BUY", false);
+        let first_row: Vec<serde_json::Value> =
+            serde_json::from_slice(&first_observations[&1].payload).unwrap();
+        let first_payload = activity_payload(vec![
+            first_row[0].clone();
+            usize::try_from(RECONCILIATION_PAGE_LIMIT)
+                .unwrap()
+        ]);
+        let second_payload = second_observations[&2].payload.clone();
+        let healthy = parsed_aggregates(&[&first_payload, &second_payload]);
+        let expected = healthy
+            .iter()
+            .map(|aggregate| {
+                (
+                    aggregate.group_id.key().clone(),
+                    aggregate.semantic_revision.as_str().to_owned(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        let mut baseline_keys = None;
+        for anomalous in [false, true] {
+            let mut rows: Vec<serde_json::Value> = serde_json::from_slice(&second_payload).unwrap();
+            if anomalous {
+                let mut anomaly = rows[0].clone();
+                anomaly["transactionHash"] = serde_json::json!("0xanomaly");
+                anomaly["price"] = serde_json::json!("2");
+                rows.push(anomaly);
+            }
+            let terminal_payload = activity_payload(rows);
+            let mut observations = BTreeMap::from([
+                (1, activity_observation(1, &first_payload)),
+                (2, activity_observation(2, &terminal_payload)),
+            ]);
+            let pages = [
+                activity_page_pair(&observations[&1], &first_payload, None, 100, 0),
+                activity_page_pair(
+                    &observations[&2],
+                    &terminal_payload,
+                    None,
+                    100,
+                    RECONCILIATION_PAGE_LIMIT,
+                ),
+            ];
+            let mut evidence = producer_page_evidence(&pages);
+            if anomalous {
+                evidence[1].anomalies =
+                    pe_source_polymarket_public::parse_activity_response_with_acceptance(
+                        &terminal_payload,
+                        first.facts.wallet,
+                        &ActivityParseContext {
+                            source_id: SourceId(observations[&2].source_id.clone()),
+                            observed_at: observations[&2].observed_at.clone(),
+                            received_at: observations[&2].received_at.clone(),
+                            transport: ActivityTransport::Replay,
+                        },
+                        pe_source_polymarket_public::ActivityRowAcceptance::StrictWithAnomalies,
+                    )
+                    .unwrap()
+                    .anomalies;
+                assert_eq!(evidence[1].anomalies.len(), 1);
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let state = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+            for mut continuation in [first.clone(), second.clone()] {
+                let aggregate = healthy
+                    .iter()
+                    .find(|aggregate| {
+                        aggregate.group_id.key() == &continuation.facts.source_trade_id
+                    })
+                    .unwrap();
+                continuation.facts.semantic_revision =
+                    aggregate.semantic_revision.as_str().to_owned();
+                continuation.facts.share_amount = aggregate.share_sum;
+                continuation.facts.decision_inputs =
+                    serde_json::json!({"fixed_end":100, "pages":evidence});
+                continuation.page_occurrences =
+                    pages.iter().map(|(page, _)| page.clone()).collect();
+                commit_read_fixture_v2(&mut continuation, &mut observations);
+                store_read_decision(&state, &continuation, "decision_pending", true);
+            }
+            if anomalous {
+                observations.get_mut(&2).unwrap().schema_version =
+                    crate::trade_poller::ACTIVITY_POLL_ANOMALY_PAGE_SCHEMA_VERSION;
+            }
+            let source = SealedSource::Map(&observations);
+            let reads = complete_activity_read_scopes(
+                &state.decision_pending_history().unwrap(),
+                EventSeq(3),
+                source,
+            )
+            .unwrap();
+            assert_eq!(reads.len(), 1);
+            assert_eq!(reads[0].aggregates, healthy);
+            let universe = source_trade_universe(EventSeq(3), &observations).unwrap();
+            assert_eq!(
+                universe.keys().cloned().collect::<HashSet<_>>(),
+                expected.iter().map(|(id, _)| id.clone()).collect()
+            );
+            let keys =
+                decision_keys_from_source_observations(&state, None, source, &universe, &reads)
+                    .unwrap();
+            let selected = decision_rows_from_source_observations(
+                &state,
+                &prefix_at(None),
+                &prefix_at(Some(3)),
+                &observations,
+            )
+            .unwrap();
+            assert_eq!(
+                selected
+                    .rows
+                    .iter()
+                    .map(|row| (row.source_trade_id.clone(), row.semantic_revision.clone()))
+                    .collect::<HashSet<_>>(),
+                expected
+            );
+            assert_eq!(
+                selected.in_prefix.iter().cloned().collect::<HashSet<_>>(),
+                expected
+            );
+            assert_eq!(
+                keys.iter()
+                    .map(|(_, id, revision)| (id.clone(), revision.clone()))
+                    .collect::<HashSet<_>>(),
+                expected
+            );
+            if let Some(baseline) = &baseline_keys {
+                assert_eq!(&keys, baseline);
+            } else {
+                baseline_keys = Some(keys);
+            }
+        }
+    }
+
     fn assert_selection_results_equal(
         map: Result<SelectedDecisionRows, QualificationError>,
         indexed: Result<(SelectedDecisionRows, TailBinding), QualificationError>,
@@ -16823,6 +16960,21 @@ mod anomaly_universe_tests {
         let mut anomaly = healthy.clone();
         anomaly["price"] = serde_json::json!("2");
         anomaly["transactionHash"] = serde_json::json!("0xanomaly");
+        let healthy_id = pe_source_polymarket_public::parse_activity_row(
+            &serde_json::to_vec(&healthy).unwrap(),
+            None,
+            &ActivityParseContext {
+                source_id: SourceId(crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                observed_at: SourceTimestamp(now),
+                received_at: ReceivedAt(now),
+                transport: ActivityTransport::Replay,
+            },
+        )
+        .unwrap()
+        .group_id()
+        .unwrap()
+        .key()
+        .clone();
         for schema_version in [2, 3, 4, 5] {
             for positions in [false, true] {
                 let payload = serde_json::to_vec(&if positions {
@@ -16854,7 +17006,14 @@ mod anomaly_universe_tests {
                     assert!(result.is_err());
                 } else {
                     result.unwrap();
-                    assert_eq!(first.len(), usize::from(!positions));
+                    assert_eq!(
+                        first.keys().cloned().collect::<HashSet<_>>(),
+                        if positions {
+                            HashSet::new()
+                        } else {
+                            HashSet::from([healthy_id.clone()])
+                        }
+                    );
                 }
             }
         }
