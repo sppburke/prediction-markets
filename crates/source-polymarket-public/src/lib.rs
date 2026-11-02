@@ -19,11 +19,13 @@ pub mod reconciliation;
 pub use activity::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate, ActivityAggregationError,
     ActivityIdentityError, ActivityParseContext, ActivityParseError, ActivityRevisionComparison,
-    ActivitySemanticRevision, ActivityTradeObservation, ActivityTransport, ActivityType,
-    ActivityValidationError, ActivityWindowInvalidation, NormalizedActivity,
-    NormalizedActivityWindow, PriceWeightedShareAmount, SourceActivityGroupComponents,
-    SourceActivityGroupId, aggregate_activity_rows, parse_activity_response, parse_activity_row,
-    parse_activity_trade_observation, project_legacy_contract_qty_v1,
+    ActivityRowAcceptance, ActivityRowAnomaly, ActivityRowAnomalyKind, ActivitySemanticRevision,
+    ActivityTradeObservation, ActivityTransport, ActivityType, ActivityValidationError,
+    ActivityWindowInvalidation, NormalizedActivity, NormalizedActivityWindow, ParsedActivityRow,
+    PriceWeightedShareAmount, SourceActivityGroupComponents, SourceActivityGroupId,
+    aggregate_activity_rows, parse_activity_response, parse_activity_response_with_acceptance,
+    parse_activity_row, parse_activity_row_with_acceptance, parse_activity_trade_observation,
+    project_legacy_contract_qty_v1,
 };
 #[cfg(feature = "scenario")]
 pub use activity_ws::ActivityWsPeer;
@@ -72,8 +74,10 @@ pub use reconciliation::{
     ActivityRequestBounds, CanonicalPosition, CompleteActivityRead, CompletePositionsRead,
     POSITION_PROOF_VERSION, POSITIONS_MAX_OFFSET, PositionClassification, PositionReadError,
     RECONCILIATION_PAGE_LIMIT, ReconciliationFetcher, ReconciliationPageEvidence,
-    ReconciliationPageFetcher, activity_window_end, canonical_page_hash,
-    fetch_activity_window_semantic, fetch_complete_activity, fetch_complete_activity_semantic,
+    ReconciliationPageFetcher, activity_window_end, activity_window_end_with_acceptance,
+    canonical_page_hash, fetch_activity_window_semantic,
+    fetch_activity_window_semantic_with_acceptance, fetch_complete_activity,
+    fetch_complete_activity_semantic, fetch_complete_activity_with_acceptance,
     fetch_complete_positions,
 };
 pub mod canary;

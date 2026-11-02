@@ -1973,6 +1973,7 @@ impl ActivityWalk<'_> {
             }
         }
         let mut read = pe_source_polymarket_public::CompleteActivityRead {
+            anomalies: Vec::new(),
             requested_wallet: self.wallet,
             fixed_end: self.start,
             rows: Vec::new(),

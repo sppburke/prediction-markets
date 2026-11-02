@@ -2706,6 +2706,7 @@ mod tests {
         )
         .unwrap();
         let activity = CompleteActivityRead {
+            anomalies: Vec::new(),
             requested_wallet: wallet,
             fixed_end: 100,
             rows: parsed.rows,
@@ -2826,6 +2827,7 @@ mod tests {
         let fence_id = aggregates[1].group_id.key().clone();
         let later_id = aggregates[2].group_id.key().clone();
         let activity = CompleteActivityRead {
+            anomalies: Vec::new(),
             requested_wallet: wallet,
             fixed_end: 100,
             rows: parsed.rows,

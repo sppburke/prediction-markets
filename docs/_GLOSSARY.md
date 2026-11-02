@@ -349,6 +349,62 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `redeem_residual_limit_atomic` | 100 | **Exclusive module const** `REDEEM_RESIDUAL_LIMIT_ATOMIC` in `position-ledger` (#557). A REDEEM underflow residual of 1..=99 atomic units clamps the position closed and is recorded in the version-3 effect document; 100 or more drops the resolved market under [classifier 6](#history-format-3-and-classifier-6-739). `ShareAmount` has six decimal places, so 100 atomic units equal one ten-thousandth of a position: the limit is one four-decimal `/positions` reporting quantum and accepts venue-display quantization residue without hiding a full reported quantum. SELL and MERGE remain strict, and the tolerance cannot stack within a bucket. |
 | `rehearsal_quiescence` | production unit policy at run time | The #545 rehearsal reads the production `pe-service` unit's `TimeoutStopSec` as its exact quiescence bound and requires `KillSignal` to be SIGINT, the signal handled by the service. The harness owns no separate numeric shutdown bound (#586). |
 
+### Non-executable activity-row anomalies (#822 PR 1a)
+
+The shared REST API offers four `ActivityRowAcceptance` modes. `mapping_relaxed()` is true
+only for `Acquisition3` and `Acquisition4`; `salvage_enabled()` is true only for
+`StrictWithAnomalies` and `Acquisition4`. Existing service and Forge producers keep their current
+Strict or Acquisition3 contracts until their separate activation changes. The websocket parser
+remains strict. Forge phase 2 starts after the shared API merges; publication of affected wallets
+waits for service activation (PR 1b).
+
+An anomaly-enabled parser validates wallet (including an optional requested-wallet match), timestamp,
+type and transaction hash before interpreting lexeme-preserved outcome and numeric fields. It
+retains `Price::new` rejection as `price_out_of_range`, REST outcome-mapping failures (including
+numeric indices outside `u16`) as `unmapped_outcome`, and `ExactDecimal` rejection of `price`, `size`
+or `usdcSize` as `unrepresentable_decimal`. Unsupported defects, including independent defects on
+the same row, still fail the whole page. Missing numeric fields and parsed decimals rejected by
+`ShareAmount` or `CollateralAmount` are unsupported. Unquoted JSON numbers outside
+`serde_json::Value`'s range fail inside the parser; quoted numeric text has no such JSON-range
+restriction. Zero-share/combo exemptions apply only to type-specific requirements, after outcome
+parsing; the valid outcome sentinel retains its existing meaning.
+
+`ActivityRowAnomaly` carries exactly `row_index` (zero-based page index), `kind`, `field` (source
+wire name), `wallet`, `source_time` (`SourceTimestamp` RFC3339), `activity_type`, `transaction_hash`,
+optional `condition_id`, `asset` and `side`, `is_combo`, and `raw_row_hash` (lowercase BLAKE3 of the
+exact row bytes). It has no executable price, quantity or outcome semantics.
+`NormalizedActivityWindow` and `ReconciliationPageEvidence` retain `anomalies`, defaulted when
+absent and omitted when empty, preserving historical serialized bytes and hashes.
+`CompleteActivityRead.anomalies` is in-memory only. Saturated segments retain anomalies in page
+evidence only; admitted read anomalies come from completed terminal segments.
+
+`parse_activity_response_with_acceptance`, `parse_activity_row_with_acceptance` (optional requested
+wallet, returning `ParsedActivityRow::Row` or `Anomaly`),
+`fetch_complete_activity_with_acceptance`, `fetch_activity_window_semantic_with_acceptance` and
+`activity_window_end_with_acceptance` expose caller-selected acceptance. Existing entry points keep
+their Strict defaults; ascending lookup and unsplit walk helpers keep Acquisition3.
+`fetch_complete_activity_semantic` retains its explicit mode. Source-row page counts, bounds,
+termination, saturation and split minima include anomalies; `aggregates()` and `buckets()` remain
+aggregate-only. Consumers must explicitly merge aggregate and anomaly seconds.
+
+`ActivityAssetMapping::from_rows_with_anomalies` includes anomaly ordinary/combo classification,
+registers anomaly assets without stamped outcome identity, and retains anomalous SPLIT/MERGE
+conditions for metadata-backed held-position discovery, including asset-less rows.
+`CompleteActivityRead::asset_mapping` delegates to it. Metadata verification and conflict checks
+still apply; `from_rows` retains its existing behavior.
+
+`classify_scoped_second_with_anomalies` and `classify_scoped_historical_second_with_anomalies`
+accept anomaly slices alongside records and explicit wallet/source second, including empty records.
+Every anomaly must match that wallet and second. Resolved anomalies produce cumulative inclusive
+`unrepresentable` scope problems; unresolved anomalies enter `ScopedSecond.ignored` as evidence ID
+and activity type. They never enter `apply`, `decisions` or `consumed`. The public
+`activity_row_anomaly_trigger` derives a `SourceTradeId` by prefixing the exact raw-row hash with
+`ACTIVITY_ROW_ANOMALY_NAMESPACE` (`activity-row-anomaly:v1:`), separate from group identity.
+`resolve_anomaly_scope` reuses condition-first, verified-token-second scope resolution; only
+CONVERSION and unknown activity types can resolve to an event. Existing classifiers pass empty
+anomaly slices and retain their behavior. A second remains unscored only for a new resolvable drop
+or a certified drop starting there, under the [shared scoped rule](#history-format-3-and-classifier-6-739).
+
 ### Causal re-anchor and rehearsal rules (#557)
 
 **Late-group scope drops (#823).** A previously unseen effective position mutation arriving at or
@@ -1524,7 +1580,8 @@ point retains its behavior. Same-wallet/market/second/outcome homogeneous BUY pi
 (minimum `source_trade_id`), with every piece applied and consuming. Mixed outcomes remain ambiguous.
 
 `ScopeKind` wire strings are `event` and `market`; `Scope.id` is canonical lowercase `0x` hex.
-An event scope is a neg-risk group, not a Gamma event. `DropCause` has exactly seven wire strings:
+An event scope is a neg-risk group, not a Gamma event. `DropCause` has eight wire strings (the anomaly cause is available in the shared API; existing
+producers retain their current activation contracts):
 
 | Cause | Scope |
 |---|---|
@@ -1535,6 +1592,7 @@ An event scope is a neg-risk group, not a Gamma event. `DropCause` has exactly s
 | `unknown_condition` | Resolved market for a redemption needing an unknown anchor |
 | `unknown_type` | Resolved neg-risk event group, otherwise market |
 | `unmapped` | Resolved market for an invalid mapping or non-canonical effective position id |
+| `unrepresentable` | Resolved market; event only for anomalous CONVERSION or unknown activity type |
 
 Scope resolution normalizes `\x` to `0x` and lowercases for lookup only, trying group id, market
 condition id, then token's market. Market causes do not use a group-id match. Conversion/unknown-type

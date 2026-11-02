@@ -320,6 +320,41 @@ impl NormalizedActivity {
 pub struct NormalizedActivityWindow {
     pub requested_wallet: WalletAddress,
     pub rows: Vec<NormalizedActivity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anomalies: Vec<ActivityRowAnomaly>,
+}
+
+/// A non-executable row whose numeric or outcome semantics cannot be represented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityRowAnomaly {
+    pub row_index: usize,
+    pub kind: ActivityRowAnomalyKind,
+    pub field: String,
+    pub wallet: WalletAddress,
+    pub source_time: SourceTimestamp,
+    pub activity_type: ActivityType,
+    pub transaction_hash: String,
+    pub condition_id: Option<PolymarketConditionId>,
+    pub asset: Option<PolymarketTokenId>,
+    pub side: Option<Side>,
+    pub is_combo: bool,
+    pub raw_row_hash: String,
+}
+
+/// The supported reasons for retaining a row as anomaly evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityRowAnomalyKind {
+    PriceOutOfRange,
+    UnmappedOutcome,
+    UnrepresentableDecimal,
+}
+
+/// One accepted row or non-executable anomaly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedActivityRow {
+    Row(NormalizedActivity),
+    Anomaly(ActivityRowAnomaly),
 }
 
 impl NormalizedActivityWindow {
@@ -391,6 +426,24 @@ pub enum ActivityRowAcceptance {
     Strict,
     /// Retain absent condition IDs and TRADE assets for scoped classification.
     Acquisition3,
+    /// Strict mappings with non-executable anomaly evidence.
+    StrictWithAnomalies,
+    /// Relaxed acquisition mappings with non-executable anomaly evidence.
+    Acquisition4,
+}
+
+impl ActivityRowAcceptance {
+    /// Whether absent condition IDs and TRADE assets are retained.
+    #[must_use]
+    pub const fn mapping_relaxed(self) -> bool {
+        matches!(self, Self::Acquisition3 | Self::Acquisition4)
+    }
+
+    /// Whether supported representation failures become anomalies.
+    #[must_use]
+    pub const fn salvage_enabled(self) -> bool {
+        matches!(self, Self::StrictWithAnomalies | Self::Acquisition4)
+    }
 }
 
 /// Parse one complete REST response. A missing, invalid, or mismatched payload
@@ -408,7 +461,8 @@ pub fn parse_activity_response(
     )
 }
 
-pub(crate) fn parse_activity_response_with_acceptance(
+/// Parse a REST page with explicit mapping and anomaly acceptance.
+pub fn parse_activity_response_with_acceptance(
     raw: &[u8],
     requested_wallet: WalletAddress,
     context: &ActivityParseContext,
@@ -419,18 +473,23 @@ pub(crate) fn parse_activity_response_with_acceptance(
             message: error.to_string(),
         })?;
     let mut rows = Vec::with_capacity(raw_rows.len());
+    let mut anomalies = Vec::new();
     for (row_index, raw_row) in raw_rows.into_iter().enumerate() {
-        rows.push(parse_row(
+        match parse_row_with_acceptance(
             raw_row.get(),
             Some(requested_wallet),
             context,
             row_index,
             row_acceptance,
-        )?);
+        )? {
+            ParsedActivityRow::Row(row) => rows.push(row),
+            ParsedActivityRow::Anomaly(anomaly) => anomalies.push(anomaly),
+        }
     }
     Ok(NormalizedActivityWindow {
         requested_wallet,
         rows,
+        anomalies,
     })
 }
 
@@ -452,6 +511,20 @@ pub fn parse_activity_row(
         0,
         ActivityRowAcceptance::Strict,
     )
+}
+
+/// Parse one row with optional wallet binding and explicit acceptance.
+pub fn parse_activity_row_with_acceptance(
+    raw: &[u8],
+    requested_wallet: Option<WalletAddress>,
+    context: &ActivityParseContext,
+    row_acceptance: ActivityRowAcceptance,
+) -> Result<ParsedActivityRow, ActivityParseError> {
+    let raw_row: Box<RawValue> =
+        serde_json::from_slice(raw).map_err(|error| ActivityParseError::Json {
+            message: error.to_string(),
+        })?;
+    parse_row_with_acceptance(raw_row.get(), requested_wallet, context, 0, row_acceptance)
 }
 
 /// Parse one payload accepted under the `activity/trades` websocket envelope.
@@ -482,7 +555,7 @@ pub fn parse_activity_trade_observation(
     Ok(observation)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum FlexibleI64 {
     Number(i64),
@@ -550,7 +623,8 @@ impl<'de> Deserialize<'de> for ExactDecimal {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawActivity {
+#[serde(bound(deserialize = "I: Deserialize<'de>, N: Deserialize<'de>"))]
+struct RawActivity<I = FlexibleU16, N = ExactDecimal> {
     #[serde(default, alias = "proxy_wallet")]
     proxy_wallet: Option<String>,
     #[serde(default)]
@@ -564,17 +638,17 @@ struct RawActivity {
     #[serde(default)]
     asset: Option<String>,
     #[serde(default, alias = "outcome_index")]
-    outcome_index: Option<FlexibleU16>,
+    outcome_index: Option<I>,
     #[serde(default)]
     outcome: Option<String>,
     #[serde(default)]
     side: Option<String>,
     #[serde(default)]
-    price: Option<ExactDecimal>,
+    price: Option<N>,
     #[serde(default)]
-    size: Option<ExactDecimal>,
+    size: Option<N>,
     #[serde(default, alias = "usdc_size")]
-    usdc_size: Option<ExactDecimal>,
+    usdc_size: Option<N>,
     #[serde(default, alias = "is_combo")]
     is_combo: Option<bool>,
 }
@@ -594,6 +668,199 @@ fn parse_row(
     let parsed = normalize_row(raw, wallet, context, raw_row, row_acceptance)
         .map_err(|source| ActivityParseError::InvalidRow { row_index, source })?;
     Ok(parsed)
+}
+
+fn parse_row_with_acceptance(
+    raw_row: &str,
+    requested_wallet: Option<WalletAddress>,
+    context: &ActivityParseContext,
+    row_index: usize,
+    row_acceptance: ActivityRowAcceptance,
+) -> Result<ParsedActivityRow, ActivityParseError> {
+    if !row_acceptance.salvage_enabled() {
+        return parse_row(
+            raw_row,
+            requested_wallet,
+            context,
+            row_index,
+            row_acceptance,
+        )
+        .map(ParsedActivityRow::Row);
+    }
+    let json_error = |error: serde_json::Error| ActivityParseError::Json {
+        message: format!("row {row_index}: {error}"),
+    };
+    let invalid = |source| ActivityParseError::InvalidRow { row_index, source };
+    let mut raw: RawActivity<Box<RawValue>, Box<RawValue>> =
+        serde_json::from_str(raw_row).map_err(json_error)?;
+    let wallet = parse_wallet(raw.proxy_wallet.take(), requested_wallet, row_index)?;
+    let activity_type =
+        ActivityType::from(required_string(raw.activity_type.clone(), "type").map_err(invalid)?);
+    let transaction_hash = required_string(raw.transaction_hash.clone(), "transactionHash")
+        .map_err(invalid)?
+        .to_ascii_lowercase();
+    let source_epoch = raw
+        .timestamp
+        .clone()
+        .ok_or(ActivityValidationError::MissingField { field: "timestamp" })
+        .and_then(FlexibleI64::parse)
+        .map(normalize_epoch_seconds)
+        .map_err(invalid)?;
+    let source_time = SourceTimestamp(
+        time::OffsetDateTime::from_unix_timestamp(source_epoch)
+            .map_err(|_| invalid(ActivityValidationError::InvalidTimestamp(source_epoch)))?,
+    );
+    // Page evidence re-reads JSON as Value. Reject its out-of-range numbers
+    // here too, without using that lossy representation to interpret decimals.
+    serde_json::from_str::<serde_json::Value>(raw_row).map_err(json_error)?;
+    let condition_id = optional_nonempty(raw.condition_id.clone())
+        .map(|value| PolymarketConditionId(value.to_ascii_lowercase()));
+    let asset = optional_nonempty(raw.asset.clone()).map(PolymarketTokenId);
+    let side = parse_side(raw.side.clone()).map_err(invalid)?;
+    let is_combo = raw.is_combo.unwrap_or(false);
+    let label_present = optional_nonempty(raw.outcome.clone()).is_some();
+    let mut anomaly = None;
+    let outcome_index = match raw.outcome_index.take() {
+        Some(value) => match serde_json::from_str::<FlexibleU16>(value.get()) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                if !matches!(value.get().as_bytes().first(), Some(b'-' | b'0'..=b'9')) {
+                    return Err(json_error(error));
+                }
+                anomaly = Some((ActivityRowAnomalyKind::UnmappedOutcome, "outcomeIndex"));
+                None
+            }
+        },
+        None => None,
+    };
+    let outcome_index = match outcome_index.map(FlexibleU16::parse).transpose() {
+        Ok(value) => value,
+        Err(_) => {
+            anomaly = Some((ActivityRowAnomalyKind::UnmappedOutcome, "outcomeIndex"));
+            None
+        }
+    };
+    let outcome = match parse_outcome(outcome_index.map(FlexibleU16::Number), label_present) {
+        Ok(value) => value,
+        Err(_) => {
+            anomaly = Some((ActivityRowAnomalyKind::UnmappedOutcome, "outcomeIndex"));
+            None
+        }
+    };
+    let mut decimal = |value: Option<Box<RawValue>>, field| {
+        let value =
+            value.ok_or_else(|| invalid(ActivityValidationError::MissingField { field }))?;
+        match serde_json::from_str::<ExactDecimal>(value.get()) {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => {
+                anomaly.get_or_insert((ActivityRowAnomalyKind::UnrepresentableDecimal, field));
+                Ok(None)
+            }
+        }
+    };
+    let price = decimal(raw.price.take(), "price")?;
+    let size = decimal(raw.size.take(), "size")?;
+    let usdc_size = decimal(raw.usdc_size.take(), "usdcSize")?;
+    if let Some(value) = price
+        && Price::new(value.0).is_err()
+    {
+        anomaly.get_or_insert((ActivityRowAnomalyKind::PriceOutOfRange, "price"));
+    }
+    let share_amount = size
+        .map(|value| {
+            ShareAmount::from_decimal_exact(value.0).map_err(|error| {
+                invalid(ActivityValidationError::InvalidShareAmount {
+                    value: value.0,
+                    reason: error.to_string(),
+                })
+            })
+        })
+        .transpose()?;
+    if let Some(value) = usdc_size {
+        CollateralAmount::from_decimal_exact(value.0).map_err(|error| {
+            invalid(ActivityValidationError::InvalidCollateralAmount {
+                value: value.0,
+                reason: error.to_string(),
+            })
+        })?;
+    }
+    // Representation failures must not mask missing effect fields. Only a
+    // known zero-share amount or combo classification grants the exemptions.
+    let share_amount = share_amount.unwrap_or(ShareAmount::from_atomic(1));
+    validate_type_specific(
+        &activity_type,
+        condition_id.as_ref(),
+        asset.as_ref(),
+        Some(OutcomeId(0)),
+        true,
+        side,
+        share_amount,
+        is_combo,
+        row_acceptance,
+    )
+    .map_err(invalid)?;
+    if let Err(error) = validate_type_specific(
+        &activity_type,
+        condition_id.as_ref(),
+        asset.as_ref(),
+        outcome,
+        label_present,
+        side,
+        share_amount,
+        is_combo,
+        row_acceptance,
+    ) {
+        match error {
+            ActivityValidationError::InvalidConditionOutcomeMapping => {
+                let field = if outcome.is_some() {
+                    "outcome"
+                } else {
+                    "outcomeIndex"
+                };
+                anomaly.get_or_insert((ActivityRowAnomalyKind::UnmappedOutcome, field));
+            }
+            error => return Err(invalid(error)),
+        }
+    }
+    if let Some((kind, field)) = anomaly {
+        return Ok(ParsedActivityRow::Anomaly(ActivityRowAnomaly {
+            row_index,
+            kind,
+            field: field.to_owned(),
+            wallet,
+            source_time,
+            activity_type,
+            transaction_hash,
+            condition_id,
+            asset,
+            side,
+            is_combo,
+            raw_row_hash: blake3::hash(raw_row.as_bytes()).to_hex().to_string(),
+        }));
+    }
+    normalize_row(
+        RawActivity {
+            proxy_wallet: None,
+            timestamp: raw.timestamp,
+            activity_type: raw.activity_type,
+            transaction_hash: raw.transaction_hash,
+            condition_id: raw.condition_id,
+            asset: raw.asset,
+            outcome_index: outcome_index.map(FlexibleU16::Number),
+            outcome: raw.outcome,
+            side: raw.side,
+            price,
+            size,
+            usdc_size,
+            is_combo: raw.is_combo,
+        },
+        wallet,
+        context,
+        raw_row,
+        row_acceptance,
+    )
+    .map(ParsedActivityRow::Row)
+    .map_err(invalid)
 }
 
 fn parse_wallet(
@@ -868,12 +1135,12 @@ fn validate_type_specific(
     }
     match activity_type {
         ActivityType::Trade => {
-            if condition_id.is_none() && row_acceptance == ActivityRowAcceptance::Strict {
+            if condition_id.is_none() && !row_acceptance.mapping_relaxed() {
                 return Err(ActivityValidationError::MissingField {
                     field: "conditionId",
                 });
             }
-            if asset.is_none() && row_acceptance == ActivityRowAcceptance::Strict {
+            if asset.is_none() && !row_acceptance.mapping_relaxed() {
                 return Err(ActivityValidationError::MissingField { field: "asset" });
             }
             if outcome.is_none() {
@@ -884,14 +1151,14 @@ fn validate_type_specific(
             }
         }
         ActivityType::Split | ActivityType::Merge => {
-            if condition_id.is_none() && row_acceptance == ActivityRowAcceptance::Strict {
+            if condition_id.is_none() && !row_acceptance.mapping_relaxed() {
                 return Err(ActivityValidationError::MissingField {
                     field: "conditionId",
                 });
             }
         }
         ActivityType::Redeem => {
-            if condition_id.is_none() && row_acceptance == ActivityRowAcceptance::Strict {
+            if condition_id.is_none() && !row_acceptance.mapping_relaxed() {
                 return Err(ActivityValidationError::MissingField {
                     field: "conditionId",
                 });
@@ -1693,5 +1960,393 @@ mod tests {
         // A stamped outcome with a missing label remains a hard error.
         let stamped = row.replace("\"outcomeIndex\":999", "\"outcomeIndex\":1");
         assert!(parse_activity_row(stamped.as_bytes(), Some(wallet), &context).is_err());
+    }
+
+    fn anomaly_context() -> ActivityParseContext {
+        let timestamp = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
+        ActivityParseContext {
+            source_id: SourceId("fixture".to_owned()),
+            observed_at: SourceTimestamp(timestamp),
+            received_at: ReceivedAt(timestamp),
+            transport: ActivityTransport::Rest,
+        }
+    }
+
+    fn anomaly_test_row() -> serde_json::Value {
+        serde_json::json!({
+            "proxyWallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": 50, "type": "TRADE", "transactionHash": "0xABC",
+            "conditionId": "0xAAA", "asset": "123", "side": "BUY",
+            "outcomeIndex": 0, "outcome": "Yes", "price": "0.5",
+            "size": "1", "usdcSize": "0.5", "isCombo": false
+        })
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn anomaly_modes_salvage_only_representation_failures_and_preserve_valid_rows() {
+        use ActivityRowAcceptance::{Acquisition3, Acquisition4, Strict, StrictWithAnomalies};
+        use ActivityRowAnomalyKind::{PriceOutOfRange, UnmappedOutcome, UnrepresentableDecimal};
+        let wallet = WalletAddress([0xaa; 20]);
+        let context = anomaly_context();
+        let valid = anomaly_test_row();
+        let valid_raw = serde_json::to_vec(&vec![valid.clone()]).unwrap();
+        let expected = parse_activity_response(&valid_raw, wallet, &context).unwrap();
+        for mode in [Strict, Acquisition3, StrictWithAnomalies, Acquisition4] {
+            assert_eq!(
+                mode.mapping_relaxed(),
+                matches!(mode, Acquisition3 | Acquisition4)
+            );
+            assert_eq!(
+                mode.salvage_enabled(),
+                matches!(mode, StrictWithAnomalies | Acquisition4)
+            );
+            let parsed =
+                parse_activity_response_with_acceptance(&valid_raw, wallet, &context, mode)
+                    .unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(
+                serde_json::to_vec(&parsed).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert!(
+                !serde_json::to_string(&parsed)
+                    .unwrap()
+                    .contains("anomalies")
+            );
+        }
+        for (field, value, kind) in [
+            ("price", serde_json::json!("1.1"), PriceOutOfRange),
+            ("price", serde_json::json!("-0.1"), PriceOutOfRange),
+            (
+                "outcomeIndex",
+                serde_json::json!("invalid"),
+                UnmappedOutcome,
+            ),
+            ("outcomeIndex", serde_json::json!(65536), UnmappedOutcome),
+            ("outcomeIndex", serde_json::json!(-1), UnmappedOutcome),
+            ("outcomeIndex", serde_json::json!(null), UnmappedOutcome),
+            (
+                "price",
+                serde_json::json!("4.212e-7"),
+                UnrepresentableDecimal,
+            ),
+            (
+                "size",
+                serde_json::json!("1000000000000000000000000000000"),
+                UnrepresentableDecimal,
+            ),
+            (
+                "usdcSize",
+                serde_json::json!("4.212e-7"),
+                UnrepresentableDecimal,
+            ),
+        ] {
+            let mut bad = valid.clone();
+            bad[field] = value;
+            let raw_row = serde_json::to_vec(&bad).unwrap();
+            let raw = serde_json::to_vec(&vec![valid.clone(), bad, valid.clone()]).unwrap();
+            let strict_error = parse_activity_response(&raw, wallet, &context).unwrap_err();
+            for mode in [Strict, Acquisition3] {
+                assert_eq!(
+                    parse_activity_response_with_acceptance(&raw, wallet, &context, mode)
+                        .unwrap_err(),
+                    strict_error
+                );
+            }
+            for mode in [StrictWithAnomalies, Acquisition4] {
+                let parsed =
+                    parse_activity_response_with_acceptance(&raw, wallet, &context, mode).unwrap();
+                assert_eq!(parsed.rows, vec![expected.rows[0].clone(); 2]);
+                assert_eq!(parsed.aggregates().unwrap().len(), 1);
+                let anomaly = &parsed.anomalies[0];
+                assert_eq!(parsed.anomalies.len(), 1);
+                assert_eq!(
+                    (anomaly.row_index, anomaly.kind, anomaly.field.as_str()),
+                    (1, kind, field)
+                );
+                assert_eq!(
+                    anomaly.raw_row_hash,
+                    blake3::hash(&raw_row).to_hex().to_string()
+                );
+                assert_eq!(anomaly.transaction_hash, "0xabc");
+                assert_eq!(
+                    anomaly.condition_id,
+                    Some(PolymarketConditionId("0xaaa".to_owned()))
+                );
+                let ParsedActivityRow::Anomaly(single) =
+                    parse_activity_row_with_acceptance(&raw_row, None, &context, mode).unwrap()
+                else {
+                    panic!("expected anomaly");
+                };
+                assert_eq!(single.row_index, 0);
+                assert_eq!(single.raw_row_hash, anomaly.raw_row_hash);
+                let wire = serde_json::to_value(anomaly).unwrap();
+                assert_eq!(wire.as_object().unwrap().len(), 12);
+                assert_eq!(
+                    serde_json::from_value::<ActivityRowAnomaly>(wire).unwrap(),
+                    *anomaly
+                );
+                assert_eq!(
+                    serde_json::from_slice::<NormalizedActivityWindow>(
+                        &serde_json::to_vec(&parsed).unwrap()
+                    )
+                    .unwrap(),
+                    parsed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anomaly_outcomes_validate_before_zero_share_and_combo_exemptions() {
+        for (zero, combo) in [(true, false), (false, true)] {
+            for activity_type in ["TRADE", "REDEEM"] {
+                for missing_index in [false, true] {
+                    let mut row = anomaly_test_row();
+                    row["type"] = serde_json::json!(activity_type);
+                    row["size"] = serde_json::json!(if zero { "0" } else { "1" });
+                    row["isCombo"] = serde_json::json!(combo);
+                    row["outcomeIndex"] =
+                        serde_json::json!(if missing_index { None } else { Some("invalid") });
+                    let raw = serde_json::to_vec(&vec![row.clone()]).unwrap();
+                    for mode in [
+                        ActivityRowAcceptance::Strict,
+                        ActivityRowAcceptance::Acquisition3,
+                        ActivityRowAcceptance::StrictWithAnomalies,
+                        ActivityRowAcceptance::Acquisition4,
+                    ] {
+                        let parsed = parse_activity_response_with_acceptance(
+                            &raw,
+                            WalletAddress([0xaa; 20]),
+                            &anomaly_context(),
+                            mode,
+                        );
+                        if mode.salvage_enabled() {
+                            assert_eq!(
+                                parsed.unwrap().anomalies[0].kind,
+                                ActivityRowAnomalyKind::UnmappedOutcome
+                            );
+                        } else {
+                            assert!(parsed.is_err());
+                        }
+                        let mut sentinel = row.clone();
+                        sentinel["outcomeIndex"] = serde_json::json!(999);
+                        sentinel.as_object_mut().unwrap().remove("outcome");
+                        let parsed = parse_activity_response_with_acceptance(
+                            &serde_json::to_vec(&vec![sentinel]).unwrap(),
+                            WalletAddress([0xaa; 20]),
+                            &anomaly_context(),
+                            mode,
+                        )
+                        .unwrap();
+                        assert_eq!(parsed.rows.len(), 1);
+                        assert!(parsed.anomalies.is_empty());
+                    }
+                }
+            }
+        }
+        for activity_type in ["TRADE", "REDEEM"] {
+            let mut row = anomaly_test_row();
+            row["type"] = serde_json::json!(activity_type);
+            row.as_object_mut().unwrap().remove("outcome");
+            if activity_type == "TRADE" {
+                row.as_object_mut().unwrap().remove("outcomeIndex");
+            }
+            let parsed = parse_activity_response_with_acceptance(
+                &serde_json::to_vec(&vec![row]).unwrap(),
+                WalletAddress([0xaa; 20]),
+                &anomaly_context(),
+                ActivityRowAcceptance::StrictWithAnomalies,
+            )
+            .unwrap();
+            assert_eq!(
+                parsed.anomalies[0].kind,
+                ActivityRowAnomalyKind::UnmappedOutcome
+            );
+            assert_eq!(
+                parsed.anomalies[0].field,
+                if activity_type == "TRADE" {
+                    "outcomeIndex"
+                } else {
+                    "outcome"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn anomaly_modes_reject_unsupported_defects_even_beside_salvageable_ones() {
+        for (field, value) in [
+            ("proxyWallet", serde_json::json!(null)),
+            ("proxyWallet", serde_json::json!("invalid")),
+            (
+                "proxyWallet",
+                serde_json::json!("0x1111111111111111111111111111111111111111"),
+            ),
+            ("timestamp", serde_json::json!(null)),
+            ("timestamp", serde_json::json!("invalid")),
+            ("timestamp", serde_json::json!(i64::MIN)),
+            ("type", serde_json::json!(null)),
+            ("type", serde_json::json!("")),
+            ("transactionHash", serde_json::json!(null)),
+            ("transactionHash", serde_json::json!("")),
+            ("side", serde_json::json!("invalid")),
+            ("side", serde_json::json!(null)),
+            ("isCombo", serde_json::json!("true")),
+            ("price", serde_json::json!(null)),
+            ("size", serde_json::json!(null)),
+            ("usdcSize", serde_json::json!(null)),
+            ("size", serde_json::json!("-1")),
+            ("usdcSize", serde_json::json!("-1")),
+            ("size", serde_json::json!("0.0000001")),
+            ("usdcSize", serde_json::json!("0.0000001")),
+            ("size", serde_json::json!("18446744073710")),
+            ("usdcSize", serde_json::json!("18446744073710")),
+            ("outcomeIndex", serde_json::json!(true)),
+            ("outcomeIndex", serde_json::json!({})),
+        ] {
+            for defect in [
+                None,
+                Some(("price", "1.1")),
+                Some(("outcomeIndex", "invalid")),
+                Some(("usdcSize", "4.212e-7")),
+            ] {
+                if defect.is_some_and(|(salvaged_field, _)| salvaged_field == field) {
+                    continue;
+                }
+                let mut bad = anomaly_test_row();
+                bad[field] = value.clone();
+                if let Some((field, value)) = defect {
+                    bad[field] = serde_json::json!(value);
+                }
+                let raw =
+                    serde_json::to_vec(&vec![anomaly_test_row(), bad, anomaly_test_row()]).unwrap();
+                for mode in [
+                    ActivityRowAcceptance::Strict,
+                    ActivityRowAcceptance::Acquisition3,
+                    ActivityRowAcceptance::StrictWithAnomalies,
+                    ActivityRowAcceptance::Acquisition4,
+                ] {
+                    assert!(
+                        parse_activity_response_with_acceptance(
+                            &raw,
+                            WalletAddress([0xaa; 20]),
+                            &anomaly_context(),
+                            mode
+                        )
+                        .is_err(),
+                        "{field}, {defect:?}, {mode:?}"
+                    );
+                }
+            }
+        }
+        for raw in [b"[".as_slice(), b"{}", b"[true]"] {
+            for mode in [
+                ActivityRowAcceptance::Strict,
+                ActivityRowAcceptance::Acquisition3,
+                ActivityRowAcceptance::StrictWithAnomalies,
+                ActivityRowAcceptance::Acquisition4,
+            ] {
+                assert!(
+                    parse_activity_response_with_acceptance(
+                        raw,
+                        WalletAddress([0xaa; 20]),
+                        &anomaly_context(),
+                        mode
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn anomaly_modes_preserve_decimal_lexemes_and_enforce_json_numeric_range() {
+        let row = serde_json::to_string(&anomaly_test_row()).unwrap();
+        for mode in [
+            ActivityRowAcceptance::StrictWithAnomalies,
+            ActivityRowAcceptance::Acquisition4,
+        ] {
+            let precise = row.replace("\"size\":\"1\"", "\"size\":10000000000000.000001");
+            let parsed = parse_activity_row_with_acceptance(
+                precise.as_bytes(),
+                None,
+                &anomaly_context(),
+                mode,
+            )
+            .unwrap();
+            let ParsedActivityRow::Row(parsed) = parsed else {
+                panic!("expected exact row");
+            };
+            assert_eq!(parsed.share_amount.atomic(), 10_000_000_000_000_000_001);
+            for token in ["4.212e-7", "\"1e400\""] {
+                let scientific =
+                    row.replace("\"usdcSize\":\"0.5\"", &format!("\"usdcSize\":{token}"));
+                let ParsedActivityRow::Anomaly(anomaly) = parse_activity_row_with_acceptance(
+                    scientific.as_bytes(),
+                    None,
+                    &anomaly_context(),
+                    mode,
+                )
+                .unwrap() else {
+                    panic!("expected anomaly");
+                };
+                assert_eq!(anomaly.kind, ActivityRowAnomalyKind::UnrepresentableDecimal);
+            }
+            for token in ["1e400", "-1e400"] {
+                let overflow =
+                    row.replace("\"usdcSize\":\"0.5\"", &format!("\"usdcSize\":{token}"));
+                assert!(
+                    parse_activity_row_with_acceptance(
+                        overflow.as_bytes(),
+                        None,
+                        &anomaly_context(),
+                        mode
+                    )
+                    .is_err()
+                );
+                assert!(
+                    parse_activity_response_with_acceptance(
+                        format!("[{overflow}]").as_bytes(),
+                        WalletAddress([0xaa; 20]),
+                        &anomaly_context(),
+                        mode
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anomaly_acceptance_keeps_mapping_relaxation_independent() {
+        for missing in ["conditionId", "asset"] {
+            let mut row = anomaly_test_row();
+            row.as_object_mut().unwrap().remove(missing);
+            for price in ["0.5", "1.1"] {
+                row["price"] = serde_json::json!(price);
+                let raw = serde_json::to_vec(&vec![row.clone()]).unwrap();
+                assert!(
+                    parse_activity_response_with_acceptance(
+                        &raw,
+                        wallet(),
+                        &anomaly_context(),
+                        ActivityRowAcceptance::StrictWithAnomalies
+                    )
+                    .is_err()
+                );
+                let parsed = parse_activity_response_with_acceptance(
+                    &raw,
+                    wallet(),
+                    &anomaly_context(),
+                    ActivityRowAcceptance::Acquisition4,
+                )
+                .unwrap();
+                assert_eq!(parsed.rows.len(), usize::from(price == "0.5"));
+                assert_eq!(parsed.anomalies.len(), usize::from(price == "1.1"));
+            }
+        }
     }
 }

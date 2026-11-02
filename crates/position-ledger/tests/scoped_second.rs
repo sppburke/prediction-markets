@@ -1274,3 +1274,362 @@ fn mixed_problem_seconds_are_identical_for_all_record_permutations() {
         }
     }
 }
+
+fn anomaly(
+    kind: ActivityType,
+    condition: Option<&str>,
+    token: Option<&str>,
+    hash: &str,
+) -> pe_source_polymarket_public::ActivityRowAnomaly {
+    pe_source_polymarket_public::ActivityRowAnomaly {
+        row_index: 0,
+        kind: pe_source_polymarket_public::ActivityRowAnomalyKind::UnrepresentableDecimal,
+        field: "usdcSize".to_owned(),
+        wallet: wallet(),
+        source_time: SourceTimestamp(OffsetDateTime::from_unix_timestamp(1_000).unwrap()),
+        activity_type: kind,
+        transaction_hash: "0xanomaly".to_owned(),
+        condition_id: condition.map(|id| PolymarketConditionId(id.to_owned())),
+        asset: token.map(|id| PolymarketTokenId(id.to_owned())),
+        side: Some(Side::Buy),
+        is_combo: false,
+        raw_row_hash: hash.repeat(32),
+    }
+}
+
+fn classify_anomalies(
+    aggregates: &[ActivityAggregate],
+    anomalies: &[pe_source_polymarket_public::ActivityRowAnomaly],
+    dropped: &BTreeSet<Scope>,
+    certified: bool,
+    lookups: &Lookups,
+) -> ScopedSecond {
+    use pe_position_ledger::{
+        classify_scoped_historical_second_with_anomalies, classify_scoped_second_with_anomalies,
+    };
+    let ledger = PositionLedger::new();
+    let quality = ReconstructionQuality::new(100).unwrap();
+    let records = records(aggregates);
+    let historical = classify_scoped_historical_second_with_anomalies(
+        &ledger,
+        wallet(),
+        1_000,
+        &records,
+        anomalies,
+        dropped,
+        certified,
+        quality,
+        &|_| false,
+        lookups,
+    )
+    .unwrap();
+    let live = classify_scoped_second_with_anomalies(
+        SameSecondEntryPolicy::HomogeneousPieces,
+        &ledger,
+        wallet(),
+        1_000,
+        &records,
+        anomalies,
+        dropped,
+        certified,
+        quality,
+        &SignalConfig::default(),
+        true,
+        &|_| false,
+        lookups,
+    )
+    .unwrap();
+    assert_eq!(historical, live);
+    historical
+}
+
+#[test]
+fn anomaly_only_seconds_resolve_market_or_event_without_executable_outputs() {
+    use pe_position_ledger::{activity_row_anomaly_trigger, resolve_anomaly_scope};
+    for (kind, condition, token, expected) in [
+        (
+            ActivityType::Trade,
+            Some(A),
+            None,
+            scope(ScopeKind::Market, A),
+        ),
+        (
+            ActivityType::Redeem,
+            Some(A),
+            None,
+            scope(ScopeKind::Market, A),
+        ),
+        (
+            ActivityType::Split,
+            Some(A),
+            None,
+            scope(ScopeKind::Market, A),
+        ),
+        (
+            ActivityType::Merge,
+            Some(A),
+            None,
+            scope(ScopeKind::Market, A),
+        ),
+        (
+            ActivityType::Reward,
+            Some(A),
+            None,
+            scope(ScopeKind::Market, A),
+        ),
+        (
+            ActivityType::Conversion,
+            Some(A),
+            None,
+            scope(ScopeKind::Event, GROUP),
+        ),
+        (
+            ActivityType::Unknown("FUTURE".to_owned()),
+            Some(A),
+            None,
+            scope(ScopeKind::Event, GROUP),
+        ),
+        (
+            ActivityType::Conversion,
+            Some(GROUP),
+            None,
+            scope(ScopeKind::Event, GROUP),
+        ),
+        (
+            ActivityType::Conversion,
+            Some(B),
+            None,
+            scope(ScopeKind::Market, B),
+        ),
+        (
+            ActivityType::Trade,
+            Some(UNKNOWN),
+            Some("token-a"),
+            scope(ScopeKind::Market, A),
+        ),
+        (
+            ActivityType::Trade,
+            Some("\\xAAA"),
+            None,
+            scope(ScopeKind::Market, A),
+        ),
+        (
+            ActivityType::Conversion,
+            None,
+            Some("token-a"),
+            scope(ScopeKind::Event, GROUP),
+        ),
+        (
+            ActivityType::Unknown("FUTURE".to_owned()),
+            None,
+            Some("token-a"),
+            scope(ScopeKind::Event, GROUP),
+        ),
+    ] {
+        let anomaly = anomaly(kind, condition, token, "ab");
+        assert_eq!(
+            resolve_anomaly_scope(&anomaly, &lookups()),
+            Some(expected.clone())
+        );
+        let result = classify_anomalies(
+            &[],
+            std::slice::from_ref(&anomaly),
+            &BTreeSet::new(),
+            false,
+            &lookups(),
+        );
+        assert_problem(
+            &result,
+            expected.kind,
+            &expected.id,
+            DropCause::Unrepresentable,
+        );
+        assert_eq!(
+            result.problems[0].trigger,
+            activity_row_anomaly_trigger(&anomaly)
+        );
+        assert!(
+            result.apply.is_empty()
+                && result.decisions.is_empty()
+                && result.consumed.is_empty()
+                && result.ignored.is_empty()
+        );
+    }
+}
+
+#[test]
+fn unresolved_anomalies_are_ignored_and_leave_healthy_buys_admitted() {
+    use pe_position_ledger::activity_row_anomaly_trigger;
+    let good = buy("good", B, 0, 1_000_000);
+    for kind in [
+        ActivityType::Trade,
+        ActivityType::Conversion,
+        ActivityType::Unknown("FUTURE".to_owned()),
+    ] {
+        let anomaly = anomaly(kind.clone(), Some(UNKNOWN), Some("unknown-token"), "ab");
+        for aggregates in [vec![], vec![good.clone()]] {
+            let result = classify_anomalies(
+                &aggregates,
+                std::slice::from_ref(&anomaly),
+                &BTreeSet::new(),
+                false,
+                &lookups(),
+            );
+            assert!(!result.problem_second);
+            assert!(result.problems.is_empty());
+            assert_eq!(
+                result.ignored,
+                [(activity_row_anomaly_trigger(&anomaly), kind.clone())]
+            );
+            assert_eq!(result.apply.len(), aggregates.len());
+            assert_eq!(result.decisions.len(), aggregates.len());
+            assert!(
+                result
+                    .decisions
+                    .iter()
+                    .all(|decision| decision.entry == EntryClassification::Admitted)
+            );
+            assert_eq!(result.consumed.len(), aggregates.len());
+        }
+    }
+    let anomaly = anomaly(ActivityType::Trade, Some(A), None, "ab");
+    let result = classify_anomalies(
+        &[good, buy("same-market", A, 0, 1_000_000)],
+        &[anomaly],
+        &BTreeSet::new(),
+        false,
+        &lookups(),
+    );
+    assert_problem(&result, ScopeKind::Market, A, DropCause::Unrepresentable);
+    assert_eq!(result.apply.len(), 1);
+    assert_eq!(result.decisions.len(), 1);
+    assert_eq!(result.decisions[0].market_id, market(B));
+    assert_eq!(result.decisions[0].entry, EntryClassification::NotAnEntry);
+    assert_eq!(result.consumed, [market(A), market(B)]);
+}
+
+#[test]
+fn anomaly_drops_are_permutation_invariant_cumulative_and_certified() {
+    use pe_position_ledger::activity_row_anomaly_trigger;
+    let a = anomaly(ActivityType::Trade, Some(A), None, "ab");
+    let mut earlier = a.clone();
+    earlier.raw_row_hash = "01".repeat(32);
+    let unresolved = anomaly(ActivityType::Trade, Some(UNKNOWN), None, "cd");
+    let mut anomalies = vec![a.clone(), earlier.clone(), unresolved];
+    let mut aggregates = vec![buy("one", B, 0, 1_000_000), buy("two", B, 0, 1_000_000)];
+    let expected = classify_anomalies(&aggregates, &anomalies, &BTreeSet::new(), false, &lookups());
+    assert_eq!(
+        expected.problems[0].trigger,
+        activity_row_anomaly_trigger(&earlier)
+    );
+    for _ in 0..anomalies.len() {
+        anomalies.rotate_left(1);
+        for _ in 0..aggregates.len() {
+            aggregates.reverse();
+            assert_eq!(
+                classify_anomalies(&aggregates, &anomalies, &BTreeSet::new(), false, &lookups()),
+                expected
+            );
+        }
+    }
+    for dropped in [scope(ScopeKind::Market, A), scope(ScopeKind::Event, GROUP)] {
+        let result = classify_anomalies(
+            &aggregates,
+            std::slice::from_ref(&a),
+            &BTreeSet::from([dropped]),
+            false,
+            &lookups(),
+        );
+        assert!(!result.problem_second);
+        assert!(result.problems.is_empty() && result.ignored.is_empty());
+        assert_eq!(result.decisions[0].entry, EntryClassification::Admitted);
+    }
+    for records in [vec![], aggregates] {
+        let result = classify_anomalies(
+            &records,
+            &[],
+            &BTreeSet::from([scope(ScopeKind::Market, A)]),
+            true,
+            &lookups(),
+        );
+        assert!(result.problem_second && result.problems.is_empty());
+        assert!(
+            result
+                .decisions
+                .iter()
+                .all(|decision| decision.entry != EntryClassification::Admitted)
+        );
+    }
+}
+
+#[test]
+fn anomaly_triggers_round_trip_and_wallet_second_binding_fails_closed() {
+    use pe_position_ledger::{
+        ACTIVITY_ROW_ANOMALY_NAMESPACE, activity_row_anomaly_trigger,
+        classify_scoped_historical_second_with_anomalies, classify_scoped_second_with_anomalies,
+    };
+    let anomaly = anomaly(ActivityType::Trade, Some(A), None, "ab");
+    let wire = serde_json::to_vec(&anomaly).unwrap();
+    let decoded =
+        serde_json::from_slice::<pe_source_polymarket_public::ActivityRowAnomaly>(&wire).unwrap();
+    let trigger = activity_row_anomaly_trigger(&anomaly);
+    assert_eq!(activity_row_anomaly_trigger(&decoded), trigger);
+    assert_eq!(
+        trigger.0.strip_prefix(ACTIVITY_ROW_ANOMALY_NAMESPACE),
+        Some(anomaly.raw_row_hash.as_str())
+    );
+    assert!(!trigger.0.starts_with("g2:"));
+    assert_eq!(
+        serde_json::from_str::<pe_core_types::SourceTradeId>(
+            &serde_json::to_string(&trigger).unwrap()
+        )
+        .unwrap(),
+        trigger
+    );
+    assert!(DropCause::Unmapped < DropCause::Unrepresentable);
+    assert_eq!(
+        serde_json::to_string(&DropCause::Unrepresentable).unwrap(),
+        "\"unrepresentable\""
+    );
+    assert_eq!(
+        serde_json::from_str::<DropCause>("\"unrepresentable\"").unwrap(),
+        DropCause::Unrepresentable
+    );
+    let quality = ReconstructionQuality::new(100).unwrap();
+    for (wallet, second) in [(WalletAddress([1; 20]), 1_000), (wallet(), 1_001)] {
+        let historical = classify_scoped_historical_second_with_anomalies(
+            &PositionLedger::new(),
+            wallet,
+            second,
+            &[],
+            std::slice::from_ref(&anomaly),
+            &BTreeSet::new(),
+            false,
+            quality,
+            &|_| false,
+            &lookups(),
+        );
+        let live = classify_scoped_second_with_anomalies(
+            SameSecondEntryPolicy::HomogeneousPieces,
+            &PositionLedger::new(),
+            wallet,
+            second,
+            &[],
+            std::slice::from_ref(&anomaly),
+            &BTreeSet::new(),
+            false,
+            quality,
+            &SignalConfig::default(),
+            true,
+            &|_| false,
+            &lookups(),
+        );
+        assert_eq!(historical, live);
+        assert_eq!(
+            live.unwrap_err(),
+            LedgerError::InvalidMapping {
+                source_trade_id: trigger.clone()
+            }
+        );
+    }
+}

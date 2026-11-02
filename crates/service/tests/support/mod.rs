@@ -93,6 +93,7 @@ pub fn producer_shaped_read_v1(
     assert!(row_count < pe_source_polymarket_public::RECONCILIATION_PAGE_LIMIT);
     let raw_hash = blake3::hash(payload).to_hex().to_string();
     let evidence = ReconciliationPageEvidence {
+        anomalies: Vec::new(),
         request_url: request_url.clone(),
         bounds: Some(ActivityRequestBounds {
             start: None,

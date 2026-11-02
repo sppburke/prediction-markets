@@ -20,8 +20,8 @@ use serde_json::value::RawValue;
 
 use crate::activity::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate, ActivityParseContext,
-    ActivityParseError, ActivityRowAcceptance, ActivityTransport, ActivityType, NormalizedActivity,
-    aggregate_activity_rows, parse_activity_response_with_acceptance,
+    ActivityParseError, ActivityRowAcceptance, ActivityRowAnomaly, ActivityTransport, ActivityType,
+    NormalizedActivity, aggregate_activity_rows, parse_activity_response_with_acceptance,
 };
 use crate::endpoint::{PolymarketEndpoint, PositionPartition};
 use crate::fetcher::PageFetcher;
@@ -86,6 +86,8 @@ pub struct ReconciliationPageEvidence {
     pub received_at: ReceivedAt,
     pub schema_version: u32,
     pub parser_version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anomalies: Vec<ActivityRowAnomaly>,
 }
 
 /// Complete activity response, normalized into stable ascending order.
@@ -94,6 +96,7 @@ pub struct CompleteActivityRead {
     pub requested_wallet: WalletAddress,
     pub fixed_end: i64,
     pub rows: Vec<NormalizedActivity>,
+    pub anomalies: Vec<ActivityRowAnomaly>,
     pub pages: Vec<ReconciliationPageEvidence>,
 }
 
@@ -113,7 +116,10 @@ impl CompleteActivityRead {
 
     /// Derive the complete asset mapping used by the positions parser.
     pub fn asset_mapping(&self) -> Result<ActivityAssetMapping, PositionReadError> {
-        Ok(ActivityAssetMapping::from_rows(&self.rows))
+        Ok(ActivityAssetMapping::from_rows_with_anomalies(
+            &self.rows,
+            &self.anomalies,
+        ))
     }
 }
 
@@ -154,6 +160,7 @@ pub enum ActivityReadError {
 struct ActivitySegment {
     bounds: ActivityRequestBounds,
     rows: Vec<NormalizedActivity>,
+    anomalies: Vec<ActivityRowAnomaly>,
     pages: Vec<ReconciliationPageEvidence>,
 }
 
@@ -167,6 +174,26 @@ pub async fn fetch_complete_activity(
     start: Option<i64>,
     fixed_end: i64,
 ) -> Result<CompleteActivityRead, ActivityReadError> {
+    fetch_complete_activity_with_acceptance(
+        fetcher,
+        base_url,
+        requested_wallet,
+        start,
+        fixed_end,
+        ActivityRowAcceptance::Strict,
+    )
+    .await
+}
+
+/// Fetch complete activity with provenance and explicit row acceptance.
+pub async fn fetch_complete_activity_with_acceptance(
+    fetcher: &dyn ReconciliationFetcher,
+    base_url: &str,
+    requested_wallet: WalletAddress,
+    start: Option<i64>,
+    fixed_end: i64,
+    row_acceptance: ActivityRowAcceptance,
+) -> Result<CompleteActivityRead, ActivityReadError> {
     fetch_complete_activity_with(
         fetcher,
         base_url,
@@ -174,7 +201,7 @@ pub async fn fetch_complete_activity(
         start,
         fixed_end,
         true,
-        ActivityRowAcceptance::Strict,
+        row_acceptance,
     )
     .await
 }
@@ -214,6 +241,26 @@ pub async fn activity_window_end(
     lo: i64,
     fixed_end: i64,
 ) -> Result<i64, ActivityReadError> {
+    activity_window_end_with_acceptance(
+        fetcher,
+        base_url,
+        requested_wallet,
+        lo,
+        fixed_end,
+        ActivityRowAcceptance::Acquisition3,
+    )
+    .await
+}
+
+/// Place a forward window counting both accepted rows and anomalies.
+pub async fn activity_window_end_with_acceptance(
+    fetcher: &dyn ReconciliationFetcher,
+    base_url: &str,
+    requested_wallet: WalletAddress,
+    lo: i64,
+    fixed_end: i64,
+    row_acceptance: ActivityRowAcceptance,
+) -> Result<i64, ActivityReadError> {
     let start = lo.checked_add(1).ok_or(ActivityReadError::InvalidSplit {
         start: Some(lo),
         end: fixed_end,
@@ -239,19 +286,24 @@ pub async fn activity_window_end(
             received_at,
             transport: ActivityTransport::Rest,
         },
-        ActivityRowAcceptance::Acquisition3,
+        row_acceptance,
     )?;
-    if page.rows.len() > 1 {
+    if page.rows.len() + page.anomalies.len() > 1 {
         return Err(ActivityReadError::PageTooLarge {
-            row_count: u32::try_from(page.rows.len())
+            row_count: u32::try_from(page.rows.len() + page.anomalies.len())
                 .map_err(|_| ActivityReadError::RowCountOverflow)?,
             limit: 1,
         });
     }
-    let Some(row) = page.rows.first() else {
+    let Some(source_time) = page
+        .rows
+        .first()
+        .map(|row| &row.source_time)
+        .or_else(|| page.anomalies.first().map(|anomaly| &anomaly.source_time))
+    else {
         return Ok(fixed_end);
     };
-    let boundary = row.source_time.0.unix_timestamp();
+    let boundary = source_time.0.unix_timestamp();
     if boundary <= lo || boundary > fixed_end {
         return Err(ActivityReadError::RowOutsideBounds {
             timestamp: boundary,
@@ -278,6 +330,26 @@ pub async fn fetch_activity_window_semantic(
     start: i64,
     fixed_end: i64,
 ) -> Result<Option<CompleteActivityRead>, ActivityReadError> {
+    fetch_activity_window_semantic_with_acceptance(
+        fetcher,
+        base_url,
+        requested_wallet,
+        start,
+        fixed_end,
+        ActivityRowAcceptance::Acquisition3,
+    )
+    .await
+}
+
+/// Read one unsplit semantic window with explicit row acceptance.
+pub async fn fetch_activity_window_semantic_with_acceptance(
+    fetcher: &dyn ReconciliationFetcher,
+    base_url: &str,
+    requested_wallet: WalletAddress,
+    start: i64,
+    fixed_end: i64,
+    row_acceptance: ActivityRowAcceptance,
+) -> Result<Option<CompleteActivityRead>, ActivityReadError> {
     match fetch_activity_segment(
         fetcher,
         base_url,
@@ -287,7 +359,7 @@ pub async fn fetch_activity_window_semantic(
             end: fixed_end,
         },
         false,
-        ActivityRowAcceptance::Acquisition3,
+        row_acceptance,
     )
     .await?
     {
@@ -335,6 +407,7 @@ async fn fetch_complete_activity_with(
                 complete.push(ActivitySegment {
                     bounds,
                     rows: Vec::new(),
+                    anomalies: Vec::new(),
                     pages,
                 });
                 let terminal_start =
@@ -415,6 +488,17 @@ fn assemble_activity(
         });
         rows.extend(keyed_rows.into_iter().map(|(_, _, _, row)| row));
     }
+    let mut anomalies = complete
+        .iter_mut()
+        .flat_map(|segment| std::mem::take(&mut segment.anomalies))
+        .collect::<Vec<_>>();
+    anomalies.sort_by(|left, right| {
+        left.source_time
+            .0
+            .cmp(&right.source_time.0)
+            .then_with(|| left.raw_row_hash.cmp(&right.raw_row_hash))
+            .then_with(|| left.row_index.cmp(&right.row_index))
+    });
     let mut pages = complete
         .into_iter()
         .flat_map(|segment| segment.pages)
@@ -430,6 +514,7 @@ fn assemble_activity(
         requested_wallet,
         fixed_end,
         rows,
+        anomalies,
         pages,
     })
 }
@@ -451,6 +536,7 @@ async fn fetch_activity_segment(
     row_acceptance: ActivityRowAcceptance,
 ) -> Result<SegmentResult, ActivityReadError> {
     let mut rows = Vec::new();
+    let mut anomalies = Vec::new();
     let mut pages = Vec::new();
     let mut offset = 0_u32;
     loop {
@@ -490,8 +576,13 @@ async fn fetch_activity_segment(
             &context,
             row_acceptance,
         )?;
-        for row in &page.rows {
-            let timestamp = row.source_time.0.unix_timestamp();
+        for source_time in page
+            .rows
+            .iter()
+            .map(|row| &row.source_time)
+            .chain(page.anomalies.iter().map(|anomaly| &anomaly.source_time))
+        {
+            let timestamp = source_time.0.unix_timestamp();
             if timestamp > bounds.end || bounds.start.is_some_and(|start| timestamp <= start) {
                 return Err(ActivityReadError::RowOutsideBounds {
                     timestamp,
@@ -500,30 +591,31 @@ async fn fetch_activity_segment(
                 });
             }
         }
-        let row_count =
-            u32::try_from(page.rows.len()).map_err(|_| ActivityReadError::RowCountOverflow)?;
+        let row_count = u32::try_from(page.rows.len() + page.anomalies.len())
+            .map_err(|_| ActivityReadError::RowCountOverflow)?;
         if row_count > RECONCILIATION_PAGE_LIMIT {
             return Err(ActivityReadError::PageTooLarge {
                 row_count,
                 limit: RECONCILIATION_PAGE_LIMIT,
             });
         }
-        pages.push(
-            page_evidence(
-                &raw,
-                PageEvidenceContext {
-                    request_url: &url,
-                    bounds: Some(bounds),
-                    partition: None,
-                    offset,
-                    row_count,
-                    received_at,
-                    schema_version: ACTIVITY_SCHEMA_VERSION,
-                    parser_version: ACTIVITY_PARSER_VERSION,
-                },
-            )
-            .map_err(ActivityReadError::CanonicalPage)?,
-        );
+        let mut evidence = page_evidence(
+            &raw,
+            PageEvidenceContext {
+                request_url: &url,
+                bounds: Some(bounds),
+                partition: None,
+                offset,
+                row_count,
+                received_at,
+                schema_version: ACTIVITY_SCHEMA_VERSION,
+                parser_version: ACTIVITY_PARSER_VERSION,
+            },
+        )
+        .map_err(ActivityReadError::CanonicalPage)?;
+        evidence.anomalies = page.anomalies.clone();
+        pages.push(evidence);
+        anomalies.extend(page.anomalies);
         let mut page_rows = page.rows;
         if !retain_provenance {
             for row in &mut page_rows {
@@ -537,6 +629,7 @@ async fn fetch_activity_segment(
             return Ok(SegmentResult::Complete(ActivitySegment {
                 bounds,
                 rows,
+                anomalies,
                 pages,
             }));
         }
@@ -544,6 +637,11 @@ async fn fetch_activity_segment(
             let boundary = rows
                 .iter()
                 .map(|row| row.source_time.0.unix_timestamp())
+                .chain(
+                    anomalies
+                        .iter()
+                        .map(|anomaly| anomaly.source_time.0.unix_timestamp()),
+                )
                 .min()
                 .ok_or(ActivityReadError::SaturatedTerminalSecond {
                     end: bounds.end,
@@ -591,18 +689,47 @@ pub struct ActivityAssetMapping {
 impl ActivityAssetMapping {
     #[must_use]
     pub fn from_rows(rows: &[NormalizedActivity]) -> Self {
+        Self::from_rows_with_anomalies(rows, &[])
+    }
+
+    /// Include anomaly classifications and tokens without stamping an outcome identity.
+    #[must_use]
+    pub fn from_rows_with_anomalies(
+        rows: &[NormalizedActivity],
+        anomalies: &[ActivityRowAnomaly],
+    ) -> Self {
         let mut candidates = BTreeMap::<PolymarketTokenId, Vec<ActivityAssetIdentity>>::new();
         let mut classification_by_asset =
             HashMap::<PolymarketTokenId, Option<PositionClassification>>::new();
         let mut split_merge_conditions = HashMap::new();
-        for row in rows {
-            let classification = if row.is_combo {
+        for (activity_type, condition_id, asset, outcome, is_combo) in rows
+            .iter()
+            .map(|row| {
+                (
+                    &row.activity_type,
+                    &row.condition_id,
+                    &row.asset,
+                    row.outcome,
+                    row.is_combo,
+                )
+            })
+            .chain(anomalies.iter().map(|row| {
+                (
+                    &row.activity_type,
+                    &row.condition_id,
+                    &row.asset,
+                    None,
+                    row.is_combo,
+                )
+            }))
+        {
+            let classification = if is_combo {
                 PositionClassification::Combo
             } else {
                 PositionClassification::Ordinary
             };
-            if matches!(row.activity_type, ActivityType::Split | ActivityType::Merge)
-                && let Some(condition) = &row.condition_id
+            if matches!(activity_type, ActivityType::Split | ActivityType::Merge)
+                && let Some(condition) = condition_id
             {
                 split_merge_conditions
                     .entry(condition.clone())
@@ -613,7 +740,7 @@ impl ActivityAssetMapping {
                     })
                     .or_insert(Some(classification));
             }
-            let Some(asset) = row.asset.clone() else {
+            let Some(asset) = asset.clone() else {
                 continue;
             };
             classification_by_asset
@@ -625,8 +752,7 @@ impl ActivityAssetMapping {
                 })
                 .or_insert(Some(classification));
             let identities = candidates.entry(asset).or_default();
-            let (Some(condition_id), Some(outcome)) = (row.condition_id.clone(), row.outcome)
-            else {
+            let (Some(condition_id), Some(outcome)) = (condition_id.clone(), outcome) else {
                 // SPLIT/MERGE rows may legitimately omit an outcome even when
                 // another row supplies an asset. Such a row cannot establish a
                 // token mapping; their condition can instead support metadata discovery.
@@ -1267,6 +1393,7 @@ fn page_evidence(
         received_at: context.received_at,
         schema_version: context.schema_version,
         parser_version: context.parser_version,
+        anomalies: Vec::new(),
     })
 }
 

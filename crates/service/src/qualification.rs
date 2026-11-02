@@ -7041,6 +7041,7 @@ mod tests {
             .unwrap()
             .len();
         ReconciliationPageEvidence {
+            anomalies: Vec::new(),
             request_url: url.to_owned(),
             bounds: Some(pe_source_polymarket_public::ActivityRequestBounds { start, end }),
             partition: None,
@@ -12077,6 +12078,7 @@ mod tests {
             .url("https://data-api.polymarket.com");
         let raw_hash = blake3::hash(&late_payload).to_hex().to_string();
         let page_evidence = ReconciliationPageEvidence {
+            anomalies: Vec::new(),
             request_url: request_url.clone(),
             bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
                 start: Some(source_epoch - 1),
