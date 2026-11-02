@@ -3562,7 +3562,7 @@ finally:
         self.assertTrue(cycle.is_file())
         out = Path(cycle.read_text().strip()).name
         self.assertEqual(
-            self._bootstrap_ops(),
+            self._foreground_ops(),
             ["cache-stage-v2", "winner-discovery", "activate-next",
              "cache-populate-activity-v2", "cache-populate-payout-v2", "cache-finalize-v2"],
         )
