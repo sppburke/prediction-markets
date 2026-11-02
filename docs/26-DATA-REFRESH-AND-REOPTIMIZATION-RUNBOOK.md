@@ -595,7 +595,9 @@ parameterized runs use today's date, and explicit overrides win
 After refresh each ranking run, resumes included, runs `pe-bootstrap market-scope`: Gamma's
 15-minute series and their events ending at or after the window start minus one day, about 1,350 requests at ≤ 2/s (14 min on the dev box), written to
 `market_scope.json` in the run directory ([`ranker_market_scope`](_GLOSSARY.md#ranker-market-scope),
-#784). **Stage 1** ranks the full trade universe (`--universe-from-trades` — have-data ⇒
+#784). The fresh lane starts this sweep beside activity collection, right after the candidate
+targets, and joins it at the same point (before the cutover checks and export) with the same exit
+handling; its Gamma snapshot is therefore taken when collection starts, still after the window end. **Stage 1** ranks the full trade universe (`--universe-from-trades` — have-data ⇒
 in-universe), scoring only first entries in the scope's markets. Schema two exports every
 certified first-entry position in the ranking window without a leader-price, horizon or
 statistical pre-gate. **Stage 2** waits for candidate capture, then runs export-bound
