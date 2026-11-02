@@ -2153,25 +2153,37 @@ mod tests {
             if activity_type == "TRADE" {
                 row.as_object_mut().unwrap().remove("outcomeIndex");
             }
-            let parsed = parse_activity_response_with_acceptance(
-                &serde_json::to_vec(&vec![row]).unwrap(),
-                WalletAddress([0xaa; 20]),
-                &anomaly_context(),
+            let raw = serde_json::to_vec(&vec![row]).unwrap();
+            for mode in [
+                ActivityRowAcceptance::Strict,
+                ActivityRowAcceptance::Acquisition3,
                 ActivityRowAcceptance::StrictWithAnomalies,
-            )
-            .unwrap();
-            assert_eq!(
-                parsed.anomalies[0].kind,
-                ActivityRowAnomalyKind::UnmappedOutcome
-            );
-            assert_eq!(
-                parsed.anomalies[0].field,
-                if activity_type == "TRADE" {
-                    "outcomeIndex"
-                } else {
-                    "outcome"
+                ActivityRowAcceptance::Acquisition4,
+            ] {
+                let parsed = parse_activity_response_with_acceptance(
+                    &raw,
+                    WalletAddress([0xaa; 20]),
+                    &anomaly_context(),
+                    mode,
+                );
+                if !mode.salvage_enabled() {
+                    assert!(parsed.is_err());
+                    continue;
                 }
-            );
+                let parsed = parsed.unwrap();
+                assert_eq!(
+                    parsed.anomalies[0].kind,
+                    ActivityRowAnomalyKind::UnmappedOutcome
+                );
+                assert_eq!(
+                    parsed.anomalies[0].field,
+                    if activity_type == "TRADE" {
+                        "outcomeIndex"
+                    } else {
+                        "outcome"
+                    }
+                );
+            }
         }
     }
 
