@@ -406,11 +406,11 @@ SCOPE_PID=""
 cleanup_rank_and_push() {
   local status=$?
   local pid running
-  # Signal only children bash still lists as running: an exited child may already be reaped
-  # (its status kept for `wait`) and its PID reused by an unrelated process.
-  running=" $(jobs -rp | tr '\n' ' ') "
+  # Signal only a child bash still lists as running, read right before signaling it: an exited
+  # child may already be reaped (its status kept for `wait`) and its PID reused.
   for pid in "$CAPTURE_PID" "$SAMPLER_PID" "$SCOPE_PID"; do
     [[ -n "$pid" ]] || continue
+    running=" $(jobs -rp | tr '\n' ' ') "
     [[ "$running" != *" $pid "* ]] || kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
