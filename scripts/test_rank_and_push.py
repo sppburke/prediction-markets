@@ -37,6 +37,7 @@ import os
 import json
 import shutil
 import shlex
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -300,7 +301,7 @@ class RankAndPushScenario(unittest.TestCase):
             f"exec {shlex.quote(sys.executable)} \"$@\"\n",
         )
 
-    def _run(self, *args, exit_env=None):
+    def _run(self, *args, exit_env=None, fd9=None):
         env = dict(os.environ)
         env.pop("PE_PYTHON", None)
         for variable in CYCLE_SETTINGS.values():
@@ -309,14 +310,33 @@ class RankAndPushScenario(unittest.TestCase):
         clock = self.root / "clock"
         if clock.is_dir():
             env["PATH"] = f"{clock}:{env['PATH']}"
-        return subprocess.run(
-            ["bash", str(self.wrapper), *args],
-            cwd=self.root,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+        command = ["bash", str(self.wrapper), *args]
+        if fd9 is not None:
+            # As under the loop supervisor, the wrapper inherits a lock on descriptor 9.
+            command = ["bash", "-c", 'exec 9<>"$1"; shift; exec "$@"', "bash", str(fd9), *command]
+        # Its own session: a hang's timeout ends everything the wrapper started, and the cleanup
+        # ends what a failing scenario left behind after the test's own assertions ran.
+        process = subprocess.Popen(command, cwd=self.root, env=env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(self._end_run_group, process.pid, str(self.root))
+        try:
+            stdout, stderr = process.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+            raise
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+    @staticmethod
+    def _end_run_group(group, root):
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                if os.getpgid(int(name)) == group and os.readlink(f"/proc/{name}/cwd").startswith(root):
+                    os.kill(int(name), signal.SIGKILL)
+            except (OSError, ValueError):
+                continue
 
     def _shift_clock(self, ago):
         """Run the wrapper's `date` this far behind real time (first on PATH in `_run`)."""
@@ -2617,22 +2637,30 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
-    def _install_scope_probe(self):
-        """Replace the fresh lane's scope sweep with a probe. STUB_SCOPE_MODE=overlap (default)
-        reads a FIFO the activity stage writes, so neither can finish unless both run at once,
-        then ends only after the first finalize; block waits for termination; plain just writes.
-        Every mode refuses a scope file left from an earlier attempt and records its descriptors."""
+    def _install_scope_probe(self, *, release=False):
+        """Replace the fresh lane's scope sweep with a probe. Unless STUB_SCOPE_MODE=plain, it reads
+        a FIFO the activity stage writes before anything else (collection cannot proceed until the
+        sweep runs, with its SIGTERM handler armed); block then waits for termination. With
+        `release`, it ends only after the first finalize writes a second FIFO, plus 2 s. Every
+        mode refuses a scope file left from an earlier attempt and records its descriptors."""
         os.mkfifo(self.root / "scope-overlap.pipe")
+        if release:
+            os.mkfifo(self.root / "scope-release.pipe")
         stub = self.root / "target" / "release" / "pe-bootstrap"
         body = stub.read_text()
-        marker = 'case "$1" in cache-stage-v2'
-        assert marker in body
+        first, marker = 'sub="$1"\n', 'case "$1" in cache-stage-v2'
+        assert body.count(first) == 1 and body.count(marker) == 1
+        body = body.replace(first, first +
+                            'if [[ "$1" == "cache-populate-activity-v2" && -p scope-overlap.pipe && ! -e scope-handshake'
+                            ' && "${STUB_SCOPE_MODE:-overlap}" != plain ]]; then\n'
+                            '  printf collecting > scope-overlap.pipe; : > scope-handshake\n'
+                            'fi\n', 1)
         body = body.replace(marker,
                             'if [[ "$1" == "market-scope" ]]; then\n'
                             f'  exec {shlex.quote(sys.executable)} scripts/_scope_probe.py "$@"\n'
                             'fi\n'
-                            'if [[ "$1" == "cache-populate-activity-v2" && -p scope-overlap.pipe && ! -e scope-handshake ]]; then\n'
-                            '  printf collecting > scope-overlap.pipe; : > scope-handshake\n'
+                            'if [[ "$1" == "cache-finalize-v2" && -p scope-release.pipe && ! -e scope-released ]]; then\n'
+                            '  printf finalize > scope-release.pipe; : > scope-released\n'
                             'fi\n' + marker, 1)
         _write_exec(stub, body)
         _write_exec(self.root / "scripts" / "_scope_probe.py", """#!/usr/bin/env python3
@@ -2640,29 +2668,26 @@ import os, signal, sys, time
 from pathlib import Path
 a = sys.argv[1:]
 out = Path(a[a.index('--out') + 1])
-Path('scope_started').write_text(str(os.getpid()))
-Path('scope_fds').write_text('\\n'.join(os.path.realpath(f'/proc/self/fd/{fd}') for fd in os.listdir('/proc/self/fd')))
-if out.exists():
-    raise SystemExit(98)
 mode = os.environ.get('STUB_SCOPE_MODE', 'overlap')
 if mode == 'block':
     def stopped(_signal, _frame):
         Path('scope_reaped').write_text('yes')
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, stopped)
-if mode in ('overlap', 'block'):
+Path('scope_started').write_text(str(os.getpid()))
+Path('scope_fds').write_text('\\n'.join(os.path.realpath(f'/proc/self/fd/{fd}') for fd in os.listdir('/proc/self/fd')))
+if out.exists():
+    raise SystemExit(98)
+if mode != 'plain':
     with open('scope-overlap.pipe') as pipe:
         pipe.read()
 if mode == 'block':
     while True:
         signal.pause()
-if mode == 'overlap':
-    deadline = time.time() + 30
-    while 'cache-finalize-v2' not in Path('pe_bootstrap.log').read_text():
-        if time.time() > deadline:
-            raise SystemExit(96)
-        time.sleep(0.05)
-    time.sleep(0.5)
+if os.path.exists('scope-release.pipe'):
+    with open('scope-release.pipe') as pipe:
+        pipe.read()
+    time.sleep(2)
 out.write_text('{"probe": "scope"}')
 Path('scope_done').write_text('yes')
 """)
@@ -2672,58 +2697,92 @@ Path('scope_done').write_text('yes')
 
     def test_fresh_lane_market_scope_runs_beside_collection_and_joins_before_export(self):
         """PASS: the sweep starts after the targets and before activity, overlaps collection (the
-        FIFO only opens when both run), and export starts only after it ended. FAIL: a hang (the
-        sweep or activity never meets the other) or export's assertion."""
+        FIFO opens only with both running), is released by the first finalize and still holds
+        export until it exits; it holds neither run lock, and both passes read its exact file.
+        FAIL: a hang (sweep and collection never meet) or export's scope_done assertion."""
         self._prepare_incremental_fixture(two_file=True)
-        self._install_scope_probe()
-        result = self._run()
+        self._install_scope_probe(release=True)
+        rank = self.root / "scripts/rank_72hr_buyandhold.py"
+        _write_exec(rank, rank.read_text().replace(
+            'open("rank.log", "a")',
+            'open("rank_scope_seen", "w").write(open(a[a.index("--market-scope") + 1]).read())\n'
+            'open("rank.log", "a")', 1))
+        result = self._run(fd9=self.root / "loop.lock")
         self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
-        self.assertTrue((self.root / "scope-handshake").is_file())
-        self.assertTrue((self.root / "scope_done").is_file())
+        for marker in ("scope-handshake", "scope-released", "scope_done"):
+            self.assertTrue((self.root / marker).is_file(), marker)
         out = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
+        scope_file = str((out / "market_scope.json").relative_to(self.root))
         self.assertEqual((out / "market_scope.json").read_text(), '{"probe": "scope"}')
+        self.assertEqual((self.root / "rank_scope_seen").read_text(), '{"probe": "scope"}')
+        for log in ("rank.log", "rerank.log"):
+            args = shlex.split(self._log(log).splitlines()[-1])
+            self.assertEqual(args[args.index("--market-scope") + 1], scope_file, log)
         lines = result.stdout.splitlines()
         def at(text):
             return next(i for i, line in enumerate(lines) if text in line)
-        self.assertLess(at("[targets]"), at("[market-scope] running beside collection:"))
-        self.assertLess(at("[market-scope] running beside collection:"), at("[activity] running:"))
-        self.assertLess(at("[cache-finalize] ok"), at("[market-scope] ok"))
+        self.assertLess(at("[targets]"), at("── Market scope:"))
+        self.assertLess(at("── Market scope:"), at("[market-scope] running:"))
+        self.assertLess(at("[market-scope] running:"), at("[activity] running:"))
+        self.assertLess(at("[cache-finalize] ok"), at("[market-scope] joining the sweep started beside collection"))
+        self.assertLess(at("[market-scope] joining the sweep started beside collection"), at("[market-scope] ok"))
         self.assertLess(at("[market-scope] ok"), at("── Step 0a"))
+        self.assertEqual(sum("── Market scope:" in line for line in lines), 1)
         self.assertEqual(self._bootstrap_ops().count("market-scope"), 1)
         scope = shlex.split(self._bootstrap_lines("market-scope")[0])
-        self.assertEqual(scope[scope.index("--out") + 1], str((out / "market_scope.json").relative_to(self.root)))
+        self.assertEqual(scope[scope.index("--out") + 1], scope_file)
         self.assertEqual(scope[scope.index("--recurrences") + 1], "15m")
-        lock = str((self.root / "data/eval-results/.rank_and_push.lock").resolve())
-        self.assertNotIn(lock, (self.root / "scope_fds").read_text().splitlines())
+        descriptors = (self.root / "scope_fds").read_text().splitlines()
+        for lock in ("data/eval-results/.rank_and_push.lock", "loop.lock"):
+            self.assertNotIn(str((self.root / lock).resolve()), descriptors, lock)
 
-    def test_fresh_lane_market_scope_failure_stops_at_the_join_before_export(self):
-        for code in ("75", "1"):
+    def test_fresh_lane_market_scope_status_maps_at_the_join(self):
+        for code in ("75", "1", "2"):
             with self.subTest(code=code):
                 self.tearDown(); self.setUp()
                 self._prepare_incremental_fixture(two_file=True)
                 result = self._run(exit_env={"STUB_EXIT_market_scope": code})
-                self.assertEqual(result.returncode, int(code), result.stdout + result.stderr)
-                ops = self._bootstrap_ops()
                 lines = result.stdout.splitlines()
-                started = next(i for i, line in enumerate(lines) if "[market-scope] running beside collection:" in line)
+                started = next(i for i, line in enumerate(lines) if "[market-scope] running:" in line)
                 self.assertLess(started, next(i for i, line in enumerate(lines) if "[activity] running:" in line))
+                ops = self._bootstrap_ops()
                 for stage in ("cache-populate-activity-v2", "cache-populate-payout-v2", "cache-finalize-v2"):
                     self.assertIn(stage, ops, "collection stopped before the join")
+                if code == "2":
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("[market-scope] WARN exit 2", result.stderr)
+                    self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", result.stdout)
+                    self.assertTrue(self._log("export.log"))
+                    continue
+                self.assertEqual(result.returncode, int(code), result.stdout + result.stderr)
                 self.assertIn("[market-scope] TEMPFAIL" if code == "75" else "[market-scope] FATAL", result.stderr)
                 for log in ("export.log", "rank.log", "rerank.log", "push.log"):
                     self.assertIsNone(self._log(log), log)
 
     def test_fresh_lane_refresh_failure_reaps_the_market_scope_child(self):
+        stages = {"activity": "cache_populate_activity_v2", "payout": "cache_populate_payout_v2",
+                  "cache-finalize": "cache_finalize_v2"}
+        for label, sub in stages.items():
+            with self.subTest(stage=label):
+                self.tearDown(); self.setUp()
+                self._prepare_incremental_fixture(two_file=True)
+                self._install_scope_probe()
+                result = self._run(exit_env={"STUB_SCOPE_MODE": "block", f"STUB_EXIT_{sub}": "1"})
+                self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+                self.assertIn(f"[{label}] FATAL exit 1", result.stderr)
+                self.assertTrue((self.root / "scope-handshake").is_file())
+                self.assertTrue((self.root / "scope_reaped").is_file())
+                pid = int((self.root / "scope_started").read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+                self.assertIsNone(self._log("export.log"))
+
+    def test_fresh_lane_refresh_failure_status_wins_over_a_failed_scope(self):
         self._prepare_incremental_fixture(two_file=True)
-        self._install_scope_probe()
-        result = self._run(exit_env={"STUB_SCOPE_MODE": "block", "STUB_EXIT_cache_populate_payout_v2": "1"})
+        result = self._run(exit_env={"STUB_EXIT_market_scope": "75", "STUB_EXIT_cache_populate_payout_v2": "1"})
         self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
         self.assertIn("[payout] FATAL exit 1", result.stderr)
-        self.assertTrue((self.root / "scope_reaped").is_file())
-        pid = int((self.root / "scope_started").read_text())
-        with self.assertRaises(ProcessLookupError):
-            os.kill(pid, 0)
-        self.assertIsNone(self._log("export.log"))
+        self.assertNotIn("[market-scope] TEMPFAIL", result.stderr)
 
     def test_fresh_lane_retry_acquires_a_new_scope_without_reading_the_old_one(self):
         self._prepare_incremental_fixture(two_file=True)
@@ -2732,10 +2791,11 @@ Path('scope_done').write_text('yes')
         out = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
         (out / "market_scope.json").write_text('{"stale": true}')
         self._install_scope_probe()
+        before = len(self._bootstrap_ops())
         resumed = self._run(exit_env={"STUB_SCOPE_MODE": "plain"})
         self.assertEqual(resumed.returncode, 2, resumed.stderr + resumed.stdout)
         self.assertEqual((out / "market_scope.json").read_text(), '{"probe": "scope"}')
-        self.assertEqual(self._bootstrap_ops().count("market-scope"), 2)
+        self.assertEqual(self._bootstrap_ops()[before:].count("market-scope"), 1)
 
     @staticmethod
     def _excluded_receipt(reason, **changes):

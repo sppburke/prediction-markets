@@ -405,10 +405,13 @@ SAMPLER_PID=""
 SCOPE_PID=""
 cleanup_rank_and_push() {
   local status=$?
-  local pid
+  local pid running
+  # Signal only children bash still lists as running: an exited child may already be reaped
+  # (its status kept for `wait`) and its PID reused by an unrelated process.
+  running=" $(jobs -rp | tr '\n' ' ') "
   for pid in "$CAPTURE_PID" "$SAMPLER_PID" "$SCOPE_PID"; do
     [[ -n "$pid" ]] || continue
-    kill "$pid" 2>/dev/null || true
+    [[ "$running" != *" $pid "* ]] || kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
   # The run's last capacity sample, once its children ended, closes its attempt (capacity_sampler.py summarize).
@@ -851,7 +854,8 @@ start_market_scope() {
   [[ "$SKIP_RANK" == "0" && -z "$SCOPE_PID" ]] || return 0
   market_scope_command
   rm -f -- "$MARKET_SCOPE_FILE"
-  echo "   [market-scope] running beside collection: ${MARKET_SCOPE_CMD[*]}"
+  echo "── Market scope: ${PE_RANK_MARKET_RECURRENCES:-15m} series markets from Gamma → $MARKET_SCOPE_FILE ──"
+  echo "   [market-scope] running: ${MARKET_SCOPE_CMD[*]}"
   "${MARKET_SCOPE_CMD[@]}" 8>&- 9>&- &
   SCOPE_PID=$!
 }
@@ -1112,13 +1116,14 @@ if [[ "$SKIP_RANK" == "0" ]]; then
   # Read the ranking scope after refresh, using the cycle's resolved bounds. The fresh lane
   # started the sweep beside collection, so it only joins it here.
   market_scope_command
-  echo "── Market scope: ${PE_RANK_MARKET_RECURRENCES:-15m} series markets from Gamma → $MARKET_SCOPE_FILE ──"
   if [[ -n "$SCOPE_PID" ]]; then
+    echo "   [market-scope] joining the sweep started beside collection"
     scope_status=0
     wait "$SCOPE_PID" || scope_status=$?
     SCOPE_PID=""
     refresh_stage_status "market-scope" "$scope_status"
   else
+    echo "── Market scope: ${PE_RANK_MARKET_RECURRENCES:-15m} series markets from Gamma → $MARKET_SCOPE_FILE ──"
     run_refresh_stage "market-scope" "${MARKET_SCOPE_CMD[@]}"
   fi
 fi
