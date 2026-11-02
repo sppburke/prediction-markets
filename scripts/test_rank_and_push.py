@@ -2304,7 +2304,7 @@ class RankAndPushScenario(unittest.TestCase):
             "            base = recorded['generation'] if recorded else None\n"
             "            end = now - int(os.environ.get('STUB_ACTIVITY_AGE_' + str(generation), '120'))\n"
             "            if base: end = max(end, recorded['fixed_end_unix'] + 1)\n"
-            "            recorded = {'version': 4, 'generation': generation, 'fixed_end_unix': end, 'wallets': ['0x'+'a'*40], 'base_generation': base, 'base_manifest_sha256': 'a'*64 if base else None, 'start_exclusive': recorded['fixed_end_unix'] if base else 0, 'full_read_wallets': [] if base else ['0x'+'a'*40]}\n"
+            "            recorded = {'version': int(os.environ.get('STUB_IDENTITY_VERSION_' + str(generation), '5')), 'generation': generation, 'fixed_end_unix': end, 'wallets': ['0x'+'a'*40], 'base_generation': base, 'base_manifest_sha256': 'a'*64 if base else None, 'start_exclusive': recorded['fixed_end_unix'] if base else 0, 'full_read_wallets': [] if base else ['0x'+'a'*40]}\n"
             "            recorded.update(deferred_wallets=[], repair_wallets=[], quiet_after_secs=2592000, repoll_period_secs=604800, certified_digest=hashlib.sha256(b'[]').hexdigest())\n"
             "            recorded['digest'] = hashlib.sha256(json.dumps(recorded, sort_keys=True, separators=(',', ':')).encode()).hexdigest()\n"
             "            c.execute('UPDATE cache_v2_migration_state SET fresh_collection_json = ?, ranker_projection_count = NULL, ranker_projection_digest = NULL, ranker_classifier_version = NULL', (json.dumps(recorded),))\n"
@@ -2338,7 +2338,8 @@ class RankAndPushScenario(unittest.TestCase):
             "    print(json.dumps({'generation': generation}))\n"
             "elif sub == 'cache-finalize-v2':\n"
             "    with sqlite3.connect(db) as c:\n"
-            "        generation = json.loads(c.execute('SELECT fresh_collection_json FROM cache_v2_migration_state').fetchone()[0])['generation']\n"
+            "        identity = json.loads(c.execute('SELECT fresh_collection_json FROM cache_v2_migration_state').fetchone()[0])\n"
+            "        generation = identity['generation']\n"
             "        rows = c.execute('SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?', (generation,)).fetchone()[0]\n"
             "        if c.execute('INSERT OR IGNORE INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count, group_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (generation, '[]', now, f'fresh-{generation}', 1, 'bb', 'cc', 1, rows)).rowcount:\n"
             "            c.execute('INSERT INTO activity_wallet_coverage_staging_v2 (generation, wallet_hex, aggregate_count) VALUES (?, ?, ?)', (generation, '0xabc', rows))\n"
@@ -2349,7 +2350,7 @@ class RankAndPushScenario(unittest.TestCase):
             "        columns = ['wallet_hex','generation','newest_source_unix','newest_trade_unix','aggregate_count','source_row_count','ordered_digest','scope_drops_json']\n"
             "        certs = [dict(zip(columns,row)) for row in c.execute('SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex')]\n"
             "        inputs = dict(activity_generation=generation, oracle_version=6, certificate_digest=hashlib.sha256(json.dumps(certs,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest())\n"
-            "        c.execute('UPDATE cache_v2_migration_state SET phase=?, ranker_projection_count = 1, ranker_projection_digest = ?, ranker_classifier_version = 6, ranker_projection_inputs_json=?', ('finalized',f'digest-{generation}',json.dumps(inputs)))\n"
+            "        c.execute('UPDATE cache_v2_migration_state SET phase=?, ranker_projection_count = 1, ranker_projection_digest = ?, ranker_classifier_version = ?, ranker_projection_inputs_json=?', ('finalized',f'digest-{generation}',7 if identity['version'] == 5 else 6,json.dumps(inputs)))\n"
             "    if opt('--stage-record'): json.dump({'cache_path': os.path.abspath(db), 'cache_sha256': sha(db)}, open(opt('--stage-record'), 'w'))\n"
             "elif sub == 'activate-next':\n"
             "    # Opt-in: commit the batch row as activate-next does (#788).\n"
@@ -2611,7 +2612,8 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
 
     @staticmethod
     def _excluded_receipt(reason, **changes):
-        proof = dict(version=3, disposition="excluded", exclusion_reason="acquisition_failure",
+        # The fake's default identity 5 collects acquisition 4; legacy identity-4 cases pass version=3.
+        proof = dict(version=4, disposition="excluded", exclusion_reason="acquisition_failure",
                      aggregation_status="not_attempted", start_exclusive=0, fixed_end_unix=100)
         proof.update(changes)
         return ["0x" + "a" * 40, reason, proof]
@@ -2699,22 +2701,34 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
                 self.assertEqual(resumed.returncode, 2, resumed.stdout + resumed.stderr)
                 self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
 
-    def test_unrepresentable_exclusions_are_listed_and_prepare_without_a_successor(self):
+    def test_unrepresentable_exclusions_are_listed_under_identity_four_and_held_under_identity_five(self):
         from rank_cycle_manifest import (UNREPRESENTABLE_PRICE, UNREPRESENTABLE_MAPPING,
                                          UNREPRESENTABLE_DECIMAL, ACTIVITY_RESPONSE_JSON)
         reasons = (UNREPRESENTABLE_PRICE + " 3.2: out of range", UNREPRESENTABLE_MAPPING,
                    ACTIVITY_RESPONSE_JSON + " row 1: 4.212e-7 " + UNREPRESENTABLE_DECIMAL)
         for proved in (False, True):
             for reason in reasons:
-                with self.subTest(proved=proved, reason=reason):
+                status = "complete" if proved else "not_attempted"
+                with self.subTest(proved=proved, reason=reason, identity=4):
+                    # #821: an identity-4 (acquisition-3) exclusion is named; identity 5 then re-reads it (#822).
                     self.tearDown(); self.setUp()
                     self._prepare_incremental_fixture(two_file=True)
-                    receipt = self._excluded_receipt(reason, aggregation_status="complete" if proved else "not_attempted")
-                    result = self._run(exit_env={"STUB_EXCLUSIONS_1": json.dumps([receipt])})
+                    receipt = self._excluded_receipt(reason, version=3, aggregation_status=status)
+                    result = self._run(exit_env={"STUB_IDENTITY_VERSION_1": "4", "STUB_EXCLUSIONS_1": json.dumps([receipt])})
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", result.stdout)
-                    self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), 1)
+                    lines = self._bootstrap_lines("cache-populate-activity-v2")
+                    self.assertEqual(len(lines), 2)
+                    self.assertIn("--fresh-generation 2", lines[1])
                     self.assertIn("[unrepresentable-row] 0x" + "a" * 40 + ": " + reason, result.stderr)
+                with self.subTest(proved=proved, reason=reason, identity=5):
+                    # Acquisition 4 keeps such rows as anomalies, so a remaining exclusion holds.
+                    self.tearDown(); self.setUp()
+                    self._prepare_incremental_fixture(two_file=True)
+                    receipt = self._excluded_receipt(reason, aggregation_status=status)
+                    result = self._run(exit_env={"STUB_EXCLUSIONS_1": json.dumps([receipt])})
+                    self._assert_candidate_held(result, "0x" + "a" * 40 + ": " + reason)
+                    self.assertNotIn("[unrepresentable-row]", result.stderr)
 
     def test_stale_initial_head_gets_one_top_up_then_prepares(self):
         fixed = self._prepare_incremental_fixture()
@@ -2732,6 +2746,27 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
         self.assertNotIn("--bulk-root", lines[1])
         self.assertEqual(fixed.read_bytes(), before)
         self.assertTrue((self.root / "data/eval-results/rank_and_push.pending").is_file())
+
+    def test_identity_four_head_admits_exactly_one_identity_five_successor(self):
+        # #822: a fresh identity-4 head, initial or top-up, gets one identity-5 successor and stops.
+        for versions, generations in (({"STUB_IDENTITY_VERSION_1": "4"}, 2),
+                                      ({"STUB_IDENTITY_VERSION_1": "4", "STUB_IDENTITY_VERSION_2": "4"}, 3)):
+            with self.subTest(versions=versions):
+                self.tearDown(); self.setUp()
+                fixed = self._prepare_incremental_fixture()
+                result = self._run(exit_env=versions)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", result.stdout)
+                lines = self._bootstrap_lines("cache-populate-activity-v2")
+                self.assertEqual(len(lines), generations)
+                for generation, line in enumerate(lines, 1):
+                    self.assertIn(f"--fresh-generation {generation}", line)
+                side = next(fixed.parent.glob("*.side.db"))
+                with sqlite3.connect(side) as c:
+                    raw, classifier = c.execute("SELECT fresh_collection_json, ranker_classifier_version "
+                                                "FROM cache_v2_migration_state").fetchone()
+                head = json.loads(raw)
+                self.assertEqual((head["generation"], head["version"], classifier), (generations, 5, 7))
 
     def test_interrupted_top_up_resumes_recorded_head_and_stale_top_up_never_gets_third(self):
         self._prepare_incremental_fixture()

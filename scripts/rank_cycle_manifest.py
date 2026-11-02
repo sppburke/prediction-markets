@@ -57,7 +57,7 @@ CERTIFICATE_COLUMNS = (
     "aggregate_count", "source_row_count", "ordered_digest", "scope_drops_json",
 )
 DROP_CAUSES = {"conversion", "order_dependent", "overflow", "underflow",
-               "unknown_condition", "unknown_type", "unmapped"}
+               "unknown_condition", "unknown_type", "unmapped", "unrepresentable"}
 
 
 def certificate_rows(connection: sqlite3.Connection):
@@ -124,7 +124,8 @@ def finalized_certificates(connection: sqlite3.Connection) -> dict | None:
         "FROM cache_v2_migration_state WHERE singleton = 1").fetchone()
     inputs = json.loads(inputs_raw) if inputs_raw is not None else {}
     generation = identity["generation"]
-    if (phase != "finalized" or classifier != 6 or type(inputs.get("oracle_version")) is not int
+    if (phase != "finalized" or (identity["version"], classifier) not in ((4, 6), (5, 7))
+            or type(inputs.get("oracle_version")) is not int
             or inputs["oracle_version"] != 6
             or inputs.get("activity_generation") != generation
             or _one(connection, "SELECT MAX(generation) FROM activity_coverage_manifests_v2") != generation):
@@ -529,11 +530,11 @@ def _fresh_identity(raw: str | None) -> dict | None:
     if type(version) is not int:
         raise ValueError("unsupported candidate activity identity version")
     expected = {"version", "generation", "fixed_end_unix", "wallets", "digest"}
-    if version in (2, 3, 4):
+    if version in (2, 3, 4, 5):
         expected |= {"base_generation", "base_manifest_sha256", "start_exclusive", "full_read_wallets"}
         if version >= 3:
             expected |= {"deferred_wallets", "quiet_after_secs", "repoll_period_secs"}
-        if version == 4:
+        if version in (4, 5):
             expected |= {"repair_wallets", "certified_digest"}
     elif version != 1:
         raise ValueError("unsupported candidate activity identity version")
@@ -547,7 +548,7 @@ def _fresh_identity(raw: str | None) -> dict | None:
         raise ValueError("invalid candidate generation")
     if type(identity["fixed_end_unix"]) is not int or identity["fixed_end_unix"] <= 0:
         raise ValueError("invalid candidate fixed end")
-    if version == 4:
+    if version in (4, 5):
         wallets = identity["wallets"]
         full = identity["full_read_wallets"]
         deferred = identity["deferred_wallets"]
@@ -593,7 +594,7 @@ def _bulk_root_eligible(side: sqlite3.Connection, schema: int, head: dict | None
     if generation != 1 or schema not in (2, -2):
         return False
     if schema == -2:
-        if head is None or head["version"] not in (2, 4) or head["generation"] != 1 or head["base_generation"] is not None:
+        if head is None or head["version"] not in (2, 4, 5) or head["generation"] != 1 or head["base_generation"] is not None:
             return False
     elif head is not None:
         # An ordinary collection, even an empty interrupted one, cannot convert.
@@ -749,14 +750,15 @@ def _candidate_obligations(side: sqlite3.Connection, head: dict | None, *, compl
                 continue
             kind = acquisition.get("exclusion_reason") if acquisition is not None else None
             text = reason or kind or "excluded activity receipt without a reason"
+            unrepresentable = (UNREPRESENTABLE_PRICE in text or UNREPRESENTABLE_MAPPING in text
+                               or (ACTIVITY_RESPONSE_JSON in text and UNREPRESENTABLE_DECIMAL in text))
             if wallet in ever_infra:
                 print(f"   [infra-excluded] {wallet}: {text}", file=sys.stderr)
-            elif (UNREPRESENTABLE_PRICE in text or UNREPRESENTABLE_MAPPING in text
-                    or (ACTIVITY_RESPONSE_JSON in text and UNREPRESENTABLE_DECIMAL in text)):
+            elif unrepresentable and (acquisition is None or acquisition.get("version", 3) <= 3):
                 print(f"   [unrepresentable-row] {wallet}: {text}", file=sys.stderr)
-            elif ACTIVITY_PAGE_PARSE_FAILURE in text or ACTIVITY_RESPONSE_JSON in text:
+            elif unrepresentable or ACTIVITY_PAGE_PARSE_FAILURE in text or ACTIVITY_RESPONSE_JSON in text:
                 holds.append(f"{wallet}: {text}")
-            elif (acquisition is not None and acquisition["version"] == 3
+            elif (acquisition is not None and acquisition["version"] in (3, 4)
                   and kind == "acquisition_failure" and acquisition["aggregation_status"] == "complete"):
                 successor = True
             elif kind == "dormant_deferred":
@@ -880,7 +882,10 @@ def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collect
                 # Only the initial head may take a reserve-only successor (rule 5).
                 if age > max_staleness_hours * 3600:
                     raise ValueError("activity top-up is stale; preserve the cycle and repair the held head")
-            elif head["version"] < 4 or age + TOP_UP_RESERVE_HOURS * 3600 > max_staleness_hours * 3600:
+                # A sealed identity-4 head still admits identity 5 before finalizing (#822).
+                if head["version"] == 4:
+                    generation += 1
+            elif head["version"] < 5 or age + TOP_UP_RESERVE_HOURS * 3600 > max_staleness_hours * 3600:
                 generation = initial + 1
         return targets(generation)
 

@@ -60,9 +60,18 @@ create table if not exists ranking_scope_drops (
   dropped_at_unix bigint not null,
   cause           text not null check (cause in (
     'conversion', 'order_dependent', 'overflow', 'underflow',
-    'unknown_condition', 'unknown_type', 'unmapped')),
+    'unknown_condition', 'unknown_type', 'unmapped', 'unrepresentable')),
   primary key (batch_id, wallet_hex, scope_kind, scope_id)
 );
+
+-- #822: extend existing installations as well as the fresh-table definition above.
+alter table ranking_scope_drops
+  drop constraint if exists ranking_scope_drops_cause_check;
+alter table ranking_scope_drops
+  add constraint ranking_scope_drops_cause_check
+  check (cause in (
+    'conversion', 'order_dependent', 'overflow', 'underflow',
+    'unknown_condition', 'unknown_type', 'unmapped', 'unrepresentable'));
 
 -- Spans outlive pruned batches; their endpoints intentionally have no batch FK.
 create table if not exists ranking_neg_risk_group_spans (

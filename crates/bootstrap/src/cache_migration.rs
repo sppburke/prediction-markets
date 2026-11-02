@@ -38,8 +38,9 @@ use pe_source_polymarket_public::{
 };
 use pe_source_polymarket_public::{
     ActivityReadError, CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION,
-    ClobCoverageManifest, ClobToken, ReconciliationFetcher, activity_window_end,
-    aggregate_activity_rows, fetch_activity_window_semantic, fetch_complete_activity_semantic,
+    ClobCoverageManifest, ClobToken, ReconciliationFetcher, activity_window_end_with_acceptance,
+    aggregate_activity_rows, fetch_activity_window_semantic_with_acceptance,
+    fetch_complete_activity_semantic,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
@@ -56,7 +57,7 @@ mod measurement;
 mod projection_digest;
 mod projection_v3;
 mod seed;
-pub use projection_v3::{ClassificationReport, ExportProjectionSummary};
+pub use projection_v3::{ClassificationReport, ExportProjectionSummary, UnresolvedAnomaly};
 pub use seed::{SeedPlan, SeededCacheReport, require_init_roles};
 #[cfg(target_os = "linux")]
 mod walk_prefetch;
@@ -80,7 +81,7 @@ use crate::reclamation_evidence::{
 const CACHE_BUILD_MANIFEST_VERSION: u32 = 1;
 const FROZEN_PAYLOAD_REFERENCE_VERSION: u32 = 1;
 const FINAL_STAGE_RECORD_VERSION: u32 = 2;
-const RANKER_CLASSIFIER_VERSION: u32 = 6;
+const RANKER_CLASSIFIER_VERSION: u32 = 7;
 const FRESH_COLLECTION_VERSION: u32 = 1;
 /// Wallet reads in flight during activity collection (`activity_collection_wallet_fetches`
 /// in `docs/_GLOSSARY.md`). Each wallet pages serially, so this width sets throughput
@@ -276,7 +277,8 @@ fn verify_history_write_guards(connection: &Connection) -> Result<(), BootstrapE
 
 // Checked once per stable proof, using the phase's authoritative commitment.
 fn verify_history_certificates(connection: &Connection) -> Result<(), BootstrapError> {
-    let Some(identity) = fresh_collection_record(connection)?.filter(|record| record.version == 4)
+    let Some(identity) =
+        fresh_collection_record(connection)?.filter(|record| record.history_format_three())
     else {
         return Ok(());
     };
@@ -505,8 +507,8 @@ impl RankerProjectionInputs {
         // projection digest, including markets that are not currently eligible.
         // Like the rebuild, read the whole payout table without a generation
         // filter. No activity rows are needed for this commitment.
-        let format_three =
-            fresh_collection_record(connection)?.is_some_and(|identity| identity.version == 4);
+        let format_three = fresh_collection_record(connection)?
+            .is_some_and(|identity| identity.history_format_three());
         let mut payout_evidence_digest = JsonArrayDigest::new();
         if format_three {
             let group_version: Option<i64> = connection.query_row(
@@ -630,7 +632,7 @@ impl Serialize for FreshCollectionIdentity {
             map.serialize_entry("quiet_after_secs", &self.quiet_after_secs)?;
             map.serialize_entry("repoll_period_secs", &self.repoll_period_secs)?;
         }
-        if self.version == 4 {
+        if self.history_format_three() {
             map.serialize_entry("repair_wallets", &self.repair_wallets)?;
             map.serialize_entry("certified_digest", &self.certified_digest)?;
         }
@@ -639,6 +641,35 @@ impl Serialize for FreshCollectionIdentity {
 }
 
 impl FreshCollectionIdentity {
+    fn history_format_three(&self) -> bool {
+        matches!(self.version, 4 | 5)
+    }
+
+    fn acquisition_version(&self) -> u32 {
+        match self.version {
+            5 => 4,
+            4 => 3,
+            _ => 2,
+        }
+    }
+
+    fn classifier_version(&self) -> Result<u32, BootstrapError> {
+        match self.version {
+            4 => Ok(6),
+            5 => Ok(RANKER_CLASSIFIER_VERSION),
+            _ => invalid("classifier requires history format three".to_owned()),
+        }
+    }
+
+    fn row_acceptance(&self) -> pe_source_polymarket_public::ActivityRowAcceptance {
+        use pe_source_polymarket_public::ActivityRowAcceptance;
+        match self.version {
+            5 => ActivityRowAcceptance::Acquisition4,
+            4 => ActivityRowAcceptance::Acquisition3,
+            _ => ActivityRowAcceptance::Strict,
+        }
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "the frozen identity binds each explicit collection input"
@@ -654,7 +685,7 @@ impl FreshCollectionIdentity {
         certified_digest: String,
     ) -> Result<Self, BootstrapError> {
         let mut record = Self {
-            version: 4,
+            version: 5,
             generation,
             fixed_end_unix,
             wallets,
@@ -681,7 +712,7 @@ impl FreshCollectionIdentity {
     }
 
     fn verified(self) -> Result<Self, BootstrapError> {
-        if !matches!(self.version, 1..=4) {
+        if !matches!(self.version, 1..=5) {
             return invalid(format!(
                 "fresh collection identity version {} is unsupported",
                 self.version
@@ -703,7 +734,7 @@ impl FreshCollectionIdentity {
         if self.version < 4 && (self.repair_wallets.is_some() || self.certified_digest.is_some()) {
             return invalid("older identity contains history-format-three fields".to_owned());
         }
-        if self.version == 4 {
+        if self.history_format_three() {
             let repairs = self
                 .repair_wallets
                 .as_ref()
@@ -792,7 +823,7 @@ impl FreshCollectionIdentity {
                     })
                     || self.quiet_after_secs.is_none_or(|value| value <= 0)
                     || self.repoll_period_secs.is_none_or(|value| value <= 0)
-                    || (self.version == 4
+                    || (self.history_format_three()
                         && (self.quiet_after_secs != Some(QUIET_AFTER_SECS)
                             || self.repoll_period_secs != Some(REPOLL_PERIOD_SECS)))
                 {
@@ -829,7 +860,7 @@ fn decode_fresh_identity(json: &str) -> Result<FreshCollectionIdentity, Bootstra
                 || !keys.contains_key("deferred_wallets")
                 || !keys.contains_key("quiet_after_secs")
                 || !keys.contains_key("repoll_period_secs")))
-        || (record.version == 4
+        || (record.history_format_three()
             && (keys.len() != 14
                 || !keys.contains_key("base_generation")
                 || !keys.contains_key("base_manifest_sha256")
@@ -1381,12 +1412,12 @@ fn require_bulk_root_state(
     connection: &Connection,
     identity: &FreshCollectionIdentity,
 ) -> Result<(), BootstrapError> {
-    if !matches!(identity.version, 2 | 4)
+    if !matches!(identity.version, 2 | 4 | 5)
         || identity.generation != 1
         || identity.base_generation.is_some()
     {
         return invalid(
-            "bulk root requires a version-two or version-four generation-one identity with no predecessor"
+            "bulk root requires a version-two, version-four or version-five generation-one identity with no predecessor"
                 .to_owned(),
         );
     }
@@ -1444,7 +1475,9 @@ fn begin_or_resume_fresh_collection(
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let _authorization = authorize_history_writes(&transaction)?;
     let recorded = fresh_collection_record(&transaction)?;
-    let format_three = recorded.as_ref().is_some_and(|record| record.version == 4);
+    let format_three = recorded
+        .as_ref()
+        .is_some_and(|record| record.history_format_three());
     let collection_proof = if format_three {
         CollectionProof::load(
             &transaction,
@@ -1465,7 +1498,7 @@ fn begin_or_resume_fresh_collection(
         if let Some(record) = &recorded {
             if version == CACHE_SCHEMA_VERSION_BULK_ROOT {
                 require_bulk_root_state(&transaction, record)?;
-            } else if !matches!(record.version, 2 | 4)
+            } else if !matches!(record.version, 2 | 4 | 5)
                 || record.generation != 1
                 || record.base_generation.is_some()
                 || stored_activity_manifest(&transaction, 1)?.is_none()
@@ -1944,6 +1977,7 @@ struct ActivityWalk<'a> {
     end: i64,
     deadline: Option<tokio::time::Instant>,
     held: HeldWalkRows,
+    row_acceptance: pe_source_polymarket_public::ActivityRowAcceptance,
 }
 
 impl ActivityWalk<'_> {
@@ -1954,12 +1988,13 @@ impl ActivityWalk<'_> {
 
     async fn read(&mut self, skip_probe: bool) -> Result<WalkRead, BootstrapError> {
         if !skip_probe {
-            match fetch_activity_window_semantic(
+            match fetch_activity_window_semantic_with_acceptance(
                 self.fetcher,
                 self.base_url,
                 self.wallet,
                 self.start,
                 self.end,
+                self.row_acceptance,
             )
             .await
             {
@@ -2003,24 +2038,26 @@ impl ActivityWalk<'_> {
                     let end = match top {
                         Some(end) => end,
                         None => {
-                            let end = activity_window_end(
+                            let end = activity_window_end_with_acceptance(
                                 self.fetcher,
                                 self.base_url,
                                 self.wallet,
                                 lo,
                                 self.end,
+                                self.row_acceptance,
                             )
                             .await?;
                             top = Some(end);
                             end
                         }
                     };
-                    fetch_activity_window_semantic(
+                    fetch_activity_window_semantic_with_acceptance(
                         self.fetcher,
                         self.base_url,
                         self.wallet,
                         lo,
                         end,
+                        self.row_acceptance,
                     )
                     .await
                 }
@@ -2054,9 +2091,10 @@ impl ActivityWalk<'_> {
                     }
                 }
             };
-            self.held.keep(window.rows.len())?;
+            self.held.keep(window.rows.len() + window.anomalies.len())?;
             read.fixed_end = window.fixed_end;
             read.rows.extend(window.rows);
+            read.anomalies.extend(window.anomalies);
             read.pages.extend(window.pages);
             if read.fixed_end == self.end {
                 break;
@@ -2101,7 +2139,7 @@ async fn collect_activity_v2(
     )? {
         if proof
             .as_ref()
-            .is_some_and(|proof| proof.identity.version == 4)
+            .is_some_and(|proof| proof.identity.history_format_three())
         {
             log_collection_run(
                 generation,
@@ -2153,20 +2191,20 @@ async fn collect_activity_v2(
             WalletAddress::from_hex(&wallet_hex).map_err(|error| BootstrapError::Invalid {
                 message: format!("frozen universe contains invalid wallet {wallet_hex}: {error}"),
             })?;
-        // A venue payload this parser cannot represent (observed: a TRADE row
-        // priced 3.1968021978, outside the unit interval) excludes the wallet
-        // like an unaggregatable history: no page evidence survives, so record
-        // the reason and an explicit failed acquisition without claiming a read.
+        // Non-salvageable payload defects retain whole-page failure semantics.
+        // Identity 5 salvages the supported representation failures as page
+        // evidence; earlier identities retain their recorded acceptance.
         let start_exclusive =
             proof_ref.map_or(history_start_exclusive, |proof| Some(proof.start(&wallet_hex)));
-        // One deadline starts when this wallet is first polled. Identity 4
+        // One deadline starts when this wallet is first polled. Format 3
         // checks it between proved windows and before outer retries; legacy
         // reads retain their timed whole-history acquisition (#681, #747).
         let deadline = wallet_budget.map(|budget| tokio::time::Instant::now() + budget);
-        let (complete, _held_walk_rows, stopped) = if let Some(proof) = proof_ref.filter(|proof| proof.identity.version == 4) {
+        let (complete, _held_walk_rows, stopped) = if let Some(proof) = proof_ref.filter(|proof| proof.identity.history_format_three()) {
             let mut walk = ActivityWalk {
                 fetcher, base_url, wallet, wallet_hex: &wallet_hex,
                 start: proof.start(&wallet_hex), end: fixed_end_unix, deadline,
+                row_acceptance: proof.identity.row_acceptance(),
                 held: HeldWalkRows { count: Arc::clone(held_rows), rows: 0 },
             };
             match walk.read(proof.skip_probe(&wallet_hex)).await? {
@@ -2247,7 +2285,7 @@ async fn collect_activity_v2(
             tracing::warn!(wallet = %wallet_hex, generation, %reason, acquired_end = complete.fixed_end, "activity wallet acquisition stopped with proved windows");
         }
         let mut exclusion_reason = stopped;
-        let fetched_source_row_count = u64::try_from(complete.rows.len()).map_err(|_| BootstrapError::Internal)?;
+        let fetched_source_row_count = u64::try_from(complete.rows.len() + complete.anomalies.len()).map_err(|_| BootstrapError::Internal)?;
         // The rows are needed only to aggregate: free them before the aggregate
         // sort, since a wallet can hold millions of rows (#588).
         let aggregated = aggregate_activity_rows(&complete.rows).map_err(ActivityReadError::from);
@@ -2404,7 +2442,7 @@ async fn collect_activity_v2(
     let (mut connection, counts, writer_completed) = joined;
     if proof
         .as_ref()
-        .is_some_and(|proof| proof.identity.version == 4)
+        .is_some_and(|proof| proof.identity.history_format_three())
     {
         log_collection_run(
             generation,
@@ -2550,6 +2588,20 @@ pub fn commit_activity_batch_for_test(
     let source_row_count = aggregates.iter().try_fold(0, |count, aggregate| {
         checked_activity_count(count, aggregate.row_count)
     })?;
+    let source_row_count =
+        if proof.identity.version == 5 && pages.iter().any(|page| !page.anomalies.is_empty()) {
+            checked_activity_count(
+                source_row_count,
+                incremental::count_terminal_anomalies(
+                    &wallet_hex,
+                    &pages,
+                    proof.start(&wallet_hex),
+                    proof.identity.fixed_end_unix,
+                )?,
+            )?
+        } else {
+            source_row_count
+        };
     let completion = WalletActivityCompletion {
         wallet_hex,
         acquired_end: proof.identity.fixed_end_unix,
@@ -2873,7 +2925,7 @@ impl ActivityWalletReceiptProof {
 
     fn partial(&self) -> bool {
         self.acquisition.as_ref().is_some_and(|acquisition| {
-            acquisition.version == 3
+            matches!(acquisition.version, 3 | 4)
                 && acquisition.disposition == ActivityDisposition::Excluded
                 && acquisition.exclusion_reason == Some(ActivityExclusionReason::AcquisitionFailure)
                 && acquisition.aggregation_status == AggregationStatus::Complete
@@ -2882,7 +2934,7 @@ impl ActivityWalletReceiptProof {
 
     fn continuation(&self) -> Option<(ActivityReadMode, i64)> {
         let acquisition = self.acquisition.as_ref()?;
-        if acquisition.version != 3
+        if !matches!(acquisition.version, 3 | 4)
             || acquisition.disposition != ActivityDisposition::Excluded
             || acquisition.exclusion_reason != Some(ActivityExclusionReason::AcquisitionFailure)
         {
@@ -3015,7 +3067,7 @@ impl ActivityValidation {
         if receipt
             .acquisition
             .as_ref()
-            .is_some_and(|acquisition| acquisition.version == 3)
+            .is_some_and(|acquisition| matches!(acquisition.version, 3 | 4))
         {
             return self.record_fetched(receipt);
         }
@@ -3465,7 +3517,7 @@ fn visit_activity_receipts(
             row,
             reference_sha256,
             fixed_end_unix,
-            if proof.is_some() { 2 } else { 1 },
+            proof.map_or(1, |proof| proof.identity.version),
         )?;
         if expected.binary_search(&receipt.wallet_hex).is_err() {
             return invalid(format!(
@@ -3538,7 +3590,7 @@ fn validate_activity_staging_with(
     {
         return invalid("activity coverage is missing frozen wallets".to_owned());
     }
-    if proof.is_none_or(|proof| proof.identity.version != 4) {
+    if proof.is_none_or(|proof| !proof.identity.history_format_three()) {
         check_generation_rows(
             connection,
             generation_i64,
@@ -3891,7 +3943,8 @@ pub fn verify_frozen_payload_v1(
     let reference_sha256 = sha256_bytes(&reference_bytes);
     let connection = open_existing_rw(cache_path)?;
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
-    if fresh_collection_record(&connection)?.is_some_and(|identity| identity.version == 4) {
+    if fresh_collection_record(&connection)?.is_some_and(|identity| identity.history_format_three())
+    {
         return invalid("legacy frozen verification refuses history format three".to_owned());
     }
     let cutoff = reference
@@ -4329,7 +4382,8 @@ pub fn finalize_cache_v2_with_export_manifest(
 ) -> Result<Option<CacheFinalStageRecord>, BootstrapError> {
     let (mut connection, sealed_generation, payout_generation) =
         projection_v3::open_finalize(cache_path)?;
-    if fresh_collection_record(&connection)?.is_some_and(|identity| identity.version == 4) {
+    if fresh_collection_record(&connection)?.is_some_and(|identity| identity.history_format_three())
+    {
         return projection_v3::finalize(
             connection,
             cache_path,
@@ -5639,8 +5693,8 @@ fn restore_final_stage_proof(
     final_stage_record: Option<&Path>,
 ) -> Result<Option<CacheFinalStageRecord>, BootstrapError> {
     let candidate = open_immutable(candidate_path)?;
-    let format_three =
-        fresh_collection_record(&candidate)?.is_some_and(|identity| identity.version == 4);
+    let format_three = fresh_collection_record(&candidate)?
+        .is_some_and(|identity| identity.history_format_three());
     candidate.close().map_err(|(_, error)| error)?;
     if format_three {
         return final_stage_proof(final_stage_record, request)?
@@ -6173,7 +6227,8 @@ fn verify_finalized_v2_manifests(
     if required_max(connection, "sealed_generation_manifests", "generation")? != 1 {
         return invalid("installed cache has an invalid sealed generation".to_owned());
     }
-    if fresh_collection_record(connection)?.is_some_and(|identity| identity.version == 4) {
+    if fresh_collection_record(connection)?.is_some_and(|identity| identity.history_format_three())
+    {
         // Candidate bytes are export-bound; outgoing bytes are H0-bound by the caller.
         // Neither path needs the retired spool, backup, or history rows.
         let payout = required_max(
@@ -7307,7 +7362,7 @@ mod relock_tests {
 mod quiet_identity_tests {
     use super::*;
 
-    // PASS: versions 1–4 round-trip with authentic digests and invalid deferral
+    // PASS: versions 1–5 round-trip with authentic digests and invalid deferral
     // shapes are rejected; FAIL: an invalid list, constant or root is accepted.
     #[test]
     fn fresh_identity_versions_and_deferral_contract() {
@@ -7347,7 +7402,7 @@ mod quiet_identity_tests {
             schema_version: 2,
             parser_version: 2,
         };
-        let v4 = FreshCollectionIdentity::new(
+        let v5 = FreshCollectionIdentity::new(
             2,
             200,
             wallets.clone(),
@@ -7358,6 +7413,20 @@ mod quiet_identity_tests {
             aggregate_digest(&[]).unwrap(),
         )
         .unwrap();
+        assert_eq!(v5.version, 5);
+        assert_eq!(v5.acquisition_version(), 4);
+        assert_eq!(v5.classifier_version().unwrap(), 7);
+        let mut v4 = v5.clone();
+        v4.version = 4;
+        let mut value = serde_json::to_value(&v4).unwrap();
+        value.as_object_mut().unwrap().remove("digest");
+        v4.digest = sha256_bytes(canonical_json(&value).unwrap().as_bytes());
+        assert_eq!(
+            decode_fresh_identity(&canonical_json(&v4).unwrap()).unwrap(),
+            v4
+        );
+        assert_eq!(v4.acquisition_version(), 3);
+        assert_eq!(v4.classifier_version().unwrap(), 6);
         let mut v3 = v4.clone();
         v3.version = 3;
         v3.repair_wallets = None;

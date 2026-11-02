@@ -3,8 +3,9 @@
 use super::*;
 use pe_copy_signal_engine::PositionState;
 use pe_position_ledger::{
-    DropCause, MarketLookup, Scope, ScopeKind, ScopeLookups, SecondRecord,
-    classify_scoped_historical_second,
+    ACTIVITY_ROW_ANOMALY_NAMESPACE, DropCause, MarketLookup, Scope, ScopeKind, ScopeLookups,
+    SecondRecord, activity_row_anomaly_trigger, classify_scoped_historical_second,
+    classify_scoped_historical_second_with_anomalies,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +68,49 @@ pub struct ClassificationReport {
     pub ignored_by_activity_type: BTreeMap<String, u64>,
     pub drops_by_cause: BTreeMap<String, u64>,
     pub neg_risk_markets_without_group_id: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_anomalies: Vec<UnresolvedAnomaly>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnresolvedAnomaly {
+    pub wallet_hex: String,
+    pub source_time_unix: i64,
+    pub kind: pe_source_polymarket_public::ActivityRowAnomalyKind,
+    pub field: String,
+    pub condition_id: Option<pe_core_types::PolymarketConditionId>,
+    pub asset: Option<pe_core_types::PolymarketTokenId>,
+    pub raw_row_hash: String,
+}
+
+/// Merge sorted aggregate and anomaly streams without fabricating ledger rows.
+/// Callers pass complete seconds, including the tail at a chunk boundary.
+pub(super) fn historical_seconds<'a>(
+    mut aggregates: &'a [ActivityAggregate],
+    mut anomalies: &'a [pe_source_polymarket_public::ActivityRowAnomaly],
+) -> impl Iterator<
+    Item = (
+        i64,
+        &'a [ActivityAggregate],
+        &'a [pe_source_polymarket_public::ActivityRowAnomaly],
+    ),
+> {
+    std::iter::from_fn(move || {
+        let at = aggregates
+            .first()
+            .map(|a| a.source_time.0.unix_timestamp())
+            .into_iter()
+            .chain(anomalies.first().map(|a| a.source_time.0.unix_timestamp()))
+            .min()?;
+        let n = aggregates.partition_point(|a| a.source_time.0.unix_timestamp() == at);
+        let m = anomalies.partition_point(|a| a.source_time.0.unix_timestamp() == at);
+        let (second, rest) = aggregates.split_at(n);
+        let (problems, remaining) = anomalies.split_at(m);
+        aggregates = rest;
+        anomalies = remaining;
+        Some((at, second, problems))
+    })
 }
 
 const PROJECTION_CHUNK_AGGREGATES: usize = 100_000;
@@ -150,6 +194,7 @@ pub(super) struct ClassifiedWallet {
     pub(super) rows: Vec<Value>,
     ignored: BTreeMap<String, u64>,
     causes: BTreeMap<String, u64>,
+    pub(super) unresolved_anomalies: Vec<UnresolvedAnomaly>,
 }
 
 struct WalletClassifier {
@@ -161,6 +206,9 @@ struct WalletClassifier {
     history: HashSet<String>,
     ignored: BTreeMap<String, u64>,
     quality: ReconstructionQuality,
+    classifier_version: u32,
+    anomalies: std::collections::VecDeque<pe_source_polymarket_public::ActivityRowAnomaly>,
+    unresolved_anomalies: Vec<UnresolvedAnomaly>,
 }
 
 impl WalletClassifier {
@@ -168,6 +216,8 @@ impl WalletClassifier {
         wallet_hex: &str,
         generation: u64,
         scope_drops_json: &str,
+        classifier_version: u32,
+        anomalies: Vec<pe_source_polymarket_public::ActivityRowAnomaly>,
     ) -> Result<Self, BootstrapError> {
         let wallet =
             WalletAddress::from_hex(wallet_hex).map_err(|error| BootstrapError::Invalid {
@@ -189,6 +239,9 @@ impl WalletClassifier {
             history: HashSet::new(),
             ignored: BTreeMap::new(),
             quality,
+            classifier_version,
+            anomalies: anomalies.into(),
+            unresolved_anomalies: Vec::new(),
         })
     }
 
@@ -196,10 +249,19 @@ impl WalletClassifier {
         &mut self,
         aggregates: &[ActivityAggregate],
         payout: &BoundPayouts,
+        last: bool,
     ) -> Result<Vec<Value>, BootstrapError> {
         let mut rows = Vec::new();
-        for aggregates in aggregates.chunk_by(|a, b| a.source_time == b.source_time) {
-            let second = aggregates[0].source_time.0.unix_timestamp();
+        let end = aggregates.last().map(|a| a.source_time.0.unix_timestamp());
+        let mut anomalies = Vec::new();
+        while self
+            .anomalies
+            .front()
+            .is_some_and(|a| last || end.is_some_and(|end| a.source_time.0.unix_timestamp() <= end))
+        {
+            anomalies.push(self.anomalies.pop_front().ok_or(BootstrapError::Internal)?);
+        }
+        for (second, aggregates, anomalies) in historical_seconds(aggregates, &anomalies) {
             let dropped = self
                 .drops
                 .iter()
@@ -229,16 +291,31 @@ impl WalletClassifier {
                     .filter_map(|key| self.positions.get(key).map(|state| (key.clone(), *state)))
                     .collect(),
             );
-            let classified = classify_scoped_historical_second(
-                &ledger,
-                self.wallet,
-                &records,
-                &dropped,
-                certified_problem_second,
-                self.quality,
-                &|market: &MarketId| self.history.contains(&market.to_string()),
-                payout,
-            )
+            let classified = if self.classifier_version == 7 {
+                classify_scoped_historical_second_with_anomalies(
+                    &ledger,
+                    self.wallet,
+                    second,
+                    &records,
+                    anomalies,
+                    &dropped,
+                    certified_problem_second,
+                    self.quality,
+                    &|market: &MarketId| self.history.contains(&market.to_string()),
+                    payout,
+                )
+            } else {
+                classify_scoped_historical_second(
+                    &ledger,
+                    self.wallet,
+                    &records,
+                    &dropped,
+                    certified_problem_second,
+                    self.quality,
+                    &|market: &MarketId| self.history.contains(&market.to_string()),
+                    payout,
+                )
+            }
             .map_err(|error| BootstrapError::Invalid {
                 message: format!(
                     "scoped classifier failed for {} at {second}: {error}",
@@ -261,7 +338,22 @@ impl WalletClassifier {
                     self.drops.insert(problem.scope, drop);
                 }
             }
-            for (_, activity_type) in classified.ignored {
+            for (id, activity_type) in classified.ignored {
+                if id.0.starts_with(ACTIVITY_ROW_ANOMALY_NAMESPACE) {
+                    let anomaly = anomalies
+                        .iter()
+                        .find(|a| activity_row_anomaly_trigger(a) == id)
+                        .ok_or(BootstrapError::Internal)?;
+                    self.unresolved_anomalies.push(UnresolvedAnomaly {
+                        wallet_hex: self.wallet_hex.clone(),
+                        source_time_unix: second,
+                        kind: anomaly.kind,
+                        field: anomaly.field.clone(),
+                        condition_id: anomaly.condition_id.clone(),
+                        asset: anomaly.asset.clone(),
+                        raw_row_hash: anomaly.raw_row_hash.clone(),
+                    });
+                }
                 let count = self
                     .ignored
                     .entry(activity_type.as_str().to_owned())
@@ -290,7 +382,7 @@ impl WalletClassifier {
                     .ok_or(BootstrapError::Internal)?;
                 rows.push(serde_json::json!({
                 "activity_generation": self.generation, "asset": components.asset.as_ref().map(ToString::to_string),
-                "classifier_version": RANKER_CLASSIFIER_VERSION, "condition_id": decision.market_id.to_string(),
+                "classifier_version": self.classifier_version, "condition_id": decision.market_id.to_string(),
                 "end_date_unix": end, "outcome_id": decision.outcome_id.0, "payout_vector_json": vector,
                 "price_weighted_share_amount_str": aggregate.price_weighted_share_sum.0.to_string(),
                 "share_amount_str": aggregate.share_sum.to_decimal().to_string(), "side": "buy",
@@ -355,6 +447,7 @@ impl WalletClassifier {
             rows: Vec::new(),
             ignored: self.ignored,
             causes,
+            unresolved_anomalies: self.unresolved_anomalies,
         })
     }
 }
@@ -364,13 +457,17 @@ pub(super) fn classify_loaded_wallet(
     certificate: incremental::HistoryCertificate,
     aggregates: &[ActivityAggregate],
     payout: &BoundPayouts,
+    classifier_version: u32,
+    anomalies: Vec<pe_source_polymarket_public::ActivityRowAnomaly>,
 ) -> Result<ClassifiedWallet, BootstrapError> {
     let mut classifier = WalletClassifier::new(
         &certificate.wallet_hex,
         certificate.generation,
         &certificate.scope_drops_json,
+        classifier_version,
+        anomalies,
     )?;
-    let rows = classifier.seconds(aggregates, payout)?;
+    let rows = classifier.seconds(aggregates, payout, true)?;
     let mut classified = classifier.finish(certificate)?;
     classified.rows = rows;
     Ok(classified)
@@ -496,7 +593,7 @@ pub(super) fn rebuild_ranker_projection(
                         let rows = classifier
                             .as_mut()
                             .ok_or(BootstrapError::Internal)?
-                            .seconds(&input.aggregates, &payout)?;
+                            .seconds(&input.aggregates, &payout, input.certificate.is_some())?;
                         match input.certificate {
                             Some(certificate) => {
                                 let mut classified = classifier
@@ -546,6 +643,9 @@ pub(super) fn rebuild_ranker_projection(
                 let total = report.drops_by_cause.entry(cause).or_insert(0);
                 *total = checked_activity_count(*total, added)?;
             }
+            report
+                .unresolved_anomalies
+                .extend(classified.unresolved_anomalies);
             classified.certificate.write(transaction)?;
             if carried {
                 seed::consume_seed_drops(transaction, &classified.certificate.wallet_hex)?;
@@ -578,8 +678,17 @@ pub(super) fn rebuild_ranker_projection(
                     Some(old) => old.scope_drops_json,
                     None => seed::seed_drops(transaction, wallet)?,
                 };
-                let mut classifier =
-                    Some(WalletClassifier::new(wallet, identity.generation, &drops)?);
+                let mut classifier = Some(WalletClassifier::new(
+                    wallet,
+                    identity.generation,
+                    &drops,
+                    identity.classifier_version()?,
+                    if identity.version == 5 {
+                        proof.effective_anomalies(transaction, wallet, identity.generation)?
+                    } else {
+                        Vec::new()
+                    },
+                )?);
                 let chain = incremental::HistoryChain::load(
                     transaction,
                     wallet,
@@ -661,7 +770,9 @@ pub(super) fn read_export_manifest(
     let expected = ExportProjectionSummary {
         count,
         digest: digest.to_owned(),
-        classifier_version: RANKER_CLASSIFIER_VERSION,
+        classifier_version: fresh_collection_record(connection)?
+            .ok_or(BootstrapError::Internal)?
+            .classifier_version()?,
         oracle_version: 6,
         activity_generation: inputs.activity_generation,
         spool_sha256: spool.sha256.clone(),
@@ -712,7 +823,7 @@ pub(super) fn verify_recorded_state(
     )?;
     let inputs = recorded_inputs(connection)?;
     let identity = fresh_collection_record(connection)?.ok_or(BootstrapError::Internal)?;
-    if identity.version != 4
+    if !identity.history_format_three()
         || inputs.activity_generation != identity.generation
         || inputs.payout_generation
             != to_u64(
@@ -726,13 +837,14 @@ pub(super) fn verify_recorded_state(
     {
         return invalid("finalized projection generations differ from recorded head".to_owned());
     }
+    let classifier_version = identity.classifier_version()?;
     let count = to_u64(count.ok_or(BootstrapError::Internal)?, "projection count")?;
     let digest = digest.ok_or(BootstrapError::Internal)?;
     validate_hex_sha256(&digest, "projection digest")?;
     let spool = inputs.projection_spool.ok_or(BootstrapError::Internal)?;
     validate_hex_sha256(&spool.sha256, "projection spool sha256")?;
     if phase != "finalized"
-        || classifier != Some(i64::from(RANKER_CLASSIFIER_VERSION))
+        || classifier != Some(i64::from(classifier_version))
         || inputs.oracle_version != Some(6)
         || spool.lines != count
     {
@@ -750,7 +862,7 @@ pub(super) fn verify_recorded_state(
         let expected = ExportProjectionSummary {
             count,
             digest,
-            classifier_version: RANKER_CLASSIFIER_VERSION,
+            classifier_version,
             oracle_version: 6,
             activity_generation: inputs.activity_generation,
             spool_sha256: spool.sha256,
@@ -760,7 +872,7 @@ pub(super) fn verify_recorded_state(
             || record.ranker_projection_count != count
             || record.ranker_projection_digest != expected.digest
             || record.activity_coverage_generation != inputs.activity_generation
-            || record.ranker_classifier_version != RANKER_CLASSIFIER_VERSION
+            || record.ranker_classifier_version != classifier_version
         {
             return invalid(
                 "final-stage record export summary differs from finalized state".to_owned(),
@@ -868,6 +980,7 @@ fn finalize_with_chunk(
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let authorization = authorize_history_writes(&transaction)?;
     let identity = fresh_collection_record(&transaction)?.ok_or(BootstrapError::Internal)?;
+    let classifier_version = identity.classifier_version()?;
     let proof = CollectionProof::load(&transaction, identity.generation)?
         .ok_or(BootstrapError::Internal)?;
     let manifest = completed_activity_manifest(
@@ -905,7 +1018,7 @@ fn finalize_with_chunk(
             "SELECT ranker_projection_count, ranker_projection_digest, ranker_classifier_version FROM cache_v2_migration_state WHERE singleton = 1", [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        if classifier != i64::from(RANKER_CLASSIFIER_VERSION) {
+        if classifier != i64::from(classifier_version) {
             return invalid("format-three finalized classifier is not current".to_owned());
         }
         let count = to_u64(count, "ranker projection count")?;
@@ -937,8 +1050,8 @@ fn finalize_with_chunk(
         transaction.execute("UPDATE cache_v2_migration_state SET phase = 'finalized', ranker_projection_count = ?1,
             ranker_projection_digest = ?2, ranker_classifier_version = ?3, ranker_projection_inputs_json = ?4,
             updated_at_unix = ?5 WHERE singleton = 1",
-            params![to_i64(count, "ranker projection count")?, digest, i64::from(RANKER_CLASSIFIER_VERSION), canonical_json(&inputs)?, finalized_at_unix])?;
-        tracing::info!(report = %canonical_json(&report)?, count, "classifier 6 verified pass finalized");
+            params![to_i64(count, "ranker projection count")?, digest, i64::from(classifier_version), canonical_json(&inputs)?, finalized_at_unix])?;
+        tracing::info!(report = %canonical_json(&report)?, count, classifier_version, "scoped classifier verified pass finalized");
         (count, digest, Some(report))
     };
     let started = Instant::now();
@@ -978,7 +1091,7 @@ fn finalize_with_chunk(
         payout_coverage_generation: to_u64(payout_generation, "payout generation")?,
         ranker_projection_count: count,
         ranker_projection_digest: digest,
-        ranker_classifier_version: RANKER_CLASSIFIER_VERSION,
+        ranker_classifier_version: classifier_version,
         export_manifest_sha256: Some(export_sha256),
         export_projection: Some(export_projection),
         classification_report: report.clone(),
@@ -1073,9 +1186,9 @@ mod tests {
                 (None, Some(1_900_000_000), Some("[\"1\",\"0\"]".to_owned())),
             );
         }
-        let mut classifier = WalletClassifier::new(&wallet, 1, "[]").unwrap();
+        let mut classifier = WalletClassifier::new(&wallet, 1, "[]", 6, Vec::new()).unwrap();
         for chunk in [&aggregates[..2], &aggregates[2..3], &aggregates[3..]] {
-            let rows = classifier.seconds(chunk, &payout).unwrap();
+            let rows = classifier.seconds(chunk, &payout, false).unwrap();
             assert_eq!(rows.len(), chunk.len());
             for (row, aggregate) in rows.iter().zip(chunk) {
                 assert_eq!(row["source_trade_id"], aggregate.group_id.key().0);

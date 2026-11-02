@@ -260,7 +260,11 @@ impl Carried {
     /// wallet cannot be activated.
     fn read(path: &Path, seeds: &BTreeSet<String>) -> Result<Self, BootstrapError> {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        if fresh_collection_record(&connection)?.is_none_or(|record| record.version != 4) {
+        let identity = fresh_collection_record(&connection)?;
+        if identity
+            .as_ref()
+            .is_none_or(|record| !record.history_format_three())
+        {
             return invalid("cumulative drops come only from a format-three cache".to_owned());
         }
         // A finalized cache's commitment is its finalize inputs' certificate digest, which the
@@ -276,6 +280,22 @@ impl Carried {
             ));
         }
         verify_history_certificates(&connection)?;
+        let classifier: Option<i64> = connection.query_row(
+            "SELECT ranker_classifier_version FROM cache_v2_migration_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if classifier
+            != Some(i64::from(
+                identity
+                    .ok_or(BootstrapError::Internal)?
+                    .classifier_version()?,
+            ))
+        {
+            return invalid(
+                "cumulative drops classifier differs from recorded identity".to_owned(),
+            );
+        }
         let mut drops = BTreeMap::new();
         let mut queries = vec![
             "SELECT wallet_hex, scope_drops_json FROM activity_wallet_history_v3
