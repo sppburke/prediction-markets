@@ -11,11 +11,12 @@ import tempfile
 import unittest
 
 from rank_cycle_manifest import (CERTIFICATE_COLUMNS, TOP_UP_RESERVE_HOURS, _fresh_identity,
-                                 activation_batch_recorded, candidate_targets, research_coverage, uncovered_drops)
+                                 activation_batch_recorded, candidate_targets, decode_scope_drops,
+                                 finalized_certificates, research_coverage, uncovered_drops)
 import test_rank_and_push as wrapper_tests
 
 
-def identity(generation=1, base=None, version=4):
+def identity(generation=1, base=None, version=5):
     value = dict(version=version, generation=generation, fixed_end_unix=100,
                  wallets=["0x" + "1" * 40])
     if version >= 2:
@@ -25,7 +26,7 @@ def identity(generation=1, base=None, version=4):
         value.update(deferred_wallets=value["wallets"] if base else [],
                      full_read_wallets=[] if base else value["wallets"],
                      quiet_after_secs=2_592_000, repoll_period_secs=604_800)
-    if version == 4:
+    if version in (4, 5):
         value.update(repair_wallets=[], certified_digest=hashlib.sha256(b"[]").hexdigest())
     value["digest"] = hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return json.dumps(value)
@@ -47,7 +48,7 @@ class CandidateTargetsTest(unittest.TestCase):
         return candidate_targets(self.prior, self.side, include_bulk_root=True, **kwargs)
 
     def test_version_four_identity_and_old_reader_refusal(self):
-        raw = identity()
+        raw = identity(version=4)
         decoded = _fresh_identity(raw)
         self.assertEqual(decoded["version"], 4)
         self.assertEqual(decoded["repair_wallets"], [])
@@ -78,6 +79,59 @@ class CandidateTargetsTest(unittest.TestCase):
             c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) "
                       "VALUES (1, ?, ?)", (json.loads(root)["digest"], root))
         self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24), (2, 1, 0, 0, 0))
+
+    def test_version_five_identity_keeps_version_four_shape_and_validation(self):
+        for base in (None, 1):
+            raw = identity(2, base, version=5)
+            decoded = _fresh_identity(raw)
+            self.assertEqual(decoded, json.loads(raw))
+            self.assertEqual(set(decoded), set(json.loads(identity(2, base, version=4))))
+        valid = json.loads(identity(version=5))
+        for key in valid:
+            with self.subTest(missing=key):
+                with self.assertRaisesRegex(ValueError, "malformed candidate activity identity|unsupported"):
+                    _fresh_identity(json.dumps({k: v for k, v in valid.items() if k != key}))
+        for key, value in (("unexpected", True), ("version", 6), ("generation", 2**63),
+                           ("wallets", ["0xABC"]), ("repair_wallets", ["0x" + "2" * 40]),
+                           ("deferred_wallets", valid["wallets"]), ("certified_digest", "A" * 64),
+                           ("quiet_after_secs", 1), ("repoll_period_secs", 1),
+                           ("base_manifest_sha256", "a" * 64), ("start_exclusive", 1)):
+            with self.subTest(key=key):
+                malformed = {**valid, key: value}
+                content = {k: v for k, v in malformed.items() if k != "digest"}
+                malformed["digest"] = hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                with self.assertRaises(ValueError):
+                    _fresh_identity(json.dumps(malformed))
+        with self.assertRaisesRegex(ValueError, "identity digest mismatch"):
+            _fresh_identity(json.dumps({**valid, "digest": "0" * 64}))
+
+    def test_format_three_certificates_bind_identity_classifier_and_oracle(self):
+        from test_ranker_duck_parity import build_format_three_cache
+        for version, classifier in ((4, 6), (5, 7), (4, 7), (5, 6), (5, 8)):
+            with self.subTest(version=version, classifier=classifier):
+                db = Path(self.tmp.name) / f"certified-{version}-{classifier}.db"
+                build_format_three_cache(str(db), identity_version=version, classifier_version=classifier)
+                with sqlite3.connect(db) as c:
+                    if (version, classifier) in ((4, 6), (5, 7)):
+                        self.assertEqual(finalized_certificates(c)["classifier_version"], classifier)
+                        inputs = json.loads(c.execute("SELECT ranker_projection_inputs_json FROM cache_v2_migration_state").fetchone()[0])
+                        inputs["oracle_version"] = 7
+                        c.execute("UPDATE cache_v2_migration_state SET ranker_projection_inputs_json=?", (json.dumps(inputs),))
+                    with self.assertRaisesRegex(ValueError, "format-three certificates"):
+                        finalized_certificates(c)
+
+    def test_unrepresentable_scope_drop_decodes_alongside_historical_causes(self):
+        for cause in ("conversion", "order_dependent", "overflow", "underflow",
+                      "unknown_condition", "unknown_type", "unmapped", "unrepresentable", "bad-cause"):
+            for kind in ("event", "market"):
+                with self.subTest(cause=cause, kind=kind):
+                    drop = dict(cause=cause, dropped_at_unix=100, scope_id="0xa", scope_kind=kind)
+                    raw = json.dumps([drop], sort_keys=True, separators=(",", ":"))
+                    if cause == "bad-cause":
+                        with self.assertRaisesRegex(ValueError, "invalid certificate scope drop"):
+                            decode_scope_drops(raw)
+                    else:
+                        self.assertEqual(decode_scope_drops(raw), [drop])
 
     def test_format_three_snapshot_counts_certified_available_history(self):
         from test_ranker_duck_parity import build_format_three_cache
@@ -153,6 +207,38 @@ class CandidateTargetsTest(unittest.TestCase):
             with self.subTest(changed=key):
                 with self.assertRaisesRegex(ValueError, "identity digest mismatch"):
                     _fresh_identity(json.dumps(dict(valid, **{key: value})))
+
+    def test_sealed_identity_four_heads_admit_identity_five_before_finalizing(self):
+        # #822: a fresh identity-4 head (initial or a top-up) never finalizes under classifier 6
+        # after the release; one successor admits identity 5. A stale top-up still refuses.
+        prior = identity(version=4)
+        initial = identity(2, 1, version=4)
+        with sqlite3.connect(self.prior) as c:
+            c.execute("PRAGMA user_version=2")
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (prior,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation) VALUES (1)")
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (initial,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) VALUES (2, ?, ?)",
+                      (json.loads(initial)["digest"], initial))
+        self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24),
+                         (3, 1, 0, 0, 0))
+        top_up = identity(3, 2, version=4)
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (top_up,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) VALUES (3, ?, ?)",
+                      (json.loads(top_up)["digest"], top_up))
+        self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24),
+                         (4, 1, 0, 0, 0))
+        with self.assertRaisesRegex(ValueError, "activity top-up is stale"):
+            self.targets(after_collection=True, now=101 + 86400, max_staleness_hours=24)
+        current = identity(4, 3, version=5)
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (current,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) VALUES (4, ?, ?)",
+                      (json.loads(current)["digest"], current))
+        self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24),
+                         (4, 1, 0, 0, 1))
 
     def test_version_three_initial_head_and_archived_top_up_keep_base_gates(self):
         prior = identity()
@@ -271,7 +357,7 @@ class CandidateTargetsTest(unittest.TestCase):
         self.assertEqual(self.targets()[3], 0)
 
     def test_interrupted_ordinary_identity_never_converts_even_without_rows(self):
-        for version in (1, 2, 3):
+        for version in (1, 2, 3, 4, 5):
             with self.subTest(version=version):
                 with sqlite3.connect(self.side) as c:
                     c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (identity(version=version),))
@@ -293,6 +379,26 @@ class CandidateTargetsTest(unittest.TestCase):
             c.execute("INSERT INTO activity_coverage_manifests_v2(generation) VALUES (1)")
         with self.assertRaisesRegex(ValueError, "invalid unfinished bulk root"):
             self.targets()
+
+    def test_version_five_bulk_root_resumes_then_uses_completed_head(self):
+        root = identity(version=5)
+        with sqlite3.connect(self.side) as c:
+            c.executescript("""PRAGMA user_version=-2;
+                DROP INDEX idx_activity_groups_v2_source_trade_id;
+                INSERT INTO activity_groups_v2(source_trade_id) VALUES ('retained');
+                INSERT INTO activity_wallet_coverage_staging_v2(generation) VALUES (1);""")
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (root,))
+        before = self.side.read_bytes()
+        self.assertEqual(self.targets(), (1, 1, 0, 1, 0))
+        self.assertEqual(self.side.read_bytes(), before)
+        with self.assertRaisesRegex(ValueError, "unfinished bulk root"):
+            self.targets(after_collection=True)
+        with sqlite3.connect(self.side) as c:
+            c.execute("PRAGMA user_version=2")
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) "
+                      "VALUES (1, ?, ?)", (json.loads(root)["digest"], root))
+        self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24), (1, 1, 0, 0, 1))
+        self.assertEqual(self.targets(after_collection=True, now=90000, max_staleness_hours=24), (2, 1, 0, 0, 0))
 
     def test_completed_root_skips_collection_and_unfinished_successor_still_collects(self):
         root = identity()
@@ -485,20 +591,70 @@ class CandidateObligationsTest(unittest.TestCase):
         self.head(wallets=wallets, full_read_wallets=wallets)
         reasons = (UNREPRESENTABLE_PRICE + " 3.2: out of range", UNREPRESENTABLE_MAPPING,
                    ACTIVITY_RESPONSE_JSON + " row 1: numeric token 4.212e-7 " + UNREPRESENTABLE_DECIMAL)
-        for proved in (False, True):
-            with self.subTest(proved=proved):
+        for version in (None, 1, 2, 3):
+            for proved in (False, True):
+                with self.subTest(version=version, proved=proved):
+                    with sqlite3.connect(self.side) as c:
+                        c.execute("DELETE FROM activity_wallet_coverage_staging_v2")
+                    for digit, reason in zip("123", reasons):
+                        self.receipt(reason, wallet="0x" + digit * 40, version=version or 3,
+                                     aggregation_status="complete" if proved else "not_attempted",
+                                     fixed_end_unix=100 if proved else 220)
+                    if version is None:
+                        with sqlite3.connect(self.side) as c:
+                            c.execute("UPDATE activity_wallet_coverage_staging_v2 SET acquisition_json=NULL")
+                    output = StringIO()
+                    with redirect_stderr(output):
+                        self.assertEqual(self.targets()[0], 1)
+                    self.assertEqual(output.getvalue().count("[unrepresentable-row]"), 3)
+                    for digit, reason in zip("123", reasons):
+                        self.assertIn("0x" + digit * 40 + ": " + reason, output.getvalue())
+
+    def test_acquisition_four_unrepresentable_parse_failures_hold_even_with_proved_windows(self):
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from rank_cycle_manifest import (UNREPRESENTABLE_PRICE, UNREPRESENTABLE_MAPPING,
+                                         UNREPRESENTABLE_DECIMAL, ACTIVITY_RESPONSE_JSON)
+        self.head(version=5)
+        reasons = (UNREPRESENTABLE_PRICE, UNREPRESENTABLE_MAPPING,
+                   ACTIVITY_RESPONSE_JSON + " row 1: 4.212e-7 " + UNREPRESENTABLE_DECIMAL,
+                   "activity page parse failed: " + UNREPRESENTABLE_PRICE,
+                   ACTIVITY_RESPONSE_JSON + " expected an array")
+        for reason in reasons:
+            for proved in (False, True):
+                with self.subTest(reason=reason, proved=proved):
+                    with sqlite3.connect(self.side) as c:
+                        c.execute("DELETE FROM activity_wallet_coverage_staging_v2")
+                    self.receipt(reason, version=4, aggregation_status="complete" if proved else "not_attempted",
+                                 fixed_end_unix=100 if proved else 220)
+                    for after in (False, True):
+                        output = StringIO()
+                        with redirect_stderr(output), self.assertRaises(ValueError) as held:
+                            self.targets(after_collection=after)
+                        self.assertIn(self.wallet + ": " + reason, str(held.exception))
+                        self.assertNotIn("[unrepresentable-row]", output.getvalue())
+
+    def test_acquisition_four_partial_routes_successor_and_resumes_it(self):
+        self.head(version=5)
+        self.receipt("held-row limit reached", version=4, aggregation_status="complete", fixed_end_unix=100)
+        self.assertEqual(self.targets(after_collection=False)[0], 1)
+        self.assertEqual(self.targets()[0], 2)
+        self.head(2, 1, version=5, complete=False)
+        self.assertEqual(self.targets(after_collection=False)[0], 2)
+        with self.assertRaisesRegex(ValueError, "matching completed manifest"):
+            self.targets()
+        self.head(2, 1, version=5)
+        self.assertEqual(self.targets()[0], 2)
+
+    def test_acquisition_four_no_progress_and_acquisition_two_partial_still_hold(self):
+        self.head(version=5)
+        for version, status in ((4, "not_attempted"), (2, "complete")):
+            with self.subTest(version=version, status=status):
                 with sqlite3.connect(self.side) as c:
                     c.execute("DELETE FROM activity_wallet_coverage_staging_v2")
-                for digit, reason in zip("123", reasons):
-                    self.receipt(reason, wallet="0x" + digit * 40,
-                                 aggregation_status="complete" if proved else "not_attempted",
-                                 fixed_end_unix=100 if proved else 220)
-                output = StringIO()
-                with redirect_stderr(output):
-                    self.assertEqual(self.targets()[0], 1)
-                self.assertEqual(output.getvalue().count("[unrepresentable-row]"), 3)
-                for digit, reason in zip("123", reasons):
-                    self.assertIn("0x" + digit * 40 + ": " + reason, output.getvalue())
+                self.receipt("acquisition budget exhausted", version=version, aggregation_status=status)
+                with self.assertRaisesRegex(ValueError, self.wallet + ": acquisition budget exhausted"):
+                    self.targets()
 
     def test_no_progress_parse_aggregation_and_collision_holds_persist_before_any_successor(self):
         self.head()

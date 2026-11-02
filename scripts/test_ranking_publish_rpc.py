@@ -225,6 +225,16 @@ def test_v2(url, suffix, batch, entries):
         anon_groups = psql(url, "set role anon; select count(*) from ranking_neg_risk_group_spans;").stdout.splitlines()[-1]
         if anon_groups != "2":
             raise AssertionError("anon cannot read group spans")
+        # #822: classifier 7 publishes the new cause without changing the RPC shape.
+        anomaly_drop = {**drops[0], "cause": "unrepresentable"}
+        anomaly_id = int(psql(url, call(keys[14], [anomaly_drop],
+                                       batch_row={**current, "classifier_version": 7})).stdout.strip())
+        stored_anomaly = psql(url, "select b.classifier_version, d.wallet_hex, d.scope_kind, d.scope_id, "
+                             "d.dropped_at_unix, d.cause from ranking_batches b "
+                             "join ranking_scope_drops d using (batch_id) "
+                             f"where b.batch_id={anomaly_id};").stdout.strip()
+        if stored_anomaly != "7|0xaaa|event|0xa|1700000000|unrepresentable":
+            raise AssertionError(f"unrepresentable drop did not round-trip: {stored_anomaly}")
         privileges = psql(url, "select has_function_privilege('anon', 'publish_ranking_batch_v2(text,jsonb,jsonb,jsonb)', 'EXECUTE'), "
                          "has_function_privilege('authenticated', 'publish_ranking_batch_v2(text,jsonb,jsonb,jsonb)', 'EXECUTE'), "
                          "has_function_privilege('service_role', 'publish_ranking_batch_v2(text,jsonb,jsonb,jsonb)', 'EXECUTE');").stdout.strip()
@@ -238,11 +248,16 @@ def test_v2(url, suffix, batch, entries):
         )
         for key, bad_drops in zip(keys[1:5], failures, strict=True):
             before = spans()
-            failed = psql(url, call(key, bad_drops), check=False)
+            failed = psql(url, call(key, bad_drops, batch_row={**current, "classifier_version": 7}), check=False)
             if failed.returncode == 0:
                 raise AssertionError(f"invalid v2 drops accepted: {bad_drops}")
-            count = psql(url, f"select count(*) from ranking_batches where publish_key='{key}';").stdout.strip()
-            if count != "0":
+            counts = psql(url, "select "
+                          f"(select count(*) from ranking_batches where publish_key='{key}'), "
+                          "(select count(*) from ranking_entries e join ranking_batches b using (batch_id) "
+                          f"where b.publish_key='{key}'), "
+                          "(select count(*) from ranking_scope_drops d join ranking_batches b using (batch_id) "
+                          f"where b.publish_key='{key}');").stdout.strip()
+            if counts != "0|0|0":
                 raise AssertionError("failing drop did not roll back batch and entries")
             if spans() != before:
                 raise AssertionError("failing drop changed group spans")
@@ -321,6 +336,7 @@ def test_v2(url, suffix, batch, entries):
         assert_groups(batch_b, next_batch["neg_risk_group_ids"])
         print("PASS: group failures roll back atomically; empty sets, reopening, pruning and anon reads work")
         print("PASS: v2 drops atomic; retries converge; counts checked; old classifier NULL; anon reads drops")
+        print("PASS: classifier 7 unrepresentable drop persists; unknown causes roll back atomically")
     finally:
         rendered = ",".join("'" + key + "'" for key in keys)
         psql(url, f"delete from ranking_batches where publish_key in ({rendered});", check=False)

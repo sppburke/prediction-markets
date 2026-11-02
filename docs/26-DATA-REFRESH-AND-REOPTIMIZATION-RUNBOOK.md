@@ -190,11 +190,11 @@ receipts AS (
   FROM activity_wallet_coverage_staging_v2 r JOIN tracked USING (wallet_hex)
 )
 SELECT wallet_hex, generation, frozen_end, mode, start, reason,
-       CASE WHEN acquisition_version = 3 AND disposition = 'excluded'
+       CASE WHEN acquisition_version IN (3, 4) AND disposition = 'excluded'
                  AND reason = 'acquisition_failure'
             THEN CASE WHEN aggregation_status = 'complete' THEN acquired_end ELSE start END
             ELSE NULL END AS continuation_frontier,
-       CASE WHEN acquisition_version = 3 AND disposition = 'excluded'
+       CASE WHEN acquisition_version IN (3, 4) AND disposition = 'excluded'
                  AND reason = 'acquisition_failure' AND aggregation_status = 'not_attempted'
                  AND mode = 'full' THEN 1 ELSE 0 END AS restarts_full,
        proved_source_rows,
@@ -914,9 +914,10 @@ requires the verified DuckDB snapshot and refuses SQLite.
 
 Recurring schema-two publication builds each cycle in a **private candidate** copied from the
 checkpointed fixed cache. Current cycles use [history format 3](_GLOSSARY.md#history-format-3-and-classifier-6-739):
-collection identity 4, acquisition 3 and export manifest 3, without a cache `user_version` change.
+collection identity 5, acquisition 4, classifier 7 and export manifest 3, without a cache `user_version` change.
+Frozen identity 4 keeps acquisition 3 and classifier 6; follow the [identity-5 release boundary](#identity-5-release-boundary-822).
 The union includes acquisition candidates, every retained history and the prior head's exclusions;
-no frozen reference narrows it. Classifier 6 never finalizes a format-2 head.
+no frozen reference narrows it. Neither classifier 6 nor 7 finalizes a format-2 head.
 
 ```bash
 # Under the cache lock: checkpoint, copy to pending while hashing the fixed main, then
@@ -944,7 +945,7 @@ pe-bootstrap market-scope --out "$RUN_DIR/market_scope.json" --end-date-min "$FL
 [`_GLOSSARY.md`](_GLOSSARY.md#history-format-3-and-classifier-6-739).
 The collector validates predecessor records and certificates and derives the wallet union before
 sampling/freezing the settled end. New roots read full history; polled successors read
-`(previous_end,new_end]` for wallets with usable predecessor history; identity-4 acquisition
+`(previous_end,new_end]` for wallets with usable predecessor history; identity-4/5 acquisition
 failures resume from their receipt's continuation frontier instead. A partial resumes incrementally;
 a no-progress read keeps its mode and start. New wallets, other previous exclusions and explicit
 repairs read full history. Standalone generation numbers may have gaps; the frozen identity
@@ -954,14 +955,14 @@ retain strict acceptance.
 
 **Transition in admission.** The first format-3 admission performs the format-2 predecessor walk
 once, verifies its receipts and creates certificates, tables and write-authorization triggers in
-the same transaction as identity 4. Complete wallets, including empty histories, are certified;
+the same transaction as the new identity-5 admission. Complete wallets, including empty histories, are certified;
 excluded wallets with an authenticated earlier complete receipt are certified with unknown recency;
 proofless excluded wallets must have no rows and stay uncertified. Both excluded classes next read
 in full. Retained rows without usable proof are fatal. Interruption before commit reruns the walk;
 after commit, resume returns the frozen identity. Later admissions check certificates/receipts
 without history visits. No separate transition command exists.
 
-As of 2026-10-31 (#821), new identity-4 admissions defer no wallet: complete predecessors
+Since 2026-10-31 (#821), new admissions defer no wallet: complete predecessors
 read incrementally every generation, and a historical `dormant_deferred` predecessor reads in
 full. Roots, new wallets, other exclusions and explicit repairs still read full history;
 proved partials continue from their receipt frontier. Identity 4 and its recorded quiet/repoll
@@ -1008,14 +1009,15 @@ unsplit window, then walks forward with the verified [ascending boundary lookup]
 Continuing acquisitions and full reads certified with at least 5,500 source rows skip the probe.
 The lookup places bounds only; descending terminal pages prove every kept window. A saturated
 one-second window remains fatal, and a looked-up window that is still full stops without keeping it. Missing condition/token
-alone follows acquisition 3's acceptance above. Every non-deferral failed acquisition without a
+alone follows acquisition 3/4's relaxed mapping acceptance above. Acquisition 4 additionally
+retains the three anomaly kinds under the [#822 contract](_GLOSSARY.md#identity-5-acquisition-4-and-classifier-7-822). Every non-deferral failed acquisition without a
 partial verifies retained history in the exclusion transaction, in either read mode, except an
 explicit repair's replacement. Partial history parts are verified at finalize when the wallet
 completes. A partial atomically commits proved rows and an excluded `acquisition_failure` receipt
 with complete aggregation and an acquired end strictly between its start and the generation end;
 zero-row partials are valid history parts. Excluded receipts keep zero outer counts, the empty digest,
 SQL `fixed_end_unix` equal to the frozen end and no current certificate/projection/spool rows.
-With `bootstrap_polymarket_wallet_timeout_secs` set, identity 4 checks one non-resetting deadline
+With `bootstrap_polymarket_wallet_timeout_secs` set, identity 4/5 checks one non-resetting deadline
 before outer retries and further walk windows, never cancels a page fetch in flight, and keeps proved
 windows on expiry. A walk always attempts its first window. The shared held-row bound comes from
 [`ACTIVITY_WALK_HELD_ROWS`](_GLOSSARY.md#polymarket-public-source-pollingconfig).
@@ -1031,19 +1033,20 @@ pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N" \
   --full-read-wallets "$WALLET_A,$WALLET_B"
 ```
 
-Selection is the frozen `repair_wallets` subset in identity 4; it cannot change on resume.
+Selection is the frozen `repair_wallets` subset in identity 4/5; it cannot change on resume.
 Repairs reconcile revisions/deletions and logical history damage, preserve cumulative drops, and
 cannot repair structural SQLite damage or damaged certificates/receipts/manifests/state. Follow
 [the damage boundary](#recovery-and-damage-boundaries) before selecting a repair. The shared paced
 fetcher, bounded reads/channel and single writer remain. Under a budget, a window whose page
 exhausts its internal retries retries in place while the deadline allows, retaining earlier proved
-windows. A recoverable identity-4 probe failure advances to the walk regardless of budget;
+windows. A recoverable identity-4/5 probe failure advances to the walk regardless of budget;
 without a budget, transient exhaustion in a walk window or legacy read exits
 `rank_and_push_tempfail_exit`. Permanent errors stop the cycle.
 
 **Verified pass, spool and export.** Finalize visits every available wallet once (complete,
 non-excluded head receipt, even with zero fetched rows), verifies its effective history while
-classifying it with `classify_scoped_historical_second` in whole-second chunks of at most
+classifying it with the recorded classifier (7 uses `classify_scoped_historical_second_with_anomalies`;
+frozen 6 uses `classify_scoped_historical_second`) in whole-second chunks of at most
 `projection_chunk_aggregates` (#747), and writes its new certificate and cumulative drops after the
 wallet's last chunk; a failed check or scan commits no certificate or spool.
 It reports ignored activity by type, drops by cause and neg-risk markets missing a group id.
@@ -1072,7 +1075,7 @@ Re-finalize validates input bindings and the state's count/digest/classifier/ora
 manifest, re-checks certificates, spool and the cycle's sealed manifests/receipts inside its
 verification transaction, then checkpoints/hashes the candidate. It never regenerates predecessors
 from advanced certificates or re-reads history/projection. The final-stage record binds the export
-manifest's SHA-256 and summary. Until finalize, phase checks use identity 4's incoming
+manifest's SHA-256 and summary. Until finalize, phase checks use identity 4/5's incoming
 `certified_digest`; afterwards they use the finalized `certificate_digest`, once per stable proof
 while data-version checks show no outside write. Publication reads freshness, stamps and scopes
 only from certificates at this finalized head.
@@ -1197,7 +1200,7 @@ where inputs exist, and always after collection before payout or request creatio
    ever-infra wallet is named as `[infra-excluded]`, with no hold and no successor (#826). Next,
    unrepresentable price,
    condition/outcome mapping and decimal tokens rejected by the exact-decimal parser are the
-   owner's parser exception: name the wallet and reason every cycle, but neither hold nor take a
+   owner's parser exception for acquisition 3 or earlier: name the wallet and reason every cycle, but neither hold nor take a
    successor for it, even when it has proved windows. Other parse failures (including a response
    that is not a JSON array) hold. Then proved partials and historical `DormantDeferred` receipts
    require a successor; no-progress failures, aggregation failures and collisions hold. Name every
@@ -1349,6 +1352,33 @@ pre-prepare abandonment/restaging, never regeneration.
 From the first format-3 preparation onward, keep a format-3-capable release and fix forward through
 the exact request. Never downgrade the cache in place; see [release rollback](#forge-release-deployment-and-rollback).
 
+### Identity-5 release boundary (#822)
+
+Install this Forge release only after pe-service phase 1b is installed. Apply the additive Supabase
+`ranking_scope_drops_cause_check` migration allowing `unrepresentable` and read it back before the
+first classifier-7 publication. Use the ordinary stopped release procedure at a clean publication
+boundary; retained requests keep their recorded contracts. This procedure does not authorize a
+production mutation.
+
+New admissions freeze identity 5 / acquisition 4 / classifier 7, as defined in the
+[anomaly contract](_GLOSSARY.md#identity-5-acquisition-4-and-classifier-7-822). An unfinished identity-4
+root or generation resumes and seals under acquisition 3 before its identity-5 successor is admitted.
+Interrupted identity-5 generations resume directly under acquisition 4. Format 3, projection oracle 6
+and export manifest 3 remain unchanged. Recorded classifier-6 caches verify under classifier 6 during
+activation, outgoing-cache checks, restore and recovery.
+
+The first identity-5 cycle re-reads previously excluded wallets through normal wallet selection.
+Its finalization report lists anomaly drops in `drops_by_cause.unrepresentable` and unresolved rows
+in `unresolved_anomalies` (wallet, source second, kind, field, condition, asset and raw row hash).
+Unresolved anomalies remain in effective receipt history and are classified again when later cycles
+bind market evidence. Inspect these reports and the scope rows before publication. Remaining parse
+failures, including non-array responses, still hold. The #821 reported parser exception applies only
+to acquisition 3 or earlier.
+
+Rollback to the previous release is available before the first identity-5 admission, subject to all
+ordinary release prerequisites. After that admission, retain identities, receipts, certificates and
+requests and fix forward; never downgrade or reinterpret the recorded cache in place.
+
 ### Classifier-6 catch-up and coordinated release (#739)
 
 Rollout step 1 is the reviewed/tested combined release: current main reconciled, full gate and CI
@@ -1438,14 +1468,14 @@ for a legacy cycle. New roots read the immutable staging baseline without a prio
 for a newly staged and migrated private candidate. Fixed, candidate and any legacy prior must be
 distinct paths and inodes. The candidate must have no activity rows, receipts,
 completed activity manifest, frozen-reference verification or finalized projection. Admission freezes
-identity 4 in format 3, with no predecessor, the full wallet union, empty `repair_wallets` and the
+identity 5 in format 3, with no predecessor, the full wallet union, empty `repair_wallets` and the
 empty certificate table's `certified_digest`. The same admission creates format-3 tables/triggers,
 removes the empty named identity index and sets `PRAGMA user_version=-2`. This negative version is
 reserved for the unfinished private layout; it is not an activity/parser/identity version or a
 configuration key. Existing collections are never converted. Historical version-1 identities,
 frozen-reference collections, ordinary collections without the flag, and every successor retain
-immediate indexed uniqueness. New roots use acquisition-3 full reads without a predecessor and its
-bootstrap-only relaxed row acceptance. An unfinished identity-2 root keeps its frozen acquisition-2
+immediate indexed uniqueness. New roots use acquisition-4 full reads with anomaly evidence and relaxed mapping acceptance.
+Unfinished identity-4 roots keep acquisition 3 through resume and sealing. An unfinished identity-2 root keeps its frozen acquisition-2
 contract through resume/sealing; it is never reinterpreted as acquisition 3.
 
 New ordinary schemas use `idx_activity_groups_v2_source_trade_id`, a full single-column `BINARY`
@@ -1464,8 +1494,8 @@ the completed manifest and archived identity, and restores
 precedes successor admission and the successor's settled-end clock; no top-up freshness budget is
 spent building the root index. A new format-3 root finalizes through the ordinary verified pass,
 certifying each available wallet's recency and drops from its complete full receipt. A sealed
-identity-2 root must first admit an identity-4 successor, even when fresh, so classifier 6 never
-finalizes format 2. It does not prove that later top-up, payout, ranking and preparation
+identity-2 root must first admit an identity-5 successor, even when fresh, so classifier 7 never
+finalizes format 2. Frozen identity-4 successors retain classifier 6. It does not prove that later top-up, payout, ranking and preparation
 fit the unchanged freshness limit.
 
 Global duplicates, an existing index of the same name (even one with the right definition), index
@@ -1527,7 +1557,7 @@ The zero-argument wrapper stages/migrates, discovers and activates, then asks
 root requires schema two, generation one, no existing collection identity, activity rows or receipts,
 the exact named unique index with no primary-key layout, and the unfinalized private state with no
 completed activity manifest, frozen verification or projection. A reserved-state root resumes only
-with its identity-2 or identity-4 generation-one root, no predecessor, and that same private state; retained
+with its identity-2, identity-4 or identity-5 generation-one root, no predecessor, and that same private state; retained
 wallet rows/receipts are allowed. Rust still owns admission and fails closed. Ordinary interrupted
 roots and unfinished successors use ordinary collection. Completed selected format-3 heads
 skip wrapper collection re-entry; the always-run `--after-collection` check still selects an allowed

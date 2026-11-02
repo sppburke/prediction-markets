@@ -1215,6 +1215,34 @@ class FormatThreePublicationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "content hash mismatch"):
             pr.validate_publish_request(request)
 
+    def test_classifier_seven_certificate_unrepresentable_drop_reaches_rpc_request(self):
+        drop = {"cause": "unrepresentable", "dropped_at_unix": self.entry,
+                "scope_id": "0xb", "scope_kind": "market"}
+        with sqlite3.connect(self.db) as con:
+            identity = json.loads(con.execute("SELECT fresh_collection_json FROM cache_v2_migration_state").fetchone()[0])
+            identity["version"] = 5
+            content = {key: value for key, value in identity.items() if key != "digest"}
+            identity["digest"] = hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            con.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?, ranker_classifier_version=7",
+                        (json.dumps(identity),))
+            con.execute("UPDATE activity_wallet_history_v3 SET scope_drops_json=? WHERE wallet_hex=?",
+                        (json.dumps([drop], sort_keys=True, separators=(",", ":")), self.a))
+            self.rebind_certificates(con)
+        request = pr.prepare_publish_request(self.args, self.now)
+        self.assertEqual(request["batch"]["classifier_version"], 7)
+        self.assertEqual(request["entries"][0]["scope_drops"], [drop])
+        saved = self.root / "ranking_publish_request.json"
+        pr.save_publish_request(str(saved), request)
+        request = pr.load_publish_request(str(saved))
+        latest = [{"batch_id": 42, "rank": 1, "survives": True}]
+        with mock.patch.object(pr, "_req", side_effect=[(200, 42), (200, [{"batch_id": 42}]), (200, latest),
+                                                       (200, [{"config_hash": request["batch"]["config_hash"]}])]) as rpc:
+            self.assertEqual(pr.publish_request_to_supabase(request, "https://example.test", "test"), 42)
+        body = rpc.call_args_list[0].kwargs["body"]
+        self.assertTrue(rpc.call_args_list[0].args[1].endswith("/publish_ranking_batch_v2"))
+        self.assertEqual(body["p_batch"]["classifier_version"], 7)
+        self.assertEqual(body["p_scope_drops"], [{"wallet_hex": self.a, **drop}])
+
     def test_group_read_shares_the_history_snapshot(self):
         with sqlite3.connect(self.db) as con:
             con.execute("PRAGMA journal_mode=WAL")

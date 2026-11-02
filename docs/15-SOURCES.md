@@ -72,8 +72,11 @@
 >
 > The related 10/31 `/activity` probe still found a 2026-03-26 SELL priced 3.1968021978 in
 > `0x1b5f1fc3…`'s public history. The recorded journal also contains invalid outcome mappings
-> and exact-decimal parser rejections. Those unrepresentable-row wallet exclusions are an
-> owner-approved, per-cycle reported exception pending the separate parser fix (`docs/26`).
+> and exact-decimal parser rejections. Under Forge acquisition 4 (#822), these rows are retained
+> as authenticated, non-executable anomalies: drop their resolved market (or the neg-risk event
+> for CONVERSION/unknown types), preserve the wallet's healthy history, and count/report unresolved
+> anomalies. Frozen acquisition-3-or-earlier exclusions retain the #821 per-cycle reported exception
+> (`docs/26`). Other malformed rows still fail the read.
 > These dates retain #821's probe provenance; this documentation update made no venue requests.
 
 > **CLOB neg-risk groups (#739/#588), Last checked: 2026-10-05; re-verify by
