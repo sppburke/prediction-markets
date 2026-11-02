@@ -28,6 +28,7 @@ workspace = true
 [dependencies]
 pe-copy-signal-engine         = { path = "../copy-signal-engine",           version = "0.1.0" }
 pe-core-types                 = { path = "../core-types",                   version = "0.1.0" }
+pe-event-log                  = { path = "../event-log",                    version = "0.1.0" }
 pe-position-ledger            = { path = "../position-ledger",              version = "0.1.0" }
 pe-source-core                = { path = "../source-core",                  version = "0.1.0" }
 pe-source-polymarket-public   = { path = "../source-polymarket-public",     version = "0.1.0" }
