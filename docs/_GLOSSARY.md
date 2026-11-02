@@ -349,14 +349,14 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `redeem_residual_limit_atomic` | 100 | **Exclusive module const** `REDEEM_RESIDUAL_LIMIT_ATOMIC` in `position-ledger` (#557). A REDEEM underflow residual of 1..=99 atomic units clamps the position closed and is recorded in the version-3 effect document; 100 or more drops the resolved market under [classifier 6](#history-format-3-and-classifier-6-739). `ShareAmount` has six decimal places, so 100 atomic units equal one ten-thousandth of a position: the limit is one four-decimal `/positions` reporting quantum and accepts venue-display quantization residue without hiding a full reported quantum. SELL and MERGE remain strict, and the tolerance cannot stack within a bucket. |
 | `rehearsal_quiescence` | production unit policy at run time | The #545 rehearsal reads the production `pe-service` unit's `TimeoutStopSec` as its exact quiescence bound and requires `KillSignal` to be SIGINT, the signal handled by the service. The harness owns no separate numeric shutdown bound (#586). |
 
-### Non-executable activity-row anomalies (#822 PR 1a)
+### Non-executable activity-row anomalies (#822)
 
 The shared REST API offers four `ActivityRowAcceptance` modes. `mapping_relaxed()` is true
 only for `Acquisition3` and `Acquisition4`; `salvage_enabled()` is true only for
-`StrictWithAnomalies` and `Acquisition4`. Existing service and Forge producers keep their current
-Strict or Acquisition3 contracts until their separate activation changes. The websocket parser
-remains strict. Forge phase 2 starts after the shared API merges; publication of affected wallets
-waits for service activation (PR 1b).
+`StrictWithAnomalies` and `Acquisition4`. Every pe-service `/activity` read selects
+`StrictWithAnomalies`: all seeder modes (installed and migration boot, admission and refresh) and
+the poller. Forge producers retain their Strict or Acquisition3 contracts until phase 2 activation.
+The websocket parser remains strict.
 
 An anomaly-enabled parser validates wallet (including an optional requested-wallet match), timestamp,
 type and transaction hash before interpreting lexeme-preserved outcome and numeric fields. It
@@ -387,6 +387,25 @@ their Strict defaults; ascending lookup and unsplit walk helpers keep Acquisitio
 termination, saturation and split minima include anomalies; `aggregates()` and `buckets()` remain
 aggregate-only. Consumers must explicitly merge aggregate and anomaly seconds.
 
+Service page envelopes select both producer generation and replay parse mode through
+`activity_page_generation`:
+
+| Envelope schema | Generation | Parse mode | Recording producer |
+|---|---|---|---|
+| 2 | Historical | `Strict` | Migration boot's `DurableRecordingFetcher` |
+| 3 | Committed | `Strict` | Poller's `RecordingFetcher` |
+| 4 | Committed | `StrictWithAnomalies` | Poller's `RecordingFetcher` |
+| 5 | Historical | `StrictWithAnomalies` | Migration boot's `DurableRecordingFetcher` |
+
+Both recording fetchers classify `/activity` payloads with the requested wallet before choosing
+the envelope; only a successfully parsed page containing an anomaly uses its anomaly schema.
+Healthy, empty, `/positions` and unparseable pages keep the producer's original schema; parse
+failures still fail the read. Envelope parser version and page-evidence schema/parser remain 2;
+continuation-generation matching is unchanged. All service page verifiers use this contract,
+retaining historical Strict failures and anomalies under the new schemas. Installed-boot,
+admission and refresh seeder reads remain unrecorded, retaining raw page hashes and anomaly-drop
+proofs in decision inputs.
+
 `ActivityAssetMapping::from_rows_with_anomalies` includes anomaly ordinary/combo classification,
 registers anomaly assets without stamped outcome identity, and retains anomalous SPLIT/MERGE
 conditions for metadata-backed held-position discovery, including asset-less rows.
@@ -404,6 +423,16 @@ and activity type. They never enter `apply`, `decisions` or `consumed`. The publ
 CONVERSION and unknown activity types can resolve to an event. Existing classifiers pass empty
 anomaly slices and retain their behavior. A second remains unscored only for a new resolvable drop
 or a certified drop starting there, under the [shared scoped rule](#history-format-3-and-classifier-6-739).
+
+Service `wallet_scope_drops` persists the shared `unrepresentable` cause as the local
+`unrepresentable_activity_row`, with proof exactly `{page_raw_hash, page_row_index, raw_row_hash,
+kind}`: the raw page's BLAKE3 hash, the zero-based row index, the exact raw-row BLAKE3 hash and the
+anomaly kind. `source_trade_id` is the anomaly evidence trigger, never an executable group identity.
+An anomaly-only second commits its drop or ignored outcome, exact observation retirements and
+cursor atomically without a fabricated aggregate, mutation, gate or decision. The wallet remains
+admitted and later healthy scopes can copy. The
+[scope-drop compatibility boundary](#history-format-3-and-classifier-6-739) also covers recorded
+anomaly pages.
 
 ### Causal re-anchor and rehearsal rules (#557)
 
@@ -631,9 +660,9 @@ above can clear an eligible fence; unsafe or unprovable fences remain quarantine
 | Continuation wire version | Activity-page envelope | Complete-read commitment | Decision/replay contract |
 |---|---|---|---|
 | 2 | Legacy receipt-free continuation | None | Exact pre-#545 `RuntimeConfig` decoding as `Legacy17`; legacy complete-second proof. |
-| 3 | Historical activity schema 2 / parser 2 | None | Receipt-bearing historical activity; legacy complete-second proof. |
-| 4 | Activity-page schema 3 / parser 2 | Envelope schema 1 / parser 1 / payload 1 / domain `prediction-edge/activity-read-commitment/v1` | Legacy complete-second proof. |
-| 5 | Activity-page schema 3 / parser 2 | Envelope schema 2 / parser 1 / payload 2 / domain `prediction-edge/activity-read-commitment/v2`, with observation bindings | Frozen `PaperFreshnessPolicy`, repaired complete-second proof, and precise final paper Prepared freshness clock. |
+| 3 | Historical activity pages ([page modes](#non-executable-activity-row-anomalies-822)) | None | Receipt-bearing historical activity; legacy complete-second proof. |
+| 4 | Committed activity pages ([page modes](#non-executable-activity-row-anomalies-822)) | Envelope schema 1 / parser 1 / payload 1 / domain `prediction-edge/activity-read-commitment/v1` | Legacy complete-second proof. |
+| 5 | Committed activity pages ([page modes](#non-executable-activity-row-anomalies-822)) | Envelope schema 2 / parser 1 / payload 2 / domain `prediction-edge/activity-read-commitment/v2`, with observation bindings | Frozen `PaperFreshnessPolicy`, repaired complete-second proof, and precise final paper Prepared freshness clock. |
 | 6 | Same source and commitment contract as 5 | Same payload-2 commitment and authenticated observation bindings as 5 | Paper financial semantic 2: delay-tolerant paper admission, current-book ladder without a leader-price ceiling, signed ladder intent limit, and economic wire 2. Checkpoint and terminal-evidence wire numbers remain unchanged. |
 | 7 | `source_authority` is required: `activity_frame` or `complete_read`; historical encodings omit it | Complete reads retain the payload-2 contract; frames freeze their authenticated receipt and admission prefix without decision-time REST pages or target | Paper financial semantic 3: receipt-order frame decisions, per-wallet first entries without a same-market cross-leader paper hold, subject to shared copy-scope gate E, partial Dollar/CashFraction sizing, one per-ask band check and no decision mid gate. |
 
@@ -1580,8 +1609,8 @@ point retains its behavior. Same-wallet/market/second/outcome homogeneous BUY pi
 (minimum `source_trade_id`), with every piece applied and consuming. Mixed outcomes remain ambiguous.
 
 `ScopeKind` wire strings are `event` and `market`; `Scope.id` is canonical lowercase `0x` hex.
-An event scope is a neg-risk group, not a Gamma event. `DropCause` has eight wire strings (the anomaly cause is available in the shared API; existing
-producers retain their current activation contracts):
+An event scope is a neg-risk group, not a Gamma event. `DropCause` has eight wire strings; service
+anomaly activation and local proof fields follow the [activity-row contract](#non-executable-activity-row-anomalies-822):
 
 | Cause | Scope |
 |---|---|
@@ -1666,9 +1695,13 @@ paper dispatch through Prepared; a failed import preserves the consumer's prior 
 **Scope-drop compatibility boundary.** Paper schema remains three. The first `scope_dropped`
 disposition, revision retained without a fence, or live `PrePostScopeDropped` record crosses a
 forward-only boundary. `meta` `scope_drop_boundary_unix` is first-write-wins, recorded in the same
-savepoint as the disposition/revision or durably before the live journal append. Before that key
-exists the previous binary ignores the additive table, membership values, group keys and import
-markers; afterwards preserve state and fix forward. The
+savepoint as the disposition/revision or durably before the live journal append. In addition,
+the poller's `RecordingFetcher` and migration boot's `DurableRecordingFetcher` durably record the
+marker before their first [anomaly-schema page append](#non-executable-activity-row-anomalies-822);
+failure prevents that append and read. Healthy reads create no new boundary and never reopen an
+existing one. Before that key exists, installed-mode rollback may use the previous binary, which
+ignores the additive table, membership values, group keys and import markers; afterwards preserve
+state and fix forward. Migration's pre-installation phase/log gate remains independently binding. The
 [rollback check](35-PE-SERVICE-DEPLOY-RUNBOOK.md#rollback) also requires every earlier boundary.
 
 **Publication.** Version-1 request envelopes keep their shape: the batch adds `classifier_version`

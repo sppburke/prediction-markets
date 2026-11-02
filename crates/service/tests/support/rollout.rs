@@ -836,6 +836,69 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
                 .status()
                 .is_success()
         );
+        // PASS: wallet 3 stays admitted with one local unrepresentable_activity_row drop and no
+        // executable anomaly output; its later healthy BUY fills. The anomaly page is recorded;
+        // restart preserves captured state, and sealed CLI replay reproduces five decisions/fills.
+        // FAIL: wallet deferral/fencing, an anomaly decision/fill, missing healthy copy, state
+        // drift after restart, or an inexact/unsuccessful CLI replay.
+        let anomaly_epoch = OffsetDateTime::now_utc().unix_timestamp();
+        let mut unrepresentable = row(wallet(3), 7, anomaly_epoch, 3007);
+        unrepresentable["price"] = "3.1968021978".into();
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .insert(wallet(3).to_string(), vec![unrepresentable.clone()]);
+        until(|| {
+            !paper
+                .wallet_scope_drops(&wallet(3), anomaly_epoch)
+                .unwrap()
+                .is_empty()
+        })
+        .await;
+        let local = paper.wallet_scope_drops(&wallet(3), anomaly_epoch).unwrap();
+        assert_eq!(local.len(), 1);
+        let raw_row_hash = blake3::hash(&serde_json::to_vec(&unrepresentable).unwrap())
+            .to_hex()
+            .to_string();
+        let unrepresentable_id = pe_core_types::SourceTradeId(format!(
+            "{}{raw_row_hash}",
+            pe_position_ledger::ACTIVITY_ROW_ANOMALY_NAMESPACE
+        ));
+        assert_eq!(local[0].scope_kind, "market");
+        assert_eq!(local[0].scope_id, condition(7));
+        assert_eq!(local[0].cause, "unrepresentable_activity_row");
+        assert_eq!(local[0].dropped_at_epoch, anomaly_epoch);
+        assert_eq!(local[0].source_trade_id.as_ref(), Some(&unrepresentable_id));
+        assert_eq!(
+            serde_json::from_str::<Value>(&local[0].proof_json).unwrap(),
+            json!({
+                "page_raw_hash": blake3::hash(&serde_json::to_vec(std::slice::from_ref(&unrepresentable)).unwrap()).to_hex().to_string(),
+                "page_row_index": 0,
+                "raw_row_hash": raw_row_hash,
+                "kind": "price_out_of_range"
+            })
+        );
+        assert!(paper.position_validation(&wallet(3)).unwrap().is_some());
+        assert!(paper.wallet_history_complete(&wallet(3)).unwrap());
+        assert!(!paper.is_wallet_fenced(&wallet(3)).unwrap());
+        assert!(
+            state
+                .authority
+                .lock()
+                .unwrap()
+                .projection
+                .iter()
+                .any(|row| { row["wallet_hex"] == wallet(3).to_string() })
+        );
+        assert!(
+            paper
+                .activity_groups_after(&wallet(3), 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(paper.decision_pending_history().unwrap().is_empty());
+        assert!(paper.list_fills().unwrap().is_empty());
         let epoch = OffsetDateTime::now_utc().unix_timestamp();
         *state.scope_drops.lock().unwrap() = vec![json!({
             "batch_id":2,"wallet_hex":wallet(1),"scope_kind":"market","scope_id":condition(1),
@@ -993,12 +1056,51 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
                 .activity_revision_retained_without_fence(&original_id, &revision)
                 .unwrap()
         );
+        until(|| OffsetDateTime::now_utc().unix_timestamp() > later).await;
+        let healthy_epoch = OffsetDateTime::now_utc().unix_timestamp();
+        let healthy = row(wallet(3), 8, healthy_epoch, 3008);
+        let healthy_id = id(&healthy);
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get_mut(&wallet(3).to_string())
+            .unwrap()
+            .push(healthy);
+        eprintln!("scope drops: waiting for unrepresentable-row wallet's healthy buy");
+        until(|| paper.list_fills().unwrap().len() == 5).await;
+        assert!(paper.list_fills().unwrap().iter().any(|fill| {
+            fill.market_id == MarketId(VenueMarketId(condition(8))) && fill.side == Side::Buy
+        }));
         let logs = child.stop().await;
         assert!(logs.contains("ranking scope drops imported"), "{logs}");
+        assert!(
+            pe_event_log::Reader::replay(&cfg.source_event_log_path)
+                .unwrap()
+                .any(|frame| {
+                    let (_, envelope) = frame.unwrap();
+                    envelope.source_id.0 == pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID
+                        && envelope.schema_version
+                            == pe_service::trade_poller::ACTIVITY_POLL_ANOMALY_PAGE_SCHEMA_VERSION
+                        && serde_json::from_slice::<Vec<Value>>(&envelope.payload)
+                            .unwrap()
+                            .contains(&unrepresentable)
+                })
+        );
         let financial = paper.financial_snapshot(now + 1000).unwrap();
         let history = paper.gate_history().unwrap();
         let decisions = paper.decision_pending_history().unwrap();
         let fills = paper.list_fills().unwrap();
+        assert!(
+            decisions
+                .iter()
+                .any(|row| row.source_trade_id == healthy_id)
+        );
+        assert!(
+            decisions
+                .iter()
+                .all(|row| row.source_trade_id != unrepresentable_id)
+        );
         let groups = wallets
             .iter()
             .map(|w| paper.activity_groups_after(w, 0).unwrap())
@@ -1190,8 +1292,8 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         let report: pe_service::qualification::QualificationReport =
             serde_json::from_slice(&std::fs::read(output_path).unwrap()).unwrap();
         assert!(report.replay.exact, "{:?}", report.reasons);
-        assert_eq!(report.replay.fills, 4);
-        assert_eq!(report.replay.decisions, 4);
+        assert_eq!(report.replay.fills, 5);
+        assert_eq!(report.replay.decisions, 5);
         assert_eq!(
             report.verdict,
             pe_service::qualification::QualificationVerdict::Fail,
