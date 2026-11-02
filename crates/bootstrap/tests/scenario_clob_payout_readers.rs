@@ -334,3 +334,169 @@ fn a_staged_market_lost_before_completion_fails_the_walk() {
         "reported {error}"
     );
 }
+
+/// Stages, without completing, a two-page walk whose second page repeats the
+/// half-payout market, and returns the walk's coverage manifest.
+fn stage_two_pages_repeating_a_market(
+    cache: &mut WalletCache,
+) -> pe_source_polymarket_public::ClobCoverageManifest {
+    use pe_source_polymarket_public::{ClobCoverageManifest, ClobCoveragePage};
+
+    let state = cache
+        .begin_or_resume_clob_payout_walk_v2(1_800_000_000)
+        .unwrap();
+    let evidence = |bodies: &[&str]| -> Vec<_> {
+        bodies
+            .iter()
+            .map(|body| {
+                pe_source_polymarket_public::parse_clob_market(body.as_bytes())
+                    .unwrap()
+                    .resolution_evidence()
+            })
+            .collect()
+    };
+    let first = ClobCoveragePage {
+        ordinal: 0,
+        request_cursor: None,
+        returned_next_cursor: Some("MTAwMA==".to_owned()),
+        raw_sha256: "c".repeat(64),
+        market_count: 2,
+        closed_market_count: 2,
+        resolved_payout_count: 2,
+        unresolved_payout_count: 0,
+        explicit_fifty_fifty_count: 1,
+    };
+    let second = ClobCoveragePage {
+        ordinal: 1,
+        request_cursor: Some("MTAwMA==".to_owned()),
+        returned_next_cursor: Some("LTE=".to_owned()),
+        raw_sha256: "d".repeat(64),
+        market_count: 1,
+        closed_market_count: 1,
+        resolved_payout_count: 1,
+        unresolved_payout_count: 0,
+        explicit_fifty_fifty_count: 1,
+    };
+    cache
+        .commit_clob_payout_page_v2(
+            state.generation,
+            &first,
+            &evidence(&[HALF, WINNER]),
+            1_800_000_010,
+        )
+        .unwrap();
+    cache
+        .commit_clob_payout_page_v2(state.generation, &second, &evidence(&[HALF]), 1_800_000_020)
+        .unwrap();
+    ClobCoverageManifest::complete(state.generation, vec![first, second]).unwrap()
+}
+
+/// Every column of a payout evidence table, its generation column last, by market.
+fn evidence_rows(
+    connection: &rusqlite::Connection,
+    table: &str,
+    generation_column: &str,
+) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT market_id, end_date_unix, neg_risk_market_id, neg_risk, is_50_50_outcome, \
+                    payout_status, payout_vector_json, closed, tokens_json, raw_page_sha256, \
+                    page_ordinal, schema_version, parser_version, fetched_at_unix, origin, \
+                    {generation_column} \
+             FROM {table} ORDER BY market_id"
+        ))
+        .unwrap();
+    statement
+        .query_map([], |row| (0..16).map(|index| row.get(index)).collect())
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// PASS: completion installs exactly the staged rows, column by column, and leaves
+/// no staging, page or walk-state row behind. FAIL: a row or column differs, or
+/// the walk survives its install.
+#[test]
+fn completion_installs_the_staged_rows_and_clears_the_walk() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("cache.db");
+    let mut cache = WalletCache::open(&db_path).unwrap();
+    let manifest = stage_two_pages_repeating_a_market(&mut cache);
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    let staged = evidence_rows(&connection, "clob_payout_evidence_staging_v2", "generation");
+    assert_eq!(staged.len(), 2, "the repeated market is staged once");
+
+    cache
+        .complete_clob_payout_walk_v2(&manifest, 1_800_000_030)
+        .unwrap();
+
+    assert_eq!(
+        evidence_rows(
+            &connection,
+            "clob_payout_evidence_v2",
+            "coverage_generation"
+        ),
+        staged
+    );
+    let count = |sql: &str| -> i64 { connection.query_row(sql, [], |row| row.get(0)).unwrap() };
+    assert_eq!(
+        count("SELECT COUNT(*) FROM clob_payout_evidence_staging_v2"),
+        0
+    );
+    assert_eq!(count("SELECT COUNT(*) FROM clob_payout_walk_pages_v2"), 0);
+    assert_eq!(count("SELECT COUNT(*) FROM clob_payout_walk_state_v2"), 0);
+    let committed: Option<i64> = connection
+        .query_row(
+            "SELECT evidence_count FROM clob_payout_coverage_manifests_v2 WHERE generation = ?1",
+            [i64::try_from(manifest.generation).unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(committed, Some(2));
+}
+
+/// PASS: a failure after the staging clear rolls the whole install back: staging,
+/// the walk's pages and its state stay as staged, and neither evidence nor
+/// coverage is installed. FAIL: the clear survives the failed completion, or part
+/// of the install is visible.
+#[test]
+fn a_failure_after_the_staging_clear_rolls_the_install_back() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("cache.db");
+    let mut cache = WalletCache::open(&db_path).unwrap();
+    let manifest = stage_two_pages_repeating_a_market(&mut cache);
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    let staged = evidence_rows(&connection, "clob_payout_evidence_staging_v2", "generation");
+    // Deleting the walk state is the completion's last statement, after the clear.
+    connection
+        .execute_batch(
+            "CREATE TRIGGER refuse_walk_state_delete BEFORE DELETE ON clob_payout_walk_state_v2 \
+             BEGIN SELECT RAISE(ABORT, 'injected walk state failure'); END;",
+        )
+        .unwrap();
+
+    let error = cache
+        .complete_clob_payout_walk_v2(&manifest, 1_800_000_030)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("injected walk state failure"), "{error}");
+
+    assert_eq!(
+        evidence_rows(&connection, "clob_payout_evidence_staging_v2", "generation"),
+        staged
+    );
+    let count = |sql: &str| -> i64 { connection.query_row(sql, [], |row| row.get(0)).unwrap() };
+    assert_eq!(count("SELECT COUNT(*) FROM clob_payout_evidence_v2"), 0);
+    assert_eq!(
+        count("SELECT COUNT(*) FROM clob_payout_coverage_manifests_v2"),
+        0
+    );
+    assert_eq!(count("SELECT COUNT(*) FROM clob_payout_walk_pages_v2"), 2);
+    assert_eq!(
+        cache
+            .clob_payout_walk_state_v2()
+            .unwrap()
+            .map(|state| state.generation),
+        Some(manifest.generation)
+    );
+}

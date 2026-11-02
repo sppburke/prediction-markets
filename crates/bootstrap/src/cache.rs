@@ -113,6 +113,26 @@ pub const REQUIRED_TRADES_INDEXES: [&str; 3] = [
     "idx_trades_buy_market_outcome_wallet_ts",
 ];
 
+/// Copies a finished walk's staged evidence into `clob_payout_evidence_v2` in
+/// [`WalletCache::complete_clob_payout_walk_v2`]. `NOT INDEXED` reads staging in
+/// rowid order, which is the walk's page order; through the `(generation,
+/// market_id)` key every staged row would be a random table read.
+const CLOB_PAYOUT_INSTALL_SQL: &str = "INSERT INTO clob_payout_evidence_v2 \
+     (market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, closed, \
+      tokens_json, raw_page_sha256, coverage_generation, page_ordinal, \
+      schema_version, parser_version, fetched_at_unix, origin, neg_risk_market_id, neg_risk) \
+     SELECT market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, closed, \
+            tokens_json, raw_page_sha256, generation, page_ordinal, schema_version, \
+            parser_version, fetched_at_unix, origin, neg_risk_market_id, neg_risk \
+     FROM clob_payout_evidence_staging_v2 NOT INDEXED WHERE generation = ?1";
+
+/// Clears staging once [`WalletCache::complete_clob_payout_walk_v2`] has copied it.
+/// Staging only ever holds the active walk's rows: a walk clears it in the
+/// transaction that creates its generation, and a page is staged only after its
+/// generation is checked against the active walk. So this removes the same rows as
+/// `WHERE generation = ?1`, and SQLite frees the pages instead of deleting each row.
+const CLOB_PAYOUT_STAGING_CLEAR_SQL: &str = "DELETE FROM clob_payout_evidence_staging_v2";
+
 const WRITABLE_PRAGMAS: &str = "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;";
 
 const SCHEMA: &str = concatcp!(
@@ -3031,17 +3051,7 @@ impl WalletCache {
         // Staging collapses a market the venue returned on more than one page, so the
         // rows copied here are the distinct markets this walk covered (#672). Coverage
         // records that count, because the manifest's per-page sum counts repeats twice.
-        let evidence_count = tx.execute(
-            "INSERT INTO clob_payout_evidence_v2 \
-             (market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, closed, \
-              tokens_json, raw_page_sha256, coverage_generation, page_ordinal, \
-              schema_version, parser_version, fetched_at_unix, origin, neg_risk_market_id, neg_risk) \
-             SELECT market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, closed, \
-                    tokens_json, raw_page_sha256, generation, page_ordinal, schema_version, \
-                    parser_version, fetched_at_unix, origin, neg_risk_market_id, neg_risk \
-             FROM clob_payout_evidence_staging_v2 WHERE generation = ?1",
-            params![generation],
-        )?;
+        let evidence_count = tx.execute(CLOB_PAYOUT_INSTALL_SQL, params![generation])?;
         let evidence_count = checked_i64(
             u64::try_from(evidence_count).map_err(|_| BootstrapError::Cache {
                 message: "clob payout evidence count does not fit".to_owned(),
@@ -3062,10 +3072,7 @@ impl WalletCache {
              SET evidence_count = ?2, group_version = 1 WHERE generation = ?1",
             params![generation, evidence_count],
         )?;
-        tx.execute(
-            "DELETE FROM clob_payout_evidence_staging_v2 WHERE generation = ?1",
-            params![generation],
-        )?;
+        tx.execute(CLOB_PAYOUT_STAGING_CLEAR_SQL, [])?;
         tx.execute(
             "DELETE FROM clob_payout_walk_pages_v2 WHERE generation = ?1",
             params![generation],
@@ -6778,6 +6785,41 @@ mod tests {
             .commit_clob_payout_page_v2(generation, &page, &evidence, 100)
             .unwrap();
         page
+    }
+
+    /// PASS: the completion copies staging in table order and frees staging's pages
+    /// in one step. FAIL: the copy goes through the `(generation, market_id)` key, or
+    /// the clear deletes row by row.
+    #[test]
+    fn clob_payout_completion_scans_staging_and_clears_it_without_row_deletes() {
+        let dir = TempDir::new().unwrap();
+        let cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        let plan = cache
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {CLOB_PAYOUT_INSTALL_SQL}"))
+            .unwrap()
+            .query_map([1], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(plan, ["SCAN clob_payout_evidence_staging_v2"]);
+        let opcodes = cache
+            .conn
+            .prepare(&format!("EXPLAIN {CLOB_PAYOUT_STAGING_CLEAR_SQL}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            opcodes.iter().filter(|opcode| *opcode == "Clear").count(),
+            2,
+            "staging's table and its key must both be cleared: {opcodes:?}"
+        );
+        assert!(
+            !opcodes.iter().any(|opcode| opcode == "Delete"),
+            "{opcodes:?}"
+        );
     }
 
     #[test]
