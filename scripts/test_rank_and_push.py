@@ -301,7 +301,7 @@ class RankAndPushScenario(unittest.TestCase):
             f"exec {shlex.quote(sys.executable)} \"$@\"\n",
         )
 
-    def _run(self, *args, exit_env=None, fd9=None):
+    def _run_env(self, exit_env=None):
         env = dict(os.environ)
         env.pop("PE_PYTHON", None)
         for variable in CYCLE_SETTINGS.values():
@@ -310,10 +310,18 @@ class RankAndPushScenario(unittest.TestCase):
         clock = self.root / "clock"
         if clock.is_dir():
             env["PATH"] = f"{clock}:{env['PATH']}"
+        return env
+
+    def _wrapper_command(self, args, fd9=None):
         command = ["bash", str(self.wrapper), *args]
         if fd9 is not None:
             # As under the loop supervisor, the wrapper inherits a lock on descriptor 9.
             command = ["bash", "-c", 'exec 9<>"$1"; flock -n 9 || exit 99; shift; exec "$@"', "bash", str(fd9), *command]
+        return command
+
+    def _run(self, *args, exit_env=None, fd9=None):
+        env = RankAndPushScenario._run_env(self, exit_env)
+        command = RankAndPushScenario._wrapper_command(self, args, fd9)
         # Its own session: a hang's timeout ends everything the wrapper started, and the cleanup
         # ends what a failing scenario left behind after the test's own assertions ran.
         process = subprocess.Popen(command, cwd=self.root, env=env, stdout=subprocess.PIPE,
@@ -2659,6 +2667,10 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
                             '  printf collecting > scope-overlap.pipe; : > scope-handshake\n'
                             '  if [[ -n "${STUB_WAIT_SCOPE_EXIT:-}" ]]; then\n'
                             '    for _ in $(seq 100); do [[ -e scope_exited ]] && break; sleep 0.1; done\n'
+                            '    pid=$(cut -d" " -f1 scope_identity)\n'
+                            '    for _ in $(seq 100); do\n'
+                            '      [[ -e /proc/$pid && "$(cut -d" " -f3 /proc/$pid/stat 2>/dev/null)" != Z ]] || break; sleep 0.1\n'
+                            '    done\n'
                             '  fi\n'
                             'fi\n'
                             'if [[ "$1" == "cache-populate-activity-v2" && -n "${STUB_FAIL_TOP_UP:-}"'
@@ -2686,10 +2698,12 @@ if mode == 'block':
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
     def stopped(_signal, _frame):
-        time.sleep(1)
+        time.sleep(3)
         Path('scope_reaped').write_text('yes')
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, stopped)
+born = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]
+Path('scope_identity').write_text(f'{os.getpid()} {born}')
 Path('scope_started').write_text(str(os.getpid()))
 Path('scope_fds').write_text('\\n'.join(os.path.realpath(f'/proc/self/fd/{fd}') for fd in os.listdir('/proc/self/fd')))
 if out.exists():
@@ -2715,11 +2729,13 @@ Path('scope_done').write_text('yes')
             "import os, sys\n",
             "import os, sys\n"
             "assert os.path.isfile('scope_done'), 'export before the scope join'\n"
+            "pid, born = open('scope_identity').read().split()\n"
             "try:\n"
-            "    os.kill(int(open('scope_started').read()), 0)\n"
-            "    raise SystemExit('export while the scope sweep is still alive')\n"
-            "except ProcessLookupError:\n"
-            "    pass\n", 1))
+            "    fields = open(f'/proc/{pid}/stat').read().rsplit(')', 1)[1].split()\n"
+            "except OSError:\n"
+            "    fields = None\n"
+            "if fields and fields[19] == born and fields[0] != 'Z':\n"
+            "    raise SystemExit('export while the scope sweep is still alive')\n", 1))
 
     def test_fresh_lane_market_scope_runs_beside_collection_and_joins_before_export(self):
         """PASS: the sweep starts after the targets and before activity, overlaps collection (the
@@ -2822,6 +2838,33 @@ Path('scope_done').write_text('yes')
         self.assertEqual((self.root / "scope_exited").read_text(), "75")
         self.assertIn("[payout] FATAL exit 1", result.stderr)
         self.assertNotIn("[market-scope] TEMPFAIL", result.stderr)
+
+    def test_fresh_lane_scope_sweep_holds_neither_run_lock(self):
+        """PASS: once the wrapper waits at the join, kill it without its trap; the still-running
+        sweep (its only child) holds neither the run lock nor the supervisor's descriptor-9 lock,
+        so both can be taken at once. FAIL: either flock is refused."""
+        import fcntl
+        self._prepare_incremental_fixture(two_file=True)
+        self._install_scope_probe()
+        loop_lock = self.root / "loop.lock"
+        stdout = self.root / "wrapper.stdout"
+        with stdout.open("w") as out:
+            process = subprocess.Popen(
+                RankAndPushScenario._wrapper_command(self, [], loop_lock), cwd=self.root,
+                env=RankAndPushScenario._run_env(self, {"STUB_SCOPE_MODE": "block"}),
+                stdout=out, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(RankAndPushScenario._end_run_group, process.pid, str(self.root))
+        deadline = time.time() + 30
+        while "[market-scope] joining the sweep started beside collection" not in stdout.read_text():
+            self.assertLess(time.time(), deadline, stdout.read_text())
+            self.assertIsNone(process.poll(), stdout.read_text())
+            time.sleep(0.05)
+        os.kill(process.pid, signal.SIGKILL)
+        process.wait(timeout=10)
+        os.kill(int((self.root / "scope_started").read_text()), 0)
+        for lock in (self.root / "data/eval-results/.rank_and_push.lock", loop_lock):
+            with lock.open("a") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_fresh_lane_retry_acquires_a_new_scope_without_reading_the_old_one(self):
         self._prepare_incremental_fixture(two_file=True)
