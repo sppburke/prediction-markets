@@ -278,7 +278,7 @@ impl<F: PageFetcher + Send + Sync + 'static> ClobFetcher<F> {
         let mut prefetched: Option<PrefetchedPage> = None;
         loop {
             let bytes = match prefetched.take() {
-                Some(next) => next.join().await?,
+                Some(request) => request.join().await?,
                 None => {
                     let url = build_page_url(&self.base_url, cursor.as_deref());
                     Self::fetch_page_with_retry(&self.fetcher, &url).await?
@@ -485,10 +485,10 @@ impl<F: PageFetcher + Send + Sync + 'static> ClobFetcher<F> {
                 Ok(())
             });
             if let Err(error) = written {
-                // The page did not commit: stop the next page's request and
-                // discard its outcome before reporting this failure.
-                if let Some(next) = prefetched.take() {
-                    next.cancel().await;
+                // Writing the page or its legacy cursor failed: stop the next
+                // page's request and discard its outcome before reporting it.
+                if let Some(request) = prefetched.take() {
+                    request.cancel().await;
                 }
                 return Err(error);
             }
@@ -1224,13 +1224,22 @@ mod tests {
         assert_next_page_requested_while_writing(true).await;
     }
 
-    /// Page B fails to commit while the page-C request is already running (it
-    /// moves the stored walk, releases the lock, then hangs or fails): the walk
-    /// returns page B's error after the request has stopped.
+    /// Page B's payout transaction fails part-way (its second staged market is
+    /// refused) while the page-C request is already running (it releases the
+    /// lock, then hangs or fails): the walk returns page B's error after the
+    /// request has stopped, the transaction rolled back, and both resume cursors
+    /// still name page B.
     async fn assert_write_failure_wins(page_c: Scripted, hung: Option<Arc<Dropped>>) {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("cache.db");
         let mut cache = cache_with_page_a(&path).await;
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_page_b_staging BEFORE INSERT ON clob_payout_evidence_staging_v2 \
+                 WHEN NEW.market_id = '0xb2' BEGIN SELECT RAISE(ABORT, 'injected staging failure'); END;",
+            )
+            .unwrap();
         let held = hold_write_lock(&path);
         let on_request = {
             let held = Arc::clone(&held);
@@ -1238,17 +1247,14 @@ mod tests {
                 if url == prefetch_url(Some("PAGEC"))
                     && let Some(conn) = held.lock().unwrap().take()
                 {
-                    conn.execute_batch(
-                        "UPDATE clob_payout_walk_state_v2 SET next_cursor = 'MOVED' WHERE singleton = 1; COMMIT",
-                    )
-                    .unwrap();
+                    conn.execute_batch("ROLLBACK").unwrap();
                 }
             }
         };
         let (clob, requests) = scripted(vec![(prefetch_url(Some("PAGEC")), page_c)], on_request);
         let error = clob.fetch_closed_markets(&mut cache).await.unwrap_err();
         assert!(
-            error.to_string().contains("does not match active v2 walk"),
+            error.to_string().contains("injected staging failure"),
             "{error}"
         );
         if let Some(dropped) = hung {
@@ -1258,7 +1264,26 @@ mod tests {
             *requests.lock().unwrap(),
             vec![prefetch_url(Some("PAGEB")), prefetch_url(Some("PAGEC"))]
         );
-        assert_eq!(walk_state(&path), (Some("MOVED".to_owned()), 1));
+        assert_eq!(walk_state(&path), (Some("PAGEB".to_owned()), 1));
+        assert_eq!(
+            cache.get_source_cursor(CLOB_CLOSED_CURSOR_KEY).as_deref(),
+            Some("PAGEB")
+        );
+        let (pages, staged): (i64, i64) = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM clob_payout_walk_pages_v2 WHERE page_ordinal = 1), \
+                        (SELECT COUNT(*) FROM clob_payout_evidence_staging_v2 \
+                         WHERE market_id IN ('0xb1', '0xb2'))",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (pages, staged),
+            (0, 0),
+            "page B's payout transaction rolled back"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
