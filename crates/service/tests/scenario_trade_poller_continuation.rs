@@ -171,6 +171,7 @@ fn context(epoch: i64) -> BucketDecisionContext {
         observation_provenance: HashMap::new(),
         no_copy_dispositions: HashMap::new(),
         identity_overrides: HashMap::new(),
+        scope_tokens: HashMap::new(),
         identity_unresolved: Default::default(),
         restamp_twins: Default::default(),
         history_status: None,
@@ -494,7 +495,7 @@ async fn recorded_poll(
                     }),
                 )
                 .unwrap();
-            commits.push((aggregates, Arc::clone(&context), result.clone()));
+            commits.push((aggregates.aggregates, Arc::clone(&context), result.clone()));
             let _ = committed.send(Ok(result));
         }
         commits
@@ -1279,7 +1280,7 @@ fn start_recorded_poller_with_membership(
                                 .unwrap();
                         result.newly_fenced = Some(pe_position_ledger::WalletFenceCause::Underflow);
                     }
-                    commits.push((aggregates, context, result.clone()));
+                    commits.push((aggregates.aggregates, context, result.clone()));
                     let _ = control_events
                         .send(ControlCompletion::BucketCommitted)
                         .await;
@@ -7335,6 +7336,139 @@ async fn ambiguity_carrier_certifies_only_a_drop_starting_at_its_own_second() {
                 paper.wallet_scope_drops(&wallet(), EPOCH).unwrap()[0].dropped_at_epoch,
                 start
             );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn poller_routes_valid_buckets_beside_each_anomaly_and_restarts_anomaly_only_seconds() {
+    for kind in [
+        "price",
+        "decimal",
+        "numeric_outcome",
+        "outcome",
+        "split",
+        "merge",
+        "token_fallback",
+    ] {
+        for resolved in [false, true] {
+            for mixed in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut row = activity_row(
+                    "TRADE",
+                    "0xanomaly",
+                    MARKET_A,
+                    "SELL",
+                    "1",
+                    "asset-a",
+                    EPOCH - 1,
+                );
+                match kind {
+                    "price" => row["price"] = json!("3.1968021978"),
+                    "token_fallback" => {
+                        row["price"] = json!("2");
+                        row["conditionId"] = json!("not-canonical");
+                    }
+                    "decimal" => row["usdcSize"] = json!("4.212e-7"),
+                    "numeric_outcome" => row["outcomeIndex"] = json!(65536),
+                    "outcome" => row["outcomeIndex"] = json!("invalid"),
+                    "split" | "merge" => {
+                        row["type"] = json!(if kind == "split" { "SPLIT" } else { "MERGE" });
+                        row["size"] = json!("4.212e-7");
+                        row["asset"] = json!("");
+                        row["side"] = json!("");
+                    }
+                    _ => unreachable!(),
+                }
+                if !resolved {
+                    row["conditionId"] = json!("unknown-condition");
+                    row["asset"] = json!("missing-asset");
+                }
+                let healthy =
+                    activity_row("TRADE", "0xhealthy", MARKET_B, "BUY", "1", "asset-b", EPOCH);
+                let healthy_id = aggregate(healthy.clone()).group_id.key().clone();
+                let mut rows = vec![row.clone()];
+                if mixed {
+                    rows.push(healthy.clone());
+                }
+                let (mut running, paper) =
+                    start_recorded_poller_with_owner(&dir, &[wallet()], true);
+                running
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap()
+                    .respond
+                    .send(serde_json::to_vec(&rows).unwrap())
+                    .unwrap();
+                running.completed(wallet()).await;
+                running.round_completed().await;
+                let commits = running.finish().await;
+                assert_eq!(
+                    commits.len(),
+                    if mixed { 2 } else { 1 },
+                    "{kind} resolved={resolved}"
+                );
+                assert!(commits[0].0.is_empty());
+                assert!(commits[0].2.pending.is_empty());
+                assert_eq!(
+                    paper.cursor(&wallet()).unwrap(),
+                    Some(EPOCH - 1 + i64::from(mixed))
+                );
+                assert_eq!(
+                    paper.activity(&wallet()).unwrap(),
+                    Some(EPOCH - 1 + i64::from(mixed))
+                );
+                assert_eq!(
+                    paper
+                        .wallet_scope_drops(&wallet(), EPOCH + 2)
+                        .unwrap()
+                        .len(),
+                    usize::from(resolved)
+                );
+                if mixed {
+                    assert!(paper.decision_pending_for(&healthy_id).unwrap().is_some());
+                }
+                assert!(paper.scope_drop_boundary_unix().unwrap().is_some());
+                if matches!(kind, "split" | "merge") {
+                    assert!(
+                        source_frames(&dir.path().join("source.log"))
+                            .iter()
+                            .any(|frame| frame.source_id.0
+                                == pe_source_polymarket_public::GAMMA_MARKETS_SOURCE_ID)
+                    );
+                }
+                assert!(
+                    source_frames(&dir.path().join("source.log"))
+                        .iter()
+                        .any(|frame| frame.schema_version == 4
+                            && frame.source_id.0
+                                == pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID)
+                );
+                let (mut restarted, reopened) =
+                    start_recorded_poller_with_owner(&dir, &[wallet()], true);
+                let repeat = if mixed { vec![healthy] } else { vec![row] };
+                restarted
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap()
+                    .respond
+                    .send(serde_json::to_vec(&repeat).unwrap())
+                    .unwrap();
+                restarted.completed(wallet()).await;
+                restarted.round_completed().await;
+                let repeated = restarted.finish().await;
+                assert!(
+                    repeated
+                        .iter()
+                        .all(|(_, _, result)| result.already_committed)
+                );
+                assert_eq!(
+                    reopened.wallet_scope_drops(&wallet(), EPOCH + 2).unwrap(),
+                    paper.wallet_scope_drops(&wallet(), EPOCH + 2).unwrap()
+                );
+            }
         }
     }
 }

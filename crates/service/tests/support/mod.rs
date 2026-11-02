@@ -490,7 +490,7 @@ pub async fn send_trade_bucket_with_config(
     let (committed, acknowledged) = oneshot::channel();
     control
         .send(OrchestratorControl::CommitActivityBucket {
-            aggregates: read.aggregates,
+            aggregates: read.aggregates.into(),
             context: Arc::new(context),
             committed,
         })
@@ -524,6 +524,7 @@ pub fn read_context(
         observation_provenance: HashMap::new(),
         no_copy_dispositions: HashMap::new(),
         identity_overrides: HashMap::new(),
+        scope_tokens: HashMap::new(),
         identity_unresolved: Default::default(),
         restamp_twins: Default::default(),
         history_status: None,

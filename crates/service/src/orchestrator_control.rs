@@ -8,11 +8,11 @@
 
 use std::sync::Arc;
 
+use crate::bucket_commit::ReconciliationBucket;
 use pe_core_types::PolymarketConditionId;
 use pe_core_types::WalletAddress;
 use pe_event_log::AppendReceipt;
 use pe_risk_engine::RiskHaltCause;
-use pe_source_polymarket_public::ActivityAggregate;
 use pe_trader_index::WatchlistEntry;
 use tokio::sync::oneshot;
 
@@ -96,7 +96,7 @@ pub enum OrchestratorControl {
     /// Complete fixed-end reconciliation bucket. `#544 Lane E integration`:
     /// source routing closes obligations before sending this command.
     CommitActivityBucket {
-        aggregates: Vec<ActivityAggregate>,
+        aggregates: ReconciliationBucket,
         context: Arc<BucketDecisionContext>,
         committed: oneshot::Sender<Result<BucketCommitResult, BucketCommitError>>,
     },

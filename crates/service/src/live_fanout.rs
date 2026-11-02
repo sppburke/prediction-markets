@@ -4994,6 +4994,7 @@ fn produced_decision_continuation(
         observation_provenance: HashMap::from([(source_trade_id.clone(), provenance)]),
         no_copy_dispositions: HashMap::new(),
         identity_overrides: HashMap::new(),
+        scope_tokens: HashMap::new(),
         identity_unresolved: HashSet::new(),
         restamp_twins: Default::default(),
         history_status: Some(pe_paper_state::WalletHistoryStatusRecord {
@@ -5076,7 +5077,7 @@ fn produced_observation_index(
     }
     .url("https://data-api.polymarket.com");
     let raw_hash = bound.raw_payload_hash.to_hex().to_string();
-    let page = pe_source_polymarket_public::ReconciliationPageEvidence {
+    let mut page = pe_source_polymarket_public::ReconciliationPageEvidence {
         anomalies: Vec::new(),
         request_url: request_url.clone(),
         bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
@@ -5100,9 +5101,21 @@ fn produced_observation_index(
         received_at: bound.received_at.clone(),
         transport: pe_source_polymarket_public::ActivityTransport::Replay,
     };
-    let window =
-        pe_source_polymarket_public::parse_activity_response(&bound.payload, wallet, &context)
-            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    let (generation, acceptance) = crate::bucket_commit::activity_page_generation(
+        &bound.source_id.0,
+        bound.schema_version,
+        bound.parser_version,
+        &bound.content_type,
+    )
+    .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    let window = pe_source_polymarket_public::parse_activity_response_with_acceptance(
+        &bound.payload,
+        wallet,
+        &context,
+        acceptance,
+    )
+    .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    page.anomalies = window.anomalies.clone();
     let aggregate = window
         .aggregates()
         .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?
@@ -5124,17 +5137,16 @@ fn produced_observation_index(
     );
     let continuation = continuation?;
     // This legacy log harness retains historical schema-2 page envelopes.
-    let continuation =
-        if bound.schema_version == pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION {
-            DecisionContinuationV3::new(
-                continuation.facts,
-                continuation.observed_source_receipt,
-                continuation.page_occurrences,
-                None,
-            )
-        } else {
-            continuation
-        };
+    let continuation = if generation == crate::bucket_commit::PageGeneration::Historical {
+        DecisionContinuationV3::new(
+            continuation.facts,
+            continuation.observed_source_receipt,
+            continuation.page_occurrences,
+            None,
+        )
+    } else {
+        continuation
+    };
     Ok(HashMap::from([(source_trade_id, (continuation, None))]))
 }
 
@@ -12464,6 +12476,7 @@ mod tests {
                     raw.facts.provenance,
                 )]),
                 no_copy_dispositions: HashMap::new(),
+                scope_tokens: HashMap::new(),
                 identity_overrides: if corrected {
                     HashMap::from([(
                         source_trade_id.clone(),

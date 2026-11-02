@@ -53,7 +53,7 @@ use pe_source_polymarket_public::{
 use pe_source_polymarket_public::{
     ActivityParseContext, ActivityTransport, ActivityType, BinaryPayoutVector,
     CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobPayoutResolution,
-    parse_activity_row, parse_activity_trade_observation, parse_clob_market,
+    parse_activity_trade_observation, parse_clob_market,
 };
 use pe_trader_index::score::lcb_5pct_decimal;
 use rust_decimal::{Decimal, MathematicalOps};
@@ -632,7 +632,7 @@ fn decision_observation_from_source(
             observation.parser_version,
             &observation.content_type,
         )
-        .is_ok_and(|generation| generation.matches_continuation(continuation.version()))
+        .is_ok_and(|(generation, _)| generation.matches_continuation(continuation.version()))
             || blake3::hash(&observation.payload).to_hex().as_str() != page.raw_hash
         {
             return insufficient(format!(
@@ -2842,7 +2842,7 @@ fn fold_source_trade_universe(
     if source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID {
         return Ok(());
     }
-    crate::bucket_commit::activity_page_generation(
+    let (_, acceptance) = crate::bucket_commit::activity_page_generation(
         source_id,
         schema_version,
         parser_version,
@@ -2869,11 +2869,20 @@ fn fold_source_trade_universe(
         transport: ActivityTransport::Replay,
     };
     for raw in raw_rows {
-        let row = parse_activity_row(raw.get().as_bytes(), None, &context).map_err(|error| {
+        let parsed = pe_source_polymarket_public::parse_activity_row_with_acceptance(
+            raw.get().as_bytes(),
+            None,
+            &context,
+            acceptance,
+        )
+        .map_err(|error| {
             QualificationError::InsufficientEvidence(format!(
                 "activity observation parse failed: {error}"
             ))
         })?;
+        let pe_source_polymarket_public::ParsedActivityRow::Row(row) = parsed else {
+            continue;
+        };
         let group_id = row.group_id().map_err(|error| {
             QualificationError::InsufficientEvidence(format!(
                 "activity observation identity failed: {error}"
@@ -16793,6 +16802,61 @@ mod tests {
                 super::canonical_membership_json(kind, payload).is_err(),
                 "{kind}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod anomaly_universe_tests {
+    use super::*;
+
+    #[test]
+    fn schema_four_and_five_anomalies_have_no_trade_universe_identity() {
+        let now = time::OffsetDateTime::from_unix_timestamp(101).unwrap();
+        let healthy = serde_json::json!({
+            "proxyWallet":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "timestamp":100,
+            "type":"TRADE", "transactionHash":"0xhealthy", "conditionId":"0xca",
+            "asset":"asset-a", "side":"BUY", "isCombo":false, "outcomeIndex":0,
+            "outcome":"Yes", "price":"0.5", "size":"1", "usdcSize":"1"
+        });
+        let mut anomaly = healthy.clone();
+        anomaly["price"] = serde_json::json!("2");
+        anomaly["transactionHash"] = serde_json::json!("0xanomaly");
+        for schema_version in [2, 3, 4, 5] {
+            for positions in [false, true] {
+                let payload = serde_json::to_vec(&if positions {
+                    vec![serde_json::json!({"asset":"asset-a", "size":"1"})]
+                } else {
+                    vec![healthy.clone(), anomaly.clone()]
+                })
+                .unwrap();
+                let mut first = HashMap::new();
+                let result = fold_source_trade_universe(
+                    &mut first,
+                    &mut Vec::new(),
+                    EventSeq(10),
+                    SourcePageRef {
+                        receipt: AppendReceipt {
+                            sequence: EventSeq(1),
+                            this_hash: blake3::hash(&payload),
+                        },
+                        source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID,
+                        schema_version,
+                        parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                        content_type: &pe_event_log::ContentType::Json,
+                        observed_at: &SourceTimestamp(now),
+                        received_at: &ReceivedAt(now),
+                        payload: &payload,
+                    },
+                );
+                if !positions && schema_version < 4 {
+                    assert!(result.is_err());
+                } else {
+                    result.unwrap();
+                    assert_eq!(first.len(), usize::from(!positions));
+                }
+            }
         }
     }
 }

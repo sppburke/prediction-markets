@@ -4,6 +4,8 @@
 #[path = "support/golden.rs"]
 mod golden;
 
+use golden::support;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -939,6 +941,7 @@ fn recording_validator(
         "source-generation-test",
         sink,
         asset_identity,
+        Arc::new(PaperStateDb::open(&dir.path().join("recording.db")).unwrap()),
     )
     .with_clock(Arc::new(|| END));
     (dir, path, validator)
@@ -1023,6 +1026,7 @@ fn context(epoch: i64) -> BucketDecisionContext {
         observation_provenance: HashMap::new(),
         no_copy_dispositions: HashMap::new(),
         identity_overrides: HashMap::new(),
+        scope_tokens: HashMap::new(),
         identity_unresolved: Default::default(),
         restamp_twins: Default::default(),
         history_status: None,
@@ -1749,10 +1753,21 @@ fn durable_bracket_validator(
             GAMMA_BATCH_SIZE,
             sink.clone(),
         )
-        .with_paper_state(paper, "installed-identity-generation".into(), receipts),
+        .with_paper_state(
+            paper.clone(),
+            "installed-identity-generation".into(),
+            receipts,
+        ),
     );
-    CausalPositionValidator::new_recording(fetcher, BASE, "source-generation-test", sink, identity)
-        .with_clock(Arc::new(|| END))
+    CausalPositionValidator::new_recording(
+        fetcher,
+        BASE,
+        "source-generation-test",
+        sink,
+        identity,
+        paper,
+    )
+    .with_clock(Arc::new(|| END))
 }
 
 #[tokio::test]
@@ -5055,7 +5070,7 @@ async fn runtime_completion_case(
         let (committed, ack) = tokio::sync::oneshot::channel();
         h.control
             .send(OrchestratorControl::CommitActivityBucket {
-                aggregates: vec![historical],
+                aggregates: vec![historical].into(),
                 context: Arc::new(context(END + 1)),
                 committed,
             })
@@ -5074,7 +5089,7 @@ async fn runtime_completion_case(
             let (committed, ack) = tokio::sync::oneshot::channel();
             h.control
                 .send(OrchestratorControl::CommitActivityBucket {
-                    aggregates: vec![aggregate],
+                    aggregates: vec![aggregate].into(),
                     context: Arc::new(ordinary),
                     committed,
                 })
@@ -5200,7 +5215,7 @@ async fn runtime_repairs_stored_history_before_membership_and_preserves_financia
                 let (committed, ack) = tokio::sync::oneshot::channel();
                 h.control
                     .send(OrchestratorControl::CommitActivityBucket {
-                        aggregates: vec![aggregate(row, newcomer)],
+                        aggregates: vec![aggregate(row, newcomer)].into(),
                         context: Arc::new(ordinary),
                         committed,
                     })
@@ -6361,70 +6376,141 @@ async fn unreadable_activity_reply_defers_only_that_wallet_at_boot() {
     assert!(paper.position_validation(&healthy).unwrap().is_some());
 }
 
+fn anomalous_row(wallet: WalletAddress, byte: u8, kind: &str) -> Value {
+    let mut row = activity(wallet, byte, "0.91", "0xanomaly", 10);
+    row["side"] = json!("SELL");
+    match kind {
+        "price" => row["price"] = json!("3.1968021978"),
+        "decimal" => row["usdcSize"] = json!("4.212e-7"),
+        "numeric_outcome" => row["outcomeIndex"] = json!(65536),
+        "outcome" => row["outcomeIndex"] = json!("invalid"),
+        _ => unreachable!(),
+    }
+    row
+}
+
 #[tokio::test]
 async fn unparseable_venue_row_defers_only_that_wallet_at_boot() {
-    // Issue #594: rehearsal attempt 9 aborted the whole boot on one wallet's venue TRADE row with
-    // price 3.1968021978. Boot leaves that wallet unvalidated and anchors the others.
-    let healthy = wallet(0x74);
-    let corrupt = wallet(0x75);
-    let (_dir, paper, mut engine) = fresh(&[healthy, corrupt]);
-    let mut responses = stable_responses(&[(healthy, 1, "1.000000"), (corrupt, 2, "1.000000")]);
-    let mut row = activity(corrupt, 2, "0.91", "0xcorrupt", 10);
-    row["side"] = json!("SELL");
-    row["price"] = json!("3.1968021978");
-    row["usdcSize"] = json!("2.909090");
-    let page = serde_json::to_vec(&vec![row]).unwrap();
-    responses.insert(
-        activity_url(corrupt),
-        vec![page.clone(), page.clone(), page],
-    );
-
-    let outcome = validator(responses)
-        .validate_direct_with_deferrals(&[healthy, corrupt], &mut engine, &paper)
-        .await
-        .unwrap();
-    let installs = outcome.accepted;
-
-    assert_eq!(installs.len(), 1);
-    assert_eq!(installs[0].wallet, healthy);
-    assert_eq!(outcome.deferred.len(), 1);
-    assert_eq!(outcome.deferred[0].0, corrupt);
-    assert_eq!(
-        outcome.deferred[0].1.class(),
-        pe_service::position_seeder::FailureClass::WalletPersistent
-    );
-    assert!(paper.position_validation(&healthy).unwrap().is_some());
-    assert!(paper.position_validation(&corrupt).unwrap().is_none());
-    assert!(paper.position_anchors(&corrupt).unwrap().is_empty());
-    assert!(!paper.is_wallet_fenced(&corrupt).unwrap());
+    for kind in ["price", "decimal", "numeric_outcome", "outcome"] {
+        for migration in [false, true] {
+            let healthy = wallet(0x74);
+            let salvaged = wallet(0x75);
+            let (dir, paper, mut engine) = fresh(&[healthy, salvaged]);
+            let mut responses = stable_responses_for_attempts(
+                &[(healthy, 1, "1.000000"), (salvaged, 2, "1.000000")],
+                2,
+            );
+            let page = serde_json::to_vec(&[anomalous_row(salvaged, 2, kind)]).unwrap();
+            responses.insert(activity_url(salvaged), vec![page; 6]);
+            let source_path = dir.path().join("migration-source.log");
+            let validator = if migration {
+                durable_bracket_validator(
+                    Arc::new(QueueFetcher::new(responses)),
+                    paper.clone(),
+                    &source_path,
+                )
+            } else {
+                validator(responses)
+            };
+            for _ in 0..2 {
+                let outcome = validator
+                    .validate_direct_with_deferrals(&[healthy, salvaged], &mut engine, &paper)
+                    .await
+                    .unwrap();
+                assert_eq!(outcome.accepted.len(), 2, "{kind} migration={migration}");
+                assert!(outcome.deferred.is_empty());
+                assert!(paper.position_validation(&salvaged).unwrap().is_some());
+                let drops = paper.wallet_scope_drops(&salvaged, END).unwrap();
+                assert_eq!(drops.len(), 1);
+                assert_eq!(drops[0].scope_id, condition(2));
+                assert_eq!(drops[0].cause, "unrepresentable_activity_row");
+                let proof: Value = serde_json::from_str(&drops[0].proof_json).unwrap();
+                assert_eq!(proof.as_object().unwrap().len(), 4);
+                assert_eq!(proof["page_row_index"], 0);
+                assert!(paper.open_decision_pending().unwrap().is_empty());
+                assert!(!paper.is_wallet_fenced(&salvaged).unwrap());
+            }
+            if migration {
+                assert!(paper.scope_drop_boundary_unix().unwrap().is_some());
+                let frames = Reader::replay(&source_path)
+                    .unwrap()
+                    .map(|frame| frame.unwrap().1)
+                    .collect::<Vec<_>>();
+                assert!(frames.iter().any(|frame| frame.schema_version == 5
+                    && frame.payload
+                        == serde_json::to_vec(&[anomalous_row(salvaged, 2, kind)]).unwrap()));
+            }
+            let payload =
+                serde_json::to_vec(&[activity(salvaged, 3, "1", "0xlater", END + 1)]).unwrap();
+            let read = support::producer_shaped_read_v2(
+                salvaged,
+                &payload,
+                END + 1,
+                END + 1,
+                support::scenario_receipt(1000),
+            );
+            let mut ctx = context(END + 1);
+            ctx.copy_eligible = true;
+            ctx.page_occurrences = vec![read.page];
+            ctx.decision_inputs_json = read.decision_inputs_json;
+            ctx.read_commitment = Some(
+                pe_service::bucket_commit::ActivityReadCommitmentReceipt::BindingsV2(
+                    support::scenario_receipt(1001),
+                ),
+            );
+            let result = engine
+                .commit_with_freshness_policy(
+                    read.aggregates,
+                    &ctx,
+                    zero_basis(),
+                    Some(pe_service::bucket_commit::PaperFreshnessPolicy {
+                        activity_ws_enabled: false,
+                        copy_latency_budget_secs: 120,
+                    }),
+                )
+                .unwrap();
+            assert_eq!(result.pending.len(), 1, "later healthy entry: {kind}");
+        }
+    }
 }
 
 #[tokio::test]
 async fn periodic_refresh_defers_a_wallet_with_an_unparseable_venue_row() {
-    // Issue #594: once such a wallet is live, the hourly anchor refresh must report `Deferred`
-    // instead of surfacing an error that would end the poll round.
-    let wallet = wallet(0x77);
-    let (_dir, paper, engine) = fresh(&[wallet]);
-    let (control_tx, control_rx) = mpsc::channel(8);
-    let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
-    let mut responses = stable_responses(&[(wallet, 1, "1.000000")]);
-    let mut row = activity(wallet, 1, "0.91", "0xcorrupt", 10);
-    row["side"] = json!("SELL");
-    row["price"] = json!("3.1968021978");
-    row["usdcSize"] = json!("2.909090");
-    let page = serde_json::to_vec(&vec![row]).unwrap();
-    responses.insert(activity_url(wallet), vec![page.clone(), page.clone(), page]);
-    let preparer =
-        AdmissionPreparer::with_validator(control_tx, Arc::clone(&paper), validator(responses));
-
-    assert_eq!(
-        preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
-        AnchorRefreshOutcome::Deferred
-    );
-    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
-    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
-    drop(preparer);
-    actor.await.unwrap();
+    for kind in ["price", "decimal", "numeric_outcome", "outcome"] {
+        for anchored in [false, true] {
+            let wallet = wallet(0x77);
+            let (_dir, paper, mut engine) = fresh(&[wallet]);
+            if anchored {
+                install_empty_anchor(&mut engine, &paper, wallet, 0);
+            }
+            let (control_tx, control_rx) = mpsc::channel(8);
+            let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+            let mut responses = stable_responses_for_attempts(&[(wallet, 1, "1.000000")], 2);
+            let page = serde_json::to_vec(&[anomalous_row(wallet, 1, kind)]).unwrap();
+            responses.insert(activity_url(wallet), vec![page; 6]);
+            let preparer = AdmissionPreparer::with_validator(
+                control_tx,
+                Arc::clone(&paper),
+                validator(responses),
+            );
+            for pass in 0..2 {
+                assert_eq!(
+                    preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
+                    if pass == 0 {
+                        AnchorRefreshOutcome::Anchored
+                    } else {
+                        AnchorRefreshOutcome::Skipped
+                    },
+                    "{kind}"
+                );
+                assert_eq!(paper.wallet_scope_drops(&wallet, END).unwrap().len(), 1);
+                assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+            }
+            assert_eq!(paper.activity(&wallet).unwrap(), Some(10));
+            drop(preparer);
+            actor.await.unwrap();
+        }
+    }
 }
 
 fn rollout_history(dir: &TempDir) -> Vec<pe_paper_state::MarketHistoryRecord> {
@@ -6898,7 +6984,7 @@ async fn paper_service_rollout_recovery_cutoff_before_recorded_revision_defers()
     // An ordinary retry through the same serialized owner remains an exact disposed retry.
     let (committed, acknowledgement) = tokio::sync::oneshot::channel();
     tx.send(OrchestratorControl::CommitActivityBucket {
-        aggregates: vec![revised.clone()],
+        aggregates: vec![revised.clone()].into(),
         context: Arc::new(context(200)),
         committed,
     })
@@ -8778,4 +8864,44 @@ async fn membership_acquired_between_boot_batch_replays_survives_a_later_rollbac
         .count();
     assert_eq!(attempts, 3);
     server.abort();
+}
+
+#[tokio::test]
+async fn runtime_reentry_retains_anomaly_only_baseline_tokens_and_clocks() {
+    for kind in ["price", "decimal", "numeric_outcome", "outcome"] {
+        let wallet = wallet(0xe7);
+        let (_dir, paper, engine) = fresh(&[wallet]);
+        paper.seed_cursor_if_absent(&wallet, 10).unwrap();
+        let mut row = anomalous_row(wallet, 1, kind);
+        row["timestamp"] = json!(990_000);
+        let positions = vec![position(wallet, 1, "1")];
+        let reads = reentry_reads(
+            wallet,
+            1_000_000,
+            [1_000_000; 3],
+            &[row],
+            [&[]; 3],
+            &positions,
+        );
+        let validator = clocked_validator(Arc::new(QueueFetcher::new(reads)), vec![1_000_000]);
+        let (tx, rx) = mpsc::channel(2);
+        let actor = spawn_control_actor(rx, engine, paper.clone());
+        let preparer = AdmissionPreparer::with_validator(tx, paper.clone(), validator);
+        let outcome = preparer
+            .scenario_prepare_reentry(&[wallet], &HashMap::from([(wallet, 10)]))
+            .await
+            .unwrap();
+        assert_eq!(outcome.admitted, vec![wallet]);
+        assert_eq!(
+            paper.wallet_scope_drops(&wallet, 1_000_000).unwrap().len(),
+            1
+        );
+        assert_eq!(paper.activity(&wallet).unwrap(), Some(990_000));
+        let balances: Vec<(MarketId, OutcomeId, ShareAmount)> =
+            serde_json::from_str(&paper.position_anchors(&wallet).unwrap()[0].balances_json)
+                .unwrap();
+        assert_eq!(balances[0].2, ShareAmount::from_whole(1).unwrap());
+        drop(preparer);
+        actor.await.unwrap();
+    }
 }

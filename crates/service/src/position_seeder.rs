@@ -23,10 +23,12 @@ use pe_position_ledger::LedgerEffect;
 use pe_position_ledger::PositionLedger;
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAssetMapping, ActivityParseError,
-    ActivityReadError, ActivityValidationError, CompleteActivityRead, CompletePositionsRead,
-    PositionClassification, PositionReadError, ReconciliationFetcher, ReqwestFetcher,
-    fetch_complete_activity, fetch_complete_positions,
+    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAssetMapping, ActivityParseContext,
+    ActivityParseError, ActivityReadError, ActivityRowAcceptance, ActivityTransport,
+    ActivityValidationError, CompleteActivityRead, CompletePositionsRead, PositionClassification,
+    PositionReadError, ReconciliationFetcher, ReqwestFetcher,
+    fetch_complete_activity_with_acceptance, fetch_complete_positions,
+    parse_activity_response_with_acceptance,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -39,7 +41,7 @@ use crate::asset_identity::{
 };
 use crate::bucket_commit::{
     AnchorInstallError, BucketCommitEngine, BucketCommitError, BucketDecisionContext,
-    IdentityOverride,
+    IdentityOverride, ReconciliationBucket,
 };
 use crate::orchestrator_control::{AdmissionLedgerCapture, OrchestratorControl};
 use crate::trade_poller::{ACTIVITY_POLL_SOURCE_ID, restamp_twins};
@@ -654,6 +656,7 @@ struct BracketActivityEvidence<'a> {
 struct PreparedActivity {
     mapping: ActivityAssetMapping,
     identity_overrides: HashMap<SourceTradeId, IdentityOverride>,
+    scope_tokens: HashMap<PolymarketTokenId, IdentityOverride>,
     identity_unresolved: HashSet<SourceTradeId>,
     no_copy_dispositions: HashMap<SourceTradeId, NoCopyDisposition>,
     unresolved_assets: BTreeMap<String, String>,
@@ -735,10 +738,12 @@ impl CausalPositionValidator {
         source_log_generation: impl Into<Arc<str>>,
         source_log: BootSourceLog,
         asset_identity: Arc<AssetIdentityResolver>,
+        paper_state: Arc<PaperStateDb>,
     ) -> Self {
         let recording = DurableRecordingFetcher {
             inner: fetcher,
             sink: source_log,
+            paper_state,
         };
         Self::new(
             Arc::new(recording),
@@ -1379,12 +1384,13 @@ impl CausalPositionValidator {
         start: Option<i64>,
         fixed_end: i64,
     ) -> Result<CompleteActivityRead, CausalPositionError> {
-        fetch_complete_activity(
+        fetch_complete_activity_with_acceptance(
             self.fetcher.as_ref(),
             &self.base_url,
             wallet,
             start,
             fixed_end,
+            ActivityRowAcceptance::StrictWithAnomalies,
         )
         .await
         .map_err(|source| CausalPositionError::Activity { wallet, source })
@@ -1396,7 +1402,10 @@ impl CausalPositionValidator {
         activity: &CompleteActivityRead,
     ) -> Result<PreparedActivity, CausalPositionError> {
         let (mapping, resolved) = self
-            .resolve_activity_mapping(wallet, ActivityAssetMapping::from_rows(&activity.rows))
+            .resolve_activity_mapping(
+                wallet,
+                ActivityAssetMapping::from_rows_with_anomalies(&activity.rows, &activity.anomalies),
+            )
             .await?;
         self.prepare_resolved_activity(wallet, activity, mapping, resolved)
     }
@@ -1415,10 +1424,15 @@ impl CausalPositionValidator {
         // Build the union in place before awaiting resolution; only the short tail is cloned.
         let baseline_len = baseline.rows.len();
         baseline.rows.extend_from_slice(&activity.rows);
-        let union = ActivityAssetMapping::from_rows(&baseline.rows);
+        let baseline_anomaly_len = baseline.anomalies.len();
+        baseline.anomalies.extend_from_slice(&activity.anomalies);
+        let union =
+            ActivityAssetMapping::from_rows_with_anomalies(&baseline.rows, &baseline.anomalies);
+        baseline.anomalies.truncate(baseline_anomaly_len);
         baseline.rows.truncate(baseline_len);
         let (mapping, resolved) = self.resolve_activity_mapping(wallet, union).await?;
-        let mut tail_mapping = ActivityAssetMapping::from_rows(&activity.rows);
+        let mut tail_mapping =
+            ActivityAssetMapping::from_rows_with_anomalies(&activity.rows, &activity.anomalies);
         apply_resolved_mapping(wallet, &mut tail_mapping, &resolved)?;
         let prepared = self.prepare_resolved_activity(wallet, activity, tail_mapping, resolved)?;
         Ok((prepared, mapping))
@@ -1572,6 +1586,22 @@ impl CausalPositionValidator {
         Ok(PreparedActivity {
             mapping,
             identity_overrides,
+            scope_tokens: resolved
+                .verified
+                .iter()
+                .map(|(asset, identity)| {
+                    (
+                        asset.clone(),
+                        IdentityOverride {
+                            verified: MarketOutcomeId::new(
+                                MarketId(VenueMarketId(identity.condition_id.0.clone())),
+                                identity.outcome,
+                            ),
+                            evidence_hash: identity.evidence_hash.clone(),
+                        },
+                    )
+                })
+                .collect(),
             identity_unresolved,
             no_copy_dispositions,
             unresolved_assets,
@@ -1638,8 +1668,7 @@ impl CausalPositionValidator {
         count_change: bool,
     ) -> Result<bool, CausalPositionError> {
         let mut changed = false;
-        let buckets = activity
-            .buckets()
+        let buckets = ReconciliationBucket::from_read(wallet, activity)
             .map_err(|source| CausalPositionError::Activity { wallet, source })?;
         let context = Arc::new(bracket_context(
             activity,
@@ -1793,6 +1822,12 @@ fn newest_activity_unix(activity: &CompleteActivityRead) -> Option<i64> {
         .rows
         .iter()
         .map(|row| row.source_time.0.unix_timestamp())
+        .chain(
+            activity
+                .anomalies
+                .iter()
+                .map(|anomaly| anomaly.source_time.0.unix_timestamp()),
+        )
         .max()
 }
 
@@ -1988,6 +2023,7 @@ fn log_unresolved_activity_assets(
 struct DurableRecordingFetcher {
     inner: Arc<dyn ReconciliationFetcher>,
     sink: BootSourceLog,
+    paper_state: Arc<PaperStateDb>,
 }
 
 impl ReconciliationFetcher for DurableRecordingFetcher {
@@ -1998,9 +2034,45 @@ impl ReconciliationFetcher for DurableRecordingFetcher {
         Box::pin(async move {
             let payload = self.inner.fetch(url).await?;
             let received_at = time::OffsetDateTime::now_utc();
+            let anomalous = reqwest::Url::parse(url)
+                .ok()
+                .filter(|url| url.path() == "/activity")
+                .and_then(|url| {
+                    url.query_pairs()
+                        .find(|(key, _)| key == "user")
+                        .map(|(_, value)| value.into_owned())
+                })
+                .and_then(|user| WalletAddress::from_hex(&user).ok())
+                .is_some_and(|wallet| {
+                    parse_activity_response_with_acceptance(
+                        &payload,
+                        wallet,
+                        &ActivityParseContext {
+                            source_id: SourceId(ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                            observed_at: SourceTimestamp(received_at),
+                            received_at: ReceivedAt(received_at),
+                            transport: ActivityTransport::Rest,
+                        },
+                        ActivityRowAcceptance::StrictWithAnomalies,
+                    )
+                    .is_ok_and(|page| !page.anomalies.is_empty())
+                });
+            if anomalous {
+                pe_event_log::run_blocking(|| {
+                    self.paper_state
+                        .record_scope_drop_boundary(received_at.unix_timestamp())
+                })
+                .map_err(|error| SourceError::Fatal {
+                    message: format!("scope-drop boundary failed: {error}"),
+                })?;
+            }
             let envelope = EnvelopeIn {
                 source_id: SourceId(ACTIVITY_POLL_SOURCE_ID.to_owned()),
-                schema_version: ACTIVITY_SCHEMA_VERSION,
+                schema_version: if anomalous {
+                    crate::trade_poller::ACTIVITY_HISTORICAL_ANOMALY_PAGE_SCHEMA_VERSION
+                } else {
+                    ACTIVITY_SCHEMA_VERSION
+                },
                 parser_version: ACTIVITY_PARSER_VERSION,
                 observed_at: SourceTimestamp(received_at),
                 received_at: ReceivedAt(received_at),
@@ -2049,6 +2121,7 @@ fn bracket_context(
         observation_provenance: HashMap::new(),
         no_copy_dispositions: prepared.no_copy_dispositions.clone(),
         identity_overrides: prepared.identity_overrides.clone(),
+        scope_tokens: prepared.scope_tokens.clone(),
         identity_unresolved: prepared.identity_unresolved.clone(),
         restamp_twins,
         history_status: None,
@@ -2069,8 +2142,7 @@ fn commit_direct(
         NewlyFenced,
     }
 
-    let buckets = activity
-        .buckets()
+    let buckets = ReconciliationBucket::from_read(wallet, activity)
         .map_err(|source| CausalPositionError::Activity { wallet, source })?;
     let twins = restamp_twins(paper_state, &activity.rows).map_err(|error| {
         CausalPositionError::BucketCommit {
@@ -2654,6 +2726,7 @@ mod tests {
         let mut sink = SourceEventSink::open(dir.path().join("source.log")).unwrap();
         sink.fail_next_append();
         let fetcher = DurableRecordingFetcher {
+            paper_state: Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap()),
             inner: Arc::new(EmptyFetcher),
             sink: Arc::new(tokio::sync::Mutex::new(sink)),
         };
@@ -2715,6 +2788,7 @@ mod tests {
         let prepared = PreparedActivity {
             mapping: activity.asset_mapping().unwrap(),
             identity_overrides: HashMap::new(),
+            scope_tokens: HashMap::new(),
             identity_unresolved: HashSet::new(),
             no_copy_dispositions: HashMap::new(),
             unresolved_assets: BTreeMap::new(),
@@ -2836,6 +2910,7 @@ mod tests {
         let prepared = PreparedActivity {
             mapping: activity.asset_mapping().unwrap(),
             identity_overrides: HashMap::new(),
+            scope_tokens: HashMap::new(),
             identity_unresolved: HashSet::new(),
             no_copy_dispositions: HashMap::new(),
             unresolved_assets: BTreeMap::new(),
@@ -2938,5 +3013,286 @@ mod tests {
                 expected
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod anomaly_recording_tests {
+    use super::*;
+    use crate::source_event_sink::SourceEventSink;
+
+    struct Page(Vec<u8>);
+    impl ReconciliationFetcher for Page {
+        fn fetch<'a>(
+            &'a self,
+            _url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async { Ok(self.0.clone()) })
+        }
+    }
+    fn payload(wallet: WalletAddress, anomalous: bool) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!([{
+            "proxyWallet": wallet, "timestamp": 100, "type":"TRADE", "transactionHash":"0xanomaly",
+            "conditionId":"0xca", "asset":"asset-a", "side":"BUY", "isCombo":false,
+            "outcomeIndex":0, "outcome":"Yes", "price":if anomalous {"2"} else {"0.5"}, "size":"1", "usdcSize":"1"
+        }])).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn anomaly_boundary_precedes_append_and_survives_failures_and_restart() {
+        for case in [
+            "healthy",
+            "healthy_existing",
+            "empty_existing",
+            "empty",
+            "bad_payload",
+            "positions",
+            "mismatched_wallet",
+            "marker_failure",
+            "append_failure",
+            "success",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("paper.db");
+            let paper = Arc::new(PaperStateDb::open(&path).unwrap());
+            if case.ends_with("_existing") {
+                paper.record_scope_drop_boundary(77).unwrap();
+            }
+            let source = dir.path().join("source.log");
+            let sink = Arc::new(tokio::sync::Mutex::new(
+                SourceEventSink::open(&source).unwrap(),
+            ));
+            let wallet = WalletAddress([0xaa; 20]);
+            let bytes = match case {
+                "empty" | "empty_existing" => b"[]".to_vec(),
+                "bad_payload" => b"[".to_vec(),
+                "mismatched_wallet" => payload(WalletAddress([0xbb; 20]), true),
+                _ => payload(wallet, !matches!(case, "healthy" | "healthy_existing")),
+            };
+            if case == "marker_failure" {
+                rusqlite::Connection::open(&path).unwrap().execute_batch("CREATE TRIGGER reject_boundary BEFORE INSERT ON meta WHEN NEW.key = 'scope_drop_boundary_unix' BEGIN SELECT RAISE(ABORT, 'injected boundary failure'); END;").unwrap();
+            }
+            if case == "append_failure" {
+                sink.lock().await.fail_next_append();
+            }
+            let fetcher = DurableRecordingFetcher {
+                inner: Arc::new(Page(bytes)),
+                sink: sink.clone(),
+                paper_state: paper.clone(),
+            };
+            let endpoint = if case == "positions" {
+                "positions"
+            } else {
+                "activity"
+            };
+            let result = fetcher
+                .fetch(&format!("https://example.test/{endpoint}?user={wallet}"))
+                .await;
+            assert_eq!(
+                result.is_err(),
+                matches!(case, "marker_failure" | "append_failure"),
+                "{case}"
+            );
+            let boundary =
+                matches!(case, "append_failure" | "success") || case.ends_with("_existing");
+            assert_eq!(
+                paper.scope_drop_boundary_unix().unwrap().is_some(),
+                boundary,
+                "{case}"
+            );
+            let frames = pe_event_log::Reader::replay(&source)
+                .unwrap()
+                .map(|frame| frame.unwrap().1)
+                .collect::<Vec<_>>();
+            if matches!(case, "marker_failure" | "append_failure") {
+                assert!(frames.is_empty());
+            } else {
+                assert_eq!(
+                    frames[0].schema_version,
+                    if case == "success" {
+                        5
+                    } else {
+                        ACTIVITY_SCHEMA_VERSION
+                    }
+                );
+            }
+            if case.ends_with("_existing") {
+                assert_eq!(paper.scope_drop_boundary_unix().unwrap(), Some(77));
+            }
+            drop(fetcher);
+            drop(sink);
+            drop(paper);
+            let reopened = PaperStateDb::open(&path).unwrap();
+            let exists: i64 = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='scope_drop_boundary_unix')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+            assert_eq!(exists, i64::from(boundary));
+            assert_eq!(
+                reopened.scope_drop_boundary_unix().unwrap().is_some(),
+                boundary
+            );
+            if boundary {
+                let before = reopened.scope_drop_boundary_unix().unwrap();
+                reopened.record_scope_drop_boundary(999).unwrap();
+                assert_eq!(reopened.scope_drop_boundary_unix().unwrap(), before);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn migration_anomaly_boundary_survives_side_database_resume_and_installation() {
+        use crate::paper_migration::{
+            PaperMigrationBoot, PaperMigrationPaths, rollback_version_one,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PaperMigrationPaths {
+            fixed_main: dir.path().join("paper.db"),
+            source_log: dir.path().join("source.log"),
+            paper_log: dir.path().join("paper.log"),
+            live_journal: dir.path().join("live.log"),
+            legacy_history: dir.path().join("history.json"),
+            binary_identity: "anomaly-boundary-test".to_owned(),
+        };
+        rusqlite::Connection::open(&paths.fixed_main)
+            .unwrap()
+            .execute_batch(include_str!(
+                "../../paper-state/tests/fixtures/paper_state_v1.sql"
+            ))
+            .unwrap();
+        pe_event_log::Writer::open(&paths.source_log)
+            .unwrap()
+            .sync()
+            .unwrap();
+        pe_event_log::Writer::open(&paths.paper_log)
+            .unwrap()
+            .sync()
+            .unwrap();
+        drop(pe_execution_core::LiveJournal::open(&paths.live_journal).unwrap());
+        std::fs::write(&paths.legacy_history, br#"{"wallets":[]}"#).unwrap();
+        let boot = PaperMigrationBoot::prepare(paths.clone(), 100).unwrap();
+        assert_ne!(boot.active_main, paths.fixed_main);
+        let side_path = boot.active_main.clone();
+        let wallet = WalletAddress([0xaa; 20]);
+        let url = format!("https://example.test/activity?user={wallet}");
+        let paper = Arc::new(PaperStateDb::open(&side_path).unwrap());
+        let mut source = SourceEventSink::open(&paths.source_log).unwrap();
+        source.fail_next_append();
+        let fetcher = DurableRecordingFetcher {
+            inner: Arc::new(Page(payload(wallet, true))),
+            sink: Arc::new(tokio::sync::Mutex::new(source)),
+            paper_state: paper.clone(),
+        };
+        assert!(fetcher.fetch(&url).await.is_err());
+        let marker = paper.scope_drop_boundary_unix().unwrap().unwrap();
+        drop(fetcher);
+        drop(paper);
+        drop(boot);
+        let boot = PaperMigrationBoot::prepare(paths.clone(), 101).unwrap();
+        assert_eq!(boot.active_main, side_path);
+        let paper = Arc::new(PaperStateDb::open(&boot.active_main).unwrap());
+        assert_eq!(paper.scope_drop_boundary_unix().unwrap(), Some(marker));
+        let fetcher = DurableRecordingFetcher {
+            inner: Arc::new(Page(payload(wallet, true))),
+            sink: Arc::new(tokio::sync::Mutex::new(
+                SourceEventSink::open(&paths.source_log).unwrap(),
+            )),
+            paper_state: paper.clone(),
+        };
+        fetcher.fetch(&url).await.unwrap();
+        drop(fetcher);
+        let backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().to_string_lossy().contains(".v1."))
+            .unwrap();
+        assert!(rollback_version_one(&paths, &backup, &dir.path().join("failed.db")).is_err());
+        paper
+            .record_migration_activation_facts(
+                &serde_json::json!({"fixture":"complete"}),
+                &paths.binary_identity,
+            )
+            .unwrap();
+        drop(paper);
+        drop(boot);
+        let resumed = PaperMigrationBoot::prepare(paths.clone(), 102).unwrap();
+        resumed.session.unwrap().finish().unwrap();
+        let installed = PaperStateDb::open(&paths.fixed_main).unwrap();
+        let exists: i64 = rusqlite::Connection::open_with_flags(
+            &paths.fixed_main,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='scope_drop_boundary_unix')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+        assert_eq!(exists, 1);
+        assert_eq!(installed.scope_drop_boundary_unix().unwrap(), Some(marker));
+        assert!(
+            pe_event_log::Reader::replay(&paths.source_log)
+                .unwrap()
+                .any(|frame| frame.unwrap().1.schema_version == 5)
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_recorder_uses_each_requested_wallet_among_positions_pages() {
+        struct Pages(std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>);
+        impl ReconciliationFetcher for Pages {
+            fn fetch<'a>(
+                &'a self,
+                _url: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>>
+            {
+                Box::pin(async { Ok(self.0.lock().unwrap().pop_front().unwrap()) })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let first = WalletAddress([0xaa; 20]);
+        let second = WalletAddress([0xbb; 20]);
+        let source = dir.path().join("source.log");
+        let fetcher = DurableRecordingFetcher {
+            inner: Arc::new(Pages(std::sync::Mutex::new(
+                [
+                    payload(first, true),
+                    br#"[{"asset":"a","size":"1"}]"#.to_vec(),
+                    payload(second, true),
+                    payload(first, true),
+                ]
+                .into(),
+            ))),
+            sink: Arc::new(tokio::sync::Mutex::new(
+                SourceEventSink::open(&source).unwrap(),
+            )),
+            paper_state: paper.clone(),
+        };
+        for (endpoint, wallet) in [
+            ("activity", first),
+            ("positions", first),
+            ("activity", second),
+            ("activity", second),
+        ] {
+            fetcher
+                .fetch(&format!("https://example.test/{endpoint}?user={wallet}"))
+                .await
+                .unwrap();
+        }
+        let schemas = pe_event_log::Reader::replay(&source)
+            .unwrap()
+            .map(|frame| frame.unwrap().1.schema_version)
+            .collect::<Vec<_>>();
+        assert_eq!(schemas, vec![5, 2, 5, 2]);
+        assert!(paper.scope_drop_boundary_unix().unwrap().is_some());
     }
 }
