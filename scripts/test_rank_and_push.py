@@ -318,7 +318,7 @@ class RankAndPushScenario(unittest.TestCase):
         # ends what a failing scenario left behind after the test's own assertions ran.
         process = subprocess.Popen(command, cwd=self.root, env=env, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True, start_new_session=True)
-        self.addCleanup(self._end_run_group, process.pid, str(self.root))
+        self.addCleanup(RankAndPushScenario._end_run_group, process.pid, str(self.root))
         try:
             stdout, stderr = process.communicate(timeout=60)
         except subprocess.TimeoutExpired:
