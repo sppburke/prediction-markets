@@ -7641,8 +7641,7 @@ async fn anomaly_counterparts_retire_exact_receipts_and_preserve_unmatched_order
             for corrected in [false, true] {
                 for resolved in [false, true] {
                     for coverage in ["fresh", "covered", "all_stored"] {
-                        let dir =
-                            tempfile::tempdir_in(std::env::var("PASS_SCRATCH").unwrap()).unwrap();
+                        let dir = tempfile::tempdir().unwrap();
                         let (mut running, paper) = start_recorded_poller_with_membership(
                             &dir,
                             &[wallet()],
@@ -7748,10 +7747,17 @@ async fn anomaly_counterparts_retire_exact_receipts_and_preserve_unmatched_order
                         assert!(!paper.activity_observation_retired(unmatched).unwrap());
                         assert!(paper.decision_pending_for(&healthy_id).unwrap().is_none());
                         assert_eq!(paper.feed_history_frontiers().unwrap(), frontier);
-                        assert_eq!(
-                            paper.wallet_scope_drops(&wallet(), EPOCH).unwrap().len(),
-                            usize::from(resolved)
-                        );
+                        let drops = paper.wallet_scope_drops(&wallet(), EPOCH).unwrap();
+                        assert_eq!(drops.len(), usize::from(resolved));
+                        if resolved {
+                            assert_eq!(drops[0].scope_kind, "market");
+                            assert_eq!(
+                                drops[0].scope_id,
+                                if corrected { MARKET_A } else { MARKET_B }
+                            );
+                            assert_eq!(drops[0].cause, "unrepresentable_activity_row");
+                            assert_eq!(drops[0].dropped_at_epoch, EPOCH - 5 + delta);
+                        }
                         rows.push(unmatched_row);
                         running
                             .requests
@@ -7833,7 +7839,7 @@ async fn anomaly_correlation_keeps_exact_identity_side_and_ambiguity_policy() {
         "two_anomalies",
         "aggregate_and_anomaly",
     ] {
-        let dir = tempfile::tempdir_in(std::env::var("PASS_SCRATCH").unwrap()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let (mut running, paper) = start_recorded_poller_with_membership(
             &dir,
             &[wallet()],
@@ -7939,12 +7945,18 @@ async fn anomaly_correlation_keeps_exact_identity_side_and_ambiguity_policy() {
 #[tokio::test(start_paused = true)]
 async fn anomaly_counterpart_failure_and_crashes_keep_atomic_retirement() {
     use pe_service::trade_poller::ReconciliationCrashBoundary;
-    for crash in [
-        None,
-        Some(ReconciliationCrashBoundary::Commitment),
-        Some(ReconciliationCrashBoundary::Bucket),
-    ] {
-        let dir = tempfile::tempdir_in(std::env::var("PASS_SCRATCH").unwrap()).unwrap();
+    for (kind, crash) in ["decimal", "price", "numeric_outcome", "outcome"]
+        .into_iter()
+        .flat_map(|kind| {
+            [
+                None,
+                Some(ReconciliationCrashBoundary::Commitment),
+                Some(ReconciliationCrashBoundary::Bucket),
+            ]
+            .map(|crash| (kind, crash))
+        })
+    {
+        let dir = tempfile::tempdir().unwrap();
         let (mut running, paper) = start_recorded_poller_with_membership(
             &dir,
             &[wallet()],
@@ -7972,7 +7984,13 @@ async fn anomaly_counterpart_failure_and_crashes_keep_atomic_retirement() {
             connection.execute_batch("CREATE TRIGGER fail_anomaly_retirement BEFORE INSERT ON meta WHEN NEW.key LIKE 'retired_activity_observation:%' BEGIN SELECT RAISE(FAIL, 'injected anomaly retirement failure'); END;").unwrap();
         }
         let mut anomaly = observed;
-        anomaly["usdcSize"] = json!("4.212e-7");
+        match kind {
+            "decimal" => anomaly["usdcSize"] = json!("4.212e-7"),
+            "price" => anomaly["price"] = json!("3.1968021978"),
+            "numeric_outcome" => anomaly["outcomeIndex"] = json!(65536),
+            "outcome" => anomaly["outcomeIndex"] = json!("invalid"),
+            _ => unreachable!(),
+        }
         let payload = serde_json::to_vec(&[anomaly]).unwrap();
         running
             .requests
@@ -8032,7 +8050,7 @@ async fn anomaly_counterpart_failure_and_crashes_keep_atomic_retirement() {
             .await
             .unwrap()
             .respond
-            .send(payload)
+            .send(payload.clone())
             .unwrap();
         restarted.completed(wallet()).await;
         restarted.round_completed().await;
@@ -8042,9 +8060,52 @@ async fn anomaly_counterpart_failure_and_crashes_keep_atomic_retirement() {
             1
         );
         assert!(reopened.decision_pending_history().unwrap().is_empty());
+        let mut waiting = restarted.waiting().await;
+        while let Ok(newer) = restarted.waits.try_recv() {
+            waiting = newer;
+        }
+        assert!(waiting.obligations.is_empty(), "{kind}/{crash:?}");
+        assert!(!restarted.held.borrow().receipts.contains(&receipt));
         assert!(
             restarted.requests.try_recv().is_err(),
             "retired anomaly cannot re-arm urgent retries"
+        );
+        // Cross the next ordinary cadence: retirement must remove both runtime owners,
+        // and the next read must be a backstop with no observation selected for retry.
+        restarted.now.store(EPOCH + 30, Ordering::SeqCst);
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        let started = restarted.progress.recv().await.unwrap();
+        restarted.track(&started);
+        assert!(
+            matches!(
+                started,
+                pe_service::trade_poller::PollerProgress::Started {
+                    urgent: false,
+                    frontier,
+                    ..
+                } if frontier.is_empty()
+            ),
+            "{kind}/{crash:?}: retired anomaly started urgent work"
+        );
+        restarted
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(payload)
+            .unwrap();
+        assert!(restarted.completed(wallet()).await.is_empty());
+        restarted.round_completed().await;
+        let mut waiting = restarted.waiting().await;
+        while let Ok(newer) = restarted.waits.try_recv() {
+            waiting = newer;
+        }
+        assert!(waiting.obligations.is_empty(), "{kind}/{crash:?}");
+        assert!(!restarted.held.borrow().receipts.contains(&receipt));
+        assert!(
+            restarted.requests.try_recv().is_err(),
+            "no urgent retry after a further poll cycle"
         );
         restarted.finish().await;
     }
@@ -8054,7 +8115,7 @@ async fn anomaly_counterpart_failure_and_crashes_keep_atomic_retirement() {
 /// epoch advance between atomic commit and acknowledgement, then filters the receipt on boot.
 #[tokio::test(start_paused = true)]
 async fn anomaly_only_empty_binding_retirement_reauthenticates_after_retention_and_restart() {
-    let dir = tempfile::tempdir_in(std::env::var("PASS_SCRATCH").unwrap()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let (mut running, paper) = start_recorded_poller_with_membership(
         &dir,
         &[wallet()],
@@ -8227,7 +8288,7 @@ async fn anomaly_only_empty_binding_retirement_reauthenticates_after_retention_a
 #[tokio::test]
 async fn anomaly_counterpart_membership_retry_keeps_receipt_until_atomic_commit() {
     use axum::{Json, Router, routing::get};
-    let dir = tempfile::tempdir_in(std::env::var("PASS_SCRATCH").unwrap()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let server_calls = calls.clone();
     let (requested, mut requests) = mpsc::channel(1);

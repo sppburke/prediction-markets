@@ -10459,33 +10459,87 @@ async fn frame_authority_survives_rest_anomaly_restart_and_qualification_selecti
     let before = h.terminal(&recorded);
     let gate = h.paper.entry_gate_result(&recorded.id).unwrap();
     let history = h.paper.gate_history().unwrap();
+    let unconsumed = h.record(2).await;
+    h.paper
+        .record_market_group(&unconsumed.admission.market.condition_id.0, "")
+        .unwrap();
     let mut rows: Value = serde_json::from_slice(&recorded.activity).unwrap();
     rows[0]["usdcSize"] = json!("4.212e-7");
+    let mut unconsumed_rows: Value = serde_json::from_slice(&unconsumed.activity).unwrap();
+    unconsumed_rows[0]["timestamp"] = json!(EPOCH);
+    unconsumed_rows[0]["usdcSize"] = json!("4.212e-7");
+    rows.as_array_mut()
+        .unwrap()
+        .push(unconsumed_rows[0].clone());
+    let mut gamma: Value = serde_json::from_slice(&recorded.gamma).unwrap();
+    let unconsumed_gamma: Value = serde_json::from_slice(&unconsumed.gamma).unwrap();
+    gamma
+        .as_array_mut()
+        .unwrap()
+        .push(unconsumed_gamma[0].clone());
     let anomaly = Recorded {
         activity: serde_json::to_vec(&rows).unwrap(),
+        gamma: serde_json::to_vec(&gamma).unwrap(),
         ..recorded.clone()
     };
     h.poll_source(&anomaly, None, at()).await;
     let drops = h.paper.wallet_scope_drops(&wallet(), EPOCH).unwrap();
-    assert_eq!(drops.len(), 1);
+    assert_eq!(drops.len(), 2);
     assert_eq!(drops[0].cause, "unrepresentable_activity_row");
     assert_eq!(drops[0].scope_id, recorded.admission.market.condition_id.0);
     assert_eq!(h.terminal(&recorded), before);
     assert_eq!(h.paper.entry_gate_result(&recorded.id).unwrap(), gate);
     assert_eq!(h.paper.gate_history().unwrap(), history);
     assert!(h.paper.leader_positions().unwrap().is_empty());
+    assert!(
+        h.paper
+            .scope_is_dropped(
+                &wallet(),
+                &unconsumed.admission.market.condition_id.0,
+                None,
+                unconsumed.epoch,
+            )
+            .unwrap()
+    );
     h.restart_frames().await;
     assert_eq!(h.terminal(&recorded), before);
     assert_eq!(h.paper.entry_gate_result(&recorded.id).unwrap(), gate);
     assert_eq!(h.paper.gate_history().unwrap(), history);
     replay_decision_pending(&h.terminal(&recorded)).unwrap();
-    let later = h.rest_counterpart(&recorded, |row| {
+    let later = h.rest_counterpart(&unconsumed, |row| {
         row["transactionHash"] = json!("0xnew-frame-in-dropped-scope");
-        row["timestamp"] = json!(EPOCH + 1);
     });
     h.hooks
         .financial_clock_unix
         .store(EPOCH + 1, Ordering::SeqCst);
+    h.empty_frontier(EPOCH).await;
+    let admitted_at = at() + time::Duration::seconds(1);
+    h.attempt(&later, admitted_at);
+    let frontiers: pe_service::frame_admission::FrontierCollection =
+        serde_json::from_value(h.paper.feed_history_frontiers().unwrap()).unwrap();
+    assert!(frontiers.frontiers.iter().any(|frontier| {
+        frontier.wallet == wallet()
+            && frontier.current(
+                admitted_at,
+                admitted_at,
+                h.health.lock().unwrap().poll_round_stale_secs,
+                None,
+            )
+    }));
+    let market = pe_core_types::MarketId(pe_core_types::VenueMarketId(
+        later.admission.market.condition_id.0.clone(),
+    ));
+    assert!(
+        h.paper
+            .market_history_record(&wallet(), &market)
+            .unwrap()
+            .is_none()
+    );
+    assert!(h.paper.entry_gate_result(&later.id).unwrap().is_none());
+    let fills = h.paper.list_fills().unwrap();
+    // Without the REST drop this is a fresh, positive-share BUY Entry in a new market:
+    // history is unconsumed, the wallet is ready, the frontier is current, and admission
+    // evidence is valid. The first frame's consumed market cannot explain this refusal.
     let receipt = h.append_frame(&later, |_| {}).await;
     h.control
         .as_ref()
@@ -10495,8 +10549,17 @@ async fn frame_authority_survives_rest_anomaly_restart_and_qualification_selecti
         .unwrap();
     h.boot_barrier_readonly().await;
     assert!(h.paper.decision_pending_for(&later.id).unwrap().is_none());
+    assert!(h.paper.entry_gate_result(&later.id).unwrap().is_none());
+    assert!(
+        h.paper
+            .market_history_record(&wallet(), &market)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(h.paper.gate_history().unwrap(), history);
     assert_eq!(h.paper.decision_pending_history().unwrap(), [before]);
     assert_eq!(h.prepared_count(), 1);
+    assert_eq!(h.paper.list_fills().unwrap(), fills);
     let report = h.qualify_one_fill().await;
     assert!(report.replay.exact, "{report:?}");
     assert_eq!(report.replay.fills, 1);
