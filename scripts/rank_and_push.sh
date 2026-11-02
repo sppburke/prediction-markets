@@ -402,12 +402,16 @@ CYCLE_CONFIG_TMP=""
 CURRENT_CYCLE_TMP=""
 CAPTURE_PID=""
 SAMPLER_PID=""
+SCOPE_PID=""
 cleanup_rank_and_push() {
   local status=$?
-  local pid
-  for pid in "$CAPTURE_PID" "$SAMPLER_PID"; do
+  local pid running
+  # Signal only a child bash still lists as running, read right before signaling it: an exited
+  # child may already be reaped (its status kept for `wait`) and its PID reused.
+  for pid in "$CAPTURE_PID" "$SAMPLER_PID" "$SCOPE_PID"; do
     [[ -n "$pid" ]] || continue
-    kill "$pid" 2>/dev/null || true
+    running=" $(jobs -rp | tr '\n' ' ') "
+    [[ "$running" != *" $pid "* ]] || kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   done
   # The run's last capacity sample, once its children ended, closes its attempt (capacity_sampler.py summarize).
@@ -824,12 +828,36 @@ run_refresh_stage() {
   echo "   [$label] running: $*"
   local rc=0
   "$@" || rc=$?
-  case "$rc" in
-    0) echo "   [$label] ok" ;;
-    2) echo "   [$label] WARN exit 2 (partial); cache durable, continuing" >&2 ;;
-    75) echo "   [$label] TEMPFAIL exit 75 (temporary failure); aborting run for supervised retry" >&2; exit "$rc" ;;
-    *) echo "   [$label] FATAL exit $rc — aborting run" >&2; exit "$rc" ;;
+  refresh_stage_status "$label" "$rc"
+}
+
+refresh_stage_status() {
+  case "$2" in
+    0) echo "   [$1] ok" ;;
+    2) echo "   [$1] WARN exit 2 (partial); cache durable, continuing" >&2 ;;
+    75) echo "   [$1] TEMPFAIL exit 75 (temporary failure); aborting run for supervised retry" >&2; exit "$2" ;;
+    *) echo "   [$1] FATAL exit $2 — aborting run" >&2; exit "$2" ;;
   esac
+}
+
+# The scope sweep reads Gamma and the cycle's frozen window bounds, never the cache (it takes no
+# cache lock), so the fresh lane runs it beside collection and only joins it at the market-scope
+# step. Its snapshot is then taken when collection starts, which is still after the window end.
+market_scope_command() {
+  MARKET_SCOPE_FILE="$OUT_DIR/market_scope.json"
+  MARKET_SCOPE_CMD=("$PE_BOOTSTRAP_BIN" market-scope --out "$MARKET_SCOPE_FILE"
+    --end-date-min "$scope_floor" --recurrences "${PE_RANK_MARKET_RECURRENCES:-15m}"
+    ${PE_RANK_MARKET_SERIES:+--series "$PE_RANK_MARKET_SERIES"} "${BOOTSTRAP_CONFIG_ARGS[@]}")
+}
+
+start_market_scope() {
+  [[ "$SKIP_RANK" == "0" && -z "$SCOPE_PID" ]] || return 0
+  market_scope_command
+  rm -f -- "$MARKET_SCOPE_FILE"
+  echo "── Market scope: ${PE_RANK_MARKET_RECURRENCES:-15m} series markets from Gamma → $MARKET_SCOPE_FILE ──"
+  echo "   [market-scope] running: ${MARKET_SCOPE_CMD[*]}"
+  "${MARKET_SCOPE_CMD[@]}" 8>&- 9>&- &
+  SCOPE_PID=$!
 }
 
 # 76 is emitted only for schema-one empty ranking/publication or globally stale
@@ -1030,6 +1058,7 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
     [[ ! -f "$prior" ]] || bulk_args+=(--prior "$prior")
   fi
   echo "   [targets] activity generation $activity_target; payout generation ${targets[1]} (complete=${targets[2]})"
+  start_market_scope
   if [[ "${targets[4]}" == "0" ]]; then
     run_refresh_stage "activity" "$PE_BOOTSTRAP_BIN" cache-populate-activity-v2 --db "$side" \
       --fresh-generation "$activity_target" "${bulk_args[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
@@ -1084,12 +1113,19 @@ else
   refresh_data
 fi
 if [[ "$SKIP_RANK" == "0" ]]; then
-  # Read the ranking scope after refresh, using the cycle's resolved bounds.
-  MARKET_SCOPE_FILE="$OUT_DIR/market_scope.json"
-  echo "── Market scope: ${PE_RANK_MARKET_RECURRENCES:-15m} series markets from Gamma → $MARKET_SCOPE_FILE ──"
-  run_refresh_stage "market-scope" "$PE_BOOTSTRAP_BIN" market-scope --out "$MARKET_SCOPE_FILE" \
-    --end-date-min "$scope_floor" --recurrences "${PE_RANK_MARKET_RECURRENCES:-15m}" \
-    ${PE_RANK_MARKET_SERIES:+--series "$PE_RANK_MARKET_SERIES"} "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  # Read the ranking scope after refresh, using the cycle's resolved bounds. The fresh lane
+  # started the sweep beside collection, so it only joins it here.
+  market_scope_command
+  if [[ -n "$SCOPE_PID" ]]; then
+    echo "   [market-scope] joining the sweep started beside collection"
+    scope_status=0
+    wait "$SCOPE_PID" || scope_status=$?
+    SCOPE_PID=""
+    refresh_stage_status "market-scope" "$scope_status"
+  else
+    echo "── Market scope: ${PE_RANK_MARKET_RECURRENCES:-15m} series markets from Gamma → $MARKET_SCOPE_FILE ──"
+    run_refresh_stage "market-scope" "${MARKET_SCOPE_CMD[@]}"
+  fi
 fi
 if [[ "$CUTOVER_MODE" == "1" ]]; then
   require_cutover_inputs
