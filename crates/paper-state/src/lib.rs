@@ -34,6 +34,7 @@ mod schema;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use rusqlite::{
@@ -846,6 +847,8 @@ pub struct PaperStateDb {
     /// A third connection, used only for WAL checkpoints, so their disk syncs never hold the shared
     /// connection or the maintenance one (#754). It writes no rows.
     checkpoint: Mutex<Connection>,
+    /// Set only after this instance has committed and checkpointed the rollback boundary.
+    scope_drop_boundary_synced: AtomicBool,
 }
 
 /// Durable reasons a departed wallet must keep its working state.
@@ -1411,6 +1414,7 @@ impl PaperStateDb {
             conn: Mutex::new(conn),
             maintenance: Mutex::new(maintenance),
             checkpoint: Mutex::new(checkpoint),
+            scope_drop_boundary_synced: AtomicBool::new(false),
         })
     }
 
@@ -1503,6 +1507,7 @@ impl PaperStateDb {
             conn: Mutex::new(conn),
             maintenance: Mutex::new(maintenance),
             checkpoint: Mutex::new(checkpoint),
+            scope_drop_boundary_synced: AtomicBool::new(false),
         })
     }
 
@@ -2420,13 +2425,19 @@ impl PaperStateDb {
 
     /// Persist the rollback boundary before a live scope-drop journal append.
     pub fn record_scope_drop_boundary(&self, recorded_at_unix: i64) -> Result<(), PaperStateError> {
+        if self.scope_drop_boundary_synced.load(Ordering::Acquire) {
+            return Ok(());
+        }
         self.with(|conn| {
             let tx = conn.transaction()?;
             tx_record_scope_drop_boundary(&tx, recorded_at_unix)?;
             tx.commit()?;
             Ok::<_, PaperStateError>(())
         })?;
-        self.sync_checkpoint_dispositions()
+        self.sync_checkpoint_dispositions()?;
+        self.scope_drop_boundary_synced
+            .store(true, Ordering::Release);
+        Ok(())
     }
 
     /// First forward-only scope-drop write, or no boundary yet.
@@ -9243,8 +9254,32 @@ mod tests {
             db.record_scope_drop_boundary(1000),
             Err(PaperStateError::MigrationCheckpointIncomplete { .. })
         ));
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), Some(1000));
+        assert!(matches!(
+            db.record_scope_drop_boundary(900),
+            Err(PaperStateError::MigrationCheckpointIncomplete { .. })
+        ));
         reader.execute_batch("ROLLBACK").unwrap();
+        db.record_scope_drop_boundary(900).unwrap();
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), Some(1000));
+    }
+
+    #[test]
+    fn scope_drops_live_boundary_skips_checkpoint_after_success() {
+        let (dir, db) = db();
         db.record_scope_drop_boundary(1000).unwrap();
+        let reader = Connection::open(dir.path().join("paper_state.db")).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM meta;")
+            .unwrap();
+        db.set_cursor(&wallet(), 100).unwrap();
+        assert!(matches!(
+            db.sync_checkpoint_dispositions(),
+            Err(PaperStateError::MigrationCheckpointIncomplete { .. })
+        ));
+        db.record_scope_drop_boundary(900).unwrap();
+        assert_eq!(db.scope_drop_boundary_unix().unwrap(), Some(1000));
+        reader.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]

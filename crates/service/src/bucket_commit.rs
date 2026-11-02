@@ -5169,45 +5169,47 @@ impl BucketCommitEngine {
             });
             lookups.check(true)?;
         }
-        let dropped = durable_drops
-            .iter()
-            .map(|drop| Scope {
-                kind: if drop.scope_kind == "event" {
-                    ScopeKind::Event
-                } else {
-                    ScopeKind::Market
-                },
-                id: drop.scope_id.clone(),
-            })
-            .collect();
-        // Resolve non-executable evidence before any all-stored or coverage shortcut.
-        let anomaly_second = pe_position_ledger::classify_scoped_second_with_anomalies(
-            complete_read_entry_policy(current_paper_version(complete_read_version(
-                context.read_commitment,
-            ))),
-            &self.ledger,
-            wallet,
-            source_epoch,
-            &[],
-            &anomalies,
-            &dropped,
-            false,
-            context.reconstruction_quality,
-            &context.signal_config,
-            true,
-            &|_| false,
-            &lookups,
-        )?;
-        lookups.check(!anomalies.is_empty())?;
-        for problem in anomaly_second.problems {
-            anomaly_drops.push(anomaly_scope_drop_record(
+        if !anomalies.is_empty() {
+            let dropped = durable_drops
+                .iter()
+                .map(|drop| Scope {
+                    kind: if drop.scope_kind == "event" {
+                        ScopeKind::Event
+                    } else {
+                        ScopeKind::Market
+                    },
+                    id: drop.scope_id.clone(),
+                })
+                .collect();
+            // Resolve non-executable evidence before any all-stored or coverage shortcut.
+            let anomaly_second = pe_position_ledger::classify_scoped_second_with_anomalies(
+                complete_read_entry_policy(current_paper_version(complete_read_version(
+                    context.read_commitment,
+                ))),
+                &self.ledger,
                 wallet,
                 source_epoch,
-                context.recorded_at_unix,
-                &problem,
+                &[],
                 &anomalies,
-                &correlation_inputs,
-            )?);
+                &dropped,
+                false,
+                context.reconstruction_quality,
+                &context.signal_config,
+                true,
+                &|_| false,
+                &lookups,
+            )?;
+            lookups.check(true)?;
+            for problem in anomaly_second.problems {
+                anomaly_drops.push(anomaly_scope_drop_record(
+                    wallet,
+                    source_epoch,
+                    context.recorded_at_unix,
+                    &problem,
+                    &anomalies,
+                    &correlation_inputs,
+                )?);
+            }
         }
         if !anomalies.is_empty()
             && self.fences.contains(&wallet)

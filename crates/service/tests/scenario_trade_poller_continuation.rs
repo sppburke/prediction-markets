@@ -7475,6 +7475,132 @@ async fn poller_routes_valid_buckets_beside_each_anomaly_and_restarts_anomaly_on
     }
 }
 
+/// A due routine refresh installs each salvaged anomaly's local drop, converges over its
+/// bracket reads, and leaves the poller able to copy a later healthy-market BUY.
+#[tokio::test(start_paused = true)]
+async fn routine_refresh_with_each_anomaly_keeps_the_poller_copying() {
+    for kind in ["price", "decimal", "numeric_outcome", "outcome"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut running, paper) =
+            start_recorded_poller_with_anchors(&dir, &[wallet()], false, true, Some(EPOCH));
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(b"[]".to_vec())
+            .unwrap();
+        running.completed(wallet()).await;
+        running.round_completed().await;
+        assert!(
+            paper
+                .wallet_scope_drops(&wallet(), EPOCH)
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut anomaly = activity_row(
+            "TRADE",
+            "routine-refresh-anomaly",
+            MARKET_A,
+            "SELL",
+            "1",
+            "asset-a",
+            EPOCH - 1,
+        );
+        let expected_kind = match kind {
+            "price" => {
+                anomaly["price"] = json!("3.1968021978");
+                "price_out_of_range"
+            }
+            "decimal" => {
+                anomaly["usdcSize"] = json!("4.212e-7");
+                "unrepresentable_decimal"
+            }
+            "numeric_outcome" => {
+                anomaly["outcomeIndex"] = json!(65536);
+                "unmapped_outcome"
+            }
+            "outcome" => {
+                anomaly["outcomeIndex"] = json!("invalid");
+                "unmapped_outcome"
+            }
+            _ => unreachable!(),
+        };
+        let payload = serde_json::to_vec(&[anomaly]).unwrap();
+        let mut activity_reads = 0;
+        loop {
+            tokio::select! {
+                biased;
+                event = running.controls.recv() => {
+                    if matches!(event, Some(ControlCompletion::Anchored(w)) if w == wallet()) {
+                        break;
+                    }
+                }
+                request = running.requests.recv() => {
+                    let request = request.unwrap();
+                    let body = if request.url.contains("/activity?") {
+                        assert!(request.url.ends_with("&start=1"), "{}", request.url);
+                        activity_reads += 1;
+                        payload.clone()
+                    } else {
+                        assert!(request.url.contains("/positions?"), "{}", request.url);
+                        b"[]".to_vec()
+                    };
+                    request.respond.send(body).unwrap();
+                }
+            }
+        }
+        assert_eq!(activity_reads, 3, "{kind}: routine bracket converges");
+        assert_eq!(paper.position_anchors(&wallet()).unwrap().len(), 2);
+        assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+        assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+        let drops = paper.wallet_scope_drops(&wallet(), EPOCH).unwrap();
+        assert_eq!(drops.len(), 1, "{kind}");
+        assert_eq!(drops[0].scope_kind, "market");
+        assert_eq!(drops[0].scope_id, MARKET_A);
+        assert_eq!(drops[0].dropped_at_epoch, EPOCH - 1);
+        assert_eq!(drops[0].cause, "unrepresentable_activity_row");
+        let proof: Value = serde_json::from_str(&drops[0].proof_json).unwrap();
+        assert_eq!(proof["kind"], expected_kind);
+        assert_eq!(proof["page_row_index"], 0);
+        assert!(paper.decision_pending_history().unwrap().is_empty());
+
+        running.now.store(EPOCH + 1, Ordering::SeqCst);
+        let healthy = stream_row(wallet(), "healthy-after-routine-refresh", EPOCH + 1);
+        let id = aggregate(healthy.clone()).group_id.key().clone();
+        let receipt = running.observe(healthy.clone()).await;
+        let poll = running.requests.recv().await.unwrap();
+        assert!(poll.url.contains("/activity?"));
+        assert!(!poll.url.ends_with("&start=1"));
+        poll.respond
+            .send(serde_json::to_vec(&[healthy]).unwrap())
+            .unwrap();
+        assert_eq!(running.completed(wallet()).await, vec![receipt]);
+        assert!(paper.is_decision_pending_open(&id).unwrap(), "{kind}");
+        assert_eq!(paper.cursor(&wallet()).unwrap(), Some(EPOCH + 1));
+        assert_eq!(
+            paper.wallet_scope_drops(&wallet(), EPOCH + 1).unwrap(),
+            drops
+        );
+        let commits = running.finish().await;
+        let bracket = commits
+            .iter()
+            .filter(|(_, context, _)| context.bracket_commit)
+            .collect::<Vec<_>>();
+        assert_eq!(bracket.len(), 3, "{kind}");
+        assert!(!bracket[0].2.already_committed);
+        assert!(bracket[1..].iter().all(|commit| commit.2.already_committed));
+        assert!(
+            bracket
+                .iter()
+                .all(|(groups, _, result)| { groups.is_empty() && result.pending.is_empty() })
+        );
+        assert_eq!(commits.last().unwrap().2.pending.len(), 1);
+    }
+}
+
 #[tokio::test]
 async fn anomaly_only_poller_acquires_cold_membership_and_commits_event_drop_once() {
     use axum::{Json, Router, routing::get};
