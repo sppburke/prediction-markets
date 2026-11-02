@@ -355,12 +355,12 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
     return rows, entry, marker
 
 
-def build_format_three_cache(db: str):
+def build_format_three_cache(db: str, *, identity_version=4, classifier_version=6):
     """Python-built C2-C5 fixture; activity mirrors deliberately disagree."""
     import rank_cycle_manifest as cycle
 
     rows, entry, _ = build_certified_cache(db)
-    rows = [{**row, "classifier_version": 6} for row in rows]
+    rows = [{**row, "classifier_version": classifier_version} for row in rows]
     rows.sort(key=lambda row: (row["wallet_hex"], row["source_time_unix"], row["source_trade_id"]))
     for index, row in enumerate(rows):
         row["condition_id"] = f"0x{index + 1:064x}"
@@ -376,7 +376,7 @@ def build_format_three_cache(db: str):
         (W("b"), 7, entry, entry - 3600, 400, 800, "b" * 64, "[]"),
         (W("f"), 6, entry + 999, entry + 999, 900, 1800, "f" * 64, encoded_drops),
     )]
-    identity = {"version": 4, "generation": 7, "base_generation": None,
+    identity = {"version": identity_version, "generation": 7, "base_generation": None,
                 "base_manifest_sha256": None, "start_exclusive": 0, "fixed_end_unix": entry + 10,
                 "wallets": [W("a"), W("b"), W("f")], "full_read_wallets": [W("a"), W("b"), W("f")],
                 "deferred_wallets": [], "repair_wallets": [], "quiet_after_secs": 2_592_000,
@@ -395,9 +395,9 @@ def build_format_three_cache(db: str):
                                    "lines": len(rows), "sha256": hashlib.sha256(spool.read_bytes()).hexdigest()}}
     with sqlite3.connect(db) as conn:
         conn.execute("ALTER TABLE cache_v2_migration_state ADD COLUMN ranker_projection_inputs_json TEXT")
-        conn.execute("UPDATE cache_v2_migration_state SET ranker_classifier_version=6, fresh_collection_json=?, "
+        conn.execute("UPDATE cache_v2_migration_state SET ranker_classifier_version=?, fresh_collection_json=?, "
                      "ranker_projection_inputs_json=?, ranker_projection_digest=?",
-                     (json.dumps(identity), json.dumps(inputs), whole_projection_digest(rows)))
+                     (classifier_version, json.dumps(identity), json.dumps(inputs), whole_projection_digest(rows)))
         conn.execute("ALTER TABLE clob_payout_evidence_v2 ADD COLUMN raw_page_sha256 TEXT")
         conn.execute("ALTER TABLE clob_payout_evidence_v2 ADD COLUMN neg_risk_market_id TEXT")
         conn.execute("DELETE FROM clob_payout_evidence_v2")
@@ -448,7 +448,7 @@ def _export_certified_cache(db: str, pq: str, expected_wallets: set[str] | None 
         con.execute(f"ATTACH '{exp._q(os.path.abspath(db))}' AS src (TYPE sqlite, READ_ONLY)")
         raw_identity = con.execute(
             "SELECT fresh_collection_json FROM src.cache_v2_migration_state").fetchone()[0]
-        three = raw_identity is not None and json.loads(raw_identity)["version"] == 4
+        three = raw_identity is not None and json.loads(raw_identity)["version"] in (4, 5)
         if three:
             # Change 4: format 3 exports the committed spool, with no marker join.
             projection = exp._export_v3_projection(con, db, pq, 100)
@@ -1158,6 +1158,41 @@ class DuckParityTest(unittest.TestCase):
             self.assertFalse((Path(tmp) / "rank/250_72hr_buyandhold_variance.txt").exists())
             self.assertFalse((Path(pq) / "activity_groups_v2.parquet").exists())
             self.assertIn("tökén雪".encode(), Path(db + ".projection-v3.jsonl").read_bytes())
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_identity_five_classifier_seven_exports_format_three_and_loads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "candidate.db"), str(Path(tmp) / "export")
+            rows, _, _ = build_format_three_cache(db, identity_version=5, classifier_version=7)
+            export(db, pq)
+            manifest = ranker_duck._load_v2_export_manifest(pq)
+            self.assertEqual(manifest["version"], 3)
+            self.assertEqual(manifest["projection"]["classifier_version"], 7)
+            self.assertEqual(manifest["projection"]["oracle_version"], 6)
+            self.assertEqual(manifest["projection"]["digest"], whole_projection_digest(rows))
+            engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, schema_version=2)
+            try:
+                self.assertEqual(list(exp._compact_projection_rows(engine, str(Path(pq) / "projection.parquet"))), rows)
+            finally:
+                engine.close()
+            path = Path(pq) / exp.V2_EXPORT_MANIFEST
+            for field, value in (("classifier_version", 5), ("classifier_version", 8), ("oracle_version", 7)):
+                with self.subTest(field=field, value=value):
+                    changed = json.loads(json.dumps(manifest))
+                    changed["projection"][field] = value
+                    path.write_text(json.dumps(changed))
+                    with self.assertRaisesRegex(ranker_duck.SchemaTwoEngineError, "scope/count/version mismatch"):
+                        ranker_duck._load_v2_export_manifest(pq)
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_format_three_export_refuses_crossed_identity_classifier_pairings(self):
+        for version, classifier in ((4, 7), (5, 6), (5, 8)):
+            with self.subTest(version=version, classifier=classifier), tempfile.TemporaryDirectory() as tmp:
+                db, pq = str(Path(tmp) / "candidate.db"), str(Path(tmp) / "export")
+                build_format_three_cache(db, identity_version=version, classifier_version=classifier)
+                with self.assertRaisesRegex(ValueError, "finalized identity/classifier"):
+                    export(db, pq)
+                self.assertFalse((Path(pq) / exp.V2_EXPORT_MANIFEST).exists())
 
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_format_three_reader_requires_complete_typed_projection_summary(self):

@@ -362,10 +362,12 @@ def _export_v3_projection(con, db_path: str, out_dir: str, row_group_size: int) 
         "FROM src.cache_v2_migration_state WHERE singleton = 1").fetchone()
     inputs = json.loads(raw_inputs)
     identity = _fresh_identity(raw_identity)
-    if (phase != "finalized" or classifier != 6 or type(inputs.get("oracle_version")) is not int
+    if (phase != "finalized" or identity is None
+            or (identity["version"], classifier) not in ((4, 6), (5, 7))
+            or type(inputs.get("oracle_version")) is not int
             or inputs["oracle_version"] != 6
-            or identity["version"] != 4 or inputs["activity_generation"] != identity["generation"]):
-        raise ValueError("format-three projection requires finalized classifier/oracle 6")
+            or inputs["activity_generation"] != identity["generation"]):
+        raise ValueError("format-three projection requires finalized identity/classifier 4/6 or 5/7 and oracle 6")
     commitment = inputs["projection_spool"]
     path_name = commitment["path_name"]
     if path_name != os.path.basename(db_path) + ".projection-v3.jsonl":
@@ -430,9 +432,9 @@ def main() -> int:
             raw = (sqlite.execute("SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1").fetchone()[0]
                    if "fresh_collection_json" in columns else None)
             identity_version = None if raw is None else json.loads(raw).get("version")
-            if identity_version not in (None, 1, 2, 3, 4):
+            if identity_version not in (None, 1, 2, 3, 4, 5):
                 raise ValueError("unsupported candidate activity identity version")
-            format_three = identity_version == 4
+            format_three = identity_version in (4, 5)
 
     import duckdb
 

@@ -120,7 +120,7 @@ def _load_v2_export_manifest(parquet_dir: str) -> dict:
                        for field in ("digest", "spool_sha256"))):
             raise SchemaTwoEngineError("format-three projection summary is incomplete or invalid")
         if (value.get("activity_scope") != "projection_spool"
-                or projection.get("classifier_version") != 6 or projection.get("oracle_version") != 6
+                or projection.get("classifier_version") not in (6, 7) or projection.get("oracle_version") != 6
                 or value["tables"]["projection"].get("count") != projection.get("count")):
             raise SchemaTwoEngineError("format-three projection scope/count/version mismatch")
     for name in required:
