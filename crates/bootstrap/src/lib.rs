@@ -240,7 +240,7 @@ fn clob_page_fetcher() -> Result<pe_source_polymarket_public::ReqwestFetcher, Bo
     Ok(pe_source_polymarket_public::ReqwestFetcher::new(clob_client).with_min_interval_ms(200))
 }
 
-async fn run_clob_closed_markets<F: PageFetcher + Send + Sync>(
+async fn run_clob_closed_markets<F: PageFetcher + Send + Sync + 'static>(
     clob_fetcher: &clob::ClobFetcher<F>,
     cache: &mut WalletCache,
 ) -> Result<clob::ClobReport, BootstrapError> {
@@ -343,7 +343,7 @@ impl AuditCounts {
 /// individually with a typed reason (the docs/26 operator escape needs the
 /// identity), while non-blocking classes are summary-counted only. Cache write
 /// errors propagate via `?` as fatal exit 1, unchanged.
-async fn run_resolution_audit<F: PageFetcher + Send + Sync>(
+async fn run_resolution_audit<F: PageFetcher + Send + Sync + 'static>(
     clob_fetcher: &clob::ClobFetcher<F>,
     cache: &mut WalletCache,
     now_unix: i64,

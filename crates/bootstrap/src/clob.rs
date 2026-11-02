@@ -9,7 +9,10 @@
 //! resolved and for all new markets ("primary-for-new").
 //!
 //! Pagination is sequential because each page returns the cursor for the
-//! next; `buffer_unordered` does not apply. The legacy `source_cursor.clob_closed`
+//! next; `buffer_unordered` does not apply. The walk requests the next page as
+//! soon as the current one is parsed, so that request overlaps the current
+//! page's database writes; pages are still written in order, and at most one
+//! request is in flight. The legacy `source_cursor.clob_closed`
 //! remains a sealed v1 resume cursor. Version-two payout evidence owns an
 //! independent staging cursor and is installed only with a complete coverage
 //! manifest from page one through a terminal response (#544).
@@ -19,6 +22,7 @@
 //! legacy `source='polygon'` rows keep their exact block timestamps (and win on
 //! `INSERT OR IGNORE` ordering); only new markets carry the CLOB approximation.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use pe_source_core::SourceError;
@@ -103,12 +107,17 @@ pub struct ClobReport {
 /// same testing infrastructure.
 pub struct ClobFetcher<F: PageFetcher> {
     base_url: String,
-    fetcher: F,
+    /// Shared with the task that requests the next page while the walk writes
+    /// the current one.
+    fetcher: Arc<F>,
 }
 
-impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
+impl<F: PageFetcher + Send + Sync + 'static> ClobFetcher<F> {
     pub fn new(base_url: String, fetcher: F) -> Self {
-        Self { base_url, fetcher }
+        Self {
+            base_url,
+            fetcher: Arc::new(fetcher),
+        }
     }
 
     #[cfg(test)]
@@ -130,11 +139,13 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
     /// [`BootstrapError::TransientSource`] — the typed temporary error whose
     /// generic exit-code mapping is the tempfail 75 the loop supervisor retries
     /// (#534; mirrors the events-walk precedent). Fatal fetch and response-parse
-    /// failures remain [`BootstrapError::Clob`] (permanent, exit 1).
-    async fn fetch_page_with_retry(&self, url: &str) -> Result<Vec<u8>, BootstrapError> {
+    /// failures remain [`BootstrapError::Clob`] (permanent, exit 1). It takes the
+    /// page fetcher rather than `self`, so the walk's next-page request can run
+    /// on its own task.
+    async fn fetch_page_with_retry(fetcher: &F, url: &str) -> Result<Vec<u8>, BootstrapError> {
         let mut attempt: u32 = 0;
         loop {
-            match self.fetcher.fetch_page(url).await {
+            match fetcher.fetch_page(url).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(SourceError::Fatal { message }) => {
                     warn!(%url, error = %message, "clob: fatal fetch error — aborting page");
@@ -181,7 +192,7 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
         condition_id: &str,
     ) -> Result<ClobMarket, BootstrapError> {
         let url = format!("{}/markets/{condition_id}", self.base_url);
-        let bytes = self.fetch_page_with_retry(&url).await?;
+        let bytes = Self::fetch_page_with_retry(&self.fetcher, &url).await?;
         parse_clob_market(&bytes).map_err(|e| BootstrapError::Clob {
             message: format!("parse market {condition_id}: {e}"),
         })
@@ -263,9 +274,16 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
             "clob: starting closed-market fetch"
         );
 
+        // The next page's request, started while the current page is written.
+        let mut prefetched: Option<PrefetchedPage> = None;
         loop {
-            let url = build_page_url(&self.base_url, cursor.as_deref());
-            let bytes = self.fetch_page_with_retry(&url).await?;
+            let bytes = match prefetched.take() {
+                Some(request) => request.join().await?,
+                None => {
+                    let url = build_page_url(&self.base_url, cursor.as_deref());
+                    Self::fetch_page_with_retry(&self.fetcher, &url).await?
+                }
+            };
 
             let page: ClobMarketsPage =
                 parse_clob_markets_page(&bytes).map_err(|e| BootstrapError::Clob {
@@ -294,162 +312,188 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                     .collect::<Vec<_>>()
             });
 
-            // `(token_id, condition_id, outcome_index)` rows for this page,
-            // flushed in one transaction after the per-market loop (issue #429).
-            let mut page_token_rows: Vec<(String, String, u16)> = Vec::new();
+            // Treat empty/missing/terminator as end-of-pages. Otherwise request
+            // the next page now, so it arrives while this page is written.
+            let next = page.next_cursor.clone().unwrap_or_default();
+            let terminal = next.is_empty() || next == CLOB_END_CURSOR;
+            if !terminal {
+                let fetcher = Arc::clone(&self.fetcher);
+                let url = build_page_url(&self.base_url, Some(next.as_str()));
+                prefetched = Some(PrefetchedPage(tokio::spawn(async move {
+                    Self::fetch_page_with_retry(&fetcher, &url).await
+                })));
+            }
 
-            for market in page.data {
-                let Some(condition_id) = market.condition_id.filter(|c| !c.is_empty()) else {
-                    // CLOB returns draft/undeployed entries with an empty (or
-                    // absent) conditionId; skip them entirely — a non-market has no
-                    // schedule, resolution, or token map. Mirrors events.rs's
-                    // empty-cond skip; an empty id would otherwise write junk rows
-                    // and (issue #429) collide every empty token on the `""` PK.
-                    continue;
-                };
-                let end_date_unix = market.end_date_iso.as_deref().and_then(parse_iso_8601);
+            let written = pe_event_log::run_blocking(|| -> Result<(), BootstrapError> {
+                // `(token_id, condition_id, outcome_index)` rows for this page,
+                // flushed in one transaction after the per-market loop (issue #429).
+                let mut page_token_rows: Vec<(String, String, u16)> = Vec::new();
 
-                // Schedule: always insert; NULL end_date for malformed/missing.
-                cache.insert_schedule_with_source(
-                    &condition_id,
-                    end_date_unix,
-                    fetched_at,
-                    "clob",
-                )?;
-                schedules += 1;
+                for market in page.data {
+                    let Some(condition_id) = market.condition_id.filter(|c| !c.is_empty()) else {
+                        // CLOB returns draft/undeployed entries with an empty (or
+                        // absent) conditionId; skip them entirely — a non-market has no
+                        // schedule, resolution, or token map. Mirrors events.rs's
+                        // empty-cond skip; an empty id would otherwise write junk rows
+                        // and (issue #429) collide every empty token on the `""` PK.
+                        continue;
+                    };
+                    let end_date_unix = market.end_date_iso.as_deref().and_then(parse_iso_8601);
 
-                // Resolution: only when the market is closed AND `end_date_iso`
-                // parsed cleanly. CLOB's `end_date_iso` is the best timestamp we
-                // have (the API does not expose a block-timestamp resolution
-                // time), so a malformed value would otherwise stamp the row
-                // with `resolved_at = now()`, lying about when the market
-                // actually settled. Skipping leaves the market unresolved until a
-                // later run parses a clean `end_date_iso` (issue #369: CLOB is the
-                // sole resolution source — there is no on-chain backfill).
-                //
-                // An identity-valid record with the `closed` field ABSENT warns
-                // and suppresses only this resolution insertion (issue #523) —
-                // the schedule insert above and the token mapping below proceed
-                // unchanged, preserving coverage.
-                if market.closed.is_none() {
-                    warn!(
-                        market_id = condition_id,
-                        "clob: paginated record missing `closed` — resolution suppressed"
-                    );
-                }
-                if !v2_only
-                    && market.closed == Some(true)
-                    && let Some(resolved_at) = end_date_unix
-                {
-                    match analyze_winners(&market.tokens).verdict {
-                        WinnerVerdict::Resolved(idx) => {
-                            cache.insert_resolution_with_source(
-                                &condition_id,
-                                Some(idx),
-                                resolved_at,
-                                fetched_at,
-                                "clob",
-                            )?;
-                            resolutions += 1;
-                        }
-                        WinnerVerdict::Voided => {
-                            cache.insert_resolution_with_source(
-                                &condition_id,
-                                None,
-                                resolved_at,
-                                fetched_at,
-                                "clob",
-                            )?;
-                            resolutions += 1;
-                        }
-                        // Winner flags not posted yet, or a contradictory payload:
-                        // record NOTHING so the market stays missing and the next
-                        // walk / audit pass retries it (issue #519 review — a
-                        // delayed flag must never be frozen as a terminal void).
-                        WinnerVerdict::Pending | WinnerVerdict::Invalid => pending_winners += 1,
+                    // Schedule: always insert; NULL end_date for malformed/missing.
+                    cache.insert_schedule_with_source(
+                        &condition_id,
+                        end_date_unix,
+                        fetched_at,
+                        "clob",
+                    )?;
+                    schedules += 1;
+
+                    // Resolution: only when the market is closed AND `end_date_iso`
+                    // parsed cleanly. CLOB's `end_date_iso` is the best timestamp we
+                    // have (the API does not expose a block-timestamp resolution
+                    // time), so a malformed value would otherwise stamp the row
+                    // with `resolved_at = now()`, lying about when the market
+                    // actually settled. Skipping leaves the market unresolved until a
+                    // later run parses a clean `end_date_iso` (issue #369: CLOB is the
+                    // sole resolution source — there is no on-chain backfill).
+                    //
+                    // An identity-valid record with the `closed` field ABSENT warns
+                    // and suppresses only this resolution insertion (issue #523) —
+                    // the schedule insert above and the token mapping below proceed
+                    // unchanged, preserving coverage.
+                    if market.closed.is_none() {
+                        warn!(
+                            market_id = condition_id,
+                            "clob: paginated record missing `closed` — resolution suppressed"
+                        );
                     }
-                }
-
-                // Map this market's CLOB tokens (token_id → condition_id, with the
-                // positional outcome_index) so the trades / price-series join can
-                // resolve outcome → token (issue #429).
-                //
-                // Order cross-check: the join's correctness rests on CLOB
-                // `tokens[]` order matching the authoritative Gamma
-                // `clob_token_ids` order. `token_id` is the on-chain CTF
-                // positionId — a globally-unique (condition, outcome) anchor — so
-                // if a token already mapped by the Gamma `events` sweep carries an
-                // `outcome_index` that differs from its CLOB array position, the
-                // two orderings disagree. Quarantine the whole market (write none
-                // of its tokens) so a real divergence fails loudly instead of
-                // silently mispricing the true_clv join. Checked against the prior
-                // stored row before the batch's conditional upsert runs.
-                let mut market_tokens: Vec<(String, String, u16)> = Vec::new();
-                let mut quarantined = false;
-                for (idx, token) in market.tokens.iter().enumerate() {
-                    let Some(token_id) = token.token_id.as_deref().filter(|t| !t.is_empty()) else {
-                        // No usable token id — absent (≈5% of markets) or empty `""`
-                        // (draft outcomes). Skip this outcome but keep `idx` so later
-                        // outcomes stay aligned with the authoritative order, and so
-                        // empty ids never collide on the `""` PK / trip the cross-check
-                        // (issue #429 follow-up).
-                        continue;
-                    };
-                    let Ok(pos) = u16::try_from(idx) else {
-                        // Outcome cardinality > u16::MAX is impossible for a real
-                        // market; skip rather than truncate.
-                        continue;
-                    };
-                    if let Some((stored_cond, stored_idx)) = cache.token_condition_outcome(token_id)
+                    if !v2_only
+                        && market.closed == Some(true)
+                        && let Some(resolved_at) = end_date_unix
                     {
-                        let cond_mismatch = stored_cond != condition_id;
-                        let order_mismatch = stored_idx.is_some_and(|s| s != i64::from(pos));
-                        if cond_mismatch || order_mismatch {
-                            error!(
-                                condition_id = condition_id.as_str(),
-                                token_id,
-                                clob_position = pos,
-                                stored_condition = stored_cond.as_str(),
-                                stored_outcome_index = ?stored_idx,
-                                "clob: token order/condition divergence vs stored Gamma map — \
-                                 quarantining market (token rows skipped to avoid mispricing the \
-                                 true_clv join, issue #429)"
-                            );
-                            quarantined = true;
-                            break;
+                        match analyze_winners(&market.tokens).verdict {
+                            WinnerVerdict::Resolved(idx) => {
+                                cache.insert_resolution_with_source(
+                                    &condition_id,
+                                    Some(idx),
+                                    resolved_at,
+                                    fetched_at,
+                                    "clob",
+                                )?;
+                                resolutions += 1;
+                            }
+                            WinnerVerdict::Voided => {
+                                cache.insert_resolution_with_source(
+                                    &condition_id,
+                                    None,
+                                    resolved_at,
+                                    fetched_at,
+                                    "clob",
+                                )?;
+                                resolutions += 1;
+                            }
+                            // Winner flags not posted yet, or a contradictory payload:
+                            // record NOTHING so the market stays missing and the next
+                            // walk / audit pass retries it (issue #519 review — a
+                            // delayed flag must never be frozen as a terminal void).
+                            WinnerVerdict::Pending | WinnerVerdict::Invalid => pending_winners += 1,
                         }
                     }
-                    market_tokens.push((token_id.to_owned(), condition_id.clone(), pos));
+
+                    // Map this market's CLOB tokens (token_id → condition_id, with the
+                    // positional outcome_index) so the trades / price-series join can
+                    // resolve outcome → token (issue #429).
+                    //
+                    // Order cross-check: the join's correctness rests on CLOB
+                    // `tokens[]` order matching the authoritative Gamma
+                    // `clob_token_ids` order. `token_id` is the on-chain CTF
+                    // positionId — a globally-unique (condition, outcome) anchor — so
+                    // if a token already mapped by the Gamma `events` sweep carries an
+                    // `outcome_index` that differs from its CLOB array position, the
+                    // two orderings disagree. Quarantine the whole market (write none
+                    // of its tokens) so a real divergence fails loudly instead of
+                    // silently mispricing the true_clv join. Checked against the prior
+                    // stored row before the batch's conditional upsert runs.
+                    let mut market_tokens: Vec<(String, String, u16)> = Vec::new();
+                    let mut quarantined = false;
+                    for (idx, token) in market.tokens.iter().enumerate() {
+                        let Some(token_id) = token.token_id.as_deref().filter(|t| !t.is_empty())
+                        else {
+                            // No usable token id — absent (≈5% of markets) or empty `""`
+                            // (draft outcomes). Skip this outcome but keep `idx` so later
+                            // outcomes stay aligned with the authoritative order, and so
+                            // empty ids never collide on the `""` PK / trip the cross-check
+                            // (issue #429 follow-up).
+                            continue;
+                        };
+                        let Ok(pos) = u16::try_from(idx) else {
+                            // Outcome cardinality > u16::MAX is impossible for a real
+                            // market; skip rather than truncate.
+                            continue;
+                        };
+                        if let Some((stored_cond, stored_idx)) =
+                            cache.token_condition_outcome(token_id)
+                        {
+                            let cond_mismatch = stored_cond != condition_id;
+                            let order_mismatch = stored_idx.is_some_and(|s| s != i64::from(pos));
+                            if cond_mismatch || order_mismatch {
+                                error!(
+                                    condition_id = condition_id.as_str(),
+                                    token_id,
+                                    clob_position = pos,
+                                    stored_condition = stored_cond.as_str(),
+                                    stored_outcome_index = ?stored_idx,
+                                    "clob: token order/condition divergence vs stored Gamma map — \
+                                     quarantining market (token rows skipped to avoid mispricing the \
+                                     true_clv join, issue #429)"
+                                );
+                                quarantined = true;
+                                break;
+                            }
+                        }
+                        market_tokens.push((token_id.to_owned(), condition_id.clone(), pos));
+                    }
+                    if quarantined {
+                        order_mismatches += 1;
+                    } else {
+                        page_token_rows.extend(market_tokens);
+                    }
                 }
-                if quarantined {
-                    order_mismatches += 1;
-                } else {
-                    page_token_rows.extend(market_tokens);
+
+                // Flush this page's token map in one transaction (issue #429).
+                if !page_token_rows.is_empty() {
+                    cache.upsert_token_conditions_batch(&page_token_rows, fetched_at)?;
+                    tokens_mapped += page_token_rows.len();
                 }
+
+                if let (Some(state), Some(coverage_page), Some(payout_evidence)) = (
+                    payout_walk.as_ref(),
+                    coverage_page.as_ref(),
+                    payout_evidence.as_deref(),
+                ) {
+                    payout_walk = Some(cache.commit_clob_payout_page_v2(
+                        state.generation,
+                        coverage_page,
+                        payout_evidence,
+                        fetched_at,
+                    )?);
+                }
+                if !terminal && !v2_only {
+                    cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, &next)?;
+                }
+                Ok(())
+            });
+            if let Err(error) = written {
+                // Writing the page or its legacy cursor failed: stop the next
+                // page's request and discard its outcome before reporting it.
+                if let Some(request) = prefetched.take() {
+                    request.cancel().await;
+                }
+                return Err(error);
             }
 
-            // Flush this page's token map in one transaction (issue #429).
-            if !page_token_rows.is_empty() {
-                cache.upsert_token_conditions_batch(&page_token_rows, fetched_at)?;
-                tokens_mapped += page_token_rows.len();
-            }
-
-            if let (Some(state), Some(coverage_page), Some(payout_evidence)) = (
-                payout_walk.as_ref(),
-                coverage_page.as_ref(),
-                payout_evidence.as_deref(),
-            ) {
-                payout_walk = Some(cache.commit_clob_payout_page_v2(
-                    state.generation,
-                    coverage_page,
-                    payout_evidence,
-                    fetched_at,
-                )?);
-            }
-
-            // Advance cursor. Treat empty/missing/terminator as end-of-pages.
-            let next = page.next_cursor.as_deref().unwrap_or("");
-            if next.is_empty() || next == CLOB_END_CURSOR {
+            if terminal {
                 info!(
                     page_count,
                     schedules,
@@ -468,10 +512,7 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
                 }
                 break;
             }
-            if !v2_only {
-                cache.set_source_cursor(CLOB_CLOSED_CURSOR_KEY, next)?;
-            }
-            cursor = Some(next.to_owned());
+            cursor = Some(next);
 
             if page_count.is_multiple_of(10) {
                 info!(
@@ -493,6 +534,32 @@ impl<F: PageFetcher + Send + Sync> ClobFetcher<F> {
             order_mismatches,
             coverage_manifest,
         })
+    }
+}
+
+/// The next page's request, running on its own task while the walk writes the
+/// current page. It owns the task until joined or cancelled; dropping it
+/// unjoined (the walk future itself was dropped) aborts the request.
+struct PrefetchedPage(tokio::task::JoinHandle<Result<Vec<u8>, BootstrapError>>);
+
+impl PrefetchedPage {
+    /// The response, or the request's own error after its retries.
+    async fn join(mut self) -> Result<Vec<u8>, BootstrapError> {
+        (&mut self.0).await.map_err(|error| BootstrapError::Clob {
+            message: format!("next-page request task failed: {error}"),
+        })?
+    }
+
+    /// Stop the request and wait until it has stopped, discarding its outcome.
+    async fn cancel(mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for PrefetchedPage {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -930,5 +997,507 @@ mod tests {
             report.schedules, 2,
             "only the two real markets insert schedules"
         );
+    }
+
+    const PREFETCH_BASE: &str = "https://clob.example";
+
+    fn prefetch_url(cursor: Option<&str>) -> String {
+        build_page_url(PREFETCH_BASE, cursor)
+    }
+
+    fn prefetch_page(markets: &[&str], next_cursor: &str) -> Vec<u8> {
+        let data: Vec<_> = markets
+            .iter()
+            .map(|id| serde_json::json!({"condition_id": id, "closed": false, "neg_risk": false}))
+            .collect();
+        serde_json::to_vec(&serde_json::json!({"data": data, "next_cursor": next_cursor})).unwrap()
+    }
+
+    /// Pages A → B → C (terminal), two markets each.
+    fn three_pages() -> HashMap<String, Vec<u8>> {
+        HashMap::from([
+            (
+                prefetch_url(None),
+                prefetch_page(&["0xa1", "0xa2"], "PAGEB"),
+            ),
+            (
+                prefetch_url(Some("PAGEB")),
+                prefetch_page(&["0xb1", "0xb2"], "PAGEC"),
+            ),
+            (
+                prefetch_url(Some("PAGEC")),
+                prefetch_page(&["0xc1", "0xc2"], CLOB_END_CURSOR),
+            ),
+        ])
+    }
+
+    /// What a scripted request does after `on_request` ran.
+    enum Scripted {
+        FailOnce,
+        Transient,
+        Fatal,
+        /// Never answers; `Dropped` is marked once the request's future is dropped.
+        Hang(Arc<Dropped>),
+        /// The request task itself fails (a fetcher fault).
+        Fault,
+    }
+
+    /// Marked (and notified) when a hanging request's future is dropped.
+    #[derive(Default)]
+    struct Dropped {
+        flag: std::sync::atomic::AtomicBool,
+        notify: tokio::sync::Notify,
+    }
+
+    impl Dropped {
+        fn get(&self) -> bool {
+            self.flag.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Marks its `Dropped` when the future holding it is dropped.
+    struct DropFlag(Arc<Dropped>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.0.notify.notify_one();
+        }
+    }
+
+    /// Serves fixed pages, records every request URL and runs `on_request`
+    /// before answering as scripted for that URL.
+    struct ScriptedFetcher {
+        pages: HashMap<String, Vec<u8>>,
+        script: std::sync::Mutex<HashMap<String, Scripted>>,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        on_request: Box<dyn Fn(&str) + Send + Sync>,
+    }
+
+    // `Scripted::Fault` panics on purpose: it is the request task's own failure.
+    #[allow(clippy::panic)]
+    impl PageFetcher for ScriptedFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            self.requests.lock().unwrap().push(url.to_owned());
+            (self.on_request)(url);
+            let hang = {
+                let mut script = self.script.lock().unwrap();
+                match script.get(url) {
+                    None => None,
+                    Some(Scripted::FailOnce) => {
+                        script.remove(url);
+                        return Err(SourceError::Transient {
+                            message: format!("blip {url}"),
+                        });
+                    }
+                    Some(Scripted::Transient) => {
+                        return Err(SourceError::Transient {
+                            message: format!("blip {url}"),
+                        });
+                    }
+                    Some(Scripted::Fatal) => {
+                        return Err(SourceError::Fatal {
+                            message: format!("refused {url}"),
+                        });
+                    }
+                    Some(Scripted::Hang(dropped)) => Some(DropFlag(Arc::clone(dropped))),
+                    Some(Scripted::Fault) => panic!("scripted fetcher fault"),
+                }
+            };
+            if let Some(flag) = hang {
+                std::future::pending::<()>().await;
+                drop(flag);
+            }
+            self.pages
+                .get(url)
+                .cloned()
+                .ok_or_else(|| SourceError::Fatal {
+                    message: format!("unexpected {url}"),
+                })
+        }
+    }
+
+    /// A walk over pages A → B → C with `script` and `on_request`, plus its
+    /// request log.
+    fn scripted(
+        script: Vec<(String, Scripted)>,
+        on_request: impl Fn(&str) + Send + Sync + 'static,
+    ) -> (
+        ClobFetcher<ScriptedFetcher>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let requests: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let fetcher = ScriptedFetcher {
+            pages: three_pages(),
+            script: std::sync::Mutex::new(script.into_iter().collect()),
+            requests: Arc::clone(&requests),
+            on_request: Box::new(on_request),
+        };
+        (
+            ClobFetcher::new(PREFETCH_BASE.to_owned(), fetcher),
+            requests,
+        )
+    }
+
+    /// The stored walk position, read through another connection.
+    fn walk_state(path: &std::path::Path) -> (Option<String>, i64) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT next_cursor, next_page_ordinal FROM clob_payout_walk_state_v2 WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    /// A cache whose walk committed page A in an earlier invocation that then
+    /// failed on page B; the next invocation resumes at page B.
+    async fn cache_with_page_a(path: &std::path::Path) -> crate::cache::WalletCache {
+        let mut cache = crate::cache::WalletCache::open(path).unwrap();
+        let (first, _) = scripted(vec![(prefetch_url(Some("PAGEB")), Scripted::Fatal)], |_| {});
+        first.fetch_closed_markets(&mut cache).await.unwrap_err();
+        assert_eq!(walk_state(path), (Some("PAGEB".to_owned()), 1));
+        cache
+    }
+
+    /// Another connection holding the write lock until `release` runs.
+    fn hold_write_lock(
+        path: &std::path::Path,
+    ) -> Arc<std::sync::Mutex<Option<rusqlite::Connection>>> {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        Arc::new(std::sync::Mutex::new(Some(conn)))
+    }
+
+    /// FAIL if page C is requested only after page B commits: only the page-C
+    /// request releases the write lock, so page B's writes would wait out the
+    /// 5 s busy timeout and the walk would fail.
+    async fn assert_next_page_requested_while_writing(on_a_worker: bool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        let cache = cache_with_page_a(&path).await;
+        let held = hold_write_lock(&path);
+        let ordinal_at_c: Arc<std::sync::Mutex<Option<i64>>> = Arc::default();
+        let on_request = {
+            let (path, held, ordinal_at_c) =
+                (path.clone(), Arc::clone(&held), Arc::clone(&ordinal_at_c));
+            move |url: &str| {
+                if url == prefetch_url(Some("PAGEC")) {
+                    *ordinal_at_c.lock().unwrap() = Some(walk_state(&path).1);
+                    if let Some(conn) = held.lock().unwrap().take() {
+                        conn.execute_batch("ROLLBACK").unwrap();
+                    }
+                }
+            }
+        };
+        let (clob, requests) = scripted(Vec::new(), on_request);
+        let walk = async move {
+            let mut cache = cache;
+            clob.fetch_closed_markets(&mut cache).await
+        };
+        let report = if on_a_worker {
+            tokio::spawn(walk).await.unwrap()
+        } else {
+            walk.await
+        }
+        .unwrap();
+        assert_eq!(report.coverage_manifest.unwrap().counts.pages, 3);
+        assert_eq!(
+            *ordinal_at_c.lock().unwrap(),
+            Some(1),
+            "page B had not committed"
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![prefetch_url(Some("PAGEB")), prefetch_url(Some("PAGEC"))]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn payout_walk_requests_the_next_page_while_writing_the_current_one() {
+        assert_next_page_requested_while_writing(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn payout_walk_overlap_holds_when_the_walk_runs_on_a_worker() {
+        assert_next_page_requested_while_writing(true).await;
+    }
+
+    /// Page B's payout transaction fails part-way (its second staged market is
+    /// refused) while the page-C request is already running (it releases the
+    /// lock, then hangs or fails): the walk returns page B's error after the
+    /// request has stopped, the transaction rolled back, and both resume cursors
+    /// still name page B.
+    async fn assert_write_failure_wins(page_c: Scripted, hung: Option<Arc<Dropped>>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        let mut cache = cache_with_page_a(&path).await;
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_page_b_staging BEFORE INSERT ON clob_payout_evidence_staging_v2 \
+                 WHEN NEW.market_id = '0xb2' BEGIN SELECT RAISE(ABORT, 'injected staging failure'); END;",
+            )
+            .unwrap();
+        let held = hold_write_lock(&path);
+        let on_request = {
+            let held = Arc::clone(&held);
+            move |url: &str| {
+                if url == prefetch_url(Some("PAGEC"))
+                    && let Some(conn) = held.lock().unwrap().take()
+                {
+                    conn.execute_batch("ROLLBACK").unwrap();
+                }
+            }
+        };
+        let (clob, requests) = scripted(vec![(prefetch_url(Some("PAGEC")), page_c)], on_request);
+        let error = clob.fetch_closed_markets(&mut cache).await.unwrap_err();
+        assert!(
+            error.to_string().contains("injected staging failure"),
+            "{error}"
+        );
+        if let Some(dropped) = hung {
+            assert!(dropped.get(), "page-C request still running");
+        }
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![prefetch_url(Some("PAGEB")), prefetch_url(Some("PAGEC"))]
+        );
+        assert_eq!(walk_state(&path), (Some("PAGEB".to_owned()), 1));
+        assert_eq!(
+            cache.get_source_cursor(CLOB_CLOSED_CURSOR_KEY).as_deref(),
+            Some("PAGEB")
+        );
+        let (pages, staged): (i64, i64) = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM clob_payout_walk_pages_v2 WHERE page_ordinal = 1), \
+                        (SELECT COUNT(*) FROM clob_payout_evidence_staging_v2 \
+                         WHERE market_id IN ('0xb1', '0xb2'))",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (pages, staged),
+            (0, 0),
+            "page B's payout transaction rolled back"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn payout_walk_write_failure_stops_a_running_next_page_request() {
+        let dropped = Arc::new(Dropped::default());
+        assert_write_failure_wins(Scripted::Hang(Arc::clone(&dropped)), Some(dropped)).await;
+    }
+
+    /// The legacy cursor update failing after page B's payout commit wins over
+    /// the running page-C request, which is stopped; the v2 checkpoint is at
+    /// page C, the legacy cursor keeps page B, and a restart resumes at page C.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn payout_walk_legacy_cursor_failure_after_the_commit_keeps_the_v2_checkpoint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        let mut cache = cache_with_page_a(&path).await;
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_page_c_cursor BEFORE INSERT ON source_cursor \
+                 WHEN NEW.value = 'PAGEC' BEGIN SELECT RAISE(ABORT, 'injected cursor failure'); END;",
+            )
+            .unwrap();
+        let held = hold_write_lock(&path);
+        let dropped = Arc::new(Dropped::default());
+        let on_request = {
+            let held = Arc::clone(&held);
+            move |url: &str| {
+                if url == prefetch_url(Some("PAGEC"))
+                    && let Some(conn) = held.lock().unwrap().take()
+                {
+                    conn.execute_batch("ROLLBACK").unwrap();
+                }
+            }
+        };
+        let (clob, _) = scripted(
+            vec![(
+                prefetch_url(Some("PAGEC")),
+                Scripted::Hang(Arc::clone(&dropped)),
+            )],
+            on_request,
+        );
+        let error = clob.fetch_closed_markets(&mut cache).await.unwrap_err();
+        assert!(
+            error.to_string().contains("injected cursor failure"),
+            "{error}"
+        );
+        assert!(dropped.get(), "page-C request still running");
+        assert_eq!(walk_state(&path), (Some("PAGEC".to_owned()), 2));
+        assert_eq!(
+            cache.get_source_cursor(CLOB_CLOSED_CURSOR_KEY).as_deref(),
+            Some("PAGEB")
+        );
+
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_page_c_cursor")
+            .unwrap();
+        let (restart, requests) = scripted(Vec::new(), |_| {});
+        let report = restart.fetch_closed_markets(&mut cache).await.unwrap();
+        assert_eq!(*requests.lock().unwrap(), vec![prefetch_url(Some("PAGEC"))]);
+        assert_eq!(report.coverage_manifest.unwrap().counts.pages, 3);
+        assert_eq!(
+            cache.get_source_cursor(CLOB_CLOSED_CURSOR_KEY).as_deref(),
+            Some("")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn payout_walk_write_failure_outranks_a_failed_next_page_request() {
+        assert_write_failure_wins(Scripted::Fatal, None).await;
+    }
+
+    /// On a current-thread runtime the next page's request never starts before
+    /// a failed write, so it is cancelled unsent.
+    #[tokio::test]
+    async fn payout_walk_write_failure_cancels_an_unsent_next_page_request() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        let mut cache = crate::cache::WalletCache::open(&path).unwrap();
+        let on_request = {
+            let path = path.clone();
+            move |url: &str| {
+                if url == prefetch_url(Some("PAGEB")) {
+                    rusqlite::Connection::open(&path)
+                        .unwrap()
+                        .execute(
+                            "UPDATE clob_payout_walk_state_v2 SET next_cursor = 'MOVED' WHERE singleton = 1",
+                            [],
+                        )
+                        .unwrap();
+                }
+            }
+        };
+        let (clob, requests) = scripted(Vec::new(), on_request);
+        let error = clob.fetch_closed_markets(&mut cache).await.unwrap_err();
+        assert!(
+            error.to_string().contains("does not match active v2 walk"),
+            "{error}"
+        );
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![prefetch_url(None), prefetch_url(Some("PAGEB"))]
+        );
+        assert_eq!(walk_state(&path), (Some("MOVED".to_owned()), 1));
+    }
+
+    /// A failed next-page request is reported only after the current page
+    /// committed, so the stored walk and the legacy cursor resume at it.
+    #[tokio::test]
+    async fn payout_walk_next_page_failure_surfaces_after_the_current_commit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        let mut cache = crate::cache::WalletCache::open(&path).unwrap();
+        let (clob, requests) =
+            scripted(vec![(prefetch_url(Some("PAGEC")), Scripted::Fatal)], |_| {});
+        let error = clob.fetch_closed_markets(&mut cache).await.unwrap_err();
+        assert!(matches!(error, BootstrapError::Clob { .. }), "{error}");
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        assert_eq!(walk_state(&path), (Some("PAGEC".to_owned()), 2));
+        assert_eq!(
+            cache.get_source_cursor(CLOB_CLOSED_CURSOR_KEY).as_deref(),
+            Some("PAGEC")
+        );
+    }
+
+    /// Exhausted retries of a next-page request keep the temporary-failure
+    /// mapping (exit 75) and the committed position.
+    #[tokio::test(start_paused = true)]
+    async fn payout_walk_next_page_retry_exhaustion_is_temporary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        let mut cache = crate::cache::WalletCache::open(&path).unwrap();
+        let (clob, requests) = scripted(
+            vec![(prefetch_url(Some("PAGEC")), Scripted::Transient)],
+            |_| {},
+        );
+        let error = clob.fetch_closed_markets(&mut cache).await.unwrap_err();
+        assert!(
+            matches!(error, BootstrapError::TransientSource { .. }),
+            "{error}"
+        );
+        let page_c_requests = requests.lock().unwrap().len() - 2;
+        assert_eq!(
+            page_c_requests,
+            usize::try_from(CLOB_PAGE_MAX_RETRIES).unwrap() + 1
+        );
+        assert_eq!(walk_state(&path), (Some("PAGEC".to_owned()), 2));
+    }
+
+    /// Walk-level retries apply to a next-page request, and nothing is
+    /// requested after the terminal page.
+    #[tokio::test(start_paused = true)]
+    async fn payout_walk_retries_a_next_page_request() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = crate::cache::WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        let (clob, requests) = scripted(
+            vec![(prefetch_url(Some("PAGEB")), Scripted::FailOnce)],
+            |_| {},
+        );
+        let report = clob.fetch_closed_markets(&mut cache).await.unwrap();
+        assert_eq!(report.coverage_manifest.unwrap().counts.pages, 3);
+        assert_eq!(report.schedules, 6);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![
+                prefetch_url(None),
+                prefetch_url(Some("PAGEB")),
+                prefetch_url(Some("PAGEB")),
+                prefetch_url(Some("PAGEC")),
+            ]
+        );
+    }
+
+    /// A request task that fails (a fetcher fault) is a permanent CLOB error.
+    #[tokio::test]
+    async fn payout_walk_maps_a_failed_request_task_to_a_permanent_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cache = crate::cache::WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        let (clob, _) = scripted(vec![(prefetch_url(Some("PAGEB")), Scripted::Fault)], |_| {});
+        let error = clob.fetch_closed_markets(&mut cache).await.unwrap_err();
+        assert!(matches!(error, BootstrapError::Clob { .. }), "{error}");
+        assert!(
+            error.to_string().contains("next-page request task failed"),
+            "{error}"
+        );
+    }
+
+    /// Dropping the walk while it waits for the next page stops that request.
+    #[tokio::test(start_paused = true)]
+    async fn payout_walk_dropped_while_waiting_stops_the_next_page_request() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        let mut cache = crate::cache::WalletCache::open(&path).unwrap();
+        let dropped = Arc::new(Dropped::default());
+        let (clob, requests) = scripted(
+            vec![(
+                prefetch_url(Some("PAGEC")),
+                Scripted::Hang(Arc::clone(&dropped)),
+            )],
+            |_| {},
+        );
+        let walk = clob.fetch_closed_markets(&mut cache);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), walk)
+                .await
+                .is_err()
+        );
+        // Dropping the walk only schedules the request's cancellation.
+        tokio::time::timeout(Duration::from_secs(60), dropped.notify.notified())
+            .await
+            .expect("page-C request still running");
+        assert!(dropped.get());
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        assert_eq!(walk_state(&path), (Some("PAGEC".to_owned()), 2));
     }
 }

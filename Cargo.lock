@@ -3601,6 +3601,7 @@ dependencies = [
  "futures",
  "pe-copy-signal-engine",
  "pe-core-types",
+ "pe-event-log",
  "pe-position-ledger",
  "pe-source-core",
  "pe-source-polymarket-public",
