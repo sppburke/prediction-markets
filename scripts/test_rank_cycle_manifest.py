@@ -16,7 +16,7 @@ from rank_cycle_manifest import (CERTIFICATE_COLUMNS, TOP_UP_RESERVE_HOURS, _fre
 import test_rank_and_push as wrapper_tests
 
 
-def identity(generation=1, base=None, version=4):
+def identity(generation=1, base=None, version=5):
     value = dict(version=version, generation=generation, fixed_end_unix=100,
                  wallets=["0x" + "1" * 40])
     if version >= 2:
@@ -48,7 +48,7 @@ class CandidateTargetsTest(unittest.TestCase):
         return candidate_targets(self.prior, self.side, include_bulk_root=True, **kwargs)
 
     def test_version_four_identity_and_old_reader_refusal(self):
-        raw = identity()
+        raw = identity(version=4)
         decoded = _fresh_identity(raw)
         self.assertEqual(decoded["version"], 4)
         self.assertEqual(decoded["repair_wallets"], [])
@@ -207,6 +207,38 @@ class CandidateTargetsTest(unittest.TestCase):
             with self.subTest(changed=key):
                 with self.assertRaisesRegex(ValueError, "identity digest mismatch"):
                     _fresh_identity(json.dumps(dict(valid, **{key: value})))
+
+    def test_sealed_identity_four_heads_admit_identity_five_before_finalizing(self):
+        # #822: a fresh identity-4 head (initial or a top-up) never finalizes under classifier 6
+        # after the release; one successor admits identity 5. A stale top-up still refuses.
+        prior = identity(version=4)
+        initial = identity(2, 1, version=4)
+        with sqlite3.connect(self.prior) as c:
+            c.execute("PRAGMA user_version=2")
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (prior,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation) VALUES (1)")
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (initial,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) VALUES (2, ?, ?)",
+                      (json.loads(initial)["digest"], initial))
+        self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24),
+                         (3, 1, 0, 0, 0))
+        top_up = identity(3, 2, version=4)
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (top_up,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) VALUES (3, ?, ?)",
+                      (json.loads(top_up)["digest"], top_up))
+        self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24),
+                         (4, 1, 0, 0, 0))
+        with self.assertRaisesRegex(ValueError, "activity top-up is stale"):
+            self.targets(after_collection=True, now=101 + 86400, max_staleness_hours=24)
+        current = identity(4, 3, version=5)
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (current,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) VALUES (4, ?, ?)",
+                      (json.loads(current)["digest"], current))
+        self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24),
+                         (4, 1, 0, 0, 1))
 
     def test_version_three_initial_head_and_archived_top_up_keep_base_gates(self):
         prior = identity()

@@ -882,7 +882,10 @@ def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collect
                 # Only the initial head may take a reserve-only successor (rule 5).
                 if age > max_staleness_hours * 3600:
                     raise ValueError("activity top-up is stale; preserve the cycle and repair the held head")
-            elif head["version"] < 4 or age + TOP_UP_RESERVE_HOURS * 3600 > max_staleness_hours * 3600:
+                # A sealed identity-4 head still admits identity 5 before finalizing (#822).
+                if head["version"] == 4:
+                    generation += 1
+            elif head["version"] < 5 or age + TOP_UP_RESERVE_HOURS * 3600 > max_staleness_hours * 3600:
                 generation = initial + 1
         return targets(generation)
 
