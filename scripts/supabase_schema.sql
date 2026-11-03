@@ -212,6 +212,8 @@ create or replace function publish_ranking_batch_v2(
   p_scope_drops jsonb
 ) returns bigint
 language plpgsql
+-- The first publication of a large neg-risk group set outlasts authenticator's 8 s limit; PostgREST hoists this.
+set statement_timeout = '120s'
 as $$
 declare
   v_batch_id bigint;
