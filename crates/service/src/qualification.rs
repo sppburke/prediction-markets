@@ -2849,12 +2849,22 @@ fn fold_source_trade_universe(
         content_type,
     )
     .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
-    let raw_rows: Vec<Box<serde_json::value::RawValue>> =
-        serde_json::from_slice(payload).map_err(|error| {
-            QualificationError::InsufficientEvidence(format!(
-                "activity observation JSON failed: {error}"
-            ))
-        })?;
+    let raw_rows: Vec<&serde_json::value::RawValue> =
+        if crate::bucket_commit::is_v2_activity_page(schema_version) {
+            pe_source_polymarket_public::decode_v2_page(payload)
+                .map_err(|error| {
+                    QualificationError::InsufficientEvidence(format!(
+                        "activity observation JSON failed: {error}"
+                    ))
+                })?
+                .data
+        } else {
+            serde_json::from_slice(payload).map_err(|error| {
+                QualificationError::InsufficientEvidence(format!(
+                    "activity observation JSON failed: {error}"
+                ))
+            })?
+        };
     // The position bracket's recording fetcher writes its `/positions` pages under this same
     // envelope identity (position_seeder.rs `fetch`). Positions rows are objects without `type`
     // and carry no trade, so such a page adds nothing to the universe; any other row shape,
@@ -6977,6 +6987,131 @@ mod tests {
         let not_objects = br#"[1,2]"#;
         let observations = BTreeMap::from([(1, activity_observation(1, not_objects))]);
         assert!(source_trade_universe(EventSeq(1), &observations).is_err());
+    }
+
+    #[test]
+    fn source_universe_accepts_empty_v2_pages() {
+        for schema_version in [6, 7] {
+            let observations =
+                BTreeMap::from([(1, v2_activity_observation(schema_version, Vec::new()))]);
+            assert!(
+                source_trade_universe(EventSeq(1), &observations)
+                    .unwrap()
+                    .is_empty(),
+                "schema {schema_version}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_universe_skips_v2_positions_pages() {
+        for schema_version in [6, 7] {
+            let position = serde_json::json!({
+                "proxy_wallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "token_id": "123", "condition_id": "0xc", "outcome_index": 0,
+                "current_size": "5", "total_size": "10", "negative_risk": false,
+                "redeemable": false, "status": "OPEN"
+            });
+            let observations =
+                BTreeMap::from([(1, v2_activity_observation(schema_version, vec![position]))]);
+            assert!(
+                source_trade_universe(EventSeq(1), &observations)
+                    .unwrap()
+                    .is_empty(),
+                "schema {schema_version}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_universe_skips_v2_anomaly_only_pages() {
+        for schema_version in [6, 7] {
+            let mut anomaly = v2_activity_row();
+            anomaly["price"] = serde_json::json!("2");
+            let observations =
+                BTreeMap::from([(1, v2_activity_observation(schema_version, vec![anomaly]))]);
+            assert!(
+                source_trade_universe(EventSeq(1), &observations)
+                    .unwrap()
+                    .is_empty(),
+                "schema {schema_version}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_universe_keeps_only_healthy_v2_trade_identities() {
+        for schema_version in [6, 7] {
+            let healthy = v2_activity_row();
+            let mut anomaly = healthy.clone();
+            anomaly["price"] = serde_json::json!("2");
+            anomaly["transaction_hash"] = serde_json::json!("0xanomaly");
+            let observation =
+                v2_activity_observation(schema_version, vec![healthy.clone(), anomaly]);
+            let healthy_id = pe_source_polymarket_public::parse_activity_row(
+                &serde_json::to_vec(&healthy).unwrap(),
+                None,
+                &ActivityParseContext {
+                    source_id: SourceId(observation.source_id.clone()),
+                    observed_at: observation.observed_at.clone(),
+                    received_at: observation.received_at.clone(),
+                    transport: ActivityTransport::Replay,
+                },
+            )
+            .unwrap()
+            .group_id()
+            .unwrap()
+            .key()
+            .clone();
+            let observations = BTreeMap::from([(1, observation)]);
+            assert_eq!(
+                source_trade_universe(EventSeq(1), &observations).unwrap(),
+                HashMap::from([(healthy_id, 1)]),
+                "schema {schema_version}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_universe_rejects_v2_mixed_typed_and_untyped_pages() {
+        for schema_version in [6, 7] {
+            let position = serde_json::json!({"token_id": "123", "current_size": "5"});
+            let observations = BTreeMap::from([(
+                1,
+                v2_activity_observation(schema_version, vec![v2_activity_row(), position]),
+            )]);
+            assert!(
+                matches!(
+                    source_trade_universe(EventSeq(1), &observations),
+                    Err(QualificationError::InsufficientEvidence(message))
+                        if message.contains("activity observation parse failed")
+                ),
+                "schema {schema_version}"
+            );
+        }
+    }
+
+    fn v2_activity_observation(
+        schema_version: u32,
+        rows: Vec<serde_json::Value>,
+    ) -> SourceObservation {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "data": rows,
+            "pagination": {"limit": 1000, "offset": 0, "has_more": false, "next_cursor": null}
+        }))
+        .unwrap();
+        let mut observation = activity_observation(1, &payload);
+        observation.schema_version = schema_version;
+        observation
+    }
+
+    fn v2_activity_row() -> serde_json::Value {
+        serde_json::json!({
+            "proxy_wallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "type": "TRADE", "condition_id": "0xc", "token_id": "123", "side": "BUY",
+            "size": "5", "usdc_size": "2.5", "price": "0.5", "timestamp": 1_700_000_000,
+            "transaction_hash": "0xhealthy", "outcome_index": 0
+        })
     }
 
     fn activity_observation(sequence: u64, payload: &[u8]) -> SourceObservation {
