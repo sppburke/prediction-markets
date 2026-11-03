@@ -30,8 +30,8 @@ use pe_position_ledger::{
 };
 use pe_source_polymarket_public::{
     ACTIVITY_MAX_OFFSET, ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate,
-    ActivityAggregationError, ActivityParseContext, ActivityRowAcceptance, ActivityRowAnomaly,
-    ActivityTransport, ActivityType, NormalizedActivity, PolymarketEndpoint,
+    ActivityAggregationError, ActivityParseContext, ActivityParseError, ActivityRowAcceptance,
+    ActivityRowAnomaly, ActivityTransport, ActivityType, NormalizedActivity, PolymarketEndpoint,
     RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence, aggregate_activity_rows,
     canonical_page_hash, parse_activity_trade_observation,
 };
@@ -2283,8 +2283,13 @@ pub(crate) fn activity_page_generation(
             PageGeneration::Committed,
             ActivityRowAcceptance::StrictWithAnomalies,
         )),
-        crate::trade_poller::ACTIVITY_HISTORICAL_ANOMALY_PAGE_SCHEMA_VERSION => Ok((
+        crate::trade_poller::ACTIVITY_HISTORICAL_ANOMALY_PAGE_SCHEMA_VERSION
+        | crate::trade_poller::ACTIVITY_HISTORICAL_V2_PAGE_SCHEMA_VERSION => Ok((
             PageGeneration::Historical,
+            ActivityRowAcceptance::StrictWithAnomalies,
+        )),
+        crate::trade_poller::ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION => Ok((
+            PageGeneration::Committed,
             ActivityRowAcceptance::StrictWithAnomalies,
         )),
         _ => Err(complete_activity_read_error(
@@ -2940,7 +2945,8 @@ pub(crate) fn parse_complete_activity_page(
         source.parser_version,
         &source.content_type,
     )?;
-    pe_source_polymarket_public::parse_activity_response_with_acceptance(
+    parse_recorded_activity_page(
+        source.schema_version,
         &source.payload,
         wallet,
         &ActivityParseContext {
@@ -2952,6 +2958,36 @@ pub(crate) fn parse_complete_activity_page(
         acceptance,
     )
     .map_err(|error| complete_activity_read_error(format!("{error_context}: {error}")))
+}
+
+/// Whether a recorded reconciliation page is a Data API v2 cursor envelope (schemas 6 and 7).
+pub(crate) fn is_v2_activity_page(schema_version: u32) -> bool {
+    matches!(
+        schema_version,
+        crate::trade_poller::ACTIVITY_HISTORICAL_V2_PAGE_SCHEMA_VERSION
+            | crate::trade_poller::ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION
+    )
+}
+
+/// Parse one recorded page in the format its schema selects: v2 envelopes for schemas 6 and 7,
+/// bare v1 arrays for 2-5. The bytes are never sniffed; `acceptance` comes from
+/// [`activity_page_generation`].
+pub(crate) fn parse_recorded_activity_page(
+    schema_version: u32,
+    payload: &[u8],
+    wallet: WalletAddress,
+    context: &ActivityParseContext,
+    acceptance: ActivityRowAcceptance,
+) -> Result<pe_source_polymarket_public::NormalizedActivityWindow, ActivityParseError> {
+    if is_v2_activity_page(schema_version) {
+        pe_source_polymarket_public::parse_activity_response_v2_with_acceptance(
+            payload, wallet, context, acceptance,
+        )
+    } else {
+        pe_source_polymarket_public::parse_activity_response_with_acceptance(
+            payload, wallet, context, acceptance,
+        )
+    }
 }
 
 fn validate_complete_activity_segment_graph(
@@ -3399,6 +3435,8 @@ pub(crate) mod continuation_validation_tests {
         .url("https://data-api.polymarket.com");
         let raw_hash = blake3::hash(&payload).to_hex().to_string();
         let pages = vec![ReconciliationPageEvidence {
+            has_more: None,
+            next_cursor: None,
             anomalies: Vec::new(),
             request_url: request_url.clone(),
             bounds: Some(ActivityRequestBounds {
@@ -7237,6 +7275,8 @@ pub(crate) mod continuation_v3_tests {
                 receipt,
             },
             ReconciliationPageEvidence {
+                has_more: None,
+                next_cursor: None,
                 anomalies: Vec::new(),
                 request_url,
                 bounds: Some(pe_source_polymarket_public::ActivityRequestBounds { start, end }),
@@ -7265,6 +7305,8 @@ pub(crate) mod continuation_v3_tests {
             .iter()
             .enumerate()
             .map(|(index, occurrence)| ReconciliationPageEvidence {
+                has_more: None,
+                next_cursor: None,
                 anomalies: Vec::new(),
                 request_url: occurrence.request_url.clone(),
                 bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
@@ -11099,6 +11141,8 @@ mod anomaly_page_tests {
             }
             .url("https://example.test");
             let evidence = ReconciliationPageEvidence {
+                has_more: None,
+                next_cursor: None,
                 request_url: request_url.clone(),
                 bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
                     start: None,
@@ -11294,9 +11338,22 @@ mod anomaly_page_tests {
                 PageGeneration::Historical,
                 ActivityRowAcceptance::StrictWithAnomalies,
             ),
+            (
+                6,
+                PageGeneration::Historical,
+                ActivityRowAcceptance::StrictWithAnomalies,
+            ),
+            (
+                7,
+                PageGeneration::Committed,
+                ActivityRowAcceptance::StrictWithAnomalies,
+            ),
         ] {
             for anomalous in [false, true] {
-                let page = source(schema, anomalous);
+                let mut page = source(schema, anomalous);
+                if is_v2_activity_page(schema) {
+                    page.payload = v2_envelope(&page.payload);
+                }
                 assert_eq!(
                     activity_page_generation(
                         &page.source_id,
@@ -11317,6 +11374,25 @@ mod anomaly_page_tests {
                 }
             }
         }
+        // The recorded schema alone selects the format: neither format parses under the other's.
+        let mut v1_under_v2 = source(7, false);
+        assert!(
+            parse_complete_activity_page(&v1_under_v2, WalletAddress([0xaa; 20]), "t").is_err()
+        );
+        v1_under_v2.schema_version = 4;
+        v1_under_v2.payload = v2_envelope(&v1_under_v2.payload);
+        assert!(
+            parse_complete_activity_page(&v1_under_v2, WalletAddress([0xaa; 20]), "t").is_err()
+        );
+    }
+
+    fn v2_envelope(rows: &[u8]) -> Vec<u8> {
+        let rows: Value = serde_json::from_slice(rows).unwrap();
+        serde_json::to_vec(&json!({
+            "data": rows,
+            "pagination": {"limit": 1000, "offset": 0, "has_more": false, "next_cursor": null},
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -11346,6 +11422,8 @@ mod anomaly_page_tests {
                 receipt,
             });
             pages.push(ReconciliationPageEvidence {
+                has_more: None,
+                next_cursor: None,
                 request_url,
                 bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
                     start: Some(0),
@@ -11438,6 +11516,8 @@ mod anomaly_page_tests {
                     receipt,
                 });
                 pages.push(ReconciliationPageEvidence {
+                    has_more: None,
+                    next_cursor: None,
                     request_url,
                     bounds: Some(pe_source_polymarket_public::ActivityRequestBounds { start, end }),
                     partition: None,

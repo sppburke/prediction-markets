@@ -69,6 +69,10 @@ pub const ACTIVITY_POLL_PAGE_SCHEMA_VERSION: u32 = 3;
 pub const ACTIVITY_POLL_ANOMALY_PAGE_SCHEMA_VERSION: u32 = 4;
 /// A migration-boot page that parses with at least one non-executable row anomaly (#822).
 pub const ACTIVITY_HISTORICAL_ANOMALY_PAGE_SCHEMA_VERSION: u32 = 5;
+/// A migration-boot Data API v2 cursor page, parsed with anomaly acceptance (#837).
+pub const ACTIVITY_HISTORICAL_V2_PAGE_SCHEMA_VERSION: u32 = 6;
+/// A poll Data API v2 cursor page, parsed with anomaly acceptance (#837).
+pub const ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION: u32 = 7;
 /// Best-effort cadence for refreshing venue-authoritative position anchors.
 pub const ANCHOR_REFRESH_SECS: u64 = 3_600;
 /// How far before a feed observation's own second its complete read starts: the venue's history
@@ -3887,6 +3891,8 @@ mod tests {
         end: i64,
     ) -> pe_source_polymarket_public::ReconciliationPageEvidence {
         pe_source_polymarket_public::ReconciliationPageEvidence {
+            has_more: None,
+            next_cursor: None,
             anomalies: Vec::new(),
             request_url: url.to_owned(),
             bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {

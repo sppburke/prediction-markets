@@ -93,6 +93,8 @@ pub fn producer_shaped_read_v1(
     assert!(row_count < pe_source_polymarket_public::RECONCILIATION_PAGE_LIMIT);
     let raw_hash = blake3::hash(payload).to_hex().to_string();
     let evidence = ReconciliationPageEvidence {
+        has_more: None,
+        next_cursor: None,
         anomalies: Vec::new(),
         request_url: request_url.clone(),
         bounds: Some(ActivityRequestBounds {
@@ -1372,6 +1374,8 @@ pub fn producer_shaped_anomaly_read(
     .url("https://data-api.polymarket.com");
     let raw_hash = blake3::hash(payload).to_hex().to_string();
     let evidence = ReconciliationPageEvidence {
+        has_more: None,
+        next_cursor: None,
         request_url: request_url.clone(),
         bounds: Some(ActivityRequestBounds {
             start: None,

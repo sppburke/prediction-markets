@@ -27,7 +27,11 @@ use crate::endpoint::{PolymarketEndpoint, PositionPartition};
 use crate::fetcher::PageFetcher;
 use crate::gamma_markets::VerifiedTokenIdentity;
 
-/// Fixed public-API page size for both reconciliation readers.
+mod v2;
+
+pub use v2::*;
+
+/// Fixed public-API page size for the legacy offset reconciliation readers.
 pub const RECONCILIATION_PAGE_LIMIT: u32 = 500;
 /// Greatest offset the Data API documents for `/activity`.
 pub const ACTIVITY_MAX_OFFSET: u32 = 5_000;
@@ -88,6 +92,10 @@ pub struct ReconciliationPageEvidence {
     pub parser_version: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anomalies: Vec<ActivityRowAnomaly>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_more: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Complete activity response, normalized into stable ascending order.
@@ -125,6 +133,12 @@ impl CompleteActivityRead {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ActivityReadError {
+    #[error("v2 activity envelope: {0}")]
+    V2Envelope(#[from] V2PageError),
+    #[error("v2 activity cursor proof: {0}")]
+    V2Authentication(#[from] V2AuthenticationError),
+    #[error("invalid v2 activity bounds ({start:?}, {end}]")]
+    InvalidBounds { start: Option<i64>, end: i64 },
     #[error("activity fetch failed for {url}: {source}")]
     Fetch { url: String, source: SourceError },
     #[error("activity page parse failed: {0}")]
@@ -1039,13 +1053,13 @@ pub struct CanonicalPosition {
     pub outcome: OutcomeId,
     pub classification: PositionClassification,
     pub size: ShareAmount,
-    /// Partition returned by the complete two-part read.
+    /// Redemption state from the v1 partition or v2 position row.
     pub redeemable: bool,
     /// Venue redemption adapter selector retained from the same position row.
     pub neg_risk: bool,
 }
 
-/// One independently complete union of the two explicit position partitions.
+/// One independently complete current-position read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletePositionsRead {
     pub requested_wallet: WalletAddress,
@@ -1068,6 +1082,10 @@ impl CompletePositionsRead {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PositionReadError {
+    #[error("v2 positions envelope: {0}")]
+    V2Envelope(#[from] V2PageError),
+    #[error("v2 positions cursor proof: {0}")]
+    V2Authentication(#[from] V2AuthenticationError),
     #[error("positions fetch failed for {url}: {source}")]
     Fetch { url: String, source: SourceError },
     #[error("positions response json: {0}")]
@@ -1200,80 +1218,14 @@ pub async fn fetch_complete_positions(
             for (row_index, raw_row) in raw_rows.into_iter().enumerate() {
                 let decoded: RawPosition<'_> =
                     serde_json::from_str(raw_row.get()).map_err(PositionReadError::Json)?;
-                let wallet_text =
-                    required_raw_string(decoded.proxy_wallet, row_index, "proxyWallet")?;
-                let payload_wallet = WalletAddress::from_hex(&wallet_text).map_err(|_| {
-                    PositionReadError::InvalidWallet {
-                        row_index,
-                        value: wallet_text.clone(),
-                    }
-                })?;
-                if payload_wallet != requested_wallet {
-                    return Err(PositionReadError::WalletMismatch {
-                        row_index,
-                        requested_wallet,
-                        payload_wallet,
-                    });
-                }
-                let asset =
-                    PolymarketTokenId(required_raw_string(decoded.asset, row_index, "asset")?);
-                let position_condition_id = PolymarketConditionId(
-                    required_raw_string(decoded.condition_id, row_index, "conditionId")?
-                        .to_ascii_lowercase(),
-                );
-                let position_outcome = OutcomeId(decoded.outcome_index.ok_or(
-                    PositionReadError::MissingField {
-                        row_index,
-                        field: "outcomeIndex",
-                    },
-                )?);
-                let identity = match mapping.identity(&asset) {
-                    Some(identity) => identity,
-                    None if mapping.unresolved().contains_key(&asset) => {
-                        return Err(PositionReadError::MetadataUnresolved {
-                            asset: asset.0,
-                            reason: "position asset unverified by venue metadata".to_owned(),
-                        });
-                    }
-                    None => {
-                        return Err(PositionReadError::MissingActivityMapping { asset: asset.0 });
-                    }
-                };
-                if !identity.verified {
-                    return Err(PositionReadError::MetadataUnresolved {
-                        asset: asset.0,
-                        reason: "position asset unverified by venue metadata".to_owned(),
-                    });
-                }
-                if mapping.journal_verified_assets.contains(&asset)
-                    && (position_condition_id != identity.condition_id
-                        || position_outcome != identity.outcome)
-                {
-                    return Err(PositionReadError::ConflictingActivityMapping { asset: asset.0 });
-                }
-                let condition_id = identity.condition_id.clone();
-                let outcome = identity.outcome;
-                let size = ShareAmount::from_decimal_exact(decoded.size.0).map_err(|error| {
-                    PositionReadError::InvalidAmount {
-                        row_index,
-                        value: decoded.size.0,
-                        reason: error.to_string(),
-                    }
-                })?;
-                let asset_key = asset.0.clone();
-                let position = CanonicalPosition {
-                    wallet: requested_wallet,
-                    asset,
-                    condition_id,
-                    outcome,
-                    classification: identity.classification,
-                    size,
-                    redeemable: partition == PositionPartition::Redeemable,
-                    neg_risk: decoded.neg_risk.ok_or(PositionReadError::MissingField {
-                        row_index,
-                        field: "negativeRisk",
-                    })?,
-                };
+                let position = normalize_position(
+                    decoded,
+                    requested_wallet,
+                    mapping,
+                    row_index,
+                    partition == PositionPartition::Redeemable,
+                )?;
+                let asset_key = position.asset.0.clone();
                 if positions.insert(asset_key.clone(), position).is_some() {
                     return Err(PositionReadError::DuplicateAsset { asset: asset_key });
                 }
@@ -1312,6 +1264,83 @@ pub async fn fetch_complete_positions(
         positions,
         pages,
         semantic_hash,
+    })
+}
+
+fn normalize_position(
+    decoded: RawPosition<'_>,
+    requested_wallet: WalletAddress,
+    mapping: &ActivityAssetMapping,
+    row_index: usize,
+    redeemable: bool,
+) -> Result<CanonicalPosition, PositionReadError> {
+    let wallet_text = required_raw_string(decoded.proxy_wallet, row_index, "proxyWallet")?;
+    let payload_wallet =
+        WalletAddress::from_hex(&wallet_text).map_err(|_| PositionReadError::InvalidWallet {
+            row_index,
+            value: wallet_text.clone(),
+        })?;
+    if payload_wallet != requested_wallet {
+        return Err(PositionReadError::WalletMismatch {
+            row_index,
+            requested_wallet,
+            payload_wallet,
+        });
+    }
+    let asset = PolymarketTokenId(required_raw_string(decoded.asset, row_index, "asset")?);
+    let position_condition_id = PolymarketConditionId(
+        required_raw_string(decoded.condition_id, row_index, "conditionId")?.to_ascii_lowercase(),
+    );
+    let position_outcome = OutcomeId(decoded.outcome_index.ok_or(
+        PositionReadError::MissingField {
+            row_index,
+            field: "outcomeIndex",
+        },
+    )?);
+    let identity = match mapping.identity(&asset) {
+        Some(identity) => identity,
+        None if mapping.unresolved().contains_key(&asset) => {
+            return Err(PositionReadError::MetadataUnresolved {
+                asset: asset.0,
+                reason: "position asset unverified by venue metadata".to_owned(),
+            });
+        }
+        None => {
+            return Err(PositionReadError::MissingActivityMapping { asset: asset.0 });
+        }
+    };
+    if !identity.verified {
+        return Err(PositionReadError::MetadataUnresolved {
+            asset: asset.0,
+            reason: "position asset unverified by venue metadata".to_owned(),
+        });
+    }
+    if mapping.journal_verified_assets.contains(&asset)
+        && (position_condition_id != identity.condition_id || position_outcome != identity.outcome)
+    {
+        return Err(PositionReadError::ConflictingActivityMapping { asset: asset.0 });
+    }
+    let condition_id = identity.condition_id.clone();
+    let outcome = identity.outcome;
+    let size = ShareAmount::from_decimal_exact(decoded.size.0).map_err(|error| {
+        PositionReadError::InvalidAmount {
+            row_index,
+            value: decoded.size.0,
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(CanonicalPosition {
+        wallet: requested_wallet,
+        asset,
+        condition_id,
+        outcome,
+        classification: identity.classification,
+        size,
+        redeemable,
+        neg_risk: decoded.neg_risk.ok_or(PositionReadError::MissingField {
+            row_index,
+            field: "negativeRisk",
+        })?,
     })
 }
 
@@ -1394,6 +1423,8 @@ fn page_evidence(
         schema_version: context.schema_version,
         parser_version: context.parser_version,
         anomalies: Vec::new(),
+        has_more: None,
+        next_cursor: None,
     })
 }
 

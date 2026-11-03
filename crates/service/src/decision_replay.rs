@@ -2003,6 +2003,8 @@ mod tests {
                 receipt,
             };
             let evidence = ReconciliationPageEvidence {
+                has_more: None,
+                next_cursor: None,
                 anomalies: Vec::new(),
                 request_url: page.request_url.clone(),
                 bounds: Some(ActivityRequestBounds {

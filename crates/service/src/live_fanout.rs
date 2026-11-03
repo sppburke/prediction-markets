@@ -5078,6 +5078,8 @@ fn produced_observation_index(
     .url("https://data-api.polymarket.com");
     let raw_hash = bound.raw_payload_hash.to_hex().to_string();
     let mut page = pe_source_polymarket_public::ReconciliationPageEvidence {
+        has_more: None,
+        next_cursor: None,
         anomalies: Vec::new(),
         request_url: request_url.clone(),
         bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
@@ -11543,6 +11545,8 @@ mod tests {
                 receipt,
             },
             pe_source_polymarket_public::ReconciliationPageEvidence {
+                has_more: None,
+                next_cursor: None,
                 anomalies: Vec::new(),
                 request_url,
                 bounds: Some(pe_source_polymarket_public::ActivityRequestBounds { start, end }),
@@ -20940,6 +20944,8 @@ mod tests {
         )
         .unwrap();
         let evidence = pe_source_polymarket_public::ReconciliationPageEvidence {
+            has_more: None,
+            next_cursor: None,
             request_url: "fixture".to_owned(),
             bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
                 start: None,

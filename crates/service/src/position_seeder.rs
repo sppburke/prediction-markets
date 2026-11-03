@@ -264,6 +264,9 @@ fn classify_activity_read(error: &pe_source_polymarket_public::ActivityReadError
         },
         ActivityReadError::SaturatedTerminalSecond { .. } => FailureClass::WalletPersistent,
         ActivityReadError::InvalidOffset { .. }
+        | ActivityReadError::V2Envelope(_)
+        | ActivityReadError::V2Authentication(_)
+        | ActivityReadError::InvalidBounds { .. }
         | ActivityReadError::RowOutsideBounds { .. }
         | ActivityReadError::InvalidSplit { .. }
         | ActivityReadError::CanonicalPage(_)
@@ -284,6 +287,8 @@ fn classify_position_read(error: &pe_source_polymarket_public::PositionReadError
         | PositionReadError::DuplicateAsset { .. }
         | PositionReadError::SaturatedTerminalPage { .. } => FailureClass::WalletPersistent,
         PositionReadError::MetadataUnresolved { .. }
+        | PositionReadError::V2Envelope(_)
+        | PositionReadError::V2Authentication(_)
         | PositionReadError::ProofComponentTooLong
         | PositionReadError::PageTooLarge { .. }
         | PositionReadError::Json(_)
@@ -439,6 +444,18 @@ impl CausalPositionError {
                 ..
             } => "activity.invalid_offset",
             Self::Activity {
+                source: ActivityReadError::V2Envelope(_),
+                ..
+            } => "activity.v2_envelope",
+            Self::Activity {
+                source: ActivityReadError::V2Authentication(_),
+                ..
+            } => "activity.v2_authentication",
+            Self::Activity {
+                source: ActivityReadError::InvalidBounds { .. },
+                ..
+            } => "activity.invalid_bounds",
+            Self::Activity {
                 source: ActivityReadError::RowOutsideBounds { .. },
                 ..
             } => "activity.row_outside_bounds",
@@ -466,6 +483,14 @@ impl CausalPositionError {
                 source: PositionReadError::Json(_),
                 ..
             } => "positions.json",
+            Self::Positions {
+                source: PositionReadError::V2Envelope(_),
+                ..
+            } => "positions.v2_envelope",
+            Self::Positions {
+                source: PositionReadError::V2Authentication(_),
+                ..
+            } => "positions.v2_authentication",
             Self::Positions {
                 source: PositionReadError::MissingField { .. },
                 ..

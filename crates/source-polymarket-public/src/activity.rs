@@ -635,7 +635,7 @@ struct RawActivity<I = FlexibleU16, N = ExactDecimal> {
     transaction_hash: Option<String>,
     #[serde(default, alias = "condition_id")]
     condition_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "token_id")]
     asset: Option<String>,
     #[serde(default, alias = "outcome_index")]
     outcome_index: Option<I>,
@@ -670,7 +670,7 @@ fn parse_row(
     Ok(parsed)
 }
 
-fn parse_row_with_acceptance(
+pub(crate) fn parse_row_with_acceptance(
     raw_row: &str,
     requested_wallet: Option<WalletAddress>,
     context: &ActivityParseContext,
