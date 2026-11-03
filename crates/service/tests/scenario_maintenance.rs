@@ -40,6 +40,9 @@
     clippy::arithmetic_side_effects
 )]
 
+#[path = "support/data_api_v2.rs"]
+mod data_api_v2;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1307,7 +1310,7 @@ async fn full_structural_set_backfills_vacancy_from_stale_survivors_in_rank_orde
         uri: axum::http::Uri,
         Query(query): Query<HashMap<String, String>>,
     ) -> Json<Value> {
-        Json(match uri.path() {
+        let response = match uri.path() {
             "/rest/v1/ranking_batches" => json!([{"batch_id":1}]),
             "/rest/v1/ranking_entries" => {
                 assert_eq!(query["batch_id"], "eq.1");
@@ -1340,7 +1343,7 @@ async fn full_structural_set_backfills_vacancy_from_stale_survivors_in_rank_orde
                         .collect::<Vec<_>>()
                 )
             }
-            "/activity" => {
+            "/v2/activity" => {
                 let user = query["user"].clone();
                 let mut starts = state.starts.lock().unwrap();
                 if !starts.contains(&user) {
@@ -1350,12 +1353,19 @@ async fn full_structural_set_backfills_vacancy_from_stale_survivors_in_rank_orde
                     "type":"TRADE","size":"1","usdcSize":"0.5","transactionHash":"0xsurvivor",
                     "price":"0.5","asset":"123","side":"BUY","outcomeIndex":0}])
             }
-            "/positions" => json!([]),
+            "/v2/positions" => json!([]),
             "/markets" => {
                 json!([{"conditionId":"0xca","clobTokenIds":["123","456"]}])
             }
             _ => json!([]),
-        })
+        };
+        Json(
+            serde_json::from_slice(&data_api_v2::fixture_page(
+                &format!("http://fixture{uri}"),
+                serde_json::to_vec(&response).unwrap(),
+            ))
+            .unwrap(),
+        )
     }
     let (dir, paper) = temp_db();
     paper.record_market_group("0xca", "").unwrap();
@@ -1584,19 +1594,26 @@ async fn budgeted_admission_reaches_100_across_ticks() {
         uri: axum::http::Uri,
         Query(query): Query<HashMap<String, String>>,
     ) -> Json<Value> {
-        Json(match uri.path() {
+        let response = match uri.path() {
             "/rest/v1/ranking_batches" => json!([{"batch_id":2}]),
             "/rest/v1/ranking_entries" => json!((1..=100).map(|n| json!({"batch_id":2,"rank":n,"wallet_hex":wallet(n),"ls_tstat":"3","hit_rate":"0.7","n_trades":60,"last_trade_unix":NOW-10,"survives":true})).collect::<Vec<_>>()),
-            "/activity" => {
+            "/v2/activity" => {
                 let user = query["user"].clone();
                 let first = state.first.lock().unwrap().insert(user.clone());
                 if first { state.started.send(user.clone()).unwrap(); state.release.acquire().await.unwrap().forget(); }
                 json!([{"proxyWallet":user,"timestamp":NOW-10,"conditionId":"0xcb","type":"TRADE","size":"1","usdcSize":"0.5","transactionHash":"0xpopulation","price":"0.5","asset":"123","side":"BUY","outcomeIndex":0}])
             },
-            "/positions" => json!([]),
+            "/v2/positions" => json!([]),
             "/markets" => json!([{"conditionId":"0xcb","clobTokenIds":["123","456"]}]),
             _ => json!([]),
-        })
+        };
+        Json(
+            serde_json::from_slice(&data_api_v2::fixture_page(
+                &format!("http://fixture{uri}"),
+                serde_json::to_vec(&response).unwrap(),
+            ))
+            .unwrap(),
+        )
     }
     let (dir, paper) = temp_db();
     for n in 1..=95 {

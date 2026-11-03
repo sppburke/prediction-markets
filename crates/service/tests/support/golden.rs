@@ -12,8 +12,7 @@
 #[path = "mod.rs"]
 pub mod support;
 
-#[path = "data_api_v2.rs"]
-mod data_api_v2;
+use support::data_api_v2;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -3862,9 +3861,17 @@ impl BracketFinancialHarness {
         .with_source_receipt_index(self.receipts.clone())
         .with_progress(progress)
         .with_clock(Arc::new(move || now));
-        let task = tokio::spawn(poller.run_until(async {
-            let _ = stopped.await;
-        }));
+        let task = tokio::spawn(async move {
+            let result = poller
+                .run_until(async {
+                    let _ = stopped.await;
+                })
+                .await;
+            if let Err(error) = &result {
+                eprintln!("poller failed: {error}");
+            }
+            result
+        });
         let mut background = None;
         let mut urgent = None;
         // The urgent read and the other wallet's backstop read run together; no refresh is due.

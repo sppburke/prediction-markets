@@ -655,12 +655,12 @@ mod tests {
                 }),
             )
             .route(
-                "/activity",
-                get(|| async { Json(Vec::<serde_json::Value>::new()) }),
+                "/v2/activity",
+                get(|| async { Json(serde_json::from_slice::<serde_json::Value>(&crate::trade_poller::test_v2_page(serde_json::json!([]))).unwrap()) }),
             )
             .route(
-                "/positions",
-                get(|| async { Json(Vec::<serde_json::Value>::new()) }),
+                "/v2/positions",
+                get(|| async { Json(serde_json::from_slice::<serde_json::Value>(&crate::trade_poller::test_v2_page(serde_json::json!([]))).unwrap()) }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1245,17 +1245,29 @@ mod tests {
                 }),
             )
             .route(
-                "/activity",
+                "/v2/activity",
                 get(|| async {
-                    Json(vec![serde_json::json!({
-                        "conditionId": "0xprior-market",
-                        "timestamp": 1_699_999_000_i64
-                    })])
+                    Json(
+                        serde_json::from_slice::<serde_json::Value>(
+                            &crate::trade_poller::test_v2_page(serde_json::json!([{
+                                "conditionId": "0xprior-market",
+                                "timestamp": 1_699_999_000_i64
+                            }])),
+                        )
+                        .unwrap(),
+                    )
                 }),
             )
             .route(
-                "/positions",
-                get(|| async { Json(Vec::<serde_json::Value>::new()) }),
+                "/v2/positions",
+                get(|| async {
+                    Json(
+                        serde_json::from_slice::<serde_json::Value>(
+                            &crate::trade_poller::test_v2_page(serde_json::json!([])),
+                        )
+                        .unwrap(),
+                    )
+                }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

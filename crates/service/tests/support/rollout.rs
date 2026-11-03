@@ -1,8 +1,7 @@
 //! The real service process, local HTTP authority, and unchanged production admission gates.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-#[path = "data_api_v2.rs"]
-mod data_api_v2;
+use crate::support::data_api_v2;
 
 use axum::{
     Json, Router,

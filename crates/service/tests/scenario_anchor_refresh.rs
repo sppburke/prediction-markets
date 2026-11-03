@@ -1,6 +1,9 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/data_api_v2.rs"]
+mod data_api_v2;
+
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -67,7 +70,7 @@ impl PollFetcher {
 impl ReconciliationFetcher for PollFetcher {
     fn fetch<'a>(
         &'a self,
-        _url: &'a str,
+        url: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -88,6 +91,7 @@ impl ReconciliationFetcher for PollFetcher {
                 .ok_or_else(|| SourceError::Fatal {
                     message: "unexpected poll page fetch".to_owned(),
                 })
+                .map(|raw| data_api_v2::fixture_page(url, raw))
         })
     }
 }
@@ -129,14 +133,16 @@ impl PageFetcher for MapFetcher {
                 .collect::<Vec<_>>();
             return Ok(serde_json::to_vec(&markets).unwrap());
         }
-        self.responses
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(url)
-            .and_then(VecDeque::pop_front)
-            .ok_or_else(|| SourceError::Fatal {
-                message: format!("no queued bracket fixture for {url}"),
-            })
+        data_api_v2::queued_fixture(
+            url,
+            &mut self
+                .responses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .ok_or_else(|| SourceError::Fatal {
+            message: format!("no queued bracket fixture for {url}"),
+        })
     }
 }
 
@@ -145,13 +151,14 @@ fn wallet(byte: u8) -> WalletAddress {
 }
 
 fn activity_url(wallet: WalletAddress) -> String {
-    PolymarketEndpoint::UserPositionActivityPage {
-        user: wallet.to_string(),
-        end: NOW,
-        start: Some(1),
-        offset: 0,
-    }
-    .url(BASE)
+    pe_source_polymarket_public::V2ActivityRequest::position_changes(
+        wallet,
+        Some(0),
+        NOW,
+        pe_source_polymarket_public::ActivityRowAcceptance::StrictWithAnomalies,
+    )
+    .url(BASE, None)
+    .unwrap()
 }
 
 fn position_url(wallet: WalletAddress, partition: PositionPartition) -> String {
@@ -562,7 +569,7 @@ async fn refreshes_at_most_one_due_wallet_per_round_in_round_robin_order() {
             let _ = shutdown_rx.await;
         })
         .await;
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "{result:?}");
     assert_eq!(
         *installed
             .lock()
@@ -831,15 +838,13 @@ async fn deferred_refresh_continues_the_poller() {
         ..
     } = harness;
     let (progress, mut completed) = mpsc::channel(8);
-    assert!(
-        poller
-            .with_progress(progress)
-            .run_until(async move {
-                let _ = stopped.await;
-            })
-            .await
-            .is_ok()
-    );
+    let result = poller
+        .with_progress(progress)
+        .run_until(async move {
+            let _ = stopped.await;
+        })
+        .await;
+    assert!(result.is_ok(), "{result:?}");
     // The urgent reconciliation runs at once (one backstop plus one urgent read); the
     // bracket retry waits out the refresh cooldown (#597), one backstop read per second.
     let installed = installed.lock().unwrap().clone();
@@ -932,10 +937,10 @@ async fn real_transaction_failure_terminates_the_poller_without_swapping() {
         ..
     } = harness;
     let result = poller.run_until(std::future::pending::<()>()).await;
-    assert!(matches!(
-        result,
-        Err(TradePollerOwnerError::AnchorRefresh(_))
-    ));
+    assert!(
+        matches!(result, Err(TradePollerOwnerError::AnchorRefresh(_))),
+        "{result:?}"
+    );
     assert!(paper.position_anchors(&wallet).unwrap().is_empty());
     assert!(paper.leader_positions().unwrap().is_empty());
     finish_harness(ingest, actor, preparer).await;

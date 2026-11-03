@@ -173,7 +173,7 @@ struct DelayedPage {
 impl pe_source_polymarket_public::ReconciliationFetcher for DelayedPage {
     fn fetch<'a>(
         &'a self,
-        _: &'a str,
+        url: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, pe_source_core::SourceError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -189,9 +189,9 @@ impl pe_source_polymarket_public::ReconciliationFetcher for DelayedPage {
                         (remaining > 0).then(|| remaining - 1)
                     });
             if remaining.is_ok() {
-                Ok(b"[]".to_vec())
+                Ok(support::data_api_v2::fixture_page(url, b"[]".to_vec()))
             } else {
-                Ok(self.page.clone())
+                Ok(support::data_api_v2::fixture_page(url, self.page.clone()))
             }
         })
     }
@@ -1091,9 +1091,17 @@ impl Harness {
             OffsetDateTime::from_unix_timestamp(poll_clock.load(Ordering::SeqCst)).unwrap()
         }));
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(poller.run_until(async move {
-            let _ = stopped.await;
-        }));
+        let task = tokio::spawn(async move {
+            let result = poller
+                .run_until(async move {
+                    let _ = stopped.await;
+                })
+                .await;
+            if let Err(error) = &result {
+                eprintln!("poller failed: {error}");
+            }
+            result
+        });
         let mut unresolved = None;
         while let Some(progress) = completed.recv().await {
             if let pe_service::trade_poller::PollerProgress::Completed {
@@ -6564,9 +6572,17 @@ impl Harness {
             OffsetDateTime::from_unix_timestamp(poll_clock.load(Ordering::SeqCst)).unwrap()
         }));
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(poller.run_until(async move {
-            let _ = stopped.await;
-        }));
+        let task = tokio::spawn(async move {
+            let result = poller
+                .run_until(async move {
+                    let _ = stopped.await;
+                })
+                .await;
+            if let Err(error) = &result {
+                eprintln!("poller failed: {error}");
+            }
+            result
+        });
         HeldPoll {
             _triggers: triggers,
             pages,
@@ -7497,13 +7513,16 @@ struct FrameBracketPages {
 }
 impl pe_source_polymarket_public::PageFetcher for FrameBracketPages {
     async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
-        Ok(if url.contains("/activity?") {
-            self.activity.clone()
-        } else if url.contains("redeemable=false") {
-            self.positions.clone()
-        } else {
-            b"[]".to_vec()
-        })
+        Ok(support::data_api_v2::fixture_page(
+            url,
+            if url.contains("/activity?") {
+                self.activity.clone()
+            } else if url.contains("/positions?") {
+                self.positions.clone()
+            } else {
+                b"[]".to_vec()
+            },
+        ))
     }
 }
 
@@ -8123,10 +8142,10 @@ async fn before_start_frame_only_triggers_reconciliation() {
     h.stop().await;
 }
 
-/// A saturated read cannot refresh a frontier.
+/// A cursor cycle cannot refresh a frontier.
 #[tokio::test(start_paused = true)]
-async fn saturated_one_second_read_keeps_frontier_without_admitted_obligation_across_restart() {
-    use pe_source_polymarket_public::{ACTIVITY_MAX_OFFSET, RECONCILIATION_PAGE_LIMIT};
+async fn repeated_v2_cursor_keeps_frontier_without_admitted_obligation_across_restart() {
+    use pe_source_polymarket_public::RECONCILIATION_PAGE_LIMIT;
     let mut h = Harness::new().await;
     let frame = h.record(1).await;
     let original: Value = serde_json::from_slice(&frame.activity).unwrap();
@@ -8152,7 +8171,7 @@ async fn saturated_one_second_read_keeps_frontier_without_admitted_obligation_ac
         }
         h.paper.set_cursor(&wallet(), EPOCH - 1).unwrap();
         let mut held = h.held_poll(&frame, Some(receipt));
-        let mut terminal_offset_seen = false;
+        let mut repeated_cursor_seen = false;
         let mut unresolved = None;
         loop {
             tokio::select! {
@@ -8162,11 +8181,12 @@ async fn saturated_one_second_read_keeps_frontier_without_admitted_obligation_ac
                     let query = url.query_pairs().collect::<HashMap<_, _>>();
                     let end = query["end"].parse::<i64>().unwrap();
                     if end == EPOCH {
-                        if query["start"] == EPOCH.to_string()
-                            && query["offset"] == ACTIVITY_MAX_OFFSET.to_string() {
-                            terminal_offset_seen = true;
-                        }
-                        request.respond.send(page.clone()).unwrap();
+                        repeated_cursor_seen |= query.contains_key("cursor");
+                        let raw = support::data_api_v2::fixture_page(&request.url, page.clone());
+                        let mut response: Value = serde_json::from_slice(&raw).unwrap();
+                        response["pagination"]["has_more"] = true.into();
+                        response["pagination"]["next_cursor"] = "repeated".into();
+                        request.respond.send(serde_json::to_vec(&response).unwrap()).unwrap();
                     } else {
                         assert_eq!(end, EPOCH - 1);
                         request.respond.send(b"[]".to_vec()).unwrap();
@@ -8185,7 +8205,7 @@ async fn saturated_one_second_read_keeps_frontier_without_admitted_obligation_ac
         }
         let _ = held.stop.send(());
         held.task.await.unwrap().unwrap();
-        assert!(terminal_offset_seen);
+        assert!(repeated_cursor_seen);
         assert!(unresolved.unwrap().is_empty());
         assert_eq!(h.paper.feed_history_frontiers().unwrap(), frontier);
         assert_eq!(read_commitments(&h).len(), commitments_before);

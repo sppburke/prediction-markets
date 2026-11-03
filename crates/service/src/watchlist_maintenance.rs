@@ -3380,17 +3380,27 @@ mod tests {
                 }
                 async fn activity(
                     State(fake): State<Fake>,
-                ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+                ) -> Result<Json<serde_json::Value>, StatusCode> {
                     fake.activity_hits.fetch_add(1, Ordering::SeqCst);
                     if fake.history_ok {
-                        Ok(Json(Vec::new()))
+                        Ok(Json(
+                            serde_json::from_slice(&crate::trade_poller::test_v2_page(
+                                serde_json::json!([]),
+                            ))
+                            .unwrap(),
+                        ))
                     } else {
                         Err(StatusCode::NOT_FOUND)
                     }
                 }
-                async fn positions(State(fake): State<Fake>) -> Json<Vec<serde_json::Value>> {
+                async fn positions(State(fake): State<Fake>) -> Json<serde_json::Value> {
                     fake.position_hits.fetch_add(1, Ordering::SeqCst);
-                    Json(Vec::new())
+                    Json(
+                        serde_json::from_slice(&crate::trade_poller::test_v2_page(
+                            serde_json::json!([]),
+                        ))
+                        .unwrap(),
+                    )
                 }
                 let app = Router::new()
                     .route(
@@ -3408,8 +3418,8 @@ mod tests {
                         "/rest/v1/wallet_lifecycle_events",
                         axum::routing::post(|| async { StatusCode::CREATED }),
                     )
-                    .route("/activity", get(activity))
-                    .route("/positions", get(positions))
+                    .route("/v2/activity", get(activity))
+                    .route("/v2/positions", get(positions))
                     .with_state(self);
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();
@@ -3918,26 +3928,25 @@ mod tests {
                         message: "exhausted venue fixture".to_owned(),
                     });
                 }
-                if url.contains("/activity?") {
-                    return Ok(b"[]".to_vec());
+                if url.contains("/v2/activity?") {
+                    return Ok(crate::trade_poller::test_v2_page(serde_json::json!([])));
                 }
                 if url.contains("/positions?") {
                     if self
                         .missing_mapping
                         .is_some_and(|wallet| url.contains(&wallet.to_string()))
                     {
-                        return serde_json::to_vec(&vec![serde_json::json!({
-                            "proxyWallet": self.missing_mapping.unwrap(),
-                            "asset": "asset-unmapped",
-                            "conditionId": format!("0x{}", "a".repeat(40)),
-                            "size": "1",
-                            "outcomeIndex": 0
-                        })])
-                        .map_err(|error| SourceError::Fatal {
-                            message: error.to_string(),
-                        });
+                        return Ok(crate::trade_poller::test_v2_page(serde_json::json!([{
+                            "proxy_wallet": self.missing_mapping.unwrap(),
+                            "token_id": "asset-unmapped",
+                            "condition_id": format!("0x{}", "a".repeat(40)),
+                            "current_size": "1",
+                            "outcome_index": 0,
+                            "redeemable": false,
+                            "negative_risk": false
+                        }])));
                     }
-                    return Ok(b"[]".to_vec());
+                    return Ok(crate::trade_poller::test_v2_page(serde_json::json!([])));
                 }
                 Err(SourceError::Fatal {
                     message: format!("unexpected fixture URL: {url}"),
@@ -5627,9 +5636,9 @@ mod tests {
                     if first && self.spend_budget {
                         tokio::time::advance(Duration::from_secs(11)).await;
                     }
-                } else if url.contains("redeemable=false") && self.shared.contains(&wallet) {
+                } else if url.contains("/v2/positions?") && self.shared.contains(&wallet) {
                     return Ok(b"{".to_vec());
-                } else if url.contains("redeemable=false")
+                } else if url.contains("/v2/positions?")
                     && self.busy.lock().unwrap().contains(&wallet)
                 {
                     // Simulate ordinary reconciliation changing the delivery cursor between
@@ -5637,7 +5646,7 @@ mod tests {
                     let at = self.paper.cursor(&wallet).unwrap().unwrap_or(NOW - 60);
                     self.paper.set_cursor(&wallet, at + 1).unwrap();
                 }
-                Ok(b"[]".to_vec())
+                Ok(crate::trade_poller::test_v2_page(serde_json::json!([])))
             }
         }
 

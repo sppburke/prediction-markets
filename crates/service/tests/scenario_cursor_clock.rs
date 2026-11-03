@@ -3,6 +3,9 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/data_api_v2.rs"]
+mod data_api_v2;
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -60,7 +63,7 @@ impl QueueFetcher {
 impl ReconciliationFetcher for QueueFetcher {
     fn fetch<'a>(
         &'a self,
-        _url: &'a str,
+        url: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -71,6 +74,7 @@ impl ReconciliationFetcher for QueueFetcher {
                 .ok_or_else(|| SourceError::Fatal {
                     message: "unexpected page fetch".to_owned(),
                 })
+                .map(|raw| data_api_v2::fixture_page(url, raw))
         })
     }
 }
@@ -255,7 +259,13 @@ async fn run_once(
     let poller = tokio::spawn(poller);
     loop {
         if matches!(
-            progress_rx.recv().await.unwrap(),
+            match progress_rx.recv().await {
+                Some(progress) => progress,
+                None => {
+                    poller.await.unwrap().unwrap();
+                    return;
+                }
+            },
             pe_service::trade_poller::PollerProgress::RoundCompleted
         ) {
             break;

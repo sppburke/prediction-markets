@@ -32,7 +32,7 @@ use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate, ActivityReadError,
     ActivityRowAcceptance, ActivityType, NormalizedActivity, ReconciliationFetcher, ReqwestFetcher,
-    fetch_complete_activity_with_acceptance, parse_activity_trade_observation,
+    V2ActivityRequest, fetch_complete_activity_v2, parse_activity_trade_observation,
 };
 use pe_trader_index::WatchlistTier;
 use time::OffsetDateTime;
@@ -2284,13 +2284,15 @@ impl WalletOperation {
             now: self.now.clone(),
         };
         let activity = match Self::cancellable(
-            fetch_complete_activity_with_acceptance(
+            fetch_complete_activity_v2(
                 &recording,
                 &self.config.base_url,
-                wallet,
-                start,
-                fixed_end,
-                ActivityRowAcceptance::StrictWithAnomalies,
+                &V2ActivityRequest::position_changes(
+                    wallet,
+                    start,
+                    fixed_end,
+                    ActivityRowAcceptance::StrictWithAnomalies,
+                ),
             ),
             cancel,
         )
@@ -2631,7 +2633,9 @@ impl WalletOperation {
             .enumerate()
         {
             if pages.iter().any(|page| {
-                page.bounds == evidence.bounds
+                page.schema_version == ACTIVITY_SCHEMA_VERSION
+                    && evidence.schema_version == ACTIVITY_SCHEMA_VERSION
+                    && page.bounds == evidence.bounds
                     && page.offset == pe_source_polymarket_public::ACTIVITY_MAX_OFFSET
                     && page.row_count == pe_source_polymarket_public::RECONCILIATION_PAGE_LIMIT
             }) {
@@ -3371,8 +3375,8 @@ pub(crate) fn activity_request_has_anomalies(
     wallet: WalletAddress,
     received_at: OffsetDateTime,
 ) -> bool {
-    url.path().ends_with("/activity")
-        && pe_source_polymarket_public::parse_activity_response_with_acceptance(
+    url.path().ends_with("/v2/activity")
+        && pe_source_polymarket_public::parse_activity_response_v2_with_acceptance(
             payload,
             wallet,
             &pe_source_polymarket_public::ActivityParseContext {
@@ -3433,11 +3437,7 @@ impl ReconciliationFetcher for RecordingFetcher {
             }
             let envelope = EnvelopeIn {
                 source_id: SourceId(ACTIVITY_POLL_SOURCE_ID.to_owned()),
-                schema_version: if anomalous {
-                    ACTIVITY_POLL_ANOMALY_PAGE_SCHEMA_VERSION
-                } else {
-                    ACTIVITY_POLL_PAGE_SCHEMA_VERSION
-                },
+                schema_version: ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION,
                 parser_version: ACTIVITY_PARSER_VERSION,
                 observed_at: SourceTimestamp(received_at),
                 received_at: ReceivedAt(received_at),
@@ -4652,6 +4652,17 @@ mod tests {
     }
 }
 
+/// Single terminal response for in-crate acquisition fixtures.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn test_v2_page(rows: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "data": rows,
+        "pagination": {"limit":1000,"offset":0,"has_more":false,"next_cursor":null}
+    }))
+    .unwrap()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod anomaly_recording_tests {
@@ -4668,11 +4679,62 @@ mod anomaly_recording_tests {
         }
     }
     fn payload(wallet: WalletAddress, anomalous: bool) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!([{
+        serde_json::to_vec(&serde_json::json!({"data":[{
             "proxyWallet": wallet, "timestamp": 100, "type":"TRADE", "transactionHash":"0xanomaly",
-            "conditionId":"0xca", "asset":"asset-a", "side":"BUY", "isCombo":false,
+            "conditionId":"0xca", "token_id":"asset-a", "side":"BUY", "isCombo":false,
             "outcomeIndex":0, "outcome":"Yes", "price":if anomalous {"2"} else {"0.5"}, "size":"1", "usdcSize":"1"
-        }])).unwrap()
+        }], "pagination":{"limit":1000,"offset":0,"has_more":false,"next_cursor":null}})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn v2_activity_read_records_exact_request_and_raw_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.log");
+        let wallet = WalletAddress([0xaa; 20]);
+        let body = payload(wallet, false);
+        let fetcher = RecordingFetcher {
+            inner: Arc::new(Page(body.clone())),
+            source_log: SourceLogHandle::boot(Arc::new(tokio::sync::Mutex::new(
+                SourceEventSink::open(&source).unwrap(),
+            ))),
+            paper_state: Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap()),
+            wallet,
+            append_closed: Arc::new(AtomicBool::new(false)),
+            occurrences: Arc::new(Mutex::new(Vec::new())),
+            now: Arc::new(|| OffsetDateTime::from_unix_timestamp(101).unwrap()),
+        };
+        let read = fetch_complete_activity_v2(
+            &fetcher,
+            "https://example.test",
+            &V2ActivityRequest::position_changes(
+                wallet,
+                Some(90),
+                100,
+                ActivityRowAcceptance::StrictWithAnomalies,
+            ),
+        )
+        .await
+        .unwrap();
+        let occurrences = fetcher.join_occurrences(&read.pages).unwrap();
+        assert_eq!(
+            occurrences[0].request_url,
+            format!(
+                "https://example.test/v2/activity?user={wallet}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&start=91&end=100&sort_direction=DESC&limit=1000"
+            )
+        );
+        let frames: Vec<_> = pe_event_log::Reader::replay(&source)
+            .unwrap()
+            .map(|frame| frame.unwrap().1)
+            .collect();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].schema_version,
+            ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION
+        );
+        assert_eq!(frames[0].parser_version, ACTIVITY_PARSER_VERSION);
+        assert_eq!(frames[0].source_id.0, ACTIVITY_POLL_SOURCE_ID);
+        assert_eq!(frames[0].payload, body);
+        assert_eq!(occurrences[0].receipt.sequence, frames[0].seq);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4703,7 +4765,7 @@ mod anomaly_recording_tests {
             ));
             let wallet = WalletAddress([0xaa; 20]);
             let bytes = match case {
-                "empty" | "empty_existing" => b"[]".to_vec(),
+                "empty" | "empty_existing" => br#"{"data":[],"pagination":{"limit":1000,"offset":0,"has_more":false,"next_cursor":null}}"#.to_vec(),
                 "bad_payload" => b"[".to_vec(),
                 "mismatched_wallet" => payload(WalletAddress([0xbb; 20]), true),
                 _ => payload(wallet, !matches!(case, "healthy" | "healthy_existing")),
@@ -4729,13 +4791,13 @@ mod anomaly_recording_tests {
                 "activity"
             };
             let prefix = if case.starts_with("prefixed_") {
-                "api/v1/"
+                "api/"
             } else {
                 ""
             };
             let result = fetcher
                 .fetch(&format!(
-                    "https://example.test/{prefix}{endpoint}?user={wallet}"
+                    "https://example.test/{prefix}v2/{endpoint}?user={wallet}"
                 ))
                 .await;
             assert_eq!(
@@ -4759,11 +4821,7 @@ mod anomaly_recording_tests {
             } else {
                 assert_eq!(
                     frames[0].schema_version,
-                    if matches!(case, "success" | "prefixed_success") {
-                        4
-                    } else {
-                        ACTIVITY_POLL_PAGE_SCHEMA_VERSION
-                    }
+                    ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION
                 );
             }
             if case.ends_with("_existing") {
