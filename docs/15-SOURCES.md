@@ -61,6 +61,30 @@
 > and offset contracts below are historical. These dates retain the supplied source-pass and live
 > check provenance; this documentation pass read the local spec and made no network requests.
 
+> **Bootstrap `/v2/activity` contract (phase 2).** Last checked: **2026-11-03**;
+> re-verify by **2027-01-02**. The official
+> [OpenAPI spec](https://data-api.polymarket.com/v2/openapi.json) documents keyset order by
+> `(block_timestamp, sequence_id)`, ASC on request, inclusive `start`/`end`, and `start=1`
+> for full history. Feed cursors carry the seek anchor and page size; every page must repeat
+> identical filters. The [rate-limit reference](https://docs.polymarket.com/api-reference/rate-limits)
+> lists 200 requests per 10 seconds. Bootstrap's page size, bounded windows, nonempty
+> continuation rule and accepted proof forms are canonical in the
+> [identity-5 contract](_GLOSSARY.md#identity-5-acquisition-4-and-classifier-7-822).
+>
+> **Bootstrap `/v2/trades` participant contract.** Last checked: **2026-11-03**;
+> re-verify by **2027-01-02**. The same spec documents `condition` chunks, cursor paging,
+> `taker_only=false` for maker and taker rows, and a fixed three-year condition feed that
+> ignores `start`/`end`. It does not state a direction; the approved 11/3 source pass observed
+> newest-first order with no inversions in seven complete walks. Bootstrap checks timestamp
+> order and requires a strict decrease before stopping below its lower bound; otherwise it
+> reads to the terminal page. Chunk size, size filter, concurrency, pacing and window guard
+> live in [`participant_lookback_secs`](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap).
+> The rate-limit reference lists 300 requests per 10 seconds. The approved dust probe found
+> a positive fill below the default size floor only when a smaller filter was sent; the
+> configured filter sits below the six-decimal share unit. These live observations retain
+> the approved source pass's provenance; this docs pass re-read the official spec and rate
+> limits without repeating the live walks.
+
 > **Scheduled-end day and leaderboard paging (#757).** Last checked: **2026-10-09** for
 > CLOB `end_date_iso`: the supplied issue evidence measured UTC-midnight markers in 99.19% of
 > 1,442,086 markets. The marker names the scheduled end's UTC day; scoring and gate C use its
@@ -72,12 +96,12 @@
 > Re-verify by **2026-12-09**. These dates retain the issue's source-pass provenance;
 > the documentation implementation made no network requests.
 
-> **Data API `/trades` for market participants (#800/#821).** Last checked: **2026-10-31**
+> **Historical Data API v1 `/trades` for market participants (#800/#821).** Last checked: **2026-10-31**
 > for the recorded 10/30–10/31 participant and history probes; re-verify by **2026-12-30**.
 > The [official user-or-markets trades reference](https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets)
 > documents comma-separated condition ids in `market`, `limit` at most 10,000, offsets
 > 0–10,000 (HTTP 400 past the cap), and deeper reads via `start`/`end` time windows.
-> `takerOnly` defaults to true; participant discovery now sends `takerOnly=false` to read
+> `takerOnly` defaulted to true; participant discovery sent `takerOnly=false` to read
 > **both maker and taker wallets**. Rows carry `proxyWallet` and `timestamp`; the recorded
 > seven-day probe found 102 of 476 heavy non-seed wallets only as makers. This is the public
 > Data API, separate from authenticated CLOB trades. Inclusive wire `start=lo&end=hi−1`
@@ -416,10 +440,10 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/api-reference/core/get-user-activity (v1 route retired, HTTP 410; historical `TAKER_REBATE` check above) | 2026-11-02 | 2027-01-01 |
 | https://docs.polymarket.com/api-reference/data-api/overview (linked by the v1 HTTP 410 body) | 2026-11-02 | 2027-01-01 |
 | https://docs.polymarket.com/migrate/data-api-v1-to-v2.md | 2026-11-02 | 2027-01-01 |
-| https://data-api.polymarket.com/v2/openapi.json (downloaded official spec, version 0.1.0) | 2026-11-02 | 2027-01-01 |
-| https://data-api.polymarket.com/v2/activity | 2026-11-02 | 2027-01-01 |
+| https://data-api.polymarket.com/v2/openapi.json (official spec, version 0.1.0) | 2026-11-03 | 2027-01-02 |
+| https://data-api.polymarket.com/v2/activity (bootstrap ASC cursor contract above) | 2026-11-03 | 2027-01-02 |
 | https://data-api.polymarket.com/v2/positions | 2026-11-02 | 2027-01-01 |
-| https://data-api.polymarket.com/v2/trades | 2026-11-02 | 2027-01-01 |
+| https://data-api.polymarket.com/v2/trades (condition-feed participant contract above) | 2026-11-03 | 2027-01-02 |
 | https://docs.polymarket.com/api-reference/feeds/list-account-activity (v2 contract checked against captured OpenAPI) | 2026-11-02 | 2027-01-01 |
 | https://docs.polymarket.com/api-reference/service/get-data-freshness | 2026-09-10 | 2026-11-09 |
 | https://docs.polymarket.com/api-reference/data-api/migrating-from-v1 (historical capture; availability claim superseded above) | 2026-09-10 | 2026-11-09 |
@@ -448,26 +472,30 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-10-13 | 2026-12-12 |
 | https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-10-15 | 2026-12-14 |
 | https://docs.polymarket.com/api-spec/gamma-openapi.yaml (`Market.events`, `Event.series`, `Series.recurrence`) | 2026-10-15 | 2026-12-14 |
-| https://gamma-api.polymarket.com/series?exclude_events=true&limit=50&offset={k} | 2026-10-28 | 2026-12-27 |
-| https://gamma-api.polymarket.com/series/{id} (the pinned ranking scope, `PE_RANK_MARKET_SERIES`) | 2026-10-28 | 2026-12-27 |
+| https://gamma-api.polymarket.com/series?exclude_events=true&limit=50&offset={k} (discover additions to the covered set) | 2026-11-03 | 2027-01-02 |
+| https://gamma-api.polymarket.com/series/{id} (read each covered series by id; verify its slug and recurrence for discovery and ranking) | 2026-11-03 | 2027-01-02 |
 | https://gamma-api.polymarket.com/events/keyset?series_id={id}&end_date_min={iso}&limit=100&after_cursor={cursor} (documented in gamma-openapi.yaml) | 2026-10-15 | 2026-12-14 |
 | https://gamma-api.polymarket.com/markets?clob_token_ids={token}&closed=true | 2026-09-02 | 2026-11-01 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 
 ## Public sources
 
-- 2026-10-28 (15/5-minute loop): `/series?exclude_events=true` (paged, 2,525 rows at 17:10 CT) listed
-  recurrence `15m` on 10 series (the eight crypto windows plus `gold` and `silver`) and `5m` on 8
-  (`eth, btc, xrp, sol, doge, bnb, hype, zec`). Participant discovery and the ranking scope
-  filter that listing, each by its own recurrence set (`bootstrap_market_recurrences` and the
-  wrapper's `PE_RANK_MARKET_RECURRENCES`, both in `_GLOSSARY.md`), except while
-  `PE_RANK_MARKET_SERIES` pins the ranking scope: then each pinned series is read by id
-  (`/series/{id}`, one request per series) and the listing is not used for ranking. The 15/5-minute
-  loop always pins it: gen 26's ten until 11/30 01:00 UTC, then the freshly verified 15m/5m set. A market of each
-  of the 18 series (16 at 21:40 CT; the two `zec` series, which that paged listing did not
-  return, fetched by id at 23:47 CT) carried `feeType` `crypto_fees_v2` with `feeSchedule`
-  `{"exponent":1,"rate":0.07,"takerOnly":true,"rebateRate":0.2}`, equal to pass 2's taker rate.
-  Re-capture every 15m/5m series and its fees before ranking `15m,5m`.
+- **Series listing and covered set. Last checked: 2026-11-03; re-verify by 2027-01-02.**
+  The official [listing](https://docs.polymarket.com/api-reference/series/list-series) and
+  [by-id](https://docs.polymarket.com/api-reference/series/get-series-by-id) references expose
+  series ids, slugs and recurrences. The approved 11/3 source pass's paged listing returned
+  the ten `15m` series then covered. Listings can omit series: a 10/28 sweep omitted the two
+  `zec` series, whose by-id reads succeeded. Discovery therefore unions the covered set with
+  every listed series of the configured recurrences, reading covered series by id and additions
+  back to the coverage start. Schema-two ranking reads that explicit covered set by id; it
+  has no configured series pin. A missing, renamed or changed-recurrence covered series fails
+  temporarily rather than shrinking scope. Recurrences and coverage are canonical in
+  [_GLOSSARY.md](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap).
+  The recorded 10/28 fee reads across the 18 `15m`/`5m` series found `feeType` `crypto_fees_v2`
+  with `feeSchedule` `{"exponent":1,"rate":0.07,"takerOnly":true,"rebateRate":0.2}`, equal to
+  pass 2's taker rate. Re-capture every series and its fees before widening to `15m,5m`.
+  This docs pass re-read the official references; the catalog observations retain the approved
+  source pass's provenance.
 
 | Link | Last checked | Re-verify by |
 |---|---|---|

@@ -934,13 +934,14 @@ pe-bootstrap cache-migrate-v2 --db "$SIDE" --manifest "$CACHE_BUILD_MANIFEST"   
 # Skipped on a retried cycle whose candidate already records $BATCH in wallet_activation_batches
 # (rank_cycle_manifest.py activation-batch; an unreadable probe exits 2) (#788):
 pe-bootstrap winner-discovery --db "$SIDE" --defer-activation \
-  --recurrences "$RECURRENCES" --series "$SERIES_PIN" --end-date-min "$FLOOR"
+  --recurrences "$RECURRENCES" --end-date-min "$FLOOR"
 pe-bootstrap activate-next --db "$SIDE" --batch-id "$BATCH" --audit-csv "$AUDIT"
 pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N"
 pe-bootstrap cache-populate-payout-v2 --db "$SIDE"         # skip only when candidate-targets --after-collection returns 1 as field three
 pe-bootstrap cache-finalize-v2 --db "$SIDE"                # certify, checkpoint and sync without a stage record
+COVERED_SERIES="$(python3 scripts/rank_cycle_manifest.py participant-series --db "$SIDE")" || exit $?
 pe-bootstrap market-scope --out "$RUN_DIR/market_scope.json" --end-date-min "$FLOOR" \
-  --recurrences "$RECURRENCES" --series "$SERIES_PIN"   # every ranking run (#784)
+  --recurrences "$RECURRENCES" --series "$COVERED_SERIES"   # every ranking run (#784)
 ```
 
 `--fresh-generation N` records the versioned acquisition identity specified in
@@ -979,8 +980,10 @@ follow `ranker_window_days` in the glossary. Discovery and candidate checks use 
 ranking lists its markets after refresh. A cycle crossing midnight keeps its creation day's
 window. Reports state the actual activity, discovery, `as_of` and publication clocks: a long
 cycle has no promised publication delay, and research retains its own recorded-`as_of` checks.
-In the commands above omit `--series` only for an unpinned scope. Participant discovery uses the
-ranking recurrences, pin and floor, both trade roles, and persisted interval coverage (`docs/27`).
+Participant discovery uses the ranking recurrences and floor, both trade roles, and persisted
+interval coverage (`docs/27`). Schema-two ranking reads the explicit covered series set by id;
+`participant-series` refuses absent, malformed or null-set coverage. Schema-one ranking keeps
+listing the catalog.
 
 Admission preserves activity rows, receipts, manifests and cumulative drops, clears the derived
 projection/binding and invalidates finalization. Incremental collection strictly inserts only fetched
@@ -1010,7 +1013,14 @@ same-wallet identity collision, is excluded with its reason/evidence retained. I
 unsplit window, then walks forward with the verified [ascending boundary lookup](15-SOURCES.md#forge-forward-activity-window-lookup-747).
 Continuing acquisitions and full reads certified with at least 5,500 source rows skip the probe.
 The lookup places bounds only; descending terminal pages prove every kept window. A saturated
-one-second window remains fatal, and a looked-up window that is still full stops without keeping it. Missing condition/token
+one-second window remains fatal, and a looked-up window that is still full stops without keeping it.
+Identity 5 reads `/v2/activity` in ASC cursor chains with the same bounded-window capacity:
+an over-cap attempt is discarded before an exact retry, and only terminal chains are kept.
+Every nonterminal page must contain a row; repeated cursors, empty continuations and malformed
+envelopes exclude the wallet and hold publication, including when earlier windows proved progress.
+Acquisition 4 authenticates both the frozen v1 offset form and the v2 cursor form, never mixed
+within a receipt. Window sizing, proof rules and in-flight memory are canonical in the
+[identity-5 contract](_GLOSSARY.md#identity-5-acquisition-4-and-classifier-7-822). Missing condition/token
 alone follows acquisition 3/4's relaxed mapping acceptance above. Acquisition 4 additionally
 retains the three anomaly kinds under the [#822 contract](_GLOSSARY.md#identity-5-acquisition-4-and-classifier-7-822). Every non-deferral failed acquisition without a
 partial verifies retained history in the exclusion transaction, in either read mode, except an
@@ -1194,8 +1204,8 @@ where inputs exist, and always after collection before payout or request creatio
    tombstone or flag, or a line of `deploy/forge/ever-infra-wallets.txt`): it is named as
    `[infra-excluded]` and never held (#826). The four exchange contracts stay blocked. Participants skipped for kept `infra` tombstones receive no new participant row
    and are reported separately, not silently admitted.
-2. Hold unless persisted participant coverage matches the cycle's recurrences and pin, has a
-   market floor at or before the cycle's, starts at or before its window start and reaches the
+2. Hold unless persisted participant coverage matches the cycle's recurrences, names an explicit
+   series set, has a market floor at or before the cycle's, starts at or before its window start and reaches the
    exclusive end `win_end + FILL_WINDOW_SECS`. A recorded activation batch never waives this:
    print wallets can first appear after the entry window ends.
 3. Classify each head exclusion once from its recorded receipt. First, any exclusion of an
@@ -1874,24 +1884,22 @@ A second checkout runs the same code with its own cache, flag, locks and cycle f
 ```
 PE_BOOTSTRAP_MARKET_RECURRENCES='["15m"]'      # participant discovery; ["15m","5m"] once the owner admits 5-minute traders
 PE_RANK_MARKET_RECURRENCES=15m                 # ranking scope; 15m,5m only after gate F copies 5-minute markets
-PE_RANK_MARKET_SERIES=10191:eth-up-or-down-15m,10192:btc-up-or-down-15m,10422:xrp-up-or-down-15m,10423:sol-up-or-down-15m,11328:doge-up-or-down-15m,11329:hype-up-or-down-15m,11330:bnb-up-or-down-15m,12518:zec-up-or-down-15m,12967:gold-up-or-down-15m,12968:silver-up-or-down-15m  # gen 26's series; from 11/30 01:00 UTC the verified 15m/5m set
 PE_BOOTSTRAP_LEADERBOARD_TOP_N=0               # leaderboard off
 PE_BOOTSTRAP_DATADASH_API_URL=                 # datadash off
 PE_RANK_RESEARCH_LINK_DIR=/mnt/storage/prediction-markets/data/eval-results
 PE_RANK_CAPACITY_SAMPLE_SECS=10                # capacity samples for the drive-room margin
 ```
 
-Each cycle records the four new settings in `cycle_configuration.json` and restores them on resume
-(meaning and defaults: `_GLOSSARY.md`, `bootstrap_market_recurrences`, `rank_market_series`,
-`rank_research_link_dir`). The cache keeps complete histories, read and certified as in the old
-loop; it differs only in which wallets it holds. The series pin keeps every
-linked cycle's market list on the November research's contract (recurrence `15m`, exactly gen 26's
-series). Keep the pin after 11/30 01:00 UTC: at a boundary with no retained cycle, set it to the freshly
-verified 15m/5m series (each `id:slug`) with `PE_RANK_MARKET_RECURRENCES=15m,5m`, and give the stopped
-old checkout the same two values. The catalog listing can omit series (one paged listing on 10/28
-returned 12 of 18), while the pin reads each series by id; a new series joins only through a
-re-verified pin. Admitting 5-minute
-participants is a capacity decision: tens of thousands of wallets trade those markets each month,
+Each cycle records the recurrence settings and research link directory in
+`cycle_configuration.json` and restores them on resume (meaning and defaults:
+`_GLOSSARY.md`, `bootstrap_market_recurrences`, `rank_research_link_dir`). A retained
+`rank_market_series` key stays recorded and is inert. The cache keeps complete histories,
+read and certified as in the old loop; it differs only in which wallets it holds. Discovery
+keeps the covered series and adds every listed series of the configured recurrences, reading
+additions back to the coverage start. Ranking uses that coverage set by id, so a catalog
+omission cannot shrink it. A new series changes the November research's frozen list and
+requires a recorded owner decision before its merger can accept that cycle (`RANKING-PROTOCOL.md`).
+Admitting 5-minute participants is a capacity decision: tens of thousands of wallets trade those markets each month,
 many with long histories. Measure their certified sizes in the old cache first.
 
 **2026-10-31 participant gate (#821).** Before installing or superseding the retained first
@@ -1971,9 +1979,9 @@ below; a recorded batch of zero stays unchanged and cannot waive participant/cov
 2. One `bash scripts/rank_and_push.sh --resume-pending` in the old checkout retires its displaced
    copy and spool; record `df -B1`.
 3. Install and verify this release in the old checkout by "Forge release deployment" above while
-   both loops are inactive (the pause helper sees every ranker process), and add the series pin to
-   its `.env` (`PE_RANK_MARKET_SERIES` as above, `PE_RANK_MARKET_RECURRENCES=15m`; after 11/30 the new
-   loop's values), so a revert's cycles meet the frozen merger's list contract. Keep its flag `stop`.
+   both loops are inactive (the pause helper sees every ranker process), and give its `.env` the
+   same `PE_RANK_MARKET_RECURRENCES` as the new loop. Its coverage must keep the covered series
+   set before a revert can publish. Keep its flag `stop`.
 4. Capacity: proceed only if free bytes ≥ 3 × S + the old loop's last payout tables, spool and
    exports + the operator reserve (`_GLOSSARY.md` `rank_capacity_operator_reserve_gb`), S being the seeds'
    certified complete-history size. These are estimates; the first cycle's samples record the actual first
@@ -2062,14 +2070,14 @@ multi-successor chain, so stay paused on this compatible release and fix forward
 **Completion on the retained side cache.** Resolve `<side>` from `cache_stage.json`; every
 command below uses `--db <side>`. Reload any recorded completion batch under its own stored
 `requested_count`, regenerate its audit, and check members against `activated_count`; cohorts
-are immutable. Import the accepted union with the cycle's recurrences, series pin and floor,
+are immutable. Import the accepted union with the cycle's recurrences, covered series set and floor,
 and the sweep's accepted `--covered-from`/`--covered-through` (`docs/27`). Record kept-`infra`
 skips. If coverage is still short of the window or closed print tail, restore frozen discovery
 settings and run:
 
 ```bash
 pe-bootstrap winner-discovery --db <side> --defer-activation \
-  --recurrences <cycle-recurrences> --series <cycle-pin> --end-date-min <cycle-floor>
+  --recurrences <cycle-recurrences> --end-date-min <cycle-floor>
 ```
 
 Record its interval, floor, pages and status; retry the same command on temporary failure.

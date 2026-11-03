@@ -517,7 +517,7 @@ class CandidateObligationsTest(unittest.TestCase):
 
     def setUp(self):
         CandidateTargetsTest.setUp(self)
-        self.coverage = dict(version=1, scope=dict(recurrences=["15m"], series=None),
+        self.coverage = dict(version=1, scope=dict(recurrences=["15m"], series=[dict(id="7", slug="seven")]),
                              market_floor_unix=0, covered_from_unix=10, covered_through_unix=200)
         self.record_coverage(self.coverage)
 
@@ -619,7 +619,10 @@ class CandidateObligationsTest(unittest.TestCase):
         reasons = (UNREPRESENTABLE_PRICE, UNREPRESENTABLE_MAPPING,
                    ACTIVITY_RESPONSE_JSON + " row 1: 4.212e-7 " + UNREPRESENTABLE_DECIMAL,
                    "activity page parse failed: " + UNREPRESENTABLE_PRICE,
-                   ACTIVITY_RESPONSE_JSON + " expected an array")
+                   ACTIVITY_RESPONSE_JSON + " expected an array",
+                   "v2 activity envelope: invalid pagination",
+                   "v2 activity cursor proof: repeated cursor",
+                   "v2 activity cursor proof: empty continuation")
         for reason in reasons:
             for proved in (False, True):
                 with self.subTest(reason=reason, proved=proved):
@@ -781,7 +784,8 @@ class CandidateObligationsTest(unittest.TestCase):
                  (dict(self.coverage, covered_from_unix=True), "malformed"),
                  (dict(self.coverage, covered_through_unix=10), "malformed"),
                  (dict(self.coverage, scope=dict(recurrences=["15m", "15m"], series=None)), "malformed"),
-                 (dict(self.coverage, scope=dict(recurrences=["5m"], series=None)), "scope differs"),
+                 (dict(self.coverage, scope=dict(self.coverage["scope"], recurrences=["5m"])), "recurrences differ"),
+                 (dict(self.coverage, scope=dict(recurrences=["15m"], series=None)), "no explicit series"),
                  (dict(self.coverage, market_floor_unix=1), "market floor"),
                  (dict(self.coverage, covered_from_unix=11), "window start"),
                  (dict(self.coverage, covered_through_unix=199), "print tail"))
@@ -820,20 +824,54 @@ class CandidateObligationsTest(unittest.TestCase):
         scope = dict(recurrences=["15m", "5m"],
                      series=[dict(id="10", slug="ten"), dict(id="7", slug="seven")])
         self.record_coverage(dict(self.coverage, scope=scope))
-        self.assertEqual(self.targets(recurrences="5m,15m", series="7:seven,10:ten")[0], 1)
+        self.assertEqual(self.targets(recurrences="5m,15m")[0], 1)
         for change in (dict(recurrences=["5m", "15m"]), dict(series=list(reversed(scope["series"]))),
                        dict(series=[dict(id="7", slug="seven"), dict(id="7", slug="seven")]),
                        dict(series=[dict(id="7", slug=None)])):
             with self.subTest(change=change):
                 self.record_coverage(dict(self.coverage, scope=dict(scope, **change)))
                 with self.assertRaisesRegex(ValueError, "malformed"):
-                    self.targets(recurrences="15m,5m", series="10:ten,7:seven")
+                    self.targets(recurrences="15m,5m")
         self.record_coverage(dict(self.coverage, scope=scope))
-        for changed in (dict(series=None), dict(series="10:ten,7:other"), dict(recurrences="15m")):
-            args = dict(recurrences="15m,5m", series="10:ten,7:seven")
-            args.update(changed)
-            with self.assertRaisesRegex(ValueError, "scope differs"):
-                self.targets(**args)
+        with self.assertRaisesRegex(ValueError, "recurrences differ"):
+            self.targets(recurrences="15m")
+        self.record_coverage(dict(self.coverage, scope=dict(scope, series=[dict(id="8", slug="eight")])))
+        self.assertEqual(self.targets(recurrences="15m,5m")[0], 1)
+
+    def test_participant_series_prints_the_explicit_set_and_refuses_invalid_coverage(self):
+        command = [sys.executable, str(Path(__file__).with_name("rank_cycle_manifest.py")),
+                   "participant-series", "--db", str(self.side)]
+        scope = dict(recurrences=["15m"], series=[dict(id="10", slug="ten"), dict(id="7", slug="seven")])
+        cases = ((dict(self.coverage, scope=scope), "10:ten,7:seven\n"),
+                 (None, "absent"), ("not-json", "malformed"), ("[]", "malformed"),
+                 (dict(self.coverage, scope=dict(scope, series=None)), "no explicit series"),
+                 (dict(self.coverage, scope=dict(scope, series=[])), "malformed"),
+                 (dict(self.coverage, scope=dict(scope, series=[dict(id=7, slug="seven")])), "malformed"),
+                 (dict(self.coverage, scope=dict(scope, series=list(reversed(scope["series"])))), "malformed"))
+        for coverage, expected in cases:
+            with self.subTest(coverage=coverage):
+                with sqlite3.connect(self.side) as c:
+                    c.execute("DELETE FROM meta")
+                    if coverage is not None:
+                        c.execute("INSERT INTO meta VALUES ('participant_discovery_coverage', ?)",
+                                  (coverage if isinstance(coverage, str) else json.dumps(coverage),))
+                before = self.side.read_bytes()
+                result = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(self.side.read_bytes(), before)
+                if expected.endswith("\n"):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, expected)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(expected, result.stderr)
+
+    def test_candidate_targets_rejects_series_option(self):
+        result = subprocess.run([sys.executable, str(Path(__file__).with_name("rank_cycle_manifest.py")),
+                                 "candidate-targets", "--side", str(self.side), "--series", "7:seven"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unrecognized arguments: --series", result.stderr)
 
     def test_inclusive_head_end_must_cover_the_last_print_second(self):
         self.head(end=198)

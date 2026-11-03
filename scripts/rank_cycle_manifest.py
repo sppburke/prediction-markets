@@ -29,6 +29,8 @@ UNREPRESENTABLE_MAPPING = "activity row has invalid condition/outcome mapping"
 UNREPRESENTABLE_DECIMAL = "is not an exactly representable decimal"
 ACTIVITY_RESPONSE_JSON = "activity response json:"
 ACTIVITY_PAGE_PARSE_FAILURE = "activity page parse failed:"
+V2_ACTIVITY_ENVELOPE = "v2 activity envelope:"
+V2_ACTIVITY_CURSOR_PROOF = "v2 activity cursor proof:"
 EXCHANGE_CONTRACTS = frozenset((
     "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e",
     "0xc5d563a36ae78145c45a50134d48a1215220f80a",
@@ -670,8 +672,7 @@ def _participant_scope(recurrences: list, series: list | None) -> dict:
     return {"recurrences": sorted(recurrences), "series": series}
 
 
-def _participant_coverage_hold(side: sqlite3.Connection, scope: dict, window_start: int,
-                               window_end: int, market_floor: int, fill_window: int) -> str | None:
+def _participant_coverage(side: sqlite3.Connection) -> dict:
     def fields(items):
         result = {}
         for key, value in items:
@@ -682,9 +683,11 @@ def _participant_coverage_hold(side: sqlite3.Connection, scope: dict, window_sta
 
     row = side.execute("SELECT value FROM meta WHERE key = 'participant_discovery_coverage'").fetchone()
     if row is None:
-        return "participant discovery coverage is absent"
+        raise ValueError("participant discovery coverage is absent")
     try:
         coverage = json.loads(row[0], object_pairs_hook=fields)
+        if not isinstance(coverage, dict) or not isinstance(coverage.get("scope"), dict):
+            raise ValueError("invalid coverage fields")
         recorded_scope = {"recurrences": coverage["scope"]["recurrences"],
                           "series": coverage["scope"].get("series")}
         normalized = _participant_scope(recorded_scope["recurrences"], recorded_scope["series"])
@@ -695,9 +698,26 @@ def _participant_coverage_hold(side: sqlite3.Connection, scope: dict, window_sta
                 or not 0 <= coverage["covered_from_unix"] < coverage["covered_through_unix"]):
             raise ValueError("invalid coverage fields")
     except (ValueError, TypeError, KeyError) as error:
-        return f"participant discovery coverage is malformed: {error}"
-    if normalized != scope:
-        return "participant discovery coverage scope differs from the ranking scope"
+        raise ValueError(f"participant discovery coverage is malformed: {error}") from error
+    if normalized["series"] is None:
+        raise ValueError("participant discovery coverage has no explicit series set")
+    return coverage
+
+
+def participant_series(db: Path) -> str:
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
+        coverage = _participant_coverage(connection)
+    return ",".join(f"{item['id']}:{item['slug']}" for item in coverage["scope"]["series"])
+
+
+def _participant_coverage_hold(side: sqlite3.Connection, scope: dict, window_start: int,
+                               window_end: int, market_floor: int, fill_window: int) -> str | None:
+    try:
+        coverage = _participant_coverage(side)
+    except ValueError as error:
+        return str(error)
+    if coverage["scope"]["recurrences"] != scope["recurrences"]:
+        return "participant discovery coverage recurrences differ from the ranking recurrences"
     if coverage["market_floor_unix"] > market_floor:
         return f"participant discovery market floor {coverage['market_floor_unix']} is later than {market_floor}"
     if coverage["covered_from_unix"] > window_start:
@@ -756,7 +776,9 @@ def _candidate_obligations(side: sqlite3.Connection, head: dict | None, *, compl
                 print(f"   [infra-excluded] {wallet}: {text}", file=sys.stderr)
             elif unrepresentable and (acquisition is None or acquisition.get("version", 3) <= 3):
                 print(f"   [unrepresentable-row] {wallet}: {text}", file=sys.stderr)
-            elif unrepresentable or ACTIVITY_PAGE_PARSE_FAILURE in text or ACTIVITY_RESPONSE_JSON in text:
+            elif unrepresentable or any(prefix in text for prefix in (
+                    ACTIVITY_PAGE_PARSE_FAILURE, ACTIVITY_RESPONSE_JSON,
+                    V2_ACTIVITY_ENVELOPE, V2_ACTIVITY_CURSOR_PROOF)):
                 holds.append(f"{wallet}: {text}")
             elif (acquisition is not None and acquisition["version"] in (3, 4)
                   and kind == "acquisition_failure" and acquisition["aggregation_status"] == "complete"):
@@ -779,7 +801,7 @@ def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collect
                       now: int | None = None, max_staleness_hours: int | None = None,
                       include_bulk_root=False, window_start_unix: int | None = None,
                       window_end_unix: int | None = None, market_floor_unix: int | None = None,
-                      fill_window_secs=120, recurrences="15m", series: str | None = None) -> tuple[int, ...]:
+                      fill_window_secs=120, recurrences="15m") -> tuple[int, ...]:
     """Select this cycle's initial head or a linked successor, read-only.
 
     Rust certifies content and linkage on every collection call. This owner only
@@ -787,8 +809,7 @@ def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collect
     The optional fourth and fifth integers report bulk routing and completed
     activity; the default three values remain unchanged for existing callers.
     """
-    pinned = None if not series else [dict(zip(("id", "slug"), item.split(":", 1))) for item in series.split(",")]
-    scope = _participant_scope(recurrences.split(","), pinned)
+    scope = _participant_scope(recurrences.split(","), None)
     if any(value is not None for value in (window_start_unix, window_end_unix, market_floor_unix)):
         if any(value is None for value in (window_start_unix, window_end_unix, market_floor_unix)):
             raise ValueError("candidate checks require window start, end and market floor together")
@@ -977,13 +998,14 @@ def parse_args():
     targets.add_argument("--market-floor-unix", type=int)
     targets.add_argument("--fill-window-secs", type=int, default=120)
     targets.add_argument("--recurrences", default="15m")
-    targets.add_argument("--series")
     targets.add_argument("--include-bulk-root", action="store_true",
                          help="append bulk eligibility and activity completion (0/1); default output stays three lines")
     batch = subparsers.add_parser("activation-batch",
                                   help="print 1 when the side cache records the activation batch, else 0")
     batch.add_argument("--db", type=Path, required=True)
     batch.add_argument("--batch-id", required=True)
+    series = subparsers.add_parser("participant-series", help="print the explicit covered series as id:slug,...")
+    series.add_argument("--db", type=Path, required=True)
     coverage = subparsers.add_parser(
         "research-coverage",
         help="print the wallets of accepted cycles since --since that --candidate's universe lacks; exit 1 if any")
@@ -1015,11 +1037,14 @@ def main() -> int:
                                        window_end_unix=args.window_end_unix,
                                        market_floor_unix=args.market_floor_unix,
                                        fill_window_secs=args.fill_window_secs,
-                                       recurrences=args.recurrences, series=args.series):
+                                       recurrences=args.recurrences):
             print(value)
         return 0
     if args.command == "activation-batch":
         print(int(activation_batch_recorded(args.db, args.batch_id)))
+        return 0
+    if args.command == "participant-series":
+        print(participant_series(args.db))
         return 0
     if args.command == "research-coverage":
         missing = research_coverage(args.root, args.since, args.candidate)

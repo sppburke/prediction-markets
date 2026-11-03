@@ -135,7 +135,6 @@ TOP_N="200"
 # PE_<name> under PE_BOOTSTRAP_<name>), recorded by its effective value and cleared on restore.
 RANK_CYCLE_SETTINGS="market_recurrences PE_BOOTSTRAP_MARKET_RECURRENCES PE_MARKET_RECURRENCES
 rank_market_recurrences PE_RANK_MARKET_RECURRENCES
-rank_market_series PE_RANK_MARKET_SERIES
 research_link_dir PE_RANK_RESEARCH_LINK_DIR"
 # DuckDB read-layer (issue #375). Empty => resolved after .env (flag > .env > default).
 # ENGINE: auto (DuckDB over a fresh Parquet snapshot, else SQLite) | duck (require it) |
@@ -696,7 +695,6 @@ PY
   )" || exit $?
   read -r RANK_WINDOW_START_UNIX RANK_WINDOW_END_UNIX scope_floor <<< "$RANK_BOUNDS"
   DISCOVERY_SCOPE_ARGS=(--recurrences "${PE_RANK_MARKET_RECURRENCES:-15m}" --end-date-min "$scope_floor")
-  [[ -z "${PE_RANK_MARKET_SERIES:-}" ]] || DISCOVERY_SCOPE_ARGS+=(--series "$PE_RANK_MARKET_SERIES")
 fi
 
 if [[ -v PE_RANK_RESEARCH_LINK_DIR ]]; then
@@ -840,19 +838,24 @@ refresh_stage_status() {
   esac
 }
 
-# The scope sweep reads Gamma and the cycle's frozen window bounds, never the cache (it takes no
-# cache lock), so the fresh lane runs it beside collection and only joins it at the market-scope
-# step. Its snapshot is then taken when collection starts, which is still after the window end.
+# The scope sweep reads Gamma and the cycle's frozen window bounds, using the candidate's
+# covered series in schema two. It takes no cache lock, so the fresh lane runs it beside
+# collection and only joins it at the market-scope step.
 market_scope_command() {
   MARKET_SCOPE_FILE="$OUT_DIR/market_scope.json"
   MARKET_SCOPE_CMD=("$PE_BOOTSTRAP_BIN" market-scope --out "$MARKET_SCOPE_FILE"
     --end-date-min "$scope_floor" --recurrences "${PE_RANK_MARKET_RECURRENCES:-15m}"
-    ${PE_RANK_MARKET_SERIES:+--series "$PE_RANK_MARKET_SERIES"} "${BOOTSTRAP_CONFIG_ARGS[@]}")
+    "${BOOTSTRAP_CONFIG_ARGS[@]}")
+  if [[ -n "${1:-}" ]]; then
+    local series
+    series="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py participant-series --db "$1")" || exit $?
+    MARKET_SCOPE_CMD+=(--series "$series")
+  fi
 }
 
 start_market_scope() {
   [[ "$SKIP_RANK" == "0" && -z "$SCOPE_PID" ]] || return 0
-  market_scope_command
+  market_scope_command "$1"
   rm -f -- "$MARKET_SCOPE_FILE"
   echo "── Market scope: ${PE_RANK_MARKET_RECURRENCES:-15m} series markets from Gamma → $MARKET_SCOPE_FILE ──"
   echo "   [market-scope] running: ${MARKET_SCOPE_CMD[*]}"
@@ -1046,7 +1049,6 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
     --window-start-unix "$RANK_WINDOW_START_UNIX" --window-end-unix "$RANK_WINDOW_END_UNIX"
     --market-floor-unix "$scope_floor" --fill-window-secs "$FILL_WINDOW_SECS"
     --recurrences "${PE_RANK_MARKET_RECURRENCES:-15m}")
-  [[ -z "${PE_RANK_MARKET_SERIES:-}" ]] || candidate_args+=(--series "$PE_RANK_MARKET_SERIES")
   local target_output
   target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets "${candidate_args[@]}")" || exit $?
   mapfile -t targets <<< "$target_output"
@@ -1058,7 +1060,7 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
     [[ ! -f "$prior" ]] || bulk_args+=(--prior "$prior")
   fi
   echo "   [targets] activity generation $activity_target; payout generation ${targets[1]} (complete=${targets[2]})"
-  start_market_scope
+  start_market_scope "$side"
   if [[ "${targets[4]}" == "0" ]]; then
     run_refresh_stage "activity" "$PE_BOOTSTRAP_BIN" cache-populate-activity-v2 --db "$side" \
       --fresh-generation "$activity_target" "${bulk_args[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
@@ -1115,7 +1117,11 @@ fi
 if [[ "$SKIP_RANK" == "0" ]]; then
   # Read the ranking scope after refresh, using the cycle's resolved bounds. The fresh lane
   # started the sweep beside collection, so it only joins it here.
-  market_scope_command
+  if [[ "$CUTOVER_MODE" == "1" ]]; then
+    market_scope_command "$DB"
+  else
+    market_scope_command
+  fi
   if [[ -n "$SCOPE_PID" ]]; then
     echo "   [market-scope] joining the sweep started beside collection"
     scope_status=0
