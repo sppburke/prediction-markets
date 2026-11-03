@@ -29,11 +29,13 @@ use pe_position_ledger::{
     TradeDecision, WalletFenceCause, classify_complete_second, resolve_problem_scope,
 };
 use pe_source_polymarket_public::{
-    ACTIVITY_MAX_OFFSET, ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate,
-    ActivityAggregationError, ActivityParseContext, ActivityParseError, ActivityRowAcceptance,
-    ActivityRowAnomaly, ActivityTransport, ActivityType, NormalizedActivity, PolymarketEndpoint,
-    RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence, aggregate_activity_rows,
-    canonical_page_hash, parse_activity_trade_observation,
+    ACTIVITY_MAX_OFFSET, ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION,
+    ACTIVITY_V2_PAGE_SCHEMA_VERSION, ActivityAggregate, ActivityAggregationError,
+    ActivityParseContext, ActivityParseError, ActivityRowAcceptance, ActivityRowAnomaly,
+    ActivityTransport, ActivityType, NormalizedActivity, PolymarketEndpoint,
+    RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence, V2ActivityRequest, V2RawPage,
+    aggregate_activity_rows, canonical_page_hash, parse_activity_trade_observation,
+    reauthenticate_activity_v2,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -1181,8 +1183,8 @@ impl ActivityReadVerification<'_> {
     /// Reconstruct one frozen fixed-end activity read from its exact receipt occurrences.
     ///
     /// Page evidence is joined with multiplicity, every retained payload is parsed and checked,
-    /// and saturated parent segments contribute no production aggregates. Only complete leaves of
-    /// the validated split graph are aggregated, matching the production reconciliation reader.
+    /// using its recorded generation. V1 contributes only complete leaves of the validated split
+    /// graph; v2 authenticates the raw cursor chain in acquisition order.
     fn reconstruct_verified_activity_read<L, E>(
         &self,
         lookup: &mut L,
@@ -1487,7 +1489,8 @@ impl ActivityReadVerification<'_> {
                 })?;
             let evidence = joined[index].1;
             if pages.iter().any(|page| {
-                page.bounds == evidence.bounds
+                page.schema_version == ACTIVITY_SCHEMA_VERSION
+                    && page.bounds == evidence.bounds
                     && page.offset == ACTIVITY_MAX_OFFSET
                     && page.row_count == RECONCILIATION_PAGE_LIMIT
             }) {
@@ -1801,6 +1804,68 @@ impl ActivityReadVerification<'_> {
         ))
     }
 
+    fn reconstruct_v2_activity_read<L, E>(
+        &self,
+        fixed_end: i64,
+        joined: &[(&PageOccurrence, &ReconciliationPageEvidence)],
+        lookup: &mut L,
+    ) -> Result<(Vec<NormalizedActivity>, Vec<ActivityRowAnomaly>), CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        let (first_occurrence, first_page) = joined.first().ok_or_else(|| {
+            complete_activity_read_error("complete v2 activity read has no pages")
+        })?;
+        let bounds = first_page
+            .bounds
+            .filter(|bounds| bounds.end == fixed_end)
+            .ok_or_else(|| {
+                complete_activity_read_error("complete v2 activity read has invalid bounds")
+            })?;
+        let base_url = first_occurrence
+            .request_url
+            .split_once("/v2/activity?")
+            .map(|(base_url, _)| base_url)
+            .filter(|base_url| !base_url.is_empty())
+            .ok_or_else(|| {
+                complete_activity_read_error("complete v2 activity read request URL is invalid")
+            })?;
+        let mut sources = Vec::with_capacity(joined.len());
+        let mut evidence = Vec::with_capacity(joined.len());
+        for (occurrence, page) in joined {
+            let source = complete_activity_page(occurrence, self.version, lookup)?;
+            if page.schema_version != ACTIVITY_V2_PAGE_SCHEMA_VERSION
+                || !is_v2_activity_page(source.schema_version)
+            {
+                return Err(complete_activity_read_error(
+                    "complete activity read mixes page generations",
+                ));
+            }
+            sources.push(source);
+            evidence.push((*page).clone());
+        }
+        let (_, acceptance) = activity_page_generation(
+            &sources[0].source_id,
+            sources[0].schema_version,
+            sources[0].parser_version,
+            &sources[0].content_type,
+        )?;
+        let request =
+            V2ActivityRequest::position_changes(self.wallet, bounds.start, bounds.end, acceptance);
+        let raw_pages = joined
+            .iter()
+            .zip(&sources)
+            .map(|((occurrence, _), source)| V2RawPage {
+                request_url: &occurrence.request_url,
+                body: &source.payload,
+            })
+            .collect::<Vec<_>>();
+        let read = reauthenticate_activity_v2(base_url, &request, &raw_pages, &evidence)
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
+        Ok((read.rows, read.anomalies))
+    }
+
     fn reconstruct_rich_activity_read<L, E>(
         &self,
         fixed_end: i64,
@@ -1812,6 +1877,12 @@ impl ActivityReadVerification<'_> {
         E: Display,
     {
         let joined = joined_read_pages(self.page_occurrences, pages)?;
+        if pages
+            .iter()
+            .any(|page| page.schema_version == ACTIVITY_V2_PAGE_SCHEMA_VERSION)
+        {
+            return self.reconstruct_v2_activity_read(fixed_end, &joined, lookup);
+        }
         let mut grouped_pages = BTreeMap::<
             (Option<i64>, i64),
             Vec<(&PageOccurrence, &ReconciliationPageEvidence)>,
@@ -1898,6 +1969,11 @@ impl ActivityReadVerification<'_> {
             let mut segment_anomalies = Vec::new();
             for (occurrence, page) in pages {
                 let source = complete_activity_page(occurrence, self.version, lookup)?;
+                if is_v2_activity_page(source.schema_version) {
+                    return Err(complete_activity_read_error(
+                        "complete activity read page envelope differs from its evidence generation",
+                    ));
+                }
                 let actual_canonical_hash =
                     canonical_page_hash(&source.payload).map_err(|error| {
                         complete_activity_read_error(format!(
@@ -6992,7 +7068,8 @@ fn anomaly_scope_drop_record(
         .find(|page| {
             page.anomalies.contains(anomaly)
                 && !pages.iter().any(|other| {
-                    other.bounds == page.bounds
+                    other.schema_version == ACTIVITY_SCHEMA_VERSION
+                        && other.bounds == page.bounds
                         && other.offset == ACTIVITY_MAX_OFFSET
                         && other.row_count == RECONCILIATION_PAGE_LIMIT
                 })
@@ -11049,7 +11126,7 @@ mod activity_exemption_tests {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod anomaly_page_tests {
+pub(crate) mod anomaly_page_tests {
     use super::*;
 
     fn source(schema: u32, anomalous: bool) -> CompleteActivityPage {
@@ -11393,6 +11470,387 @@ mod anomaly_page_tests {
             "pagination": {"limit": 1000, "offset": 0, "has_more": false, "next_cursor": null},
         }))
         .unwrap()
+    }
+
+    pub(crate) struct V2ReadFixture {
+        pub(crate) sources: Vec<CompleteActivityPage>,
+        pub(crate) occurrences: Vec<PageOccurrence>,
+        pub(crate) pages: Vec<ReconciliationPageEvidence>,
+        rows: Vec<NormalizedActivity>,
+        anomalies: Vec<ActivityRowAnomaly>,
+    }
+
+    pub(crate) fn v2_read_fixture(schema: u32, terminal_row_count: u32) -> V2ReadFixture {
+        let wallet = WalletAddress([0xaa; 20]);
+        let request = V2ActivityRequest::position_changes(
+            wallet,
+            (!matches!(schema, 6)).then_some(0),
+            101,
+            ActivityRowAcceptance::StrictWithAnomalies,
+        );
+        let mut fixture = V2ReadFixture {
+            sources: Vec::new(),
+            occurrences: Vec::new(),
+            pages: Vec::new(),
+            rows: Vec::new(),
+            anomalies: Vec::new(),
+        };
+        for (index, cursor, row_count, offset, next_cursor) in [
+            (0, None, 1, ACTIVITY_MAX_OFFSET + 1, Some("tail/opaque+?=")),
+            (
+                1,
+                Some("tail/opaque+?="),
+                terminal_row_count,
+                ACTIVITY_MAX_OFFSET,
+                None,
+            ),
+        ] {
+            let mut page = source(schema, false);
+            let template = serde_json::from_slice::<Vec<Value>>(&page.payload)
+                .unwrap()
+                .remove(0);
+            let rows = (0..row_count)
+                .map(|row_index| {
+                    let mut row = template.clone();
+                    row["token_id"] = row.as_object_mut().unwrap().remove("asset").unwrap();
+                    row["transactionHash"] = json!(format!("0xpage{index}row{row_index}"));
+                    if index == 1 && row_index == 0 {
+                        row["price"] = json!("2");
+                    }
+                    row
+                })
+                .collect::<Vec<_>>();
+            page.payload = serde_json::to_vec(&json!({
+                "data": rows,
+                "pagination": {"limit": 1000, "offset": offset,
+                    "has_more": next_cursor.is_some(), "next_cursor": next_cursor},
+            }))
+            .unwrap();
+            let request_url = request.url("https://example.test", cursor).unwrap();
+            let parsed = pe_source_polymarket_public::parse_activity_page_v2(
+                &page.payload,
+                &request_url,
+                &request,
+                &ActivityParseContext {
+                    source_id: SourceId(page.source_id.clone()),
+                    observed_at: page.observed_at.clone(),
+                    received_at: page.received_at.clone(),
+                    transport: ActivityTransport::Rest,
+                },
+            )
+            .unwrap();
+            fixture.occurrences.push(PageOccurrence {
+                request_url,
+                raw_hash: parsed.evidence.raw_page_hash.clone(),
+                receipt: AppendReceipt {
+                    sequence: pe_core_types::EventSeq(index + 1),
+                    this_hash: blake3::hash(&page.payload),
+                },
+            });
+            fixture.sources.push(page);
+            fixture.pages.push(parsed.evidence);
+            fixture.rows.extend(parsed.rows);
+            fixture.anomalies.extend(parsed.anomalies);
+        }
+        fixture
+            .rows
+            .sort_by_key(|row| row.group_id().unwrap().to_string());
+        fixture
+    }
+
+    #[test]
+    fn v2_complete_read_reconstructs_recorded_poll_and_historical_pages() {
+        for schema in [6, 7] {
+            let fixture = v2_read_fixture(schema, 1);
+            let wallet = WalletAddress([0xaa; 20]);
+            // Evidence storage order is irrelevant; receipt occurrences retain acquisition order.
+            for pages in [
+                fixture.pages.clone(),
+                fixture.pages.iter().rev().cloned().collect(),
+            ] {
+                let inputs = json!({"fixed_end":101,"pages":pages});
+                let mut sources = fixture.sources.clone();
+                let commitment = (schema == 7).then(|| {
+                    let payload = activity_read_commitment_payload_v2(
+                        wallet,
+                        101,
+                        &fixture.occurrences,
+                        &pages,
+                        &[],
+                    )
+                    .unwrap();
+                    let receipt = AppendReceipt {
+                        sequence: pe_core_types::EventSeq(3),
+                        this_hash: blake3::hash(&payload),
+                    };
+                    let mut source = source(ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION, false);
+                    source.source_id = ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned();
+                    source.parser_version = ACTIVITY_READ_COMMITMENT_PARSER_VERSION;
+                    source.payload = payload;
+                    sources.push(source);
+                    receipt
+                });
+                let verifier = ActivityReadVerification {
+                    version: if schema == 6 { 3 } else { 7 },
+                    counterpart_depth: 0,
+                    binding_filter: None,
+                    wallet,
+                    decision_inputs: &inputs,
+                    page_occurrences: &fixture.occurrences,
+                    read_commitment: commitment,
+                };
+                let mut lookup = |receipt: AppendReceipt| {
+                    Ok::<_, String>(
+                        sources[usize::try_from(receipt.sequence.0 - 1).unwrap()].clone(),
+                    )
+                };
+                let (rows, anomalies) = verifier
+                    .reconstruct_rich_activity_read(101, &pages, &mut lookup)
+                    .unwrap();
+                assert_eq!(rows, fixture.rows);
+                assert_eq!(anomalies, fixture.anomalies);
+                let verified = verifier
+                    .reconstruct_verified_activity_read(&mut lookup)
+                    .unwrap();
+                assert_eq!(verified.anomalies, fixture.anomalies);
+                assert_eq!(
+                    verified.aggregates,
+                    aggregate_activity_rows(&fixture.rows).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v2_complete_read_rejects_forged_or_incomplete_recordings() {
+        for schema in [6, 7] {
+            for case in [
+                "terminal_evidence",
+                "cursor_substitution",
+                "omitted_tail",
+                "receipt_body",
+                "mixed_evidence_head",
+                "mixed_evidence_tail",
+                "v1_envelope_head",
+                "v1_envelope_tail",
+                "v2_envelope_v1_evidence",
+                "v1_array",
+                "cursor_cycle",
+                "contradictory_pagination",
+                "anomaly_vector",
+                "bounds",
+                "fixed_end",
+                "reordered_pages",
+                "page_after_terminal",
+                "source",
+                "parser",
+                "content_type",
+                "continuation",
+            ] {
+                let mut fixture = v2_read_fixture(schema, 1);
+                let mut fixed_end = 101;
+                let mut version = if schema == 6 { 3 } else { 7 };
+                match case {
+                    "terminal_evidence" => {
+                        fixture.pages[0].has_more = Some(false);
+                        fixture.pages[0].next_cursor = None;
+                    }
+                    "cursor_substitution" => {
+                        fixture.occurrences[1].request_url.push_str("-substituted");
+                        fixture.pages[1].request_url = fixture.occurrences[1].request_url.clone();
+                    }
+                    "omitted_tail" => {
+                        fixture.occurrences.pop();
+                        fixture.pages.pop();
+                    }
+                    "receipt_body" => {
+                        fixture.sources[1].payload = fixture.sources[0].payload.clone()
+                    }
+                    "mixed_evidence_head" => {
+                        fixture.pages[0].schema_version = ACTIVITY_SCHEMA_VERSION
+                    }
+                    "mixed_evidence_tail" => {
+                        fixture.pages[1].schema_version = ACTIVITY_SCHEMA_VERSION
+                    }
+                    "v1_envelope_head" => {
+                        fixture.sources[0].schema_version = if schema == 6 { 5 } else { 4 }
+                    }
+                    "v1_envelope_tail" => {
+                        fixture.sources[1].schema_version = if schema == 6 { 5 } else { 4 }
+                    }
+                    "v2_envelope_v1_evidence" => {
+                        fixture.occurrences.truncate(1);
+                        fixture.pages.truncate(1);
+                        let page = &mut fixture.pages[0];
+                        page.schema_version = ACTIVITY_SCHEMA_VERSION;
+                        page.offset = 0;
+                        page.has_more = None;
+                        page.next_cursor = None;
+                        let bounds = page.bounds.unwrap();
+                        page.request_url = PolymarketEndpoint::UserPositionActivityPage {
+                            user: WalletAddress([0xaa; 20]).to_string(),
+                            end: bounds.end,
+                            start: bounds.start.map(|start| start + 1),
+                            offset: 0,
+                        }
+                        .url("https://example.test");
+                        fixture.occurrences[0].request_url = page.request_url.clone();
+                    }
+                    "cursor_cycle" | "contradictory_pagination" => {
+                        let mut raw: Value =
+                            serde_json::from_slice(&fixture.sources[1].payload).unwrap();
+                        raw["pagination"]["has_more"] = json!(true);
+                        if case == "cursor_cycle" {
+                            raw["pagination"]["next_cursor"] = json!("tail/opaque+?=");
+                            fixture.pages[1].next_cursor = Some("tail/opaque+?=".to_owned());
+                        }
+                        fixture.pages[1].has_more = Some(true);
+                        fixture.sources[1].payload = serde_json::to_vec(&raw).unwrap();
+                        fixture.pages[1].canonical_page_hash =
+                            canonical_page_hash(&fixture.sources[1].payload).unwrap();
+                        fixture.pages[1].raw_page_hash = blake3::hash(&fixture.sources[1].payload)
+                            .to_hex()
+                            .to_string();
+                        fixture.occurrences[1].raw_hash = fixture.pages[1].raw_page_hash.clone();
+                    }
+                    "v1_array" => {
+                        fixture.sources[1].payload = source(schema, true).payload;
+                        fixture.pages[1].canonical_page_hash =
+                            canonical_page_hash(&fixture.sources[1].payload).unwrap();
+                        fixture.pages[1].raw_page_hash = blake3::hash(&fixture.sources[1].payload)
+                            .to_hex()
+                            .to_string();
+                        fixture.occurrences[1].raw_hash = fixture.pages[1].raw_page_hash.clone();
+                    }
+                    "anomaly_vector" => fixture.pages[1].anomalies[0].row_index += 1,
+                    "bounds" => fixture.pages[1].bounds.as_mut().unwrap().start = Some(1),
+                    "fixed_end" => fixed_end += 1,
+                    "reordered_pages" => fixture.occurrences.reverse(),
+                    "page_after_terminal" => {
+                        fixture.pages.push(fixture.pages[1].clone());
+                        fixture.occurrences.push(fixture.occurrences[1].clone());
+                    }
+                    "source" => fixture.sources[1].source_id = "other".to_owned(),
+                    "parser" => fixture.sources[1].parser_version += 1,
+                    "content_type" => fixture.sources[1].content_type = ContentType::Raw,
+                    "continuation" => version = if schema == 6 { 7 } else { 3 },
+                    _ => unreachable!(),
+                }
+                let inputs = json!({"fixed_end":fixed_end,"pages":fixture.pages});
+                let verifier = ActivityReadVerification {
+                    version,
+                    counterpart_depth: 0,
+                    binding_filter: None,
+                    wallet: WalletAddress([0xaa; 20]),
+                    decision_inputs: &inputs,
+                    page_occurrences: &fixture.occurrences,
+                    read_commitment: None,
+                };
+                assert!(
+                    verifier
+                        .reconstruct_rich_activity_read(
+                            fixed_end,
+                            &fixture.pages,
+                            &mut |receipt: AppendReceipt| {
+                                Ok::<_, String>(
+                                    fixture.sources
+                                        [usize::try_from(receipt.sequence.0 - 1).unwrap()]
+                                    .clone(),
+                                )
+                            }
+                        )
+                        .is_err(),
+                    "schema {schema}: {case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v2_terminal_page_authenticates_bindings_and_anomaly_scope_proof_without_saturation() {
+        let mut fixture = v2_read_fixture(7, RECONCILIATION_PAGE_LIMIT);
+        let wallet = WalletAddress([0xaa; 20]);
+        let mut stream = source(ACTIVITY_SCHEMA_VERSION, false);
+        stream.source_id = crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned();
+        let page: Value = serde_json::from_slice(&fixture.sources[1].payload).unwrap();
+        stream.payload = serde_json::to_vec(&page["data"][1]).unwrap();
+        let observation = parse_activity_trade_observation(&stream.payload).unwrap();
+        let stream_receipt = AppendReceipt {
+            sequence: pe_core_types::EventSeq(3),
+            this_hash: blake3::hash(&stream.payload),
+        };
+        let aggregates = aggregate_activity_rows(&fixture.rows).unwrap();
+        let target = aggregates
+            .iter()
+            .find(|aggregate| aggregate.group_id == observation.group_id)
+            .unwrap();
+        let binding = ObservationBinding {
+            stream_group_id: observation.group_id.key().clone(),
+            stream_receipt,
+            history_group_id: target.group_id.key().clone(),
+            semantic_revision: target.semantic_revision.as_str().to_owned(),
+            page_raw_hash: fixture.pages[1].raw_page_hash.clone(),
+            page_occurrence_index: 1,
+            identity_provenance: None,
+            identity_receipt: None,
+            counterpart_basis_receipt: None,
+            frame_admission_receipt: None,
+        };
+        let payload = activity_read_commitment_payload_v2(
+            wallet,
+            101,
+            &fixture.occurrences,
+            &fixture.pages,
+            &[binding],
+        )
+        .unwrap();
+        let commitment_receipt = AppendReceipt {
+            sequence: pe_core_types::EventSeq(4),
+            this_hash: blake3::hash(&payload),
+        };
+        let mut commitment = source(ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION, false);
+        commitment.source_id = ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned();
+        commitment.parser_version = ACTIVITY_READ_COMMITMENT_PARSER_VERSION;
+        commitment.payload = payload;
+        fixture.sources.extend([stream, commitment]);
+        let inputs = json!({"fixed_end":101,"pages":fixture.pages});
+        let verifier = ActivityReadVerification {
+            version: 7,
+            counterpart_depth: 0,
+            binding_filter: None,
+            wallet,
+            decision_inputs: &inputs,
+            page_occurrences: &fixture.occurrences,
+            read_commitment: Some(commitment_receipt),
+        };
+        let read = verifier
+            .reconstruct_verified_activity_read(&mut |receipt: AppendReceipt| {
+                Ok::<_, String>(
+                    fixture.sources[usize::try_from(receipt.sequence.0 - 1).unwrap()].clone(),
+                )
+            })
+            .unwrap();
+        assert_eq!(read.aggregates, aggregates);
+        assert_eq!(read.anomalies, fixture.anomalies);
+        assert_eq!(
+            read.bindings.observations[&stream_receipt.sequence].0,
+            stream_receipt
+        );
+        let anomaly = &read.anomalies[0];
+        let problem = pe_position_ledger::ScopeProblem {
+            scope: Scope {
+                kind: ScopeKind::Market,
+                id: "0xca".to_owned(),
+            },
+            cause: DropCause::Unrepresentable,
+            trigger: pe_position_ledger::activity_row_anomaly_trigger(anomaly),
+        };
+        let drop = anomaly_scope_drop_record(wallet, 100, 101, &problem, &read.anomalies, &inputs)
+            .unwrap();
+        let proof: Value = serde_json::from_str(&drop.proof_json).unwrap();
+        assert_eq!(proof["page_raw_hash"], fixture.pages[1].raw_page_hash);
+        assert_eq!(proof["page_row_index"], anomaly.row_index);
+        assert_eq!(proof["raw_row_hash"], anomaly.raw_row_hash);
     }
 
     #[test]
