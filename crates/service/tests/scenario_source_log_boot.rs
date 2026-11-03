@@ -3971,10 +3971,14 @@ async fn crash_restart_from_hourly_checkpoint() {
     assert!(file_len(&tail.path) >= complete.physical_tail);
 }
 
-/// Fixed declared outcomes: all four old-binary rows are allowed. Each must verify before serving,
-/// reject the corrupt suffix control, retry idempotently and preserve finance/history/membership.
-/// New-binary rows: absent/inactive use checkpoint; active full-walks and clears; unreadable always
-/// full-walks until quiesced recovery, whose next full walk publishes a usable checkpoint.
+/// Rollback matrix over the four checkpoint invalidation records, for the previous production
+/// binary (`PE_ROLLBACK_SERVICE_BINARY`) and then this build. Each direction starts from the row's
+/// own record and a wallet that needs a boot re-anchor, and must preserve finances, history and
+/// decisions. Every boot fences a readable record; absent and inactive records use the checkpoint
+/// and verify its prefix after listening; an active record forces a full walk and the next
+/// checkpoint clears it; an unreadable record stops boot with status 78 before listening until
+/// quiesced recovery, whose boot full-walks, and the boot after that uses the checkpoint. The
+/// previous binary must also refuse a corrupt suffix and retry its covered row idempotently.
 #[tokio::test]
 async fn previous_binary_rollback_matrix() {
     let Some(previous) = std::env::var_os("PE_ROLLBACK_SERVICE_BINARY") else {
@@ -3985,10 +3989,8 @@ async fn previous_binary_rollback_matrix() {
     };
     let previous = PathBuf::from(previous);
     assert!(previous.is_absolute());
-    for binary in [
-        Path::new(env!("CARGO_BIN_EXE_pe-service")),
-        previous.as_path(),
-    ] {
+    let current = Path::new(env!("CARGO_BIN_EXE_pe-service"));
+    for binary in [current, previous.as_path()] {
         let output = std::process::Command::new("sha256sum")
             .arg(binary)
             .output()
@@ -4014,7 +4016,7 @@ async fn previous_binary_rollback_matrix() {
         // A genuine new-owner hourly artifact and persistent lock are the old reader's input.
         let child = checkpoint_rollout::Child::start_checkpoint(
             &fixture.config_path,
-            Path::new(env!("CARGO_BIN_EXE_pe-service")),
+            current,
             &[(
                 "PE_SCENARIO_CHECKPOINT_PUBLISH_INTERVAL_MS",
                 Path::new("500"),
@@ -4029,7 +4031,6 @@ async fn previous_binary_rollback_matrix() {
         let output = child.finish_checkpoint(Some("-INT")).await;
         assert!(output.status.success(), "{row}: {output:?}");
         fixture.mirror_positions();
-        fixture.stale_anchors();
         let source = &fixture.cfg.source_event_log_path;
         let mut lock = pe_service::source_checkpoint::checkpoint_path(source).into_os_string();
         lock.push(".lock");
@@ -4037,242 +4038,253 @@ async fn previous_binary_rollback_matrix() {
         let mut record = pe_service::source_checkpoint::checkpoint_path(source).into_os_string();
         record.push(".invalidation");
         let record = PathBuf::from(record);
-        match row {
-            "absent" => {
-                if record.exists() {
-                    std::fs::remove_file(&record).unwrap();
-                }
-            }
-            "inactive" => std::fs::write(&record, br#"{"generation":4,"active":false}"#).unwrap(),
-            "active" => std::fs::write(&record, br#"{"generation":4,"active":true}"#).unwrap(),
-            "unreadable" => std::fs::write(&record, b"unreadable quarantine").unwrap(),
-            _ => unreachable!(),
-        }
-        let record_before = std::fs::read(&record).ok();
         let finances = fixture.paper.financial_snapshot(NOW_UNIX).unwrap();
         let history = fixture.paper.gate_history().unwrap();
         let decisions = fixture.paper.decision_pending_history().unwrap();
-        let source_before = std::fs::read(source).unwrap();
-        // Control in every row: append a corrupt complete frame after the checkpoint.
-        append(
-            source,
-            envelope("rollback.control", 1, 1, b"control", NOW_UNIX),
-        );
-        let mut corrupt = std::fs::read(source).unwrap();
-        *corrupt.last_mut().unwrap() ^= 1;
-        std::fs::write(source, corrupt).unwrap();
-        fixture.clear_logs();
-        let output = boot_binary_at(&fixture.config_path, &previous).await;
-        assert!(
-            !output.status.success(),
-            "{row}: corrupt suffix unexpectedly allowed"
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("CRC"),
-            "{row}: {output:?}"
-        );
-        assert!(!fixture.logs().contains("pe-service listening"));
-        assert_eq!(std::fs::read(&record).ok(), record_before);
-        std::fs::write(source, &source_before).unwrap();
-        fixture.clear_logs();
-        std::fs::remove_file(&fixture.cfg.status_path).unwrap();
-        let retry_start = file_len(source);
-        // copy() serves transaction 1001; this is the same already-covered row, unchanged.
-        let covered_hash = format!("0x{:064x}", 1001);
-        let child =
-            checkpoint_rollout::Child::start_checkpoint(&fixture.config_path, &previous, &[]);
-        fixture.wait_log("pe-service listening").await;
-        let logs = fixture.logs();
-        let admitted = logs
-            .lines()
-            .position(|line| {
-                let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
-                    return false;
-                };
-                let fields = event.get("fields").unwrap_or(&event);
-                fields["message"] == "wallet bracket completed"
-                    && fields["wallet"] == fixture.wallet().to_string()
-                    && fields["outcome"] == "accepted"
-            })
-            .expect("previous binary must admit the stale-anchor fixture wallet");
-        let listening = logs
-            .lines()
-            .position(|line| line.contains("pe-service listening"))
-            .unwrap();
-        assert!(
-            admitted < listening,
-            "{row}: previous-binary boot admission must precede listening"
-        );
-        // The previous poller records each reconciliation page before processing it, and
-        // persists the wallet's feed-history frontier only after that read's buckets and
-        // retirements are acknowledged. A frontier citing a page with this exact retry,
-        // appended after this run began, proves the retry was processed successfully.
-        checkpoint_until(|| {
-            let Ok(frames) = pe_event_log::Reader::replay_with_offsets(source) else {
-                return false;
-            };
-            let covered = frames
-                .filter_map(Result::ok)
-                .filter(|(offset, _, frame)| {
-                    *offset >= retry_start
-                        && frame.source_id.0 == "polymarket-public.activity-reconciliation"
-                        && serde_json::from_slice::<serde_json::Value>(&frame.payload)
-                            .ok()
-                            .is_some_and(|rows| {
-                                rows.as_array().is_some_and(|rows| {
-                                    rows.iter()
-                                        .any(|row| row["transactionHash"] == covered_hash)
-                                })
-                            })
+        for (direction, binary) in [("previous", previous.as_path()), ("new", current)] {
+            // Each direction starts from the row's own record.
+            match row {
+                "absent" => {
+                    if record.exists() {
+                        std::fs::remove_file(&record).unwrap();
+                    }
+                }
+                "inactive" => {
+                    std::fs::write(&record, br#"{"generation":4,"active":false}"#).unwrap();
+                }
+                "active" => std::fs::write(&record, br#"{"generation":4,"active":true}"#).unwrap(),
+                "unreadable" => std::fs::write(&record, b"unreadable quarantine").unwrap(),
+                _ => unreachable!(),
+            }
+            let record_before = std::fs::read(&record).ok();
+            if direction == "previous" {
+                // Control in every row: append a corrupt complete frame after the checkpoint.
+                let source_before = std::fs::read(source).unwrap();
+                append(
+                    source,
+                    envelope("rollback.control", 1, 1, b"control", NOW_UNIX),
+                );
+                let mut corrupt = std::fs::read(source).unwrap();
+                *corrupt.last_mut().unwrap() ^= 1;
+                std::fs::write(source, corrupt).unwrap();
+                fixture.clear_logs();
+                let output = boot_binary_at(&fixture.config_path, binary).await;
+                assert!(
+                    !output.status.success(),
+                    "{row}: corrupt suffix unexpectedly allowed"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("CRC"),
+                    "{row}: {output:?}"
+                );
+                assert!(!fixture.logs().contains("pe-service listening"));
+                assert_eq!(std::fs::read(&record).ok(), record_before);
+                std::fs::write(source, &source_before).unwrap();
+            }
+            fixture.clear_logs();
+            if fixture.cfg.status_path.exists() {
+                std::fs::remove_file(&fixture.cfg.status_path).unwrap();
+            }
+            if row == "unreadable" {
+                let output = boot_binary_at(&fixture.config_path, binary).await;
+                assert_eq!(output.status.code(), Some(78), "{direction}: {output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("install source retention fence"),
+                    "{direction}: {output:?}"
+                );
+                assert!(!fixture.logs().contains("pe-service listening"));
+                assert_eq!(std::fs::read(&record).ok(), record_before, "{direction}");
+                let mut command = std::process::Command::new(binary);
+                command
+                    .env_clear()
+                    .arg("--recover-source-checkpoint")
+                    .arg("--paper-state")
+                    .arg(&fixture.cfg.paper_state_db_path);
+                let output = support::bounded_command_output(command).await;
+                assert!(output.status.success(), "{direction} recovery: {output:?}");
+                fixture.clear_logs();
+            }
+            // Boot reuses an anchor whatever its age, so a required re-anchor is what makes it walk
+            // the wallet before listening; set it after any boot that stopped early, which walks it.
+            rusqlite::Connection::open(&fixture.cfg.paper_state_db_path)
+                .unwrap()
+                .execute(
+                    "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+                    [fixture.wallet().to_string()],
+                )
+                .unwrap();
+            let retry_start = file_len(source);
+            // copy() serves transaction 1001; this is the same already-covered row, unchanged.
+            let covered_hash = format!("0x{:064x}", 1001);
+            let child =
+                checkpoint_rollout::Child::start_checkpoint(&fixture.config_path, binary, &[]);
+            fixture.wait_log("pe-service listening").await;
+            let logs = fixture.logs();
+            let admitted = logs
+                .lines()
+                .position(|line| {
+                    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+                        return false;
+                    };
+                    let fields = event.get("fields").unwrap_or(&event);
+                    fields["message"] == "wallet bracket completed"
+                        && fields["wallet"] == fixture.wallet().to_string()
+                        && fields["outcome"] == "accepted"
                 })
-                .map(|(_, sequence, frame)| (sequence.0, frame.this_hash.to_hex().to_string()))
-                .collect::<std::collections::HashSet<_>>();
-            let Ok(collection) = fixture.paper.feed_history_frontiers() else {
-                return false;
-            };
-            collection["frontiers"].as_array().is_some_and(|frontiers| {
-                frontiers.iter().any(|frontier| {
-                    frontier["wallet"] == fixture.wallet().to_string()
-                        && frontier["page_occurrences"]
-                            .as_array()
-                            .is_some_and(|pages| {
-                                pages.iter().any(|page| {
-                                    let receipt = &page["receipt"];
-                                    receipt["sequence"].as_u64().is_some_and(|sequence| {
-                                        receipt["this_hash"].as_str().is_some_and(|hash| {
-                                            covered.contains(&(sequence, hash.to_owned()))
+                .unwrap_or_else(|| panic!("{direction} {row}: the re-anchor wallet is walked"));
+            let listening = logs
+                .lines()
+                .position(|line| line.contains("pe-service listening"))
+                .unwrap();
+            assert!(
+                admitted < listening,
+                "{direction} {row}: boot admission must precede listening"
+            );
+            if direction == "previous" {
+                // The previous poller records each reconciliation page before processing it, and
+                // persists the wallet's feed-history frontier only after that read's buckets and
+                // retirements are acknowledged. A frontier citing a page with this exact retry,
+                // appended after this run began, proves the retry was processed successfully.
+                checkpoint_until(|| {
+                    let Ok(frames) = pe_event_log::Reader::replay_with_offsets(source) else {
+                        return false;
+                    };
+                    let covered = frames
+                        .filter_map(Result::ok)
+                        .filter(|(offset, _, frame)| {
+                            *offset >= retry_start
+                                && frame.source_id.0 == "polymarket-public.activity-reconciliation"
+                                && serde_json::from_slice::<serde_json::Value>(&frame.payload)
+                                    .ok()
+                                    .is_some_and(|page| {
+                                        page["data"].as_array().is_some_and(|rows| {
+                                            rows.iter()
+                                                .any(|row| row["transaction_hash"] == covered_hash)
                                         })
                                     })
-                                })
-                            })
+                        })
+                        .map(|(_, sequence, frame)| {
+                            (sequence.0, frame.this_hash.to_hex().to_string())
+                        })
+                        .collect::<std::collections::HashSet<_>>();
+                    let Ok(collection) = fixture.paper.feed_history_frontiers() else {
+                        return false;
+                    };
+                    collection["frontiers"].as_array().is_some_and(|frontiers| {
+                        frontiers.iter().any(|frontier| {
+                            frontier["wallet"] == fixture.wallet().to_string()
+                                && frontier["page_occurrences"]
+                                    .as_array()
+                                    .is_some_and(|pages| {
+                                        pages.iter().any(|page| {
+                                            let receipt = &page["receipt"];
+                                            receipt["sequence"].as_u64().is_some_and(|sequence| {
+                                                receipt["this_hash"].as_str().is_some_and(|hash| {
+                                                    covered.contains(&(sequence, hash.to_owned()))
+                                                })
+                                            })
+                                        })
+                                    })
+                        })
+                    })
                 })
+                .await;
+            }
+            checkpoint_until(|| {
+                std::fs::read(&fixture.cfg.status_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .is_some_and(|status| {
+                        status["uptime_secs"]
+                            .as_u64()
+                            .is_some_and(|seconds| seconds >= 2)
+                    })
             })
-        })
-        .await;
-        checkpoint_until(|| {
-            std::fs::read(&fixture.cfg.status_path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                .is_some_and(|status| {
-                    status["uptime_secs"]
-                        .as_u64()
-                        .is_some_and(|seconds| seconds >= 2)
-                })
-        })
-        .await;
-        fixture.assert_live_membership();
-        let output = child.finish_checkpoint(Some("-INT")).await;
-        assert!(output.status.success(), "{row}: {output:?}");
-        let logs = fixture.logs();
-        assert!(
-            logs.find("source checkpoint raw prefix verified").unwrap()
-                < logs.find("pe-service listening").unwrap()
-        );
-        assert_eq!(
-            std::fs::read(&record).ok(),
-            record_before,
-            "old binary changed {row} record"
-        );
-        assert_eq!(
-            fixture.paper.financial_snapshot(NOW_UNIX).unwrap(),
-            finances
-        );
-        assert_eq!(fixture.paper.gate_history().unwrap(), history);
-        assert_eq!(fixture.paper.decision_pending_history().unwrap(), decisions);
-        assert!(!fixture.paper.is_wallet_fenced(&fixture.wallet()).unwrap());
-        assert!(
-            fixture
-                .paper
-                .wallet_history_complete(&fixture.wallet())
-                .unwrap()
-        );
-        fixture.clear_logs();
-        let child = checkpoint_rollout::Child::start_checkpoint(
-            &fixture.config_path,
-            Path::new(env!("CARGO_BIN_EXE_pe-service")),
-            &[],
-        );
-        fixture.wait_log("pe-service listening").await;
-        if row != "unreadable" {
+            .await;
+            fixture.assert_live_membership();
             fixture.wait_log("source checkpoint published").await;
-        }
-        let output = child.finish_checkpoint(Some("-INT")).await;
-        assert!(output.status.success(), "{row}: new reader {output:?}");
-        let boot =
-            &checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0];
-        assert_eq!(
-            boot["checkpoint_used"],
-            matches!(row, "absent" | "inactive"),
-            "{row}"
-        );
-        if row == "active" {
-            assert!(
-                pe_service::source_checkpoint::read_authority(source)
-                    .unwrap()
-                    .permits_checkpoint()
-            );
-        }
-        if row == "unreadable" {
-            assert_eq!(std::fs::read(&record).ok(), record_before);
-            fixture.clear_logs();
-            let child = checkpoint_rollout::Child::start_checkpoint(
-                &fixture.config_path,
-                Path::new(env!("CARGO_BIN_EXE_pe-service")),
-                &[],
-            );
-            fixture.wait_log("pe-service listening").await;
-            assert!(
-                !checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0]
-                    ["checkpoint_used"]
-                    .as_bool()
-                    .unwrap()
-            );
-            assert!(child.finish_checkpoint(Some("-INT")).await.status.success());
-            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
-            command
-                .env_clear()
-                .arg("--recover-source-checkpoint")
-                .arg("--paper-state")
-                .arg(&fixture.cfg.paper_state_db_path);
-            assert!(
-                support::bounded_command_output(command)
-                    .await
-                    .status
-                    .success()
-            );
-            fixture.clear_logs();
-            let child = checkpoint_rollout::Child::start_checkpoint(
-                &fixture.config_path,
-                Path::new(env!("CARGO_BIN_EXE_pe-service")),
-                &[],
-            );
-            fixture.wait_log("source checkpoint published").await;
+            let output = child.finish_checkpoint(Some("-INT")).await;
+            assert!(output.status.success(), "{direction} {row}: {output:?}");
+            let logs = fixture.logs();
+            let boot = &checkpoint_events(&logs, "source checkpoint verification completed")[0];
+            let uses_checkpoint = matches!(row, "absent" | "inactive");
             assert_eq!(
-                checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0]["prefix_verification"],
-                "full_walk"
+                boot["checkpoint_used"], uses_checkpoint,
+                "{direction} {row}"
             );
-            assert!(child.finish_checkpoint(Some("-INT")).await.status.success());
-            fixture.clear_logs();
-            let child = checkpoint_rollout::Child::start_checkpoint(
-                &fixture.config_path,
-                Path::new(env!("CARGO_BIN_EXE_pe-service")),
-                &[],
-            );
-            fixture.wait_log("source checkpoint prefix verified").await;
-            assert!(child.finish_checkpoint(Some("-INT")).await.status.success());
             assert_eq!(
-                checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0]["checkpoint_used"],
-                true
+                boot["prefix_verification"],
+                if uses_checkpoint {
+                    "deferred"
+                } else {
+                    "full_walk"
+                },
+                "{direction} {row}"
+            );
+            if uses_checkpoint {
+                assert!(
+                    logs.find("pe-service listening").unwrap()
+                        < logs.find("source checkpoint prefix verified").unwrap(),
+                    "{direction} {row}: the checkpoint prefix is verified after listening"
+                );
+            }
+            // Boot fenced the readable record and the new checkpoint cleared an active one; recovery
+            // replaced the unreadable record with generation 1.
+            assert_eq!(
+                pe_service::source_checkpoint::read_authority(source).unwrap(),
+                pe_service::source_checkpoint::Authority::Readable(
+                    pe_service::source_checkpoint::InvalidationRecord {
+                        generation: match row {
+                            "absent" => 0,
+                            "unreadable" => 1,
+                            _ => 4,
+                        },
+                        active: false,
+                        retention_fence: true,
+                    }
+                ),
+                "{direction} {row}"
+            );
+            if row == "unreadable" {
+                // The boot after recovery uses the checkpoint its full walk published.
+                fixture.clear_logs();
+                let child =
+                    checkpoint_rollout::Child::start_checkpoint(&fixture.config_path, binary, &[]);
+                fixture.wait_log("source checkpoint prefix verified").await;
+                assert!(child.finish_checkpoint(Some("-INT")).await.status.success());
+                assert_eq!(
+                    checkpoint_events(&fixture.logs(), "source checkpoint verification completed")
+                        [0]["checkpoint_used"],
+                    true,
+                    "{direction}"
+                );
+            }
+            assert_eq!(
+                fixture.paper.financial_snapshot(NOW_UNIX).unwrap(),
+                finances,
+                "{direction} {row}"
+            );
+            assert_eq!(
+                fixture.paper.gate_history().unwrap(),
+                history,
+                "{direction} {row}"
+            );
+            assert_eq!(
+                fixture.paper.decision_pending_history().unwrap(),
+                decisions,
+                "{direction} {row}"
+            );
+            assert!(!fixture.paper.is_wallet_fenced(&fixture.wallet()).unwrap());
+            assert!(
+                fixture
+                    .paper
+                    .wallet_history_complete(&fixture.wallet())
+                    .unwrap()
             );
         }
-        assert_eq!(
-            fixture.paper.financial_snapshot(NOW_UNIX).unwrap(),
-            finances
-        );
-        assert_eq!(fixture.paper.gate_history().unwrap(), history);
-        assert_eq!(fixture.paper.decision_pending_history().unwrap(), decisions);
         eprintln!(
-            "rollback row {row}: allowed PASS; corrupt control refused; retry idempotent; drained; balances/history/decisions/fences preserved; new invalidation policy PASS"
+            "rollback row {row}: PASS for the previous binary and this build; corrupt control refused; retry idempotent; balances/history/decisions/fences preserved"
         );
     }
 }

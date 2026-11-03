@@ -1095,8 +1095,8 @@ impl CausalPositionValidator {
                 false,
             )
             .await?;
-            // Each tail prepares the union of baseline and tail rows; the baseline's own preparation
-            // is no longer needed, so free it before the tails.
+            // Each tail resolves identities from baseline and tail rows together but prepares only its
+            // own rows; the baseline's preparation is not needed after its commit, so free it here.
             drop(prepared);
             attempt.baseline_completed = Some(Instant::now());
             let start = Some(
