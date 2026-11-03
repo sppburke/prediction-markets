@@ -36,9 +36,9 @@ use pe_core_types::{
 use pe_position_ledger::{EntryClassification, LedgerMutation, PositionLedger, SecondVerdict};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ActivityParseContext, ActivityTransport, CLOB_RESOLUTION_PARSER_VERSION,
+    ActivityParseContext, ActivityReadError, ActivityTransport, CLOB_RESOLUTION_PARSER_VERSION,
     CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageManifest, ClobCoveragePage, FixtureFetcher,
-    PageFetcher, parse_activity_response,
+    PageFetcher, V2AuthenticationError, V2PageError, parse_activity_response,
 };
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -528,7 +528,7 @@ async fn finalize_empty_activity_side(
         side,
         &FixtureFetcher::new(HashMap::from([(
             activity_url(WALLET, watermark + 1),
-            b"[]".to_vec(),
+            activity_response(&activity_url(WALLET, watermark + 1), b"[]".to_vec()),
         )])),
         "https://data.example",
         2,
@@ -1770,7 +1770,10 @@ async fn redemption_noops_and_verified_identity_shape_the_projection() {
             rows.sort_by_key(|row| std::cmp::Reverse(row["timestamp"].as_i64().unwrap()));
             (
                 activity_url(wallet, fixed_end),
-                serde_json::to_vec(&rows).unwrap(),
+                activity_response(
+                    &activity_url(wallet, fixed_end),
+                    serde_json::to_vec(&rows).unwrap(),
+                ),
             )
         })
         .collect::<HashMap<_, _>>();
@@ -2166,8 +2169,16 @@ async fn retained_classifier_activity_at_version(
         populate_activity_fresh_v2(
             side,
             &FixtureFetcher::new(HashMap::from([(
-                activity_url(WALLET, fixed_end),
-                raw.clone(),
+                if classifier_version == 6 {
+                    activity_v1_url(WALLET, fixed_end)
+                } else {
+                    activity_url(WALLET, fixed_end)
+                },
+                if classifier_version == 6 {
+                    raw.clone()
+                } else {
+                    activity_response(&activity_url(WALLET, fixed_end), raw.clone())
+                },
             )])),
             "https://data.example",
             7,
@@ -4198,12 +4209,28 @@ const WALLET_D: &str = "0x4444444444444444444444444444444444444444";
 const WALLET_E: &str = "0x5555555555555555555555555555555555555555";
 const FRESH_END: i64 = 1_800_000_000;
 
-// Fresh collection reaches full history: the exclusive bound 0 is `start=1`
-// on the wire, where an omitted `start` returns only the venue's recent window.
-fn activity_url(wallet: &str, end: i64) -> String {
+// Frozen identities retain their v1 offset requests and proof bytes.
+fn activity_v1_url(wallet: &str, end: i64) -> String {
     format!(
         "https://data.example/activity?user={wallet}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={end}&start=1"
     )
+}
+
+// Fresh collection reaches full history: the exclusive bound 0 is `start=1`.
+fn activity_url(wallet: &str, end: i64) -> String {
+    format!(
+        "https://data.example/v2/activity?user={wallet}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&start=1&end={end}&sort_direction=ASC&limit=1000"
+    )
+}
+
+fn activity_response(url: &str, body: Vec<u8>) -> Vec<u8> {
+    if reqwest::Url::parse(url).unwrap().path() == "/v2/activity" {
+        let mut rows: Vec<Value> = serde_json::from_slice(&body).unwrap();
+        rows.sort_by_key(|row| row["timestamp"].as_i64().unwrap());
+        v2_activity_envelope(&rows.iter().collect::<Vec<_>>(), 0, 0, false)
+    } else {
+        body
+    }
 }
 
 // Every wallet other than the original trades one distinct market per epoch.
@@ -4241,18 +4268,17 @@ fn activity_rows(wallet: &str, epochs: &[i64], revised: bool) -> Vec<u8> {
     serde_json::to_vec(&rows).unwrap()
 }
 
-fn fresh_fetcher(wallets: &[&str], end: i64, epochs: &[i64], revised: bool) -> FixtureFetcher {
-    FixtureFetcher::new(
-        wallets
+fn fresh_fetcher(wallets: &[&str], epochs: &[i64], revised: bool) -> DatasetFetcher {
+    DatasetFetcher {
+        rows: wallets
             .iter()
-            .map(|wallet| {
-                (
-                    activity_url(wallet, end),
-                    activity_rows(wallet, epochs, revised),
-                )
+            .flat_map(|wallet| {
+                serde_json::from_slice::<Vec<Value>>(&activity_rows(wallet, epochs, revised))
+                    .unwrap()
             })
             .collect(),
-    )
+        ..Default::default()
+    }
 }
 
 fn fresh_record(path: &std::path::Path) -> Value {
@@ -4320,13 +4346,20 @@ async fn finalize_fresh_initial(dir: &TempDir, side: &std::path::Path) -> String
 }
 
 async fn prepare_fresh_initial(dir: &TempDir, side: &std::path::Path) {
+    prepare_fresh_initial_with_identity(dir, side, false).await;
+}
+
+async fn prepare_fresh_initial_with_identity(dir: &TempDir, side: &std::path::Path, frozen: bool) {
     seed_initial_candidate(side);
     let manifest = write_build_manifest(dir, side);
     migrate_cache_v2(side, &manifest).unwrap();
+    if frozen {
+        collection_admit_v1(side, 1, FRESH_END, &[]).await;
+    }
     let union = [WALLET, WALLET_B, WALLET_C, WALLET_D];
     let manifest = populate_activity_fresh_v2(
         side,
-        &fresh_fetcher(&union, FRESH_END, &[FRESH_END - 1, FRESH_END - 101], false),
+        &fresh_fetcher(&union, &[FRESH_END - 1, FRESH_END - 101], false),
         "https://data.example",
         1,
         FRESH_END,
@@ -4693,12 +4726,7 @@ async fn condition_index_is_optional_through_collection_resume_finalize_and_acti
         };
         let manifest = populate_activity_fresh_v2(
             &side,
-            &fresh_fetcher(
-                &wallets,
-                FRESH_END,
-                &[FRESH_END - 1, FRESH_END - 101],
-                false,
-            ),
+            &fresh_fetcher(&wallets, &[FRESH_END - 1, FRESH_END - 101], false),
             "https://data.example",
             1,
             FRESH_END,
@@ -4821,7 +4849,10 @@ impl PageFetcher for InterruptAfterFirst {
         let url = url.to_owned();
         async move {
             if url.contains(first) {
-                return Ok(activity_rows(first, &[FRESH_END + 50], false));
+                return Ok(activity_response(
+                    &url,
+                    activity_rows(first, &[FRESH_END + 50], false),
+                ));
             }
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
@@ -4882,6 +4913,7 @@ impl PageFetcher for RecordingFetcher {
                 .collect::<Vec<_>>(),
         )
         .unwrap();
+        let body = activity_response(url, body);
         async move { Ok(body) }
     }
 }
@@ -4932,14 +4964,7 @@ impl WriteLockedFetcher {
             .map(|wallet| activity_url(wallet, FRESH_END + 100))
             .to_vec();
         if self.fail_last_read {
-            expected.push(
-                pe_source_polymarket_public::PolymarketEndpoint::UserPositionActivityWindowEnd {
-                    user: WALLET_D.to_owned(),
-                    start: 1,
-                    end: FRESH_END + 100,
-                }
-                .url("https://data.example"),
-            );
+            expected.push(activity_url(WALLET_D, FRESH_END + 100));
         }
         assert_eq!(*self.calls.lock().unwrap(), expected);
     }
@@ -4963,7 +4988,10 @@ impl PageFetcher for WriteLockedFetcher {
             .into_iter()
             .find(|wallet| url.contains(wallet))
             .unwrap();
-        Ok(activity_rows(wallet, &[FRESH_END + 50], false))
+        Ok(activity_response(
+            url,
+            activity_rows(wallet, &[FRESH_END + 50], false),
+        ))
     }
 }
 
@@ -5117,7 +5145,7 @@ impl PageFetcher for PendingActivityReads {
             // Ensure the other three reads are in flight before the writer
             // can fail. They never answer, so only writer failure can wake us.
             tokio::task::yield_now().await;
-            return Ok(activity_rows(WALLET, &[], false));
+            return Ok(activity_response(url, activity_rows(WALLET, &[], false)));
         }
         let _pending = PendingActivityRead(&self.dropped);
         std::future::pending().await
@@ -5154,7 +5182,7 @@ impl PageFetcher for BudgetedReads {
                 .into_iter()
                 .find(|wallet| url.contains(wallet))
                 .unwrap();
-            return Ok(activity_rows(wallet, &[], false));
+            return Ok(activity_response(url, activity_rows(wallet, &[], false)));
         }
         self.attempts.fetch_add(1, Ordering::SeqCst);
         match self.behaviour {
@@ -5164,7 +5192,10 @@ impl PageFetcher for BudgetedReads {
             TargetBehaviour::Hang => {
                 let _pending = PendingActivityRead(&self.dropped);
                 self.release.notified().await;
-                Ok(activity_rows(self.target, &[], false))
+                Ok(activity_response(
+                    url,
+                    activity_rows(self.target, &[], false),
+                ))
             }
         }
     }
@@ -5190,6 +5221,7 @@ fn excluded_receipt(side: &std::path::Path, wallet: &str) -> (Option<String>, i6
 async fn wallet_budget_finishes_an_identity4_page_after_its_deadline() {
     let dir = TempDir::new().unwrap();
     let side = budgeted_candidate(&dir);
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     let fetcher = BudgetedReads::new(WALLET_B, TargetBehaviour::Hang);
     let config = collection_config(&side);
     let run = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
@@ -5489,7 +5521,7 @@ async fn activity_resume_validates_receipt_identity_shape_and_counts_before_sour
     assert_eq!(manifest.wallet_count, 4);
     assert_eq!(
         *fetcher.calls.lock().unwrap(),
-        [WALLET, WALLET_C, WALLET_D].map(|wallet| activity_url(wallet, FRESH_END + 100))
+        [WALLET, WALLET_C, WALLET_D].map(|wallet| activity_v1_url(wallet, FRESH_END + 100))
     );
 }
 
@@ -5522,7 +5554,7 @@ async fn activity_resume_defers_completed_wallet_content_corruption_to_completio
     // despite its deleted group. The old startup content scan makes no calls.
     assert_eq!(
         *fetcher.calls.lock().unwrap(),
-        [WALLET, WALLET_C, WALLET_D].map(|wallet| activity_url(wallet, FRESH_END + 100))
+        [WALLET, WALLET_C, WALLET_D].map(|wallet| activity_v1_url(wallet, FRESH_END + 100))
     );
     assert_eq!(generation_rows(&side, 1), 7);
     assert_eq!(
@@ -5810,6 +5842,7 @@ impl PageFetcher for UnparseableWalletFetcher {
                 .unwrap();
             activity_rows(wallet, &[FRESH_END - 1], false)
         };
+        let body = activity_response(url, body);
         async move { Ok(body) }
     }
 }
@@ -5944,10 +5977,10 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_parsed() {
                             (pe_source_polymarket_public::PolymarketEndpoint::UserPositionActivityWindowEnd {
                                 user: wallet.to_owned(), start: 1, end: next_end,
                             }.url("https://data.example"), b"[]".to_vec()),
-                            (activity_url(wallet, next_end), activity_rows(wallet, &[FRESH_END - 1, FRESH_END - 101], false)),
+                            (activity_url(wallet, next_end), activity_response(&activity_url(wallet, next_end), activity_rows(wallet, &[FRESH_END - 1, FRESH_END - 101], false))),
                         ]
                     } else {
-                        vec![(activity_url(wallet, next_end).replace("start=1", &format!("start={}", FRESH_END + 1)), b"[]".to_vec())]
+                        vec![(activity_url(wallet, next_end).replace("start=1", &format!("start={}", FRESH_END + 1)), activity_response(&activity_url(wallet, next_end), b"[]".to_vec()))]
                     }
                 })
                 .collect(),
@@ -5981,10 +6014,13 @@ impl PageFetcher for InterruptAfterAmbiguous {
         let url = url.to_owned();
         async move {
             if url.contains(WALLET_B) {
-                return Ok(ambiguous_fill_rows(WALLET_B));
+                return Ok(activity_response(&url, ambiguous_fill_rows(WALLET_B)));
             }
             if url.contains(WALLET_D) {
-                return Ok(activity_rows(WALLET_D, &[FRESH_END - 1], false));
+                return Ok(activity_response(
+                    &url,
+                    activity_rows(WALLET_D, &[FRESH_END - 1], false),
+                ));
             }
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
@@ -6043,9 +6079,16 @@ fn receipt(side: &std::path::Path, generation: i64, wallet: &str) -> Option<(i64
 /// resume fetches only wallets without a receipt, validation and finalization
 /// accept the receipt set, the ranker projects nothing for the wallet, and the
 /// next generation's union keeps the wallet even though it is inactive and
-/// retains no history, so a valid history is collected again.
+/// retains no history, so a valid history is collected again. Identity 5 reads
+/// v2; the frozen identity 4 also carries an authentic pre-649 exclusion.
 #[tokio::test]
 async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated() {
+    for frozen in [false, true] {
+        excluded_aggregation_successor(frozen).await;
+    }
+}
+
+async fn excluded_aggregation_successor(frozen: bool) {
     let dir = tempfile::Builder::new()
         .prefix("pe-fresh-excluded-")
         .tempdir_in(std::env::current_dir().unwrap())
@@ -6056,6 +6099,9 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
     let manifest = write_build_manifest(&dir, &side);
     migrate_cache_v2(&side, &manifest).unwrap();
 
+    if frozen {
+        collection_admit_v1(&side, 1, FRESH_END, &[]).await;
+    }
     let interrupted = populate_activity_fresh_v2(
         &side,
         &InterruptAfterAmbiguous { side: side.clone() },
@@ -6088,7 +6134,6 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
         &side,
         &fresh_fetcher(
             &[WALLET, WALLET_C],
-            FRESH_END,
             &[FRESH_END - 1, FRESH_END - 101],
             false,
         ),
@@ -6124,7 +6169,8 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
     );
     assert!(!classifier_projection_rows(&side).is_empty());
 
-    for legacy in [false, true] {
+    let legacies: &[bool] = if frozen { &[false, true] } else { &[false] };
+    for &legacy in legacies {
         // The finalized cache is the next cycle's prior: the excluded wallet is
         // inactive and retains no history there, and only its excluded receipt
         // can carry it into the next union.
@@ -6169,13 +6215,16 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
                         if wallet == WALLET_B {
                             (
                                 activity_url(wallet, next_end),
-                                activity_rows(wallet, &[FRESH_END - 1, FRESH_END - 101], false),
+                                activity_response(
+                                    &activity_url(wallet, next_end),
+                                    activity_rows(wallet, &[FRESH_END - 1, FRESH_END - 101], false),
+                                ),
                             )
                         } else {
                             (
                                 activity_url(wallet, next_end)
                                     .replace("start=1", &format!("start={}", FRESH_END + 1)),
-                                b"[]".to_vec(),
+                                activity_response(&activity_url(wallet, next_end), b"[]".to_vec()),
                             )
                         }
                     })
@@ -8110,7 +8159,7 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
     finalize_against_unfused_reference(&side, &dir.path().join("retained.json"), FRESH_END + 2);
     // Collection already installed the manifest, before payout/projection finalization.
     let unfinalized_legacy = dir.path().join("unfinalized-legacy.db");
-    std::fs::copy(&unfinalized, &unfinalized_legacy).unwrap();
+    prepare_fresh_initial_with_identity(&dir, &unfinalized_legacy, true).await;
     install_legacy_receipt_manifest(&unfinalized_legacy, 1);
     let legacy = dir.path().join("legacy.db");
     std::fs::copy(&unfinalized_legacy, &legacy).unwrap();
@@ -8697,7 +8746,7 @@ async fn lifecycle_check_counts_and_diagnostics_preserve_json_reports() {
             &side,
             &FixtureFetcher::new(HashMap::from([(
                 activity_url(WALLET, FRESH_END),
-                b"[]".to_vec(),
+                activity_response(&activity_url(WALLET, FRESH_END), b"[]".to_vec()),
             )])),
             "https://data.example",
             u64::try_from(initial_schema).unwrap(),
@@ -10318,6 +10367,7 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
     assert_eq!(generation_rows(&side, 7), 0);
     // The clock is not sampled on a damaged predecessor, and no successor identity is written.
     let damaged = dataset_candidate(&dir, "clock.db", &[]);
+    collection_admit_v1(&damaged, 1, FRESH_END, &[]).await;
     populate_activity_fresh_v2(
         &damaged,
         &source,
@@ -10399,6 +10449,7 @@ async fn retained_wallet_without_a_predecessor_receipt_refuses_a_successor_befor
         rows: vec![dataset_row(WALLET, "0xmarket", "base", "BUY", FRESH_END)],
         ..Default::default()
     };
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     populate_activity_fresh_v2(
         &side,
         &source,
@@ -10602,6 +10653,7 @@ async fn incremental_authentic_v1_resume_and_old_reader_proof_boundary() {
         )],
         ..Default::default()
     };
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     populate_activity_fresh_v2(
         &side,
         &source,
@@ -10945,6 +10997,7 @@ async fn incremental_equal_revision_collision_still_excludes_instead_of_upsertin
         rows: vec![old.clone()],
         ..Default::default()
     };
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     populate_activity_fresh_v2(
         &side,
         &source,
@@ -11399,6 +11452,7 @@ async fn acquisition_failure_authentic_649_resume_preserves_proofs_and_recovers_
         ..Default::default()
     };
     source.rows[1]["side"] = Value::from("invalid");
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     populate_activity_fresh_v2(
         &side,
         &source,
@@ -12950,7 +13004,7 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
                     "&start=1",
                     &format!("&start={}", if cycle == 1 { 1 } else { FRESH_END + cycle }),
                 ),
-                b"[]".to_vec(),
+                activity_response(&activity_url(WALLET, FRESH_END + cycle), b"[]".to_vec()),
             )])),
             "https://data.example",
             u64::try_from(cycle).unwrap(),
@@ -13813,6 +13867,7 @@ async fn incremental_interrupted_v2_resume_preserves_identity_and_receipts() {
     assert_eq!(stored_receipt_proofs(&conn, 1), proofs);
     assert!(empty.calls.lock().unwrap().is_empty());
 
+    collection_admit_v1(&side, 2, FRESH_END + 2, &[]).await;
     populate_activity_fresh_v2(
         &side,
         &source,
@@ -14234,6 +14289,8 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
     );
     let interrupted_anomaly_root = scenario == PublicationScenario::InterruptedAnomalyRoot;
     let legacy_root = scenario == PublicationScenario::LegacyRoot;
+    // Only the unfinished format-two root resumes a frozen v1 walk.
+    let frozen_activity = legacy_root;
     let recovery = scenario == PublicationScenario::Recovery;
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let quiet = format!(
@@ -14470,6 +14527,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         markets,
         serde_json::json!([{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"}]),
         scope_events,
+        frozen_activity,
     );
     let (address, requests, batches) = (
         venue.address,
@@ -14497,7 +14555,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
     )
     .unwrap();
     std::fs::write(dir.path().join(".env"), format!(
-        "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_CATEGORIES='[\"OVERALL\"]'\nPE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER={}\nPE_RANKER_ENGINE=duck\nPE_RANK_MARKET_SERIES=7:btc-up-or-down-15m\nWIN_END={}\n",
+        "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_TOP_N=0\nPE_BOOTSTRAP_LEADERBOARD_CATEGORIES='[\"OVERALL\"]'\nPE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER={}\nPE_RANKER_ENGINE=duck\nWIN_END={}\n",
         dir.path().join("watchlist.json").display(), if scenario == PublicationScenario::Unrepresentable || anomalies { "prepare" } else { "1" }, time::OffsetDateTime::from_unix_timestamp(now - 86_400).unwrap().date())).unwrap();
     if scenario == PublicationScenario::ParticipantHold {
         let path = dir.path().join(".env");
@@ -14526,14 +14584,16 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         let name = format!("cron-{stamp}");
         let out = data.join("eval-results").join(&name);
         std::fs::create_dir_all(&out).unwrap();
+        let mut configuration = serde_json::json!({"cache_lane":"fresh_v2"});
+        // A retained pin stays recorded but cannot override the coverage set.
+        if scenario == PublicationScenario::Transition {
+            configuration["rank_market_series"] = Value::from("999:obsolete-pin");
+        }
         for (file, value) in [
-            (
-                "cycle_configuration.json",
-                serde_json::json!({"cache_lane":"fresh_v2", "rank_market_series":"7:btc-up-or-down-15m"}),
-            ),
+            ("cycle_configuration.json", configuration.clone()),
             (
                 "cycle_manifest.json",
-                serde_json::json!({"version":1,"configuration":{"cache_lane":"fresh_v2", "rank_market_series":"7:btc-up-or-down-15m"}}),
+                serde_json::json!({"version":1,"configuration":configuration}),
             ),
         ] {
             std::fs::write(out.join(file), serde_json::to_vec(&value).unwrap()).unwrap();
@@ -14691,6 +14751,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 ),
                 0
             );
+            assert_wrapper_v2_requests(&requests.lock().unwrap(), frozen_activity);
             venue.stop();
             return;
         }
@@ -14791,6 +14852,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                     source,
                     overrides: BTreeMap::from([(WALLET_C.to_owned(), b"{}".to_vec())]),
                     walk_wallet: None,
+                    probe_failed: std::sync::atomic::AtomicBool::new(false),
                     end: now - 120,
                 };
                 collection_run(
@@ -14802,8 +14864,9 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 )
                 .await
                 .unwrap();
-                hold(&[WALLET_C, "activity response json:"]);
+                hold(&[WALLET_C, "v2 activity envelope:"]);
                 assert_eq!(fresh_record(&side)["generation"], 1);
+                assert_wrapper_v2_requests(&requests.lock().unwrap(), frozen_activity);
                 venue.stop();
                 return;
             }
@@ -14891,6 +14954,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 source,
                 overrides: BTreeMap::new(),
                 walk_wallet: Some(WALLET_D.to_owned()),
+                probe_failed: std::sync::atomic::AtomicBool::new(false),
                 end: now - 120,
             };
             if interrupted_anomaly_root {
@@ -14994,6 +15058,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         };
         assert_eq!(output.status.code(), expected, "{output:?}");
         assert!(request.exists());
+        assert_wrapper_scope(&out, if expected == Some(2) { &side } else { &fixed });
         let identity = fresh_record(
             if scenario == PublicationScenario::Unrepresentable || anomalies {
                 &side
@@ -15140,6 +15205,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 assert_eq!(identity["deferred_wallets"], serde_json::json!([]));
             }
         }
+        assert_wrapper_v2_requests(&requests.lock().unwrap(), frozen_activity);
         venue.stop();
         return;
     }
@@ -15173,6 +15239,9 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         assert_eq!(fresh_record(&side)["version"], 2);
         assert_eq!(count(&side, "PRAGMA user_version"), -2);
         assert!(out.join("cache_stage.json").exists());
+    }
+    if scenario == PublicationScenario::Transition {
+        prepare_cycle(0);
     }
     let mut cycles = Vec::new();
     let mut infra_certificate = None;
@@ -15588,6 +15657,18 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
             ).unwrap();
             assert_eq!(changed, 3);
         }
+        assert_wrapper_scope(&out, &fixed);
+        if scenario == PublicationScenario::Transition {
+            let configuration: Value = serde_json::from_slice(
+                &std::fs::read(out.join("cycle_configuration.json")).unwrap(),
+            )
+            .unwrap();
+            if cycle == 0 {
+                assert_eq!(configuration["rank_market_series"], "999:obsolete-pin");
+            } else {
+                assert!(configuration.get("rank_market_series").is_none());
+            }
+        }
         assert!(!cycles.contains(&out));
         cycles.push(out);
     }
@@ -15619,6 +15700,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         );
         assert_eq!(before.stdout, after.stdout);
     }
+    assert_wrapper_v2_requests(&requests.lock().unwrap(), frozen_activity);
     venue.stop();
 }
 
@@ -15627,6 +15709,7 @@ struct WrapperActivityFixture {
     overrides: BTreeMap<String, Vec<u8>>,
     walk_wallet: Option<String>,
     end: i64,
+    probe_failed: std::sync::atomic::AtomicBool,
 }
 
 impl PageFetcher for WrapperActivityFixture {
@@ -15642,7 +15725,11 @@ impl PageFetcher for WrapperActivityFixture {
         if self.walk_wallet.as_ref() == Some(&query["user"])
             && query["start"] == "1"
             && query["end"] == self.end.to_string()
-            && query["sortDirection"] == "DESC"
+            && (if parsed.path() == "/v2/activity" {
+                !self.probe_failed.swap(true, Ordering::SeqCst)
+            } else {
+                query["sortDirection"] == "DESC"
+            })
         {
             return Err(SourceError::Transient {
                 message: "fixture exhausted probe retries".to_owned(),
@@ -15654,12 +15741,13 @@ impl PageFetcher for WrapperActivityFixture {
 
 // PASS: real parser failures match the wrapper's named E11 constants exactly as
 // recorded in collector receipts; a non-array response matches none; the wrapper's
-// page-parse prefix and exchange-contract set equal the Rust owners'. FAIL: drift.
+// page-parse and v2 envelope/cursor-proof prefixes and exchange-contract set equal
+// the Rust owners'. FAIL: drift.
 #[tokio::test]
 async fn unrepresentable_parser_text_matches_receipt_reasons_and_wrapper_constants() {
     let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let constants = Command::new("python3").current_dir(repository).args(["-c",
-        "import json,sys; sys.path.insert(0, 'scripts'); import rank_cycle_manifest as m; print(json.dumps([m.UNREPRESENTABLE_PRICE,m.UNREPRESENTABLE_MAPPING,m.UNREPRESENTABLE_DECIMAL,m.ACTIVITY_RESPONSE_JSON,m.ACTIVITY_PAGE_PARSE_FAILURE]+sorted(m.EXCHANGE_CONTRACTS)))"])
+        "import json,sys; sys.path.insert(0, 'scripts'); import rank_cycle_manifest as m; print(json.dumps([m.UNREPRESENTABLE_PRICE,m.UNREPRESENTABLE_MAPPING,m.UNREPRESENTABLE_DECIMAL,m.ACTIVITY_RESPONSE_JSON,m.ACTIVITY_PAGE_PARSE_FAILURE,m.V2_ACTIVITY_ENVELOPE,m.V2_ACTIVITY_CURSOR_PROOF]+sorted(m.EXCHANGE_CONTRACTS)))"])
         .output().unwrap();
     assert!(
         constants.status.success(),
@@ -15672,7 +15760,20 @@ async fn unrepresentable_parser_text_matches_receipt_reasons_and_wrapper_constan
         .map(|address| format!("{address:#x}"))
         .collect();
     contracts.sort();
-    assert_eq!(constants[5..], contracts[..]);
+    assert_eq!(constants[7..], contracts[..]);
+    // The wrapper holds a v2 walk's envelope and cursor-proof exclusions by these prefixes.
+    for (error, prefix) in [
+        (
+            ActivityReadError::from(V2PageError::InvalidLimit(1001)),
+            &constants[5],
+        ),
+        (
+            ActivityReadError::from(V2AuthenticationError::EmptyContinuation { index: 0 }),
+            &constants[6],
+        ),
+    ] {
+        assert!(error.to_string().starts_with(prefix.as_str()), "{error}");
+    }
     let mut price = dataset_row(WALLET, "0xa", "price", "BUY", FRESH_END);
     price["price"] = Value::from("3.1968021978");
     let mut mapping = price.clone();
@@ -15709,7 +15810,7 @@ async fn unrepresentable_parser_text_matches_receipt_reasons_and_wrapper_constan
         freeze_identity_four(&side);
         populate_activity_fresh_v2(
             &side,
-            &FixtureFetcher::new(HashMap::from([(activity_url(WALLET, FRESH_END), body)])),
+            &FixtureFetcher::new(HashMap::from([(activity_v1_url(WALLET, FRESH_END), body)])),
             "https://data.example",
             1,
             FRESH_END,
@@ -15765,6 +15866,43 @@ fn fixture_participant_coverage(path: &std::path::Path, now: i64) {
     .unwrap();
 }
 
+fn assert_wrapper_scope(out: &std::path::Path, cache: &std::path::Path) {
+    let coverage = WalletCache::open_read_only(cache)
+        .unwrap()
+        .participant_discovery_coverage()
+        .unwrap()
+        .unwrap();
+    let series = serde_json::to_value(coverage.scope.series.unwrap()).unwrap();
+    assert_eq!(
+        series,
+        serde_json::json!([{"id":"7","slug":"btc-up-or-down-15m"}])
+    );
+    let scope: Value =
+        serde_json::from_slice(&std::fs::read(out.join("market_scope.json")).unwrap()).unwrap();
+    assert_eq!(scope["series"], series);
+    let reads = scope["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|page| page["kind"] == "series")
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0]["series_id"], "7");
+    assert!(reads[0]["url"].as_str().unwrap().ends_with("/series/7"));
+}
+
+fn assert_wrapper_v2_requests(requests: &[String], frozen_activity: bool) {
+    for request in requests {
+        let route = request.split_whitespace().nth(1).unwrap();
+        let url = reqwest::Url::parse(&format!("http://fixture{route}")).unwrap();
+        assert!(
+            !matches!(url.path(), "/trades" | "/v1/leaderboard"),
+            "{request}"
+        );
+        assert!(frozen_activity || url.path() != "/activity", "{request}");
+    }
+}
+
 /// A loopback stand-in for the data API, CLOB, Gamma and Supabase that the real wrapper calls.
 struct FixtureVenue {
     address: std::net::SocketAddr,
@@ -15780,6 +15918,7 @@ impl FixtureVenue {
         markets: Vec<Value>,
         series: Value,
         scope_events: Vec<Value>,
+        frozen_activity: bool,
     ) -> Self {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
@@ -15839,7 +15978,14 @@ impl FixtureVenue {
                 let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
                 server_requests.lock().unwrap().push(first.to_owned());
                 let (status, body) = match url.path() {
-                    "/v1/leaderboard" => ("200 OK", serde_json::json!([{"proxyWallet":WALLET}])),
+                    "/activity" | "/trades" | "/v1/leaderboard"
+                        if url.path() != "/activity" || !frozen_activity =>
+                    {
+                        (
+                            "410 Gone",
+                            serde_json::json!({"error":"Data API v1 retired"}),
+                        )
+                    }
                     "/activity" => {
                         let start = query["start"].parse::<i64>().unwrap();
                         let end = query["end"].parse::<i64>().unwrap();
@@ -15883,13 +16029,25 @@ impl FixtureVenue {
                             .unwrap();
                         ("200 OK", serde_json::from_slice(&body).unwrap())
                     }
-                    "/trades" => {
-                        assert_eq!(query["takerOnly"], "false");
-                        let start = query["start"].parse::<i64>().unwrap();
-                        let end = query["end"].parse::<i64>().unwrap();
-                        let offset = query["offset"].parse::<usize>().unwrap();
-                        let conditions = query["market"].split(',').collect::<Vec<_>>();
-                        let selected = server_rows
+                    "/v2/trades" => {
+                        assert_eq!(query["taker_only"], "false");
+                        assert_eq!(query["filter_amount"], "0.0000001");
+                        assert!(!query.contains_key("start") && !query.contains_key("end"));
+                        let offset = query.get("cursor").map_or(0, |cursor| {
+                            cursor
+                                .strip_prefix("trades:")
+                                .unwrap()
+                                .parse::<usize>()
+                                .unwrap()
+                        });
+                        if offset == 0 {
+                            assert_eq!(query["limit"], "1000");
+                        } else {
+                            assert!(!query.contains_key("limit"));
+                        }
+                        let conditions = query["condition"].split(',').collect::<Vec<_>>();
+                        assert!(conditions.len() <= 20);
+                        let mut selected = server_rows
                             .lock()
                             .unwrap()
                             .iter()
@@ -15898,21 +16056,25 @@ impl FixtureVenue {
                                     && row["conditionId"]
                                         .as_str()
                                         .is_some_and(|id| conditions.contains(&id))
-                                    && row["timestamp"].as_i64().unwrap() >= start
-                                    && row["timestamp"].as_i64().unwrap() <= end
                             })
-                            .skip(offset)
-                            .take(10_000)
                             .cloned()
                             .collect::<Vec<_>>();
-                        ("200 OK", Value::from(selected))
+                        selected.sort_by_key(|row| {
+                            std::cmp::Reverse(row["timestamp"].as_i64().unwrap())
+                        });
+                        let has_more = offset + 1000 < selected.len();
+                        let data = selected.iter().skip(offset).take(1000).map(|row| serde_json::json!({"proxy_wallet":row["proxyWallet"],"timestamp":row["timestamp"]})).collect::<Vec<_>>();
+                        (
+                            "200 OK",
+                            serde_json::json!({"data":data,"pagination":{"limit":1000,"offset":offset,"has_more":has_more,"next_cursor":has_more.then(||format!("trades:{}",offset+1000))}}),
+                        )
                     }
                     "/markets" => (
                         "200 OK",
                         serde_json::json!({"data":markets,"next_cursor":"LTE="}),
                     ),
                     "/series" => ("200 OK", series.clone()),
-                    // A pinned series read by id (`market-scope --series`).
+                    // Read the explicit coverage set by id (`market-scope --series`).
                     path if path.starts_with("/series/") => series
                         .as_array()
                         .unwrap()
@@ -18673,7 +18835,7 @@ async fn history_v3_collection_reports_run_timing_and_writer_counts() {
     impl PageFetcher for LastReadFetcher<'_> {
         async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
             let bytes = self.source.fetch_page(url).await?;
-            if self.source.calls.lock().unwrap().len() == 36 {
+            if self.source.calls.lock().unwrap().len() == 35 {
                 self.barrier.wait();
             }
             Ok(bytes)
@@ -18712,7 +18874,7 @@ async fn history_v3_collection_reports_run_timing_and_writer_counts() {
     )
     .await
     .unwrap();
-    assert_eq!(source.calls.lock().unwrap().len(), 36);
+    assert_eq!(source.calls.lock().unwrap().len(), 35);
     let fields = take(7, 1, 33, 0, 1, 0, 0, 2);
     assert!(
         fields["producer_blocked_ms"].as_u64().unwrap() > 0,
@@ -19135,8 +19297,17 @@ async fn collection_766_zero_row_full_partial_deletes_certified_tail() {
     struct EmptyPrefix<'a>(&'a DatasetFetcher);
     impl PageFetcher for EmptyPrefix<'_> {
         async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
-            if url.contains("sortDirection=ASC") {
-                return Ok(serde_json::to_vec(&vec![self.0.rows[0].clone()]).unwrap());
+            let parsed = reqwest::Url::parse(url).unwrap();
+            let end = parsed
+                .query_pairs()
+                .find(|(key, _)| key == "end")
+                .unwrap()
+                .1
+                .parse::<i64>()
+                .unwrap();
+            // The over-cap probe is discarded; the exact retry now has no rows.
+            if end < FRESH_END {
+                return Ok(activity_response(url, b"[]".to_vec()));
             }
             self.0.fetch_page(url).await
         }
@@ -19169,7 +19340,7 @@ async fn collection_766_zero_row_full_partial_deletes_certified_tail() {
     assert_eq!(proof["aggregate_count"], 0);
     assert_eq!(proof["source_row_count"], 0);
     assert_eq!(proof["acquisition"]["fetched_source_row_count"], 0);
-    assert_eq!(proof["acquisition"]["fixed_end_unix"], FRESH_END - 20_001);
+    assert_eq!(proof["acquisition"]["fixed_end_unix"], FRESH_END - 15_002);
     assert_eq!(history_v3_wallet_count(&side), 0);
     let fields = collection_766_events(&log, "activity wallet excluded from generation");
     assert_eq!(fields.len(), 1);
@@ -22140,8 +22311,8 @@ async fn seeded_cache_publishes_exact_entries() {
 /// FAIL (end to end, real wrapper): a cache provisioned by `cache-init` (carrying drops) does not
 /// collect a bulk root with complete histories, stop at `prepare` with nothing published, publish the
 /// saved request on resume, run an ordinary successor, and keep a research link for each cycle; or
-/// the leaderboard is still requested, discovery walks an unpinned 5-minute series, or ranking leaves
-/// the pinned 15-minute series.
+/// any retired v1 route is requested, discovery walks a 5-minute series, or ranking differs from
+/// the explicit participant coverage set.
 #[tokio::test]
 async fn real_wrapper_seeded_loop_prepares_and_publishes() {
     real_wrapper_seeded_publication(false).await;
@@ -22276,6 +22447,7 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
         serde_json::json!([{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"},
                            {"id":"8","slug":"btc-up-or-down-5m","recurrence":"5m"}]),
         scope_events,
+        false,
     );
     let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for tree in ["scripts", "deploy"] {
@@ -22300,7 +22472,7 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
     let address = venue.address;
     let env = |cutover: &str| {
         std::fs::write(dir.path().join(".env"), format!(
-            "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_TOP_N=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER={cutover}\nPE_RANKER_ENGINE=duck\nPE_BOOTSTRAP_MARKET_RECURRENCES='[\"15m\",\"5m\"]'\nPE_RANK_MARKET_RECURRENCES=15m\nPE_RANK_MARKET_SERIES=7:btc-up-or-down-15m\nPE_RANK_RESEARCH_LINK_DIR={}\nWIN_END={}\nPE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS={}\n",
+            "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_TOP_N=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER={cutover}\nPE_RANKER_ENGINE=duck\nPE_BOOTSTRAP_MARKET_RECURRENCES='[\"15m\",\"5m\"]'\nPE_RANK_MARKET_RECURRENCES=15m\nPE_RANK_RESEARCH_LINK_DIR={}\nWIN_END={}\nPE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS={}\n",
             dir.path().join("watchlist.json").display(), research.display(), time::OffsetDateTime::from_unix_timestamp(cycle_end).unwrap().date(), if supersession { 0 } else { 20_000 })).unwrap();
     };
     let python = Command::new("python3")
@@ -22354,7 +22526,7 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
         let prior = data.join(format!("wallet_cache.{name}.prior.db"));
         let build = out.join("cache_build_manifest.json");
         let configuration = serde_json::json!({"cache_lane":"fresh_v2",
-            "rank_market_series":"7:btc-up-or-down-15m", "rank_market_recurrences":"15m",
+            "rank_market_recurrences":"15m",
             "market_recurrences":"[\"15m\",\"5m\"]", "research_link_dir":research});
         std::fs::write(
             out.join("cycle_configuration.json"),
@@ -22581,8 +22753,6 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
             &[
                 "winner-discovery",
                 "--defer-activation",
-                "--series",
-                "7:btc-up-or-down-15m",
                 "--end-date-min",
                 &floor,
                 "--recurrences",
@@ -22785,6 +22955,8 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
         );
         assert!(!pending.exists());
         assert!(linked(&out));
+        assert_wrapper_scope(&out, &fixed);
+        assert_wrapper_v2_requests(&venue.requests.lock().unwrap(), false);
         venue.stop();
         return;
     }
@@ -22804,15 +22976,16 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
     assert!(first.join("ranking_publish_request.json").is_file());
     assert!(data.join("eval-results/rank_and_push.pending").exists());
     assert!(linked(&first));
+    assert_wrapper_scope(&first, &fixed);
     let scope: Value =
         serde_json::from_slice(&std::fs::read(first.join("market_scope.json")).unwrap()).unwrap();
     assert_eq!(scope["recurrence"], "15m");
-    // The research period's pin: exactly the pinned series, as the frozen merger requires.
+    // The ranking scope is exactly the set certified by participant coverage.
     assert_eq!(
         scope["series"],
         serde_json::json!([{"id": "7", "slug": "btc-up-or-down-15m"}])
     );
-    // Read by id, not listed: one series read, for the pinned series.
+    // Ranking reads every covered series by id.
     let reads: Vec<&Value> = scope["pages"]
         .as_array()
         .unwrap()
@@ -22848,7 +23021,7 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
     assert!(linked(&run_dir(&stdout)));
     let requests = venue.requests.lock().unwrap().clone();
     assert!(
-        !requests.iter().any(|request| request.contains("/series?")),
+        requests.iter().any(|request| request.contains("/series?")),
         "{requests:?}"
     );
     let expected_floor = time::OffsetDateTime::from_unix_timestamp(cycle_end - 181 * DAY).unwrap();
@@ -22872,7 +23045,7 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
     assert!(
         requests
             .iter()
-            .any(|request| request.contains("/trades?") && request.contains("takerOnly=false"))
+            .any(|request| request.contains("/v2/trades?") && request.contains("taker_only=false"))
     );
     assert!(
         !requests
@@ -22886,6 +23059,7 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
             .any(|request| request.contains("/events/keyset") && request.contains("series_id=8")),
         "{requests:?}"
     );
+    assert_wrapper_v2_requests(&venue.requests.lock().unwrap(), false);
     venue.stop();
 }
 
