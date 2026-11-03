@@ -5384,6 +5384,7 @@ async fn activity_writer_error_cancels_pending_reads_and_rolls_back_wallet() {
 async fn interrupt_fresh_candidate_after_one_receipt(dir: &TempDir, side: &std::path::Path) {
     seed_initial_candidate(side);
     migrate_cache_v2(side, &write_build_manifest(dir, side)).unwrap();
+    collection_admit_v1(side, 1, FRESH_END + 100, &[]).await;
     let error = populate_activity_fresh_v2(
         side,
         &InterruptAfterFirst {
@@ -8936,6 +8937,8 @@ struct DatasetFetcher {
     rows: Vec<Value>,
     calls: Mutex<Vec<(String, i64, i64)>>,
     index: Mutex<DatasetIndex>,
+    urls: Mutex<Vec<String>>,
+    v2_page_sizes: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -8947,13 +8950,41 @@ struct DatasetIndex {
 
 impl PageFetcher for DatasetFetcher {
     async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        self.urls.lock().unwrap().push(url.to_owned());
         let url = reqwest::Url::parse(url).unwrap();
         let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        let v2 = url.path() == "/v2/activity";
         let wallet = query["user"].clone();
         let start = query["start"].parse::<i64>().unwrap();
         let end = query["end"].parse::<i64>().unwrap();
-        let offset = query["offset"].parse::<usize>().unwrap();
-        let limit = query["limit"].parse::<usize>().unwrap();
+        let (offset, page_index, limit) = if v2 {
+            assert_eq!(query["type"], "TRADE,SPLIT,MERGE,REDEEM,CONVERSION");
+            assert_eq!(query["sort_direction"], "ASC");
+            assert!(!query.contains_key("offset"));
+            if let Some(cursor) = query.get("cursor") {
+                assert!(!query.contains_key("limit"));
+                let parts = cursor
+                    .strip_prefix("activity:")
+                    .unwrap()
+                    .split(':')
+                    .collect::<Vec<_>>();
+                (parts[0].parse().unwrap(), parts[1].parse().unwrap(), 1000)
+            } else {
+                assert_eq!(query["limit"], "1000");
+                (0, 0, 1000)
+            }
+        } else {
+            (
+                query["offset"].parse::<usize>().unwrap(),
+                0,
+                query["limit"].parse::<usize>().unwrap(),
+            )
+        };
+        let limit = if v2 {
+            self.v2_page_sizes.get(page_index).copied().unwrap_or(limit)
+        } else {
+            limit
+        };
         self.calls
             .lock()
             .unwrap()
@@ -8990,7 +9021,11 @@ impl PageFetcher for DatasetFetcher {
             index.newest_end = end.max(index.newest_end);
         }
         let Some(positions) = index.wallets.get(&wallet) else {
-            return Ok(b"[]".to_vec());
+            return Ok(if v2 {
+                v2_activity_envelope(&[], offset, page_index, false)
+            } else {
+                b"[]".to_vec()
+            });
         };
         let lo = positions.partition_point(|position| {
             self.rows[*position]["timestamp"].as_i64().unwrap() < start
@@ -8998,7 +9033,7 @@ impl PageFetcher for DatasetFetcher {
         let hi = positions
             .partition_point(|position| self.rows[*position]["timestamp"].as_i64().unwrap() <= end);
         let window = &positions[lo..hi];
-        let rows = if query["sortDirection"] == "ASC" {
+        let rows = if v2 || query["sortDirection"] == "ASC" {
             window
                 .iter()
                 .skip(offset)
@@ -9032,8 +9067,48 @@ impl PageFetcher for DatasetFetcher {
             }
             selected
         };
-        Ok(serde_json::to_vec(&rows).unwrap())
+        Ok(if v2 {
+            v2_activity_envelope(
+                &rows,
+                offset,
+                page_index,
+                offset + rows.len() < window.len(),
+            )
+        } else {
+            serde_json::to_vec(&rows).unwrap()
+        })
     }
+}
+
+fn v2_activity_envelope(
+    rows: &[&Value],
+    offset: usize,
+    page_index: usize,
+    has_more: bool,
+) -> Vec<u8> {
+    let data = rows
+        .iter()
+        .map(|row| {
+            let mut row = (*row).clone();
+            for (old, new) in [
+                ("proxyWallet", "proxy_wallet"),
+                ("conditionId", "condition_id"),
+                ("asset", "token_id"),
+                ("transactionHash", "transaction_hash"),
+                ("outcomeIndex", "outcome_index"),
+                ("usdcSize", "usdc_size"),
+            ] {
+                if let Some(value) = row.as_object_mut().unwrap().remove(old) {
+                    row[new] = value;
+                }
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&serde_json::json!({
+        "data":data, "pagination":{"limit":1000,"offset":offset,"has_more":has_more,
+        "next_cursor":has_more.then(|| format!("activity:{}:{}", offset + rows.len(), page_index + 1))}
+    })).unwrap()
 }
 
 fn fixture_market(market: &str) -> String {
@@ -15796,6 +15871,18 @@ impl FixtureVenue {
                             ),
                         )
                     }
+                    "/v2/activity" => {
+                        let source = DatasetFetcher {
+                            rows: server_rows.lock().unwrap().clone(),
+                            ..Default::default()
+                        };
+                        let body = tokio::runtime::Builder::new_current_thread()
+                            .build()
+                            .unwrap()
+                            .block_on(source.fetch_page(url.as_str()))
+                            .unwrap();
+                        ("200 OK", serde_json::from_slice(&body).unwrap())
+                    }
                     "/trades" => {
                         assert_eq!(query["takerOnly"], "false");
                         let start = query["start"].parse::<i64>().unwrap();
@@ -19867,6 +19954,11 @@ async fn collection_admit(side: &std::path::Path, generation: u64, end: i64, ful
     .unwrap_err();
 }
 
+async fn collection_admit_v1(side: &std::path::Path, generation: u64, end: i64, full: &[String]) {
+    collection_admit(side, generation, end, full).await;
+    freeze_identity_four(side);
+}
+
 async fn collection_run(
     side: &std::path::Path,
     fetcher: &dyn pe_source_polymarket_public::ReconciliationFetcher,
@@ -19954,7 +20046,7 @@ async fn collection_747_progress_resume_never_ranked_early_and_same_head_equalit
     let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
     for generation in 1..=3 {
         let end = FRESH_END + i64::try_from(generation).unwrap() - 1;
-        collection_admit(&side, generation, end, &[]).await;
+        collection_admit_v1(&side, generation, end, &[]).await;
         source.source.calls.lock().unwrap().clear();
         collection_run(
             &side,
@@ -20023,6 +20115,7 @@ async fn collection_747_progress_resume_never_ranked_early_and_same_head_equalit
         } else {
             Vec::new()
         };
+        collection_admit_v1(&comparator, generation, end, &full).await;
         history_v3_collect(&comparator, &fast, generation, end, &full)
             .await
             .unwrap();
@@ -20056,7 +20149,7 @@ async fn collection_747_expired_probe_and_mid_window_deadlines_keep_first_window
         if let Some(call) = failure {
             source.failures.insert(call, 0);
         }
-        collection_admit(&side, 1, FRESH_END, &[]).await;
+        collection_admit_v1(&side, 1, FRESH_END, &[]).await;
         collection_run(
             &side,
             &source,
@@ -20087,7 +20180,7 @@ async fn collection_747_retry_after_is_deadline_bounded_and_no_progress_keeps_mo
     let mut source = CollectionDataset::new(collection_rows(WALLET, 6000), 1);
     source.failures.insert(1, 0); // Probe falls through after internal retries exhaust.
     source.failures.insert(2, 300); // Lookup's Retry-After exceeds the remaining budget.
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     let began = tokio::time::Instant::now();
     collection_run(
         &side,
@@ -20103,7 +20196,7 @@ async fn collection_747_retry_after_is_deadline_bounded_and_no_progress_keeps_mo
     let proof = collection_proof(&side, 1, WALLET);
     assert_eq!(proof["acquisition"]["aggregation_status"], "not_attempted");
     assert_eq!(proof["acquisition"]["fixed_end_unix"], FRESH_END);
-    collection_admit(&side, 2, FRESH_END + 1, &[]).await;
+    collection_admit_v1(&side, 2, FRESH_END + 1, &[]).await;
     let resumed = CollectionDataset::new(source.source.rows.clone(), 1);
     collection_run(
         &side,
@@ -20143,7 +20236,7 @@ async fn collection_747_zero_row_partial_is_an_authenticated_history_part() {
         rows: collection_rows(WALLET, 6000),
         ..Default::default()
     };
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     let held = Arc::new(std::sync::atomic::AtomicU64::new(2_000_000));
     collection_run(
         &side,
@@ -20167,7 +20260,7 @@ async fn collection_747_zero_row_partial_is_an_authenticated_history_part() {
     )
     .await
     .unwrap();
-    collection_admit(&side, 2, FRESH_END + 1, &[]).await;
+    collection_admit_v1(&side, 2, FRESH_END + 1, &[]).await;
     collection_run(
         &side,
         &source,
@@ -20201,7 +20294,7 @@ async fn collection_747_partial_full_incremental_no_progress_completion_and_expl
         } else {
             Vec::new()
         };
-        collection_admit(&side, generation, end, &full).await;
+        collection_admit_v1(&side, generation, end, &full).await;
         assert_eq!(
             fresh_record(&side)["deferred_wallets"],
             serde_json::json!([])
@@ -20275,7 +20368,7 @@ async fn collection_747_growing_history_completes_when_progress_exceeds_arrivals
                 end,
             ));
         }
-        collection_admit(&side, generation, end, &[]).await;
+        collection_admit_v1(&side, generation, end, &[]).await;
         let held = Arc::new(std::sync::atomic::AtomicU64::new(2_000_000));
         collection_run(&side, &source, end, Arc::clone(&held), None)
             .await
@@ -20346,7 +20439,7 @@ async fn collection_747_shared_count_bounds_and_releases_more_than_64_wallets_be
             .collect(),
         ..Default::default()
     };
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     assert_eq!(fresh_record(&side)["wallets"].as_array().unwrap().len(), 66);
     let held = Arc::new(std::sync::atomic::AtomicU64::new(2_000_000));
     let fetcher = WatchedDataset {
@@ -20418,7 +20511,7 @@ async fn collection_747_partial_insert_replace_rollback_and_release_count() {
         } else {
             Vec::new()
         };
-        collection_admit(&side, generation, FRESH_END, &full).await;
+        collection_admit_v1(&side, generation, FRESH_END, &full).await;
         let before = query_values(
             &side,
             "SELECT * FROM activity_groups_v2 ORDER BY source_trade_id",
@@ -20477,7 +20570,7 @@ async fn collection_747_completed_wallet_detects_tampered_partial_rows_at_finali
     let dir = TempDir::new().unwrap();
     let side = dataset_candidate(&dir, "tamper.db", &[]);
     let source = CollectionDataset::new(collection_rows(WALLET, 6000), 1);
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     collection_run(
         &side,
         &source,
@@ -20488,7 +20581,7 @@ async fn collection_747_completed_wallet_detects_tampered_partial_rows_at_finali
     .await
     .unwrap();
     history_v3_damage_connection(&side).execute("UPDATE activity_groups_v2 SET share_amount_str = '2.250001' WHERE source_time_unix = ?1", [FRESH_END - 20_000]).unwrap();
-    collection_admit(&side, 2, FRESH_END + 1, &[]).await;
+    collection_admit_v1(&side, 2, FRESH_END + 1, &[]).await;
     collection_run(
         &side,
         &source.source,
@@ -20535,8 +20628,8 @@ async fn collection_747_probe_complete_urls_and_fixed_receipts_match_existing_re
         },
         urls: Mutex::new(Vec::new()),
     };
-    collection_admit(&side, 1, FRESH_END, &[]).await;
-    collection_admit(&other, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&other, 1, FRESH_END, &[]).await;
     let wallet = WalletAddress::from_hex(WALLET).unwrap();
     let mut prior = pe_source_polymarket_public::fetch_complete_activity_semantic(
         &source,
@@ -20604,7 +20697,7 @@ async fn collection_747_large_certificate_skips_probe_when_full_history_has_shru
         rows: source.rows[..3].to_vec(),
         ..Default::default()
     };
-    collection_admit(&side, 2, FRESH_END + 1, &[WALLET.to_owned()]).await;
+    collection_admit_v1(&side, 2, FRESH_END + 1, &[WALLET.to_owned()]).await;
     let comparator = dir.path().join("hint-probe.db");
     std::fs::copy(&side, &comparator).unwrap();
     collection_run(
@@ -20759,7 +20852,7 @@ async fn collection_747_receipt_shapes_reject_short_complete_bad_partial_and_sho
         } else {
             let side = dataset_candidate(&dir, "shape.db", &[]);
             let source = CollectionDataset::new(collection_rows(WALLET, 6000), 1);
-            collection_admit(&side, 1, FRESH_END, &[]).await;
+            collection_admit_v1(&side, 1, FRESH_END, &[]).await;
             collection_run(
                 &side,
                 &source,
@@ -20894,7 +20987,7 @@ async fn collection_747_group_across_windows_fails_aggregation_at_partial_end() 
     // A later row of the same group that is not an exact copy stays ambiguous.
     rows[4999]["size"] = serde_json::json!("2.500002");
     let source = CollectionDataset::new(rows, 1);
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     collection_run(
         &side,
         &source,
@@ -20912,7 +21005,7 @@ async fn collection_747_group_across_windows_fails_aggregation_at_partial_end() 
     );
     assert!(proof["acquisition"]["fixed_end_unix"].as_i64().unwrap() < FRESH_END);
     assert_eq!(history_v3_wallet_count(&side), 0);
-    collection_admit(&side, 2, FRESH_END + 1, &[]).await;
+    collection_admit_v1(&side, 2, FRESH_END + 1, &[]).await;
     assert_eq!(
         fresh_record(&side)["full_read_wallets"],
         serde_json::json!([WALLET])
@@ -21000,7 +21093,7 @@ async fn collection_747_lookup_disagreement_keeps_earlier_windows_only() {
         },
         lookups: AtomicUsize::new(0),
     };
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     collection_run(
         &side,
         &source,
@@ -21031,7 +21124,7 @@ async fn collection_747_cross_generation_collision_records_partial_end_and_reads
     let source = CollectionDataset::new(rows, 1);
     for generation in 1..=2 {
         let end = FRESH_END + i64::try_from(generation).unwrap() - 1;
-        collection_admit(&side, generation, end, &[]).await;
+        collection_admit_v1(&side, generation, end, &[]).await;
         collection_run(
             &side,
             &source,
@@ -21049,7 +21142,7 @@ async fn collection_747_cross_generation_collision_records_partial_end_and_reads
     );
     assert!(proof["acquisition"]["fixed_end_unix"].as_i64().unwrap() < FRESH_END + 1);
     assert_eq!(history_v3_wallet_count(&side), 4999);
-    collection_admit(&side, 3, FRESH_END + 2, &[]).await;
+    collection_admit_v1(&side, 3, FRESH_END + 2, &[]).await;
     assert_eq!(
         fresh_record(&side)["full_read_wallets"],
         serde_json::json!([WALLET])
@@ -21112,7 +21205,7 @@ async fn collection_747_quiet_certificate_partial_then_empty_completion_stays_ac
             FRESH_END + index,
         ));
     }
-    collection_admit(&side, 2, FRESH_END + 6001, &[WALLET.to_owned()]).await;
+    collection_admit_v1(&side, 2, FRESH_END + 6001, &[WALLET.to_owned()]).await;
     collection_run(
         &side,
         &source,
@@ -21193,7 +21286,7 @@ async fn collection_747_external_write_refuses_partial_commit_and_releases_count
         rows: collection_rows(WALLET, 6000),
         ..Default::default()
     };
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     let fetcher = OutsideWrite {
         source: &source,
         side: &side,
@@ -21232,7 +21325,7 @@ async fn collection_747_window_retry_keeps_bounds_and_finishes_internal_backoff_
         let side = dataset_candidate(&dir, "window-retry.db", &[]);
         let mut source = CollectionDataset::new(collection_rows(WALLET, 12_000), 1);
         source.failures.insert(24, retry_after);
-        collection_admit(&side, 1, FRESH_END, &[]).await;
+        collection_admit_v1(&side, 1, FRESH_END, &[]).await;
         let began = tokio::time::Instant::now();
         collection_run(
             &side,
@@ -23447,4 +23540,1131 @@ async fn forge_822_seed_carries_unrepresentable_drop_without_trigger_rows() {
         report["differences_by_rule"]["certified_cumulative_scope_drop"],
         1
     );
+}
+
+// Data API v2 activity: identity 5 / acquisition 4 retains only complete cursor windows.
+#[tokio::test]
+async fn collection_v2_probe_complete_and_single_second_capacity() {
+    for count in [0_usize, 1000, 5000, 5001, 5499, 5500] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "v2-capacity.db", &[]);
+        let source = DatasetFetcher {
+            rows: (0..count)
+                .map(|index| dataset_row(WALLET, "0xa", &format!("row-{index:08}"), "BUY", 1))
+                .collect(),
+            ..Default::default()
+        };
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let result = collection_run(&side, &source, FRESH_END, Arc::clone(&held), None).await;
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+        if count == 5500 {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("one-second activity window")
+            );
+            assert!(receipt(&side, 1, WALLET).is_none());
+            assert_eq!(history_v3_wallet_count(&side), 0);
+        } else {
+            result.unwrap();
+            let proof = collection_proof(&side, 1, WALLET);
+            assert_eq!(proof["acquisition"]["version"], 4);
+            assert_eq!(proof["acquisition"]["disposition"], "complete");
+            assert_eq!(proof["source_row_count"], count);
+            let pages = proof["pages"].as_array().unwrap();
+            assert_eq!(pages.len(), count.div_ceil(1000).max(1));
+            assert!(
+                pages
+                    .iter()
+                    .all(|page| page["schema_version"] == 3 && page["parser_version"] == 2)
+            );
+            assert_eq!(pages.last().unwrap()["has_more"], false);
+            assert!(pages.last().unwrap()["next_cursor"].is_null());
+            let before = query_values(
+                &side,
+                "SELECT page_evidence_json, acquisition_json FROM activity_wallet_coverage_staging_v2",
+            );
+            collection_run(
+                &side,
+                &HistoryV3StopFetcher,
+                FRESH_END,
+                Arc::clone(&held),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                before,
+                query_values(
+                    &side,
+                    "SELECT page_evidence_json, acquisition_json FROM activity_wallet_coverage_staging_v2"
+                )
+            );
+        }
+        let urls = source.urls.lock().unwrap();
+        assert!(
+            urls.iter()
+                .all(|url| reqwest::Url::parse(url).unwrap().path() == "/v2/activity")
+        );
+        assert_eq!(
+            urls.len(),
+            if count == 5500 {
+                12
+            } else {
+                count.div_ceil(1000).max(1)
+            }
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_v2_expired_and_failed_probe_still_keeps_exact_first_window() {
+    for (budget, failure, expected_rows, calls) in [
+        (0, None, 4999, 11),
+        (1, Some(1), 4999, 12),
+        (1, Some(6), 4999, 17),
+        (18, None, 9998, 22),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "v2-deadline.db", &[]);
+        let mut source = CollectionDataset::new(collection_rows(WALLET, 12_000), 1);
+        if let Some(call) = failure {
+            source.failures.insert(call, 0);
+        }
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        collection_run(
+            &side,
+            &source,
+            FRESH_END,
+            Arc::clone(&held),
+            Some(std::time::Duration::from_secs(budget)),
+        )
+        .await
+        .unwrap();
+        let proof = collection_proof(&side, 1, WALLET);
+        assert_eq!(
+            proof["acquisition"]["fetched_source_row_count"], expected_rows,
+            "budget={budget}, failure={failure:?}"
+        );
+        assert_eq!(proof["acquisition"]["aggregation_status"], "complete");
+        assert_eq!(history_v3_wallet_count(&side), expected_rows);
+        assert_eq!(source.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+        let pages = proof["pages"].as_array().unwrap();
+        assert_eq!(pages[0]["bounds"]["end"], FRESH_END - 15_002);
+        assert!(pages.iter().all(|page| page["bounds"]["end"] != FRESH_END));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_v2_retry_after_is_deadline_bounded_and_no_progress_keeps_full_mode() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "v2-retry.db", &[]);
+    let mut source = CollectionDataset::new(collection_rows(WALLET, 6000), 1);
+    source.failures.insert(1, 0);
+    source.failures.insert(2, 300);
+    collection_admit(&side, 1, FRESH_END, &[]).await;
+    let began = tokio::time::Instant::now();
+    collection_run(
+        &side,
+        &source,
+        FRESH_END,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Some(std::time::Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(began.elapsed(), std::time::Duration::from_secs(10));
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    let proof = collection_proof(&side, 1, WALLET);
+    assert_eq!(proof["acquisition"]["aggregation_status"], "not_attempted");
+    assert!(proof["pages"].as_array().unwrap().is_empty());
+    collection_admit(&side, 2, FRESH_END + 1, &[]).await;
+    let resumed = CollectionDataset::new(source.source.rows.clone(), 1);
+    collection_run(
+        &side,
+        &resumed,
+        FRESH_END + 1,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Some(std::time::Duration::from_secs(1)),
+    )
+    .await
+    .unwrap();
+    let proof = collection_proof(&side, 2, WALLET);
+    assert_eq!(proof["acquisition"]["mode"], "full");
+    assert_eq!(proof["acquisition"]["start_exclusive"], 0);
+    assert_eq!(proof["acquisition"]["fetched_source_row_count"], 4999);
+    assert_eq!(resumed.calls.load(Ordering::SeqCst), 11);
+}
+
+#[tokio::test]
+async fn collection_v2_terminal_crossing_page_is_discarded_and_inflight_stays_below_6500() {
+    for sizes in [
+        vec![],
+        vec![1000, 1000, 1000, 1000, 1000, 499, 1000],
+        vec![1; 5500],
+    ] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "v2-crossing.db", &[]);
+        let source = DatasetFetcher {
+            rows: collection_rows(WALLET, 6499),
+            v2_page_sizes: sizes,
+            ..Default::default()
+        };
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        collection_run(
+            &side,
+            &source,
+            FRESH_END,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            None,
+        )
+        .await
+        .unwrap();
+        let proof = collection_proof(&side, 1, WALLET);
+        assert_eq!(proof["source_row_count"], 6499);
+        assert!(
+            proof["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|page| !(page["bounds"]["start"] == 0 && page["bounds"]["end"] == FRESH_END))
+        );
+        // The next request's seek offset proves how many rows the current attempt retained.
+        // Include the discarded crossing response, including the largest possible 6,499-row attempt.
+        let urls = source.urls.lock().unwrap();
+        let mut peak = 0;
+        let mut crossing = false;
+        for url in urls.iter() {
+            let url = reqwest::Url::parse(url).unwrap();
+            let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+            let (offset, index) = query.get("cursor").map_or((0, 0), |cursor| {
+                let parts = cursor
+                    .strip_prefix("activity:")
+                    .unwrap()
+                    .split(':')
+                    .collect::<Vec<_>>();
+                (
+                    parts[0].parse::<usize>().unwrap(),
+                    parts[1].parse::<usize>().unwrap(),
+                )
+            });
+            let start = query["start"].parse::<i64>().unwrap();
+            let end = query["end"].parse::<i64>().unwrap();
+            let available = source
+                .rows
+                .iter()
+                .filter(|row| (start..=end).contains(&row["timestamp"].as_i64().unwrap()))
+                .count();
+            let retained =
+                (offset + source.v2_page_sizes.get(index).copied().unwrap_or(1000)).min(available);
+            assert!(offset <= 5499);
+            assert!(retained < 6500);
+            peak = peak.max(retained);
+            crossing |= retained > 5499;
+        }
+        assert!(crossing);
+        if source.v2_page_sizes.get(5) == Some(&499) {
+            assert_eq!(peak, 6499);
+        }
+    }
+}
+
+#[tokio::test]
+async fn collection_v2_exact_retry_growth_stops_without_committing_discarded_pages() {
+    struct Growing {
+        source: DatasetFetcher,
+    }
+    impl PageFetcher for Growing {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            let query = parsed
+                .query_pairs()
+                .into_owned()
+                .collect::<BTreeMap<_, _>>();
+            if query["end"] == FRESH_END.to_string() {
+                return self.source.fetch_page(url).await;
+            }
+            let mut changed = parsed;
+            let pairs = query
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        if key == "end" {
+                            FRESH_END.to_string()
+                        } else {
+                            value
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            changed.query_pairs_mut().clear().extend_pairs(pairs);
+            let mut body: Value =
+                serde_json::from_slice(&self.source.fetch_page(changed.as_str()).await?).unwrap();
+            let end = reqwest::Url::parse(url)
+                .unwrap()
+                .query_pairs()
+                .find(|(key, _)| key == "end")
+                .unwrap()
+                .1
+                .parse::<i64>()
+                .unwrap();
+            for row in body["data"].as_array_mut().unwrap() {
+                row["timestamp"] = Value::from(end);
+            }
+            Ok(serde_json::to_vec(&body).unwrap())
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "v2-grew.db", &[]);
+    let source = Growing {
+        source: DatasetFetcher {
+            rows: collection_rows(WALLET, 6000),
+            ..Default::default()
+        },
+    };
+    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_run(
+        &side,
+        &source,
+        FRESH_END,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        None,
+    )
+    .await
+    .unwrap();
+    let proof = collection_proof(&side, 1, WALLET);
+    assert_eq!(
+        proof["exclusion_reason"],
+        "activity window grew between reads"
+    );
+    assert_eq!(proof["acquisition"]["aggregation_status"], "not_attempted");
+    assert!(proof["pages"].as_array().unwrap().is_empty());
+    assert_eq!(history_v3_wallet_count(&side), 0);
+}
+
+#[tokio::test]
+async fn collection_v2_width_growth_and_shared_held_row_partial() {
+    for sparse in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "v2-width.db", &[]);
+        let rows = if sparse {
+            (0..5500)
+                .map(|index| {
+                    dataset_row(
+                        WALLET,
+                        "0xa",
+                        &format!("width-{index}"),
+                        "BUY",
+                        if index < 100 { 1 } else { 2 },
+                    )
+                })
+                .collect()
+        } else {
+            collection_rows(WALLET, 12_000)
+        };
+        let source = DatasetFetcher {
+            rows,
+            ..Default::default()
+        };
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        let held = Arc::new(std::sync::atomic::AtomicU64::new(if sparse {
+            0
+        } else {
+            1_995_001
+        }));
+        collection_run(&side, &source, FRESH_END, Arc::clone(&held), None)
+            .await
+            .unwrap();
+        let proof = collection_proof(&side, 1, WALLET);
+        let pages = proof["pages"].as_array().unwrap();
+        if sparse {
+            assert_eq!(pages[0]["bounds"], serde_json::json!({"start":0,"end":1}));
+            assert_eq!(pages[1]["bounds"], serde_json::json!({"start":1,"end":9}));
+            assert_eq!(pages[7]["bounds"], serde_json::json!({"start":9,"end":17}));
+            assert_eq!(pages[8]["bounds"], serde_json::json!({"start":17,"end":81}));
+            assert_eq!(proof["source_row_count"], 5500);
+            assert_eq!(held.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(proof["acquisition"]["fetched_source_row_count"], 4999);
+            assert_eq!(
+                proof["exclusion_reason"],
+                "activity walk held-row limit reached"
+            );
+            assert_eq!(held.load(Ordering::SeqCst), 1_995_001);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_v2_window_retry_restarts_bounds_and_finishes_page_backoff_after_deadline() {
+    struct InternalBackoff<'a>(&'a CollectionDataset);
+    impl PageFetcher for InternalBackoff<'_> {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            if self.0.calls.load(Ordering::SeqCst) == 18 {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            }
+            self.0.fetch_page(url).await
+        }
+    }
+    for retry_after in [0, 90] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "v2-window-retry.db", &[]);
+        let mut source = CollectionDataset::new(collection_rows(WALLET, 12_000), 1);
+        source.failures.insert(18, retry_after);
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        let began = tokio::time::Instant::now();
+        collection_run(
+            &side,
+            &InternalBackoff(&source),
+            FRESH_END,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Some(std::time::Duration::from_secs(55)),
+        )
+        .await
+        .unwrap();
+        let proof = collection_proof(&side, 1, WALLET);
+        assert_eq!(
+            proof["acquisition"]["fetched_source_row_count"],
+            if retry_after == 0 { 9998 } else { 4999 }
+        );
+        assert_eq!(
+            source.calls.load(Ordering::SeqCst),
+            if retry_after == 0 { 23 } else { 18 }
+        );
+        assert_eq!(
+            began.elapsed(),
+            std::time::Duration::from_secs(if retry_after == 0 { 73 } else { 55 })
+        );
+        let urls = source.source.urls.lock().unwrap();
+        if retry_after == 0 {
+            let last = reqwest::Url::parse(&urls[17]).unwrap();
+            let query = last.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+            assert_eq!(query["start"], (FRESH_END - 15_001).to_string());
+            assert_eq!(query["end"], (FRESH_END - 10_003).to_string());
+            assert!(!query.contains_key("cursor"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn collection_v2_schema_3_tampered_receipts_reject_before_any_write() {
+    for damage in [
+        "mixed",
+        "broken_cursor",
+        "repeated_cursor",
+        "after_terminal",
+        "missing_terminal",
+        "empty_continuation",
+        "user",
+        "type",
+        "start",
+        "end",
+        "direction",
+        "path",
+        "limit",
+        "first_cursor",
+        "later_limit",
+        "large_page",
+        "large_window",
+        "gap",
+        "overlap",
+    ] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "v2-proof.db", &[]);
+        let source = DatasetFetcher {
+            rows: collection_rows(WALLET, 2501),
+            ..Default::default()
+        };
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        let mut proof = collection_proof(&side, 1, WALLET);
+        let pages = proof["pages"].as_array_mut().unwrap();
+        match damage {
+            "mixed" => pages[1]["schema_version"] = Value::from(2),
+            "broken_cursor" | "user" | "type" | "start" | "end" | "direction" | "path"
+            | "limit" | "first_cursor" | "later_limit" => {
+                let index = usize::from(matches!(damage, "broken_cursor" | "later_limit"));
+                let mut url =
+                    reqwest::Url::parse(pages[index]["request_url"].as_str().unwrap()).unwrap();
+                let mut query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+                let (key, value) = match damage {
+                    "broken_cursor" => ("cursor", "broken"),
+                    "user" => ("user", WALLET_B),
+                    "type" => ("type", "TRADE"),
+                    "start" => ("start", "2"),
+                    "end" => ("end", "5"),
+                    "direction" => ("sort_direction", "DESC"),
+                    "limit" => ("limit", "500"),
+                    "first_cursor" => ("cursor", "unexpected"),
+                    _ => ("limit", "1000"),
+                };
+                query.insert(key.to_owned(), value.to_owned());
+                url.query_pairs_mut().clear().extend_pairs(query);
+                if damage == "path" {
+                    url.set_path("/activity");
+                }
+                pages[index]["request_url"] = Value::from(url.to_string());
+            }
+            "repeated_cursor" => pages[1]["next_cursor"] = pages[0]["next_cursor"].clone(),
+            "after_terminal" => {
+                pages[0]["has_more"] = Value::from(false);
+                pages[0]["next_cursor"] = Value::Null;
+            }
+            "missing_terminal" => {
+                pages.pop();
+            }
+            "empty_continuation" => pages[0]["row_count"] = Value::from(0),
+            "large_page" => pages[0]["row_count"] = Value::from(1001),
+            "large_window" => {
+                let terminal = pages.last().unwrap().clone();
+                pages.pop();
+                while pages.len() < 5 {
+                    let page = pages[0].clone();
+                    pages.push(page);
+                }
+                pages.push(terminal);
+                for (index, page) in pages.iter_mut().enumerate() {
+                    let mut url =
+                        reqwest::Url::parse(page["request_url"].as_str().unwrap()).unwrap();
+                    let mut query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+                    query.remove("cursor");
+                    query.remove("limit");
+                    if index == 0 {
+                        query.insert("limit".to_owned(), "1000".to_owned());
+                    } else {
+                        query.insert("cursor".to_owned(), format!("proof-{index}"));
+                    }
+                    url.query_pairs_mut().clear().extend_pairs(query);
+                    page["request_url"] = Value::from(url.to_string());
+                    page["row_count"] = Value::from(if index == 5 { 500 } else { 1000 });
+                    page["has_more"] = Value::from(index != 5);
+                    page["next_cursor"] = if index == 5 {
+                        Value::Null
+                    } else {
+                        Value::from(format!("proof-{}", index + 1))
+                    };
+                }
+            }
+            "gap" | "overlap" => {
+                let hi = FRESH_END - 2;
+                for page in pages.iter_mut() {
+                    collection_page_bounds(page, 0, hi);
+                }
+                let mut extra = pages.last().unwrap().clone();
+                extra["row_count"] = Value::from(0);
+                let mut url = reqwest::Url::parse(extra["request_url"].as_str().unwrap()).unwrap();
+                let mut query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+                query.remove("cursor");
+                query.insert("limit".to_owned(), "1000".to_owned());
+                url.query_pairs_mut().clear().extend_pairs(query);
+                extra["request_url"] = Value::from(url.to_string());
+                collection_page_bounds(
+                    &mut extra,
+                    if damage == "gap" { FRESH_END } else { hi - 1 },
+                    FRESH_END,
+                );
+                pages.push(extra);
+            }
+            _ => unreachable!(),
+        }
+        for page in pages.iter_mut() {
+            if page["next_cursor"].is_null() {
+                page.as_object_mut().unwrap().remove("next_cursor");
+            }
+        }
+        collection_read_commitment(&mut proof);
+        collection_reseal_receipt(&side, &proof);
+        // Resume an unfinished head to isolate page authentication from manifest commitments.
+        history_v3_damage_connection(&side)
+            .execute(
+                "DELETE FROM activity_coverage_manifests_v2 WHERE generation = 1",
+                [],
+            )
+            .unwrap();
+        let before = query_values(&side, "SELECT * FROM activity_wallet_coverage_staging_v2");
+        let history = query_values(&side, "SELECT * FROM activity_groups_v2");
+        let error = collection_run(
+            &side,
+            &HistoryV3StopFetcher,
+            FRESH_END,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("activity"), "{damage}: {error}");
+        assert_eq!(
+            before,
+            query_values(&side, "SELECT * FROM activity_wallet_coverage_staging_v2"),
+            "{damage}"
+        );
+        assert_eq!(
+            history,
+            query_values(&side, "SELECT * FROM activity_groups_v2"),
+            "{damage}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn collection_v2_malformed_envelopes_and_cursor_proofs_exclude_without_or_after_progress() {
+    struct Malformed {
+        source: DatasetFetcher,
+        kind: &'static str,
+        partial: bool,
+    }
+    impl PageFetcher for Malformed {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            let query = parsed
+                .query_pairs()
+                .into_owned()
+                .collect::<BTreeMap<_, _>>();
+            let fail = !self.partial || query["start"] != "1";
+            if !fail {
+                return self.source.fetch_page(url).await;
+            }
+            if self.kind == "envelope" {
+                return Ok(b"[]".to_vec());
+            }
+            let cursor = query
+                .get("cursor")
+                .cloned()
+                .unwrap_or_else(|| "bad-cursor".to_owned());
+            if self.kind == "empty" {
+                return Ok(
+                    serde_json::to_vec(&serde_json::json!({"data":[], "pagination":{
+                    "limit":1000,"offset":0,"has_more":true,"next_cursor":cursor}}))
+                    .unwrap(),
+                );
+            }
+            let row = dataset_row(
+                WALLET,
+                "0xa",
+                "repeated",
+                "BUY",
+                query["start"].parse().unwrap(),
+            );
+            let mut body: Value =
+                serde_json::from_slice(&v2_activity_envelope(&[&row], 0, 0, true)).unwrap();
+            body["pagination"]["next_cursor"] = Value::from(cursor);
+            Ok(serde_json::to_vec(&body).unwrap())
+        }
+    }
+    for kind in ["envelope", "repeated", "empty"] {
+        for partial in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let side = dataset_candidate(&dir, "v2-malformed.db", &[]);
+            let source = Malformed {
+                source: DatasetFetcher {
+                    rows: collection_rows(WALLET, 12_000),
+                    ..Default::default()
+                },
+                kind,
+                partial,
+            };
+            collection_admit(&side, 1, FRESH_END, &[]).await;
+            collection_run(
+                &side,
+                &source,
+                FRESH_END,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                None,
+            )
+            .await
+            .unwrap();
+            let proof = collection_proof(&side, 1, WALLET);
+            let reason = proof["exclusion_reason"].as_str().unwrap();
+            assert!(
+                reason.starts_with(if kind == "envelope" {
+                    "v2 activity envelope:"
+                } else {
+                    "v2 activity cursor proof:"
+                }),
+                "{reason}"
+            );
+            assert_eq!(proof["acquisition"]["disposition"], "excluded");
+            assert_eq!(
+                proof["acquisition"]["aggregation_status"],
+                if partial { "complete" } else { "not_attempted" }
+            );
+            assert_eq!(
+                proof["acquisition"]["fetched_source_row_count"],
+                if partial { 4999 } else { 0 }
+            );
+            assert_eq!(
+                history_v3_wallet_count(&side),
+                if partial { 4999 } else { 0 }
+            );
+            assert_eq!(proof["aggregate_count"], 0);
+            assert_eq!(count(&side, "SELECT COUNT(*) FROM ranker_entries_v2"), 0);
+            collection_run(
+                &side,
+                &HistoryV3StopFetcher,
+                FRESH_END,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
+// Counterpart of the interrupted identity-five root wrapper fixture: acquisition and replay only.
+#[tokio::test]
+async fn collection_v2_14085_interrupted_identity_five_root_preserves_anomaly_receipt_bytes() {
+    struct Interrupt<'a> {
+        source: &'a DatasetFetcher,
+        side: &'a std::path::Path,
+    }
+    impl PageFetcher for Interrupt<'_> {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            if reqwest::Url::parse(url)
+                .unwrap()
+                .query_pairs()
+                .any(|(key, value)| key == "user" && value == WALLET_B)
+            {
+                while receipt(self.side, 1, WALLET).is_none() {
+                    tokio::task::yield_now().await;
+                }
+                return Err(SourceError::Transient {
+                    message: "interrupted after committed anomaly receipt".to_owned(),
+                });
+            }
+            self.source.fetch_page(url).await
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "v2-interrupted.db", &[WALLET_B]);
+    let source = DatasetFetcher {
+        rows: vec![
+            forge_822_anomaly(0, FRESH_END - 1),
+            dataset_row(WALLET_B, "0xa", "healthy", "BUY", FRESH_END),
+        ],
+        ..Default::default()
+    };
+    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_run(
+        &side,
+        &Interrupt {
+            source: &source,
+            side: &side,
+        },
+        FRESH_END,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        None,
+    )
+    .await
+    .unwrap_err();
+    let before = query_values(
+        &side,
+        &format!(
+            "SELECT page_evidence_json, acquisition_json FROM activity_wallet_coverage_staging_v2 WHERE wallet_hex = '{WALLET}'"
+        ),
+    );
+    source.calls.lock().unwrap().clear();
+    collection_run(
+        &side,
+        &source,
+        FRESH_END,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        source
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|call| call.0 == WALLET_B)
+    );
+    assert_eq!(
+        before,
+        query_values(
+            &side,
+            &format!(
+                "SELECT page_evidence_json, acquisition_json FROM activity_wallet_coverage_staging_v2 WHERE wallet_hex = '{WALLET}'"
+            )
+        )
+    );
+    projection_v3_payouts(&side);
+    let report = pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_chunk_for_test(
+        &side,
+        FRESH_END + 1,
+        1,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.drops_by_cause["unrepresentable"], 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_v2_progress_resume_never_ranked_early_and_same_head_equality() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "partial.db", &[]);
+    let comparator = dataset_candidate(&dir, "comparator.db", &[]);
+    let source = CollectionDataset::new(collection_rows(WALLET, 12_000), 1);
+    let fast = DatasetFetcher {
+        rows: source.source.rows.clone(),
+        ..Default::default()
+    };
+    let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    for generation in 1..=3 {
+        let end = FRESH_END + i64::try_from(generation).unwrap() - 1;
+        collection_admit(&side, generation, end, &[]).await;
+        source.source.calls.lock().unwrap().clear();
+        collection_run(
+            &side,
+            &source,
+            end,
+            Arc::clone(&held),
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+        let proof = collection_proof(&side, generation, WALLET);
+        if generation < 3 {
+            assert_eq!(proof["acquisition"]["disposition"], "excluded");
+            assert_eq!(proof["acquisition"]["aggregation_status"], "complete");
+            assert_eq!(
+                proof["acquisition"]["exclusion_reason"],
+                "acquisition_failure"
+            );
+            assert_eq!(proof["aggregate_count"], 0);
+            assert_eq!(proof["source_row_count"], 0);
+            assert_eq!(proof["acquisition"]["fetched_source_row_count"], 4999);
+            assert_eq!(
+                count(
+                    &side,
+                    &format!(
+                        "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = {generation} AND fixed_end_unix = {end} AND exclusion_reason IS NOT NULL"
+                    )
+                ),
+                1
+            );
+        } else {
+            assert_eq!(proof["acquisition"]["disposition"], "complete");
+        }
+        if generation > 1 {
+            assert_eq!(proof["acquisition"]["mode"], "incremental");
+            assert_eq!(
+                proof["acquisition"]["start_exclusive"],
+                collection_proof(&side, generation - 1, WALLET)["acquisition"]["fixed_end_unix"]
+            );
+            assert!(source.source.calls.lock().unwrap()[0].1 > 1);
+        }
+        // Restart validates the frozen receipt before and after finalization.
+        collection_run(&side, &HistoryV3StopFetcher, end, Arc::clone(&held), None)
+            .await
+            .unwrap();
+        dataset_payouts(&side, &source.source.rows).await;
+        finalize_cache_v2_unbound(&side, None, end + 1).unwrap();
+        collection_run(&side, &HistoryV3StopFetcher, end, Arc::clone(&held), None)
+            .await
+            .unwrap();
+        if generation < 3 {
+            assert_eq!(
+                count(
+                    &side,
+                    &format!(
+                        "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE generation = {generation}"
+                    )
+                ),
+                0
+            );
+            assert!(projection_v3_rows(&side).is_empty());
+        }
+        let full = if generation == 3 {
+            vec![WALLET.to_owned()]
+        } else {
+            Vec::new()
+        };
+        history_v3_collect(&comparator, &fast, generation, end, &full)
+            .await
+            .unwrap();
+        dataset_payouts(&comparator, &fast.rows).await;
+        finalize_cache_v2_unbound(&comparator, None, end + 1).unwrap();
+    }
+    assert_eq!(
+        serde_json::to_vec(&collection_decoded_history(&side)).unwrap(),
+        serde_json::to_vec(&collection_decoded_history(&comparator)).unwrap()
+    );
+    assert_eq!(
+        query_values(
+            &side,
+            "SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex"
+        ),
+        query_values(
+            &comparator,
+            "SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex"
+        )
+    );
+    assert_eq!(projection_v3_rows(&side), projection_v3_rows(&comparator));
+}
+
+#[tokio::test]
+async fn collection_v2_shared_count_bounds_and_releases_more_than_64_wallets_behind_failing_writer()
+{
+    struct WatchedDataset<'a> {
+        source: &'a DatasetFetcher,
+        held: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl PageFetcher for WatchedDataset<'_> {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            assert!(self.held.load(Ordering::SeqCst) <= 2_000_000 + 65 * 5500);
+            tokio::task::yield_now().await;
+            let parsed = reqwest::Url::parse(url).unwrap();
+            let query = parsed
+                .query_pairs()
+                .into_owned()
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(parsed.path(), "/v2/activity");
+            assert_eq!(query["sort_direction"], "ASC");
+            self.source.fetch_page(url).await
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    let wallets = std::iter::once(WALLET.to_owned())
+        .chain((1..=65).map(|index| format!("0x{index:040x}")))
+        .collect::<Vec<_>>();
+    let refs = wallets.iter().map(String::as_str).collect::<Vec<_>>();
+    let side = dataset_candidate(&dir, "memory.db", &refs);
+    let source = DatasetFetcher {
+        rows: wallets
+            .iter()
+            .flat_map(|wallet| {
+                (0..5500).map(move |index| {
+                    dataset_row(
+                        wallet,
+                        "0xa",
+                        if index < 5499 { "head" } else { "tail" },
+                        "BUY",
+                        1 + i64::from(index >= 5499),
+                    )
+                })
+            })
+            .collect(),
+        ..Default::default()
+    };
+    collection_admit(&side, 1, FRESH_END, &[]).await;
+    assert_eq!(fresh_record(&side)["wallets"].as_array().unwrap().len(), 66);
+    let held = Arc::new(std::sync::atomic::AtomicU64::new(2_000_000));
+    let fetcher = WatchedDataset {
+        source: &source,
+        held: Arc::clone(&held),
+    };
+    let connection = Connection::open(&side).unwrap();
+    let (release, wait) = std::sync::mpsc::sync_channel(1);
+    let mut first = true;
+    connection
+        .commit_hook(Some(move || {
+            if first {
+                first = false;
+                wait.recv().unwrap();
+                true
+            } else {
+                false
+            }
+        }))
+        .unwrap();
+    let run = pe_bootstrap::cache_migration::collect_activity_v2_with_limits_for_test(
+        connection,
+        &fetcher,
+        "https://data.example",
+        FRESH_END + 1,
+        Arc::clone(&held),
+        None,
+    );
+    let mut run = std::pin::pin!(run);
+    tokio::select! {
+        result = &mut run => {
+            release.send(()).ok();
+            panic!("collection stopped before filling the writer queue: {result:?}, held={}", held.load(Ordering::SeqCst));
+        }
+        () = async {
+            while held.load(Ordering::SeqCst) < 2_000_000 + 65 * 5499 {
+                tokio::task::yield_now().await;
+            }
+        } => {}
+    }
+    assert_eq!(held.load(Ordering::SeqCst), 2_000_000 + 65 * 5499);
+    release.send(()).unwrap();
+    let result = run.await;
+    let error = result.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            pe_bootstrap::error::BootstrapError::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_COMMITHOOK
+        ),
+        "{error}"
+    );
+    assert_eq!(held.load(Ordering::SeqCst), 2_000_000);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE json_extract(acquisition_json, '$.fetched_source_row_count') = 5499 AND exclusion_reason IS NOT NULL"
+        ),
+        0
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_v2_receipt_shapes_reject_short_complete_bad_partial_and_short_unattempted() {
+    for shape in [
+        "complete",
+        "partial_at_end",
+        "partial_at_start",
+        "partial_past_end",
+        "not_attempted",
+        "acquisition2",
+    ] {
+        let dir = TempDir::new().unwrap();
+        let (side, mut proof) = if shape == "acquisition2" {
+            let (side, _) =
+                history_v3_legacy_seed(&dir, vec![dataset_row(WALLET, "0xa", "head", "BUY", 1)])
+                    .await;
+            let proof = collection_proof(&side, 1, WALLET);
+            assert_eq!(fresh_record(&side)["version"], 2);
+            assert_eq!(proof["acquisition"]["version"], 2);
+            assert_eq!(proof["acquisition"]["disposition"], "complete");
+            assert_eq!(proof["acquisition"]["aggregation_status"], "complete");
+            (side, proof)
+        } else {
+            let side = dataset_candidate(&dir, "shape.db", &[]);
+            let source = CollectionDataset::new(collection_rows(WALLET, 6000), 1);
+            collection_admit(&side, 1, FRESH_END, &[]).await;
+            collection_run(
+                &side,
+                &source,
+                FRESH_END,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Some(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+            let proof = collection_proof(&side, 1, WALLET);
+            (side, proof)
+        };
+        match shape {
+            "complete" => {
+                proof["acquisition"]["disposition"] = Value::from("complete");
+                proof["acquisition"]["exclusion_reason"] = Value::Null;
+                proof.as_object_mut().unwrap().remove("exclusion_reason");
+                proof["aggregate_count"] = proof["acquisition"]["fetched_aggregate_count"].clone();
+                proof["source_row_count"] =
+                    proof["acquisition"]["fetched_source_row_count"].clone();
+                proof["ordered_aggregate_digest"] =
+                    proof["acquisition"]["fetched_aggregate_digest"].clone();
+            }
+            "not_attempted" => {
+                proof["pages"] = serde_json::json!([]);
+                proof["acquisition"]["aggregation_status"] = Value::from("not_attempted");
+                proof["acquisition"]["fetched_aggregate_count"] = Value::Null;
+                proof["acquisition"]["fetched_aggregate_digest"] = Value::Null;
+                proof["acquisition"]["fetched_source_row_count"] = Value::from(0);
+            }
+            "acquisition2" => {
+                proof["acquisition"]["disposition"] = Value::from("excluded");
+                proof["acquisition"]["exclusion_reason"] = Value::from("acquisition_failure");
+                proof["acquisition"]["fixed_end_unix"] = Value::from(FRESH_END - 1);
+                proof["exclusion_reason"] = Value::from("fixture acquisition failure");
+                proof["aggregate_count"] = Value::from(0);
+                proof["source_row_count"] = Value::from(0);
+                proof["ordered_aggregate_digest"] =
+                    Value::from(whole_json_digest(&serde_json::json!([])));
+                for page in proof["pages"].as_array_mut().unwrap() {
+                    collection_page_bounds(page, 0, FRESH_END - 1);
+                }
+            }
+            _ => {
+                let end = match shape {
+                    "partial_at_end" => FRESH_END,
+                    "partial_at_start" => 0,
+                    _ => FRESH_END + 1,
+                };
+                proof["acquisition"]["fixed_end_unix"] = Value::from(end);
+                for page in proof["pages"].as_array_mut().unwrap() {
+                    collection_page_bounds(page, 0, end);
+                }
+            }
+        }
+        collection_read_commitment(&mut proof);
+        collection_reseal_receipt(&side, &proof);
+        let error = collection_run(
+            &side,
+            &HistoryV3StopFetcher,
+            FRESH_END,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(if shape == "partial_at_end" {
+                "invalid excluded activity receipt"
+            } else {
+                "activity acquisition identity mismatch"
+            }),
+            "{shape}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn collection_v2_terminal_window_proofs_reject_gaps_overlaps_and_outside_pages() {
+    for damage in ["gap", "overlap", "outside"] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "pages.db", &[]);
+        let source = DatasetFetcher {
+            rows: collection_rows(WALLET, 12_000),
+            ..Default::default()
+        };
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        let mut proof = collection_proof(&side, 1, WALLET);
+        for page in proof["pages"].as_array_mut().unwrap() {
+            let lo = page["bounds"]["start"].as_i64().unwrap();
+            let hi = page["bounds"]["end"].as_i64().unwrap();
+            if damage == "gap" && lo == 0 {
+                collection_page_bounds(page, 1, hi);
+            }
+            if damage == "overlap" && lo != 0 {
+                collection_page_bounds(page, lo - 1, hi);
+            }
+            if damage == "outside" && hi == FRESH_END {
+                collection_page_bounds(page, lo, hi + 1);
+            }
+        }
+        collection_read_commitment(&mut proof);
+        collection_reseal_receipt(&side, &proof);
+        let error = collection_run(
+            &side,
+            &HistoryV3StopFetcher,
+            FRESH_END,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(if damage == "outside" {
+                "outside the frozen read window"
+            } else {
+                "gap or overlap"
+            }),
+            "{damage}: {error}"
+        );
+    }
 }

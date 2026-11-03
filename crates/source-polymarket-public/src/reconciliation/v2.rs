@@ -319,6 +319,8 @@ pub enum V2AuthenticationError {
     PageCountMismatch,
     #[error("v2 cursor repeated: {0}")]
     RepeatedCursor(String),
+    #[error("v2 page {index} is empty but continues the cursor chain")]
+    EmptyContinuation { index: usize },
     #[error("v2 page follows the terminal page")]
     PageAfterTermination,
     #[error("v2 read has no terminal page")]
@@ -603,4 +605,17 @@ fn v2_page_evidence(
         has_more: Some(pagination.has_more),
         next_cursor: pagination.next_cursor.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::V2AuthenticationError;
+
+    #[test]
+    fn v2_empty_continuation_names_the_page() {
+        assert_eq!(
+            V2AuthenticationError::EmptyContinuation { index: 2 }.to_string(),
+            "v2 page 2 is empty but continues the cursor chain",
+        );
+    }
 }
