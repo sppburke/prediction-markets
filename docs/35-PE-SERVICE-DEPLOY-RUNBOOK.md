@@ -2067,8 +2067,9 @@ and its retention fence (today `cfaf643`); the same command runs `previous_binar
 PE_ROLLBACK_SERVICE_BINARY='<absolute path to the previous production binary>' cargo nextest run -p pe-service --all-features --test scenario_source_log_boot previous_binary --no-capture
 ```
 
-Without the variable both tests print SKIP and return early (CI leaves it unset); a skip proves nothing. Record the
-printed executable identities and every row's result in the deployment artifacts. Each row runs in both directions, the
+Without the variable (CI leaves it unset) the matrix prints SKIP and returns early, and
+`previous_binary_reuses_runtime_tail_anchor` prints SKIP and checks only this build; neither proves rollback
+compatibility. Record the printed executable identities and every row's result in the deployment artifacts. Each row runs in both directions, the
 previous binary and then this build, from the row's own record, with the wallet marked `reanchor_required` so boot
 walks it before listening:
 
