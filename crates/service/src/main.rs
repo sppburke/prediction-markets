@@ -2,6 +2,11 @@
 
 mod http_server;
 
+// glibc's per-thread arenas kept their high-water memory as paper-state work moved across many
+// `block_in_place` threads; in the recorded workload jemalloc materially reduced that retention.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;

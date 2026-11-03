@@ -5019,7 +5019,8 @@ impl BucketCommitEngine {
         if aggregates.is_empty() && anomalies.is_empty() {
             return Err(BucketCommitError::Empty);
         }
-        let mut context = context.clone();
+        // A read's buckets share one read-sized context; copy it only for a bucket that changes it.
+        let mut context = std::borrow::Cow::Borrowed(context);
         // Without a source index there is no retention boundary to compare against.
         if let Some(read) = context.verified_read.as_ref()
             && let Some(index) = self.frame_source_index.as_ref()
@@ -5055,7 +5056,7 @@ impl BucketCommitEngine {
                 ));
             }
             fresh.retention_epoch = Some(epoch);
-            context.verified_read = Some(std::sync::Arc::new(fresh));
+            context.to_mut().verified_read = Some(std::sync::Arc::new(fresh));
         }
         if let Some(read) = context.verified_read.as_ref()
             && (context.read_commitment
@@ -5120,6 +5121,7 @@ impl BucketCommitEngine {
                         continue;
                     }
                     let id = aggregate.group_id.key();
+                    let context = context.to_mut();
                     context.observed_source_receipts.insert(id.clone(), receipt);
                     if id != &facts.source_trade_id {
                         context.no_copy_dispositions.insert(
@@ -5142,7 +5144,7 @@ impl BucketCommitEngine {
                 ));
             }
         }
-        let context = &context;
+        let context: &BucketDecisionContext = &context;
 
         if aggregates.iter().any(|aggregate| {
             aggregate.group_id.components().wallet != wallet
