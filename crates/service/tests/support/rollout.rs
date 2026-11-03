@@ -92,6 +92,7 @@ struct HttpState {
     activity: Mutex<HashMap<String, Vec<Value>>>,
     positions: Mutex<Vec<Value>>,
     data_api_v2: Mutex<data_api_v2::DataApiV2>,
+    activity_page_size_cap: Option<usize>,
     slow_started: Notify,
     slow: Semaphore,
     release_slow: std::sync::atomic::AtomicBool,
@@ -129,6 +130,7 @@ pub async fn boundary_mark() {
         activity: Mutex::new(HashMap::new()),
         positions: Mutex::new(Vec::new()),
         data_api_v2: Mutex::new(Default::default()),
+        activity_page_size_cap: None,
         slow_started: Notify::new(),
         slow: Semaphore::new(0),
         release_slow: AtomicBool::new(true),
@@ -221,12 +223,12 @@ async fn serve(
             })
             .collect::<Vec<_>>();
         if path == "/v2/activity" {
-            let body = match state
-                .data_api_v2
-                .lock()
-                .unwrap()
-                .reply(path, &data, &q, None)
-            {
+            let body = match state.data_api_v2.lock().unwrap().reply(
+                path,
+                &data,
+                &q,
+                state.activity_page_size_cap,
+            ) {
                 Ok(body) => body,
                 Err(status) => return status.into_response(),
             };
@@ -584,7 +586,8 @@ fn envelope(payload: Vec<u8>, source: &str, at: i64, schema: u32, parser: u32) -
     }
 }
 /// PASS: a real, fully configured binary copies during slow admission, clears only a safe fence,
-/// repairs first-entry history, settles once, and restores checkpoint+suffix and exact decisions.
+/// repairs first-entry history, settles once, and restores checkpoint+suffix and exact decisions
+/// from schema-7 v2 cursor pages with schema-3 evidence. FAIL: v1 acquisition or restart drift.
 pub async fn run() {
     run_case(false, false).await;
 }
@@ -596,6 +599,8 @@ pub async fn run_boot_waves() {
 /// PASS: runtime ranking imports and local anomalies exclude only their scopes; revised BUYs
 /// retain their original fill without fencing. Restart preserves drops, imports, dispositions,
 /// fills, balances and history, and the sealed CLI verifier reproduces every decision exactly.
+/// Schema-7 pages and schema-3 cursor evidence include a forced multi-page read.
+/// FAIL: a v1 fetch, missing cursor proof, lost state or inexact sealed replay.
 /// This short run does not meet the qualification duration or closed-copy sample thresholds.
 pub async fn scope_drops() {
     run_case(false, true).await;
@@ -670,6 +675,7 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         ])),
         positions: Mutex::new(Vec::new()),
         data_api_v2: Mutex::new(Default::default()),
+        activity_page_size_cap: (!boot_waves).then_some(1),
         slow_started: Notify::new(),
         slow: Semaphore::new(0),
         release_slow: AtomicBool::new(boot_waves || scope_drops),
@@ -908,7 +914,8 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         // The v2 fake serves the row under v2 field names in a single terminal cursor page.
         let served_row = data_api_v2::activity_row(&unrepresentable);
         let served_page = json!({"data": [served_row.clone()],
-            "pagination": {"limit": 1000, "offset": 0, "has_more": false, "next_cursor": null}});
+            "pagination": {"limit": state.activity_page_size_cap.unwrap_or(1000),
+                "offset": 0, "has_more": false, "next_cursor": null}});
         let raw_row_hash = blake3::hash(&serde_json::to_vec(&served_row).unwrap())
             .to_hex()
             .to_string();
@@ -1143,6 +1150,7 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         let financial = paper.financial_snapshot(now + 1000).unwrap();
         let history = paper.gate_history().unwrap();
         let decisions = paper.decision_pending_history().unwrap();
+        assert_v2_committed_reads(&paper, &cfg.source_event_log_path);
         let fills = paper.list_fills().unwrap();
         assert!(
             decisions
@@ -1205,10 +1213,19 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
                 .status()
                 .is_success()
         );
-        child.stop().await;
+        let restart_logs = child.stop().await;
+        assert!(
+            restart_logs.contains("source checkpoint verification completed"),
+            "{restart_logs}"
+        );
+        assert!(
+            restart_logs.contains("open decision continuations validated"),
+            "{restart_logs}"
+        );
         assert_eq!(paper.financial_snapshot(now + 1000).unwrap(), financial);
         assert_eq!(paper.gate_history().unwrap(), history);
         assert_eq!(paper.decision_pending_history().unwrap(), decisions);
+        assert_v2_committed_reads(&paper, &cfg.source_event_log_path);
         assert_eq!(paper.list_fills().unwrap(), fills);
         assert_eq!(*state.import_reads.lock().unwrap(), imports);
         assert!(paper.scope_drop_batch_imported(1).unwrap());
@@ -1575,6 +1592,7 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         .clone();
     let decisions = paper.decision_pending_history().unwrap();
     assert!(!decisions.is_empty());
+    assert_v2_committed_reads(&paper, &cfg.source_event_log_path);
     // Re-prepare against completed state, then force one wallet's boot walk to fail locally.
     SourceLogBoot::prepare_checkpoint(&cfg.paper_state_db_path).unwrap();
     Writer::open(&cfg.source_event_log_path)
@@ -1652,6 +1670,7 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         assert_eq!(paper.gate_history().unwrap().get(&w), history.get(&w));
     }
     assert_eq!(paper.decision_pending_history().unwrap(), decisions);
+    assert_v2_committed_reads(&paper, &cfg.source_event_log_path);
     assert_eq!(state.authority.lock().unwrap().settlements.len(), 1);
     for w in [wallet(1), wallet(2), wallet(3)] {
         assert_eq!(
@@ -1681,6 +1700,10 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
     until(|| paper.list_fills().unwrap().len() == 3).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     let second_logs = child.stop().await;
+    assert!(
+        second_logs.contains("open decision continuations validated"),
+        "{second_logs}"
+    );
     assert!(
         second_logs.contains("\"checkpoint_used\":true"),
         "{second_logs}"
@@ -1773,6 +1796,74 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
     server.abort();
 }
 
+fn assert_v2_committed_reads(paper: &PaperStateDb, source_path: &Path) {
+    use pe_service::bucket_commit::DecisionContinuationV3;
+    use pe_service::trade_poller::{ACTIVITY_POLL_SOURCE_ID, ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION};
+    use pe_source_polymarket_public::{
+        ACTIVITY_V2_PAGE_SCHEMA_VERSION, ReconciliationPageEvidence,
+    };
+
+    let frames = pe_event_log::Reader::replay(source_path)
+        .unwrap()
+        .map(|frame| frame.unwrap().1)
+        .collect::<Vec<_>>();
+    let mut multipage = false;
+    let decisions = paper.decision_pending_history().unwrap();
+    assert!(!decisions.is_empty());
+    for decision in decisions {
+        let continuation = DecisionContinuationV3::from_durable(&decision).unwrap();
+        let pages: Vec<ReconciliationPageEvidence> =
+            serde_json::from_value(continuation.facts.decision_inputs["pages"].clone()).unwrap();
+        assert!(!pages.is_empty());
+        assert_eq!(pages.len(), continuation.page_occurrences.len());
+        multipage |= pages.len() > 1;
+        for (index, occurrence) in continuation.page_occurrences.iter().enumerate() {
+            let frame = frames
+                .iter()
+                .find(|frame| frame.seq == occurrence.receipt.sequence)
+                .unwrap();
+            assert_eq!(frame.this_hash, occurrence.receipt.this_hash);
+            assert_eq!(frame.source_id.0, ACTIVITY_POLL_SOURCE_ID);
+            assert_eq!(frame.schema_version, ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION);
+            let page = pages
+                .iter()
+                .find(|page| {
+                    page.raw_page_hash == occurrence.raw_hash
+                        && page.request_url == occurrence.request_url
+                })
+                .unwrap();
+            assert_eq!(page.schema_version, ACTIVITY_V2_PAGE_SCHEMA_VERSION);
+            let url = reqwest::Url::parse(&occurrence.request_url).unwrap();
+            assert_eq!(url.path(), "/v2/activity");
+            let query = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
+            assert_eq!(
+                query.get("limit").map(String::as_str),
+                (index == 0).then_some("1000")
+            );
+            assert_eq!(query.contains_key("cursor"), index != 0);
+            if index != 0 {
+                let previous = &continuation.page_occurrences[index - 1];
+                let previous = pages
+                    .iter()
+                    .find(|page| page.request_url == previous.request_url)
+                    .unwrap();
+                assert_eq!(query.get("cursor"), previous.next_cursor.as_ref());
+            }
+            let raw: Value = serde_json::from_slice(&frame.payload).unwrap();
+            let pagination = &raw["pagination"];
+            assert!(pagination.get("has_more").is_some());
+            assert!(pagination.get("next_cursor").is_some());
+            assert_eq!(page.has_more, pagination["has_more"].as_bool());
+            assert_eq!(
+                page.next_cursor.as_deref(),
+                pagination["next_cursor"].as_str()
+            );
+            assert_eq!(page.has_more, Some(index + 1 < pages.len()));
+        }
+    }
+    assert!(multipage, "the capped fake forces a committed cursor read");
+}
+
 /// Minimal real-process checkpoint fixture reusing the rollout's local financial authority.
 pub struct CheckpointFixture {
     pub dir: tempfile::TempDir,
@@ -1840,6 +1931,7 @@ impl CheckpointFixture {
             activity: Mutex::new(HashMap::new()),
             positions: Mutex::new(Vec::new()),
             data_api_v2: Mutex::new(Default::default()),
+            activity_page_size_cap: None,
             slow_started: Notify::new(),
             slow: Semaphore::new(0),
             release_slow: AtomicBool::new(true),
@@ -2059,6 +2151,7 @@ mod data_api_tests {
                 json!({"proxyWallet":"other", "asset":"9", "size":"2", "redeemable":false}),
             ]),
             data_api_v2: Mutex::new(Default::default()),
+            activity_page_size_cap: None,
             slow_started: Notify::new(),
             slow: Semaphore::new(0),
             release_slow: AtomicBool::new(true),

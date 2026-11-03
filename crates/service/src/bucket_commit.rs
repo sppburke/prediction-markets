@@ -11048,6 +11048,269 @@ mod activity_exemption_tests {
         }
     }
 
+    // PASS: token enrichment creates a new late group; executable REDEEM drops only its scope,
+    // sentinel/combo exemptions survive, and v1 bytes, disposition and ledger replay stay intact.
+    // FAIL: identity remapping, a wallet fence/re-anchor, rewritten v1 evidence or copying blocked elsewhere.
+    #[test]
+    fn v1_redemption_reread_on_v2_preserves_identity_routing_and_replay() {
+        use pe_event_log::{EnvelopeIn, Reader, Writer};
+
+        for (outcome, combo) in [(0, false), (999, false), (0, true)] {
+            let (dir, paper, mut engine) = fixture();
+            let purchase = group("TRADE", "purchase", 99, 0, false, "0xa1");
+            let wallet = purchase.group_id.components().wallet;
+            engine.commit(vec![purchase], &context(), basis()).unwrap();
+            let original = group("REDEEM", "cutover", 100, outcome, combo, "0xa1");
+            let row = json!({
+                "proxyWallet": wallet, "timestamp": 100, "conditionId": "0xa1",
+                "type": "REDEEM", "size": "2", "usdcSize": "1", "transactionHash": "cutover",
+                "price": "0.5", "asset": "", "side": "", "outcomeIndex": outcome,
+                "outcome": if outcome == 999 { "" } else { "Yes" }, "isCombo": combo,
+            });
+            let v1_payload = serde_json::to_vec(std::slice::from_ref(&row)).unwrap();
+            let parse_context = ActivityParseContext {
+                source_id: SourceId(crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                observed_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+                received_at: ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+                transport: ActivityTransport::Rest,
+            };
+            let parse = |schema, payload: &[u8]| {
+                parse_recorded_activity_page(
+                    schema,
+                    payload,
+                    wallet,
+                    &parse_context,
+                    ActivityRowAcceptance::StrictWithAnomalies,
+                )
+                .unwrap()
+                .aggregates()
+                .unwrap()
+                .remove(0)
+            };
+            let v1_schema = crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION;
+            assert_eq!(parse(v1_schema, &v1_payload), original);
+            engine
+                .commit(vec![original.clone()], &context(), basis())
+                .unwrap();
+            let v1_record = paper
+                .activity_group_state(original.group_id.key())
+                .unwrap()
+                .unwrap();
+            let v1_replay = crate::paper_recovery::replay_frozen_records(
+                wallet,
+                &[],
+                &paper.activity_groups_after(&wallet, 0).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(v1_replay.snapshots(), engine.ledger().snapshots());
+            let anchors = paper.position_anchors(&wallet).unwrap();
+
+            let mut tokenized = row;
+            tokenized.as_object_mut().unwrap().remove("asset");
+            tokenized["token_id"] = json!("asset");
+            let v2_payload = serde_json::to_vec(&json!({
+                "data": [tokenized],
+                "pagination": {"limit": 1000, "offset": 0, "has_more": false, "next_cursor": null},
+            }))
+            .unwrap();
+            let v2_schema = crate::trade_poller::ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION;
+            let reread = parse(v2_schema, &v2_payload);
+            assert_ne!(reread.group_id, original.group_id);
+            assert_eq!(
+                reread.group_id.components().asset.as_ref().unwrap().0,
+                "asset"
+            );
+            let path = dir.path().join("source.log");
+            let mut writer = Writer::open(&path).unwrap();
+            for (schema_version, payload) in
+                [(v1_schema, v1_payload.clone()), (v2_schema, v2_payload)]
+            {
+                writer
+                    .append_synced(EnvelopeIn {
+                        source_id: parse_context.source_id.clone(),
+                        schema_version,
+                        parser_version: ACTIVITY_PARSER_VERSION,
+                        observed_at: parse_context.observed_at.clone(),
+                        received_at: parse_context.received_at.clone(),
+                        content_type: ContentType::Json,
+                        payload,
+                    })
+                    .unwrap();
+            }
+            drop(writer);
+            let mut ctx = context();
+            ctx.identity_overrides.insert(
+                reread.group_id.key().clone(),
+                IdentityOverride {
+                    verified: MarketOutcomeId::new(
+                        MarketId(VenueMarketId("0xa1".to_owned())),
+                        OutcomeId(0),
+                    ),
+                    evidence_hash: "a".repeat(64),
+                },
+            );
+            let result = engine.commit(vec![reread.clone()], &ctx, basis()).unwrap();
+            let executable = outcome == 0 && !combo;
+            assert_eq!(
+                result.dispositions[&reread.group_id.key().0],
+                if executable {
+                    "scope_dropped"
+                } else {
+                    "raw_only"
+                }
+            );
+            let drops = paper.wallet_scope_drops(&wallet, 100).unwrap();
+            assert_eq!(drops.len(), usize::from(executable));
+            if executable {
+                assert_eq!(drops[0].scope_kind, "market");
+                assert_eq!(drops[0].scope_id, "0xa1");
+                assert_eq!(drops[0].cause, "reanchor_required_late_group");
+                assert_eq!(
+                    drops[0].source_trade_id.as_ref(),
+                    Some(reread.group_id.key())
+                );
+            }
+            assert_eq!(result.newly_fenced, None);
+            assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+            assert!(!paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+            assert_eq!(paper.position_anchors(&wallet).unwrap(), anchors);
+            assert_eq!(
+                paper
+                    .activity_group_state(original.group_id.key())
+                    .unwrap()
+                    .unwrap(),
+                v1_record
+            );
+            assert_eq!(
+                crate::paper_recovery::replay_frozen_records(
+                    wallet,
+                    &[],
+                    &paper.activity_groups_after(&wallet, 0).unwrap(),
+                )
+                .unwrap()
+                .snapshots(),
+                v1_replay.snapshots()
+            );
+            assert!(
+                engine
+                    .commit(vec![original.clone()], &context(), basis())
+                    .unwrap()
+                    .already_committed
+            );
+            let frames = Reader::replay(&path)
+                .unwrap()
+                .map(|frame| frame.unwrap().1)
+                .collect::<Vec<_>>();
+            assert_eq!(frames[0].schema_version, v1_schema);
+            assert_eq!(frames[0].payload, v1_payload);
+            assert_eq!(
+                parse(frames[0].schema_version, &frames[0].payload),
+                original
+            );
+            assert_eq!(parse(frames[1].schema_version, &frames[1].payload), reread);
+
+            let healthy = group("TRADE", "elsewhere", 101, 0, false, "0xa2");
+            let request = V2ActivityRequest::position_changes(
+                wallet,
+                Some(100),
+                101,
+                ActivityRowAcceptance::StrictWithAnomalies,
+            );
+            let request_url = request.url("https://example.test", None).unwrap();
+            let payload = serde_json::to_vec(&json!({
+                "data": [{"proxyWallet": wallet, "timestamp": 101, "conditionId": "0xa2",
+                    "type": "TRADE", "size": "2", "usdcSize": "1", "transactionHash": "elsewhere",
+                    "price": "0.5", "token_id": "asset", "side": "BUY", "outcomeIndex": 0,
+                    "outcome": "Yes", "isCombo": false}],
+                "pagination": {"limit": 1000, "offset": 0, "has_more": false, "next_cursor": null},
+            }))
+            .unwrap();
+            let page = pe_source_polymarket_public::parse_activity_page_v2(
+                &payload,
+                &request_url,
+                &request,
+                &parse_context,
+            )
+            .unwrap();
+            assert_eq!(parse(v2_schema, &payload), healthy);
+            let mut writer = Writer::open(&path).unwrap();
+            let receipt = writer
+                .append_synced(EnvelopeIn {
+                    source_id: parse_context.source_id.clone(),
+                    schema_version: v2_schema,
+                    parser_version: ACTIVITY_PARSER_VERSION,
+                    observed_at: parse_context.observed_at.clone(),
+                    received_at: parse_context.received_at.clone(),
+                    content_type: ContentType::Json,
+                    payload,
+                })
+                .unwrap();
+            ctx.page_occurrences = vec![PageOccurrence {
+                request_url,
+                raw_hash: page.evidence.raw_page_hash.clone(),
+                receipt,
+            }];
+            let pages = vec![page.evidence];
+            let payload = activity_read_commitment_payload_v2(
+                wallet,
+                101,
+                &ctx.page_occurrences,
+                &pages,
+                &[],
+            )
+            .unwrap();
+            let receipt = writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId(ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned()),
+                    schema_version: ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+                    parser_version: ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+                    observed_at: parse_context.observed_at.clone(),
+                    received_at: parse_context.received_at.clone(),
+                    content_type: ContentType::Json,
+                    payload,
+                })
+                .unwrap();
+            drop(writer);
+            ctx.read_commitment = Some(ActivityReadCommitmentReceipt::BindingsV2(receipt));
+            ctx.decision_inputs_json = json!({"fixed_end": 101, "pages": pages}).to_string();
+            ctx.applied_configuration =
+                RuntimeConfig::from_service_config(&crate::config::ServiceConfig::default());
+            ctx.copy_eligible = true;
+            ctx.history_status = Some(WalletHistoryStatusRecord {
+                wallet,
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: 110,
+            });
+            let result = engine
+                .commit_with_freshness_policy(
+                    vec![healthy],
+                    &ctx,
+                    basis(),
+                    Some(PaperFreshnessPolicy {
+                        activity_ws_enabled: false,
+                        copy_latency_budget_secs: 120,
+                    }),
+                )
+                .unwrap();
+            assert_eq!(
+                result.pending.len(),
+                1,
+                "copying continues in an unaffected market"
+            );
+            assert_eq!(
+                crate::paper_recovery::replay_frozen_records(
+                    wallet,
+                    &[],
+                    &paper.activity_groups_after(&wallet, 0).unwrap(),
+                )
+                .unwrap()
+                .snapshots(),
+                engine.ledger().snapshots()
+            );
+        }
+    }
+
     #[test]
     fn known_redemptions_and_combos_never_reanchor_or_fence() {
         for (kind, combo) in [("REDEEM", false), ("TRADE", true), ("REDEEM", true)] {
