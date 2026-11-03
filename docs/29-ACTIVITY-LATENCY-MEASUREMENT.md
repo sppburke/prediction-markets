@@ -733,16 +733,16 @@ for e in source.values("polymarket-activity-ws", "polymarket-public.activity-rec
     contract = (e["schema_version"], e["parser_version"])
     if contract not in ((2, 2), (3, 2), (6, 2), (7, 2)):
         raise ValueError(f"unsupported reconciliation page contract {contract}")
-    rows = [payload(e)] if is_frame else payload(e)
-    if not is_frame and contract in ((6, 2), (7, 2)):
-        rows = rows["data"]
-        for r in rows:  # a v2 page no longer marks anomaly rows by schema: refuse anything that could be one
+    v2 = not is_frame and contract in ((6, 2), (7, 2))
+    rows = payload(e)["data"] if v2 else [payload(e)] if is_frame else payload(e)
+    for r in rows:
+        if r.get("type", r.get("activity_type", "TRADE" if is_frame else "")).strip().upper() != "TRADE": continue
+        # A v2 page no longer marks anomaly rows by schema: refuse a countable trade that could be one.
+        if v2 and not r.get("is_combo", r.get("isCombo", False)) and Decimal(str(r.get("size", 0))) > 0:
             numbers = [r.get(k) for k in ("price", "size", "usdc_size", "usdcSize") if r.get(k) is not None]
             if (any("e" in str(v).lower() for v in numbers) or not 0 <= Decimal(str(r.get("price", 0))) <= 1
                     or (str(r.get("outcome_index", r.get("outcomeIndex", ""))) == "999" and not (r.get("outcome") or "").strip())):
                 raise ValueError(f"possible anomaly row in v2 page {e['seq']}: outside this census (#822)")
-    for r in rows:
-        if r.get("type", r.get("activity_type", "TRADE" if is_frame else "")).strip().upper() != "TRADE": continue
         wallet = r.get("proxyWallet", r.get("proxy_wallet", "")).strip().lower()
         tx = r.get("transactionHash", r.get("transaction_hash", "")).strip().lower()
         condition = r.get("conditionId", r.get("condition_id"))
