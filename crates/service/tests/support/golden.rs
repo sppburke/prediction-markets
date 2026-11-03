@@ -12,6 +12,9 @@
 #[path = "mod.rs"]
 pub mod support;
 
+#[path = "data_api_v2.rs"]
+mod data_api_v2;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -3697,6 +3700,7 @@ impl BracketFinancialHarness {
         .with_source_log(self.source.clone());
         let preparing = preparer.prepare(wallets);
         tokio::pin!(preparing);
+        let mut data_api_v2 = data_api_v2::DataApiV2::default();
         loop {
             tokio::select! {
                 result = &mut preparing => { result.unwrap(); break; }
@@ -3708,7 +3712,22 @@ impl BracketFinancialHarness {
                         let wallet = wallets.iter().find(|wallet| request.url.contains(&wallet.to_string())).unwrap();
                         let mut rows: serde_json::Value = serde_json::from_slice(&history.activity).unwrap();
                         rows[0]["proxyWallet"] = wallet.to_string().into();
-                        if request.url.contains("/activity?") {
+                        let url = reqwest::Url::parse(&request.url).unwrap();
+                        let query = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
+                        if matches!(url.path(), "/v2/activity" | "/v2/positions") {
+                            let stored = if url.path() == "/v2/activity" {
+                                assert_eq!(query["start"], "1", "runtime validation requires full history");
+                                rows.as_array().unwrap().clone()
+                            } else {
+                                assert_eq!(query["status"], "OPEN");
+                                vec![serde_json::json!({
+                                    "proxyWallet": wallet, "asset": rows[0]["asset"],
+                                    "conditionId": history.condition.0, "size": "5", "outcomeIndex": 0,
+                                    "negativeRisk": false, "redeemable": false,
+                                })]
+                            };
+                            serde_json::to_vec(&data_api_v2.reply(url.path(), &stored, &query, None).unwrap()).unwrap()
+                        } else if request.url.contains("/activity?") {
                             assert!(request.url.ends_with("&start=1"), "runtime validation requires full history");
                             serde_json::to_vec(&rows).unwrap()
                         } else {

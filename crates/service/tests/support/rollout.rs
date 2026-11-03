@@ -1,5 +1,9 @@
 //! The real service process, local HTTP authority, and unchanged production admission gates.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+#[path = "data_api_v2.rs"]
+mod data_api_v2;
+
 use axum::{
     Json, Router,
     body::Bytes,
@@ -88,6 +92,7 @@ struct HttpState {
     authority: Mutex<Authority>,
     activity: Mutex<HashMap<String, Vec<Value>>>,
     positions: Mutex<Vec<Value>>,
+    data_api_v2: Mutex<data_api_v2::DataApiV2>,
     slow_started: Notify,
     slow: Semaphore,
     release_slow: std::sync::atomic::AtomicBool,
@@ -124,6 +129,7 @@ pub async fn boundary_mark() {
         authority: Mutex::new(Authority::default()),
         activity: Mutex::new(HashMap::new()),
         positions: Mutex::new(Vec::new()),
+        data_api_v2: Mutex::new(Default::default()),
         slow_started: Notify::new(),
         slow: Semaphore::new(0),
         release_slow: AtomicBool::new(true),
@@ -175,7 +181,7 @@ async fn serve(
     let url = reqwest::Url::parse(&format!("http://localhost{uri}")).unwrap();
     let q = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
     let path = url.path();
-    if path == "/activity" {
+    if matches!(path, "/activity" | "/v2/activity") {
         let w = q.get("user").unwrap();
         if q.get("start").is_some_and(|start| start == "1") {
             let reads = {
@@ -215,6 +221,36 @@ async fn serve(
                     .is_some_and(|at| at >= start && at <= end)
             })
             .collect::<Vec<_>>();
+        if path == "/v2/activity" {
+            let body = match state
+                .data_api_v2
+                .lock()
+                .unwrap()
+                .reply(path, &data, &q, None)
+            {
+                Ok(body) => body,
+                Err(status) => return status.into_response(),
+            };
+            if q.get("start").is_some_and(|start| start == "1")
+                && !q.contains_key("cursor")
+                && state
+                    .cut_full_history_replies
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                assert_eq!(q["limit"], "1000");
+                assert_eq!(q["sort_direction"], "DESC");
+                assert_eq!(q["type"], "TRADE,SPLIT,MERGE,REDEEM,CONVERSION");
+                assert!(q["end"].parse::<i64>().is_ok());
+                let mut body = serde_json::to_string(&body).unwrap();
+                body.truncate(body.find("\":\"").unwrap() + 4);
+                return (StatusCode::OK, [("content-type", "application/json")], body)
+                    .into_response();
+            }
+            return (StatusCode::OK, Json(body)).into_response();
+        }
         if q.get("start").is_some_and(|start| start == "1")
             && q.get("offset").is_some_and(|offset| offset == "0")
             && state
@@ -234,6 +270,17 @@ async fn serve(
             return (StatusCode::OK, [("content-type", "application/json")], body).into_response();
         }
         return (StatusCode::OK, Json(json!(data))).into_response();
+    }
+    if path == "/v2/positions" {
+        return match state.data_api_v2.lock().unwrap().reply(
+            path,
+            &state.positions.lock().unwrap(),
+            &q,
+            None,
+        ) {
+            Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+            Err(status) => status.into_response(),
+        };
     }
     if path == "/positions" {
         let data = state
@@ -623,6 +670,7 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
             ),
         ])),
         positions: Mutex::new(Vec::new()),
+        data_api_v2: Mutex::new(Default::default()),
         slow_started: Notify::new(),
         slow: Semaphore::new(0),
         release_slow: AtomicBool::new(boot_waves || scope_drops),
@@ -1786,6 +1834,7 @@ impl CheckpointFixture {
             }),
             activity: Mutex::new(HashMap::new()),
             positions: Mutex::new(Vec::new()),
+            data_api_v2: Mutex::new(Default::default()),
             slow_started: Notify::new(),
             slow: Semaphore::new(0),
             release_slow: AtomicBool::new(true),
@@ -1969,5 +2018,144 @@ impl CheckpointFixture {
                 .any(|row| row["wallet_hex"] == wallet(1).to_string())
         );
         assert!(!self.paper.is_wallet_fenced(&wallet(1)).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod data_api_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+
+    fn state() -> Arc<HttpState> {
+        Arc::new(HttpState {
+            boot_waves: false,
+            ranking_batch: AtomicI64::new(1),
+            scope_drops: Mutex::new(Vec::new()),
+            group_spans: Mutex::new(Vec::new()),
+            import_reads: Mutex::new(Vec::new()),
+            rows: Vec::new(),
+            now: 0,
+            ranked_wallets: 0,
+            full_history_requests: Mutex::new(Vec::new()),
+            cut_full_history_replies: AtomicUsize::new(0),
+            start: Mutex::new(None),
+            authority: Mutex::new(Authority::default()),
+            activity: Mutex::new(HashMap::from([(
+                "wallet".to_owned(),
+                vec![
+                    json!({"proxyWallet":"wallet", "timestamp":20, "type":"REWARD", "asset":"7"}),
+                    json!({"proxyWallet":"wallet", "timestamp":10, "type":"TRADE", "asset":"8"}),
+                    json!({"proxyWallet":"wallet", "timestamp":9, "type":"TRADE", "asset":"9"}),
+                ],
+            )])),
+            positions: Mutex::new(vec![
+                json!({"proxyWallet":"wallet", "asset":"7", "size":"5", "redeemable":false}),
+                json!({"proxyWallet":"wallet", "asset":"8", "size":"1", "redeemable":true}),
+                json!({"proxyWallet":"other", "asset":"9", "size":"2", "redeemable":false}),
+            ]),
+            data_api_v2: Mutex::new(Default::default()),
+            slow_started: Notify::new(),
+            slow: Semaphore::new(0),
+            release_slow: AtomicBool::new(true),
+            gamma_fails: AtomicBool::new(false),
+            stale_ranked_wallet_2: AtomicBool::new(false),
+            gamma_failures: AtomicUsize::new(0),
+            resolved: AtomicBool::new(false),
+        })
+    }
+
+    async fn reply(state: Arc<HttpState>, uri: &str) -> (StatusCode, Bytes) {
+        let response = serve(
+            State(state),
+            OriginalUri(uri.parse().unwrap()),
+            Bytes::new(),
+        )
+        .await;
+        let status = response.status();
+        (
+            status,
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn v1_reply_bytes_stay_fixed_and_v2_full_history_cut_is_a_real_prefix() {
+        let state = state();
+        let (status, body) = reply(
+            state.clone(),
+            "/activity?user=wallet&start=10&end=20&type=TRADE&sortDirection=DESC&offset=0&limit=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), br#"[{"asset":"7","proxyWallet":"wallet","timestamp":20,"type":"REWARD"},{"asset":"8","proxyWallet":"wallet","timestamp":10,"type":"TRADE"}]"#);
+        for (redeemable, expected) in [
+            (
+                "false",
+                br#"[{"asset":"7","proxyWallet":"wallet","redeemable":false,"size":"5"}]"#
+                    .as_slice(),
+            ),
+            (
+                "true",
+                br#"[{"asset":"8","proxyWallet":"wallet","redeemable":true,"size":"1"}]"#
+                    .as_slice(),
+            ),
+        ] {
+            let (status, body) = reply(
+                state.clone(),
+                &format!("/positions?user=wallet&redeemable={redeemable}&offset=0&limit=1"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body.as_ref(), expected);
+        }
+        let uri = "/v2/activity?user=wallet&start=1&end=20&type=TRADE,SPLIT,MERGE,REDEEM,CONVERSION&sort_direction=DESC&limit=1000";
+        let (status, complete) = reply(state.clone(), uri).await;
+        assert_eq!(status, StatusCode::OK);
+        state.cut_full_history_replies.store(1, Ordering::SeqCst);
+        let (status, cut) = reply(state.clone(), uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(complete.starts_with(&cut));
+        assert!(cut.len() < complete.len());
+        assert!(serde_json::from_slice::<Value>(&cut).is_err());
+        let complete = std::str::from_utf8(&complete).unwrap();
+        assert_eq!(cut.len(), complete.find("\":\"").unwrap() + 4);
+        let (_, retried) = reply(state.clone(), uri).await;
+        assert_eq!(retried.as_ref(), complete.as_bytes());
+        assert_eq!(
+            *state.full_history_requests.lock().unwrap(),
+            vec!["wallet"; 3]
+        );
+        assert_eq!(
+            reply(state.clone(), &format!("{uri}&offset=0")).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, body) = reply(state, "/v2/positions?user=wallet&status=OPEN&filter_type=TOKENS&filter_amount=0&include_archived=true&sort_by=TOKENS&sort_direction=ASC&limit=1000").await;
+        assert_eq!(status, StatusCode::OK);
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["data"].as_array().unwrap().len(), 2);
+        assert_eq!(body["data"][0]["current_size"], "1");
+        assert_eq!(body["data"][1]["current_size"], "5");
+    }
+
+    #[tokio::test]
+    async fn v2_activity_keeps_the_wallet_hold_and_full_history_accounting() {
+        let state = state();
+        state.release_slow.store(false, Ordering::SeqCst);
+        let held = state.clone();
+        let task = tokio::spawn(async move {
+            reply(held, &format!("/v2/activity?user={}&start=1&end=20&type=TRADE,SPLIT,MERGE,REDEEM,CONVERSION&sort_direction=DESC&limit=1000", wallet(2))).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), state.slow_started.notified())
+            .await
+            .unwrap();
+        assert!(!task.is_finished());
+        assert_eq!(
+            *state.full_history_requests.lock().unwrap(),
+            vec![wallet(2).to_string()]
+        );
+        state.slow.add_permits(1);
+        assert_eq!(task.await.unwrap().0, StatusCode::OK);
     }
 }
