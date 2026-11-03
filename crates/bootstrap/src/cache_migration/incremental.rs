@@ -1358,8 +1358,16 @@ pub(super) fn decode_receipt(
         || receipt.schema_version != ACTIVITY_SCHEMA_VERSION
         || receipt.parser_version != ACTIVITY_PARSER_VERSION
         || receipt.pages.iter().any(|p| {
-            p.schema_version != ACTIVITY_SCHEMA_VERSION
+            (p.schema_version != ACTIVITY_SCHEMA_VERSION
+                && !(version == 5
+                    && receipt.acquisition.as_ref().is_some_and(|a| a.version == 4)
+                    && p.schema_version
+                        == pe_source_polymarket_public::ACTIVITY_V2_PAGE_SCHEMA_VERSION))
                 || p.parser_version != ACTIVITY_PARSER_VERSION
+                || receipt
+                    .pages
+                    .first()
+                    .is_some_and(|first| first.schema_version != p.schema_version)
         })
         || (receipt.aggregate_count == 0
             && receipt.source_row_count != 0
@@ -1416,6 +1424,137 @@ struct PageRead {
 }
 
 fn validate_pages(
+    wallet: &str,
+    pages: &[ReconciliationPageEvidence],
+    start: i64,
+    end: i64,
+    allow_anomalies: bool,
+) -> Result<PageRead, BootstrapError> {
+    use pe_source_polymarket_public::ACTIVITY_V2_PAGE_SCHEMA_VERSION;
+    if pages
+        .iter()
+        .any(|page| page.schema_version == ACTIVITY_V2_PAGE_SCHEMA_VERSION)
+    {
+        if !allow_anomalies
+            || pages.iter().any(|page| {
+                page.schema_version != ACTIVITY_V2_PAGE_SCHEMA_VERSION
+                    || page.parser_version != ACTIVITY_PARSER_VERSION
+            })
+        {
+            return invalid("activity page schema does not match acquisition 4".to_owned());
+        }
+        validate_pages_v2(wallet, pages, start, end)
+    } else {
+        validate_pages_v1(wallet, pages, start, end, allow_anomalies)
+    }
+}
+
+fn validate_pages_v2(
+    wallet: &str,
+    pages: &[ReconciliationPageEvidence],
+    start: i64,
+    end: i64,
+) -> Result<PageRead, BootstrapError> {
+    use pe_source_polymarket_public::{
+        ACTIVITY_MAX_OFFSET, RECONCILIATION_PAGE_LIMIT, V2_PAGE_LIMIT,
+    };
+    let mut read = PageRead::default();
+    let mut remaining = pages;
+    let mut frontier = start;
+    while let Some(first) = remaining.first() {
+        let bounds = first.bounds.ok_or_else(|| BootstrapError::Invalid {
+            message: "activity page omitted window".to_owned(),
+        })?;
+        let lo = bounds.start.ok_or_else(|| BootstrapError::Invalid {
+            message: "activity page omitted positive wire start".to_owned(),
+        })?;
+        if lo < start || lo >= bounds.end || bounds.end > end {
+            return invalid("activity page is outside the frozen read window".to_owned());
+        }
+        if lo != frontier {
+            return invalid("activity terminal windows have a gap or overlap".to_owned());
+        }
+        let length = remaining
+            .iter()
+            .take_while(|page| page.bounds == Some(bounds))
+            .count();
+        let (window, rest) = remaining.split_at(length);
+        let mut cursor = None;
+        let mut seen = BTreeSet::new();
+        let mut rows = 0;
+        for (index, page) in window.iter().enumerate() {
+            if page.partition.is_some() || page.row_count > V2_PAGE_LIMIT {
+                return invalid("activity page is outside the frozen read window".to_owned());
+            }
+            let terminal = index + 1 == window.len();
+            if page.has_more != Some(!terminal)
+                || page.next_cursor.is_some() == terminal
+                || page.next_cursor.as_ref().is_some_and(String::is_empty)
+                || (!terminal && page.row_count == 0)
+                || page
+                    .next_cursor
+                    .as_ref()
+                    .is_some_and(|next| !seen.insert(next.clone()))
+            {
+                return invalid("activity page cursor chain is incomplete".to_owned());
+            }
+            let url = reqwest::Url::parse(&page.request_url).map_err(|error| {
+                BootstrapError::Invalid {
+                    message: format!("invalid page URL: {error}"),
+                }
+            })?;
+            let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+            let wire_start = lo
+                .checked_add(1)
+                .ok_or(BootstrapError::Internal)?
+                .to_string();
+            if url.path() != "/v2/activity"
+                || query.get("user").map(String::as_str) != Some(wallet)
+                || query.get("type").map(String::as_str)
+                    != Some("TRADE,SPLIT,MERGE,REDEEM,CONVERSION")
+                || query.get("start") != Some(&wire_start)
+                || query.get("end") != Some(&bounds.end.to_string())
+                || query.get("sort_direction").map(String::as_str) != Some("ASC")
+                || query.get("cursor") != cursor.as_ref()
+                || (index == 0 && query.get("limit") != Some(&V2_PAGE_LIMIT.to_string()))
+                || (index > 0 && query.contains_key("limit"))
+            {
+                return invalid("activity page request does not match its proof".to_owned());
+            }
+            let mut indices = BTreeSet::new();
+            for anomaly in &page.anomalies {
+                let second = anomaly.source_time.0.unix_timestamp();
+                if anomaly.wallet.to_string() != wallet
+                    || second <= lo
+                    || second > bounds.end
+                    || anomaly.row_index
+                        >= usize::try_from(page.row_count).map_err(|_| BootstrapError::Internal)?
+                    || !indices.insert(anomaly.row_index)
+                {
+                    return invalid("activity anomaly is outside its page proof".to_owned());
+                }
+                validate_hex_sha256(&anomaly.raw_row_hash, "activity anomaly raw row hash")?;
+            }
+            validate_hex_sha256(&page.raw_page_hash, "raw page hash")?;
+            validate_hex_sha256(&page.canonical_page_hash, "canonical page hash")?;
+            rows = checked_activity_count(rows, u64::from(page.row_count))?;
+            if rows > u64::from(ACTIVITY_MAX_OFFSET + RECONCILIATION_PAGE_LIMIT - 1) {
+                return invalid("activity window exceeds capacity".to_owned());
+            }
+            read.anomalies.extend(page.anomalies.clone());
+            cursor.clone_from(&page.next_cursor);
+        }
+        read.rows = checked_activity_count(read.rows, rows)?;
+        frontier = bounds.end;
+        remaining = rest;
+    }
+    if frontier != end {
+        return invalid("activity terminal windows do not reach fixed end".to_owned());
+    }
+    Ok(read)
+}
+
+fn validate_pages_v1(
     wallet: &str,
     pages: &[ReconciliationPageEvidence],
     start: i64,
@@ -2404,6 +2543,149 @@ mod tests {
     use super::super::activity_fixtures::{complete_receipt, wallet_hex};
     use super::*;
     use pe_source_polymarket_public::{ActivityRowAcceptance, FixtureFetcher, PolymarketEndpoint};
+
+    fn schema_3_pages(counts: &[u32], start: i64, end: i64) -> Vec<ReconciliationPageEvidence> {
+        use pe_source_polymarket_public::{
+            ActivityRequestBounds, ActivitySortDirection, V2ActivityRequest,
+        };
+        let mut request = V2ActivityRequest::position_changes(
+            WalletAddress::from_hex(&wallet_hex(1)).unwrap(),
+            Some(start),
+            end,
+            ActivityRowAcceptance::Acquisition4,
+        );
+        request.direction = ActivitySortDirection::Asc;
+        counts
+            .iter()
+            .enumerate()
+            .map(|(index, count)| {
+                let cursor = (index > 0).then(|| format!("page-{index}"));
+                ReconciliationPageEvidence {
+                    request_url: request
+                        .url("https://data.example", cursor.as_deref())
+                        .unwrap(),
+                    bounds: Some(ActivityRequestBounds {
+                        start: Some(start),
+                        end,
+                    }),
+                    partition: None,
+                    offset: 12345,
+                    row_count: *count,
+                    canonical_page_hash: "a".repeat(64),
+                    raw_page_hash: "b".repeat(64),
+                    received_at: pe_core_types::ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+                    schema_version: 3,
+                    parser_version: 2,
+                    anomalies: Vec::new(),
+                    has_more: Some(index + 1 < counts.len()),
+                    next_cursor: (index + 1 < counts.len()).then(|| format!("page-{}", index + 1)),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn schema_3_acquisition_4_accepts_exact_terminal_pages_and_cosmetic_offsets() {
+        let wallet = wallet_hex(1);
+        for counts in [
+            &[0][..],
+            &[1000][..],
+            &[1000, 1000, 1000, 1000, 1000, 499][..],
+        ] {
+            let pages = schema_3_pages(counts, 0, 100);
+            let read = validate_pages(&wallet, &pages, 0, 100, true).unwrap();
+            assert_eq!(
+                read.rows,
+                counts.iter().map(|count| u64::from(*count)).sum::<u64>()
+            );
+            assert!(validate_pages(&wallet, &pages, 0, 100, false).is_err());
+        }
+        let mut pages = schema_3_pages(&[10], 0, 50);
+        pages.extend(schema_3_pages(&[20], 50, 100));
+        assert_eq!(
+            validate_pages(&wallet, &pages, 0, 100, true).unwrap().rows,
+            30
+        );
+    }
+
+    #[test]
+    fn schema_3_anomalies_follow_the_same_page_rules_as_schema_2() {
+        let wallet = wallet_hex(1);
+        let mut pages = schema_3_pages(&[1], 0, 100);
+        // Use the parser's anomaly encoding so this proof follows the shared row contract.
+        let mut request = pe_source_polymarket_public::V2ActivityRequest::position_changes(
+            WalletAddress::from_hex(&wallet).unwrap(),
+            Some(0),
+            100,
+            ActivityRowAcceptance::Acquisition4,
+        );
+        request.direction = pe_source_polymarket_public::ActivitySortDirection::Asc;
+        let body = serde_json::to_vec(&serde_json::json!({"data":[{
+            "proxy_wallet":wallet,"timestamp":100,"type":"TRADE","transaction_hash":"bad",
+            "condition_id":"0xa","token_id":"100","side":"BUY","outcome_index":0,
+            "price":"3","size":"1","usdc_size":"1"}],
+            "pagination":{"limit":1000,"offset":0,"has_more":false,"next_cursor":null}}))
+        .unwrap();
+        let page = pe_source_polymarket_public::parse_activity_page_v2(
+            &body,
+            &pages[0].request_url,
+            &request,
+            &pe_source_polymarket_public::ActivityParseContext {
+                source_id: pe_core_types::SourceId("fixture".to_owned()),
+                observed_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+                received_at: pe_core_types::ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+                transport: pe_source_polymarket_public::ActivityTransport::Rest,
+            },
+        )
+        .unwrap();
+        pages[0] = page.evidence;
+        assert_eq!(
+            validate_pages(&wallet, &pages, 0, 100, true)
+                .unwrap()
+                .anomalies
+                .len(),
+            1
+        );
+        pages[0].anomalies[0].row_index = 1;
+        assert!(validate_pages(&wallet, &pages, 0, 100, true).is_err());
+        pages[0].anomalies[0].row_index = 0;
+        pages[0].anomalies[0].source_time = SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH);
+        assert!(validate_pages(&wallet, &pages, 0, 100, true).is_err());
+    }
+
+    #[test]
+    fn acquisition_4_decode_requires_homogeneous_schema_2_or_3_pages() {
+        let wallet = wallet_hex(1);
+        let connection = Connection::open_in_memory().unwrap();
+        let mut acquisition = complete_receipt(&wallet, &[], 100).acquisition.unwrap();
+        acquisition.version = 4;
+        for (schemas, version, accepted) in [
+            (vec![2, 2], 5, true),
+            (vec![3, 3], 5, true),
+            (vec![2, 3], 5, false),
+            (vec![3, 2], 5, false),
+            (vec![3], 4, false),
+            (vec![4], 5, false),
+        ] {
+            let mut pages = schema_3_pages(&vec![0; schemas.len()], 0, 100);
+            for (page, schema) in pages.iter_mut().zip(schemas) {
+                page.schema_version = schema;
+            }
+            let decoded = connection
+                .query_row(
+                    "SELECT ?1, 'reference', 100, ?2, ?3, 0, 0, 2, 2, ?4, NULL",
+                    params![
+                        wallet,
+                        canonical_json(&pages).unwrap(),
+                        aggregate_digest(&[]).unwrap(),
+                        canonical_json(&acquisition).unwrap()
+                    ],
+                    |row| Ok(decode_receipt(row, "reference", 100, version)),
+                )
+                .unwrap();
+            assert_eq!(decoded.is_ok(), accepted);
+        }
+    }
 
     /// Three archived full reads and an unarchived head, with real page proofs.
     async fn anomaly_history(

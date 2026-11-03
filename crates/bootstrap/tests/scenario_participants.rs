@@ -77,8 +77,6 @@ fn enabled_cli_failure_is_75_and_disabled_discovery_preserves_coverage() {
     let args = [
         "winner-discovery",
         "--defer-activation",
-        "--series",
-        "7:seven",
         "--end-date-min",
         "0",
     ];
@@ -138,12 +136,17 @@ fn import_cli_refusals_change_neither_wallets_nor_coverage_and_rerun_is_idempote
     assert_eq!(repaired.1.unwrap()["market_floor_unix"], 4);
 }
 
+fn trade_page(data: Value) -> Value {
+    json!({"data": data, "pagination": {"limit":1000, "offset":0, "has_more":false, "next_cursor":null}})
+}
+
 #[derive(Default)]
 struct Venue {
     requests: Vec<String>,
     mode: u8,
     trade_time: i64,
     closed: bool,
+    series_failure: Option<&'static str>,
 }
 
 fn serve(venue: Arc<Mutex<Venue>>) -> String {
@@ -165,10 +168,28 @@ fn serve(venue: Arc<Mutex<Venue>>) -> String {
             let request = String::from_utf8_lossy(&bytes).into_owned();
             let mut venue = venue.lock().unwrap();
             venue.requests.push(request.clone());
-            let (status, body) = if request.starts_with("GET /series/7 ") {
-                (200, json!({"id":"7", "slug":"seven", "recurrence":"15m"}))
+            let (status, body) = if request.starts_with("GET /series?") {
+                (200, json!([{"id":"7", "slug":"seven", "recurrence":"15m"}]))
+            } else if request.starts_with("GET /series/7 ") {
+                match venue.series_failure {
+                    Some("gone") => (404, json!({"error":"not found"})),
+                    Some("renamed") => {
+                        (200, json!({"id":"7", "slug":"renamed", "recurrence":"15m"}))
+                    }
+                    Some("recurrence") => {
+                        (200, json!({"id":"7", "slug":"seven", "recurrence":"daily"}))
+                    }
+                    None => (200, json!({"id":"7", "slug":"seven", "recurrence":"15m"})),
+                    _ => unreachable!(),
+                }
             } else if request.starts_with("GET /events/keyset?") {
-                if request.contains("after_cursor=last") {
+                let path = request.split_whitespace().nth(1).unwrap();
+                let url = reqwest::Url::parse(&format!("http://fixture{path}")).unwrap();
+                let query: std::collections::BTreeMap<_, _> =
+                    url.query_pairs().into_owned().collect();
+                if request.contains("after_cursor=last")
+                    || query["end_date_min"].as_str() > "1970-01-02T00:00:00Z"
+                {
                     (200, json!({"events":[]}))
                 } else {
                     (
@@ -176,17 +197,26 @@ fn serve(venue: Arc<Mutex<Venue>>) -> String {
                         json!({"events":[{"series":[{"id":"7", "recurrence":"15m"}], "markets":[{"conditionId":CONDITION, "endDate":"1970-01-02T00:00:00Z", "closed":venue.closed}]}], "next_cursor":"last"}),
                     )
                 }
-            } else if request.starts_with("GET /trades?") {
+            } else if request.starts_with("GET /v2/trades?") {
                 match venue.mode {
                     0 => (400, json!({"error":"fixture failed page"})),
                     1 => (
                         200,
-                        json!([{"proxyWallet":WALLET, "timestamp":venue.trade_time}]),
+                        trade_page(
+                            json!([{"proxy_wallet":WALLET, "timestamp":venue.trade_time, "size":"0.000001"}]),
+                        ),
                     ),
-                    2 => (200, json!([{"proxyWallet":WALLET}, {}])),
+                    2 => (
+                        200,
+                        trade_page(
+                            json!([{"proxy_wallet":WALLET, "timestamp":venue.trade_time}, {"timestamp":venue.trade_time}]),
+                        ),
+                    ),
                     3 => (
                         200,
-                        json!([{"proxyWallet":NEW_WALLET, "timestamp":venue.trade_time}]),
+                        trade_page(
+                            json!([{"proxy_wallet":NEW_WALLET, "timestamp":venue.trade_time}]),
+                        ),
                     ),
                     _ => panic!("unexpected fixture mode"),
                 }
@@ -201,7 +231,7 @@ fn serve(venue: Arc<Mutex<Venue>>) -> String {
 }
 
 #[test]
-fn pinned_discovery_retries_pages_and_finds_post_end_trades_before_advancing_coverage() {
+fn discovery_retries_pages_and_finds_post_end_trades_before_advancing_coverage() {
     let dir = TempDir::new().unwrap();
     drop(WalletCache::open(&dir.path().join("cache.db")).unwrap());
     let before = time::OffsetDateTime::now_utc().unix_timestamp() - 10;
@@ -216,8 +246,6 @@ fn pinned_discovery_retries_pages_and_finds_post_end_trades_before_advancing_cov
     let args = [
         "winner-discovery",
         "--defer-activation",
-        "--series",
-        "7:seven",
         "--end-date-min",
         "0",
     ];
@@ -272,20 +300,120 @@ fn pinned_discovery_retries_pages_and_finds_post_end_trades_before_advancing_cov
         let url = reqwest::Url::parse(&format!("{base}{path}")).unwrap();
         let query: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
         match url.path() {
-            "/series/7" => {}
+            "/series" | "/series/7" => {}
             "/events/keyset" => {
                 assert_eq!(query["end_date_min"], "1970-01-01T00:00:00Z");
                 assert!(!query.contains_key("closed"));
             }
-            "/trades" => {
-                assert_eq!(query["market"], CONDITION);
-                assert_eq!(query["takerOnly"], "false");
+            "/v2/trades" => {
+                assert_eq!(query["condition"], CONDITION);
+                assert_eq!(query["taker_only"], "false");
+                assert_eq!(query["filter_amount"], "0.0000001");
+                assert_eq!(query["limit"], "1000");
                 assert!(
-                    query["start"].parse::<i64>().unwrap() == before - 5
-                        || query["start"].parse::<i64>().unwrap() == first_end - 5
+                    !query.contains_key("start")
+                        && !query.contains_key("end")
+                        && !query.contains_key("offset")
                 );
             }
-            _ => panic!("unpinned request {path}"),
+            _ => panic!("unexpected request {path}"),
         }
     }
+}
+
+#[test]
+fn discovery_refuses_changed_or_missing_covered_series_before_trades() {
+    for failure in ["gone", "renamed", "recurrence"] {
+        let dir = TempDir::new().unwrap();
+        drop(WalletCache::open(&dir.path().join("cache.db")).unwrap());
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        std::fs::write(dir.path().join("participants.txt"), WALLET).unwrap();
+        assert!(
+            imported(dir.path(), now - 100, now - 10, 0)
+                .status
+                .success()
+        );
+        let initial = snapshot(dir.path());
+        let venue = Arc::new(Mutex::new(Venue {
+            mode: 3,
+            trade_time: now,
+            series_failure: Some(failure),
+            ..Venue::default()
+        }));
+        let base = serve(Arc::clone(&venue));
+        let output = run(
+            dir.path(),
+            &[
+                "winner-discovery",
+                "--defer-activation",
+                "--end-date-min",
+                "0",
+            ],
+            &base,
+            "5",
+        );
+        assert_eq!(output.status.code(), Some(75), "{failure}: {output:?}");
+        assert_eq!(snapshot(dir.path()), initial);
+        assert!(
+            !venue
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|request| request.starts_with("GET /v2/trades"))
+        );
+    }
+}
+
+#[test]
+fn import_cannot_drop_or_rename_any_of_ten_covered_series_but_accepts_a_superset() {
+    let dir = TempDir::new().unwrap();
+    drop(WalletCache::open(&dir.path().join("cache.db")).unwrap());
+    let series = |n: u64| {
+        (1..=n)
+            .map(|id| format!("{id}:s{id}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let import = |series: &str| {
+        run(
+            dir.path(),
+            &[
+                "participants-import",
+                "--wallets",
+                "participants.txt",
+                "--series",
+                series,
+                "--end-date-min",
+                "0",
+                "--covered-from",
+                "10",
+                "--covered-through",
+                "20",
+            ],
+            "invalid URL must never be fetched",
+            "5",
+        )
+    };
+    std::fs::write(dir.path().join("participants.txt"), WALLET).unwrap();
+    assert!(import(&series(10)).status.success());
+    let initial = snapshot(dir.path());
+    std::fs::write(dir.path().join("participants.txt"), NEW_WALLET).unwrap();
+    for dropped in [series(9), series(10).replace("10:s10", "10:renamed")] {
+        let output = import(&dropped);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("retain every covered id:slug"));
+        assert_eq!(snapshot(dir.path()), initial);
+    }
+    let accepted = import(&series(11));
+    assert!(accepted.status.success(), "{accepted:?}");
+    let final_state = snapshot(dir.path());
+    assert_eq!(final_state.0, 2);
+    assert_eq!(
+        final_state.1.unwrap()["scope"]["series"]
+            .as_array()
+            .unwrap()
+            .len(),
+        11
+    );
 }

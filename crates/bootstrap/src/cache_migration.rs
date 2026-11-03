@@ -1968,6 +1968,11 @@ enum WalkRead {
     NoProgress(String),
 }
 
+enum V2WindowRead {
+    Kept(pe_source_polymarket_public::CompleteActivityRead),
+    OverCapacity(i64),
+}
+
 struct ActivityWalk<'a> {
     fetcher: &'a dyn ReconciliationFetcher,
     base_url: &'a str,
@@ -1984,6 +1989,173 @@ impl ActivityWalk<'_> {
     fn expired(&self) -> bool {
         self.deadline
             .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    }
+
+    async fn window_v2(&self, lo: i64, hi: i64) -> Result<V2WindowRead, ActivityReadError> {
+        use pe_source_polymarket_public::{
+            ACTIVITY_MAX_OFFSET, ActivitySortDirection, RECONCILIATION_PAGE_LIMIT,
+            V2ActivityRequest, V2AuthenticationError, fetch_activity_page_v2,
+        };
+        let mut request =
+            V2ActivityRequest::position_changes(self.wallet, Some(lo), hi, self.row_acceptance);
+        request.direction = ActivitySortDirection::Asc;
+        request.retain_provenance = false;
+        let mut read = pe_source_polymarket_public::CompleteActivityRead {
+            anomalies: Vec::new(),
+            requested_wallet: self.wallet,
+            fixed_end: hi,
+            rows: Vec::new(),
+            pages: Vec::new(),
+        };
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        loop {
+            let page =
+                fetch_activity_page_v2(self.fetcher, self.base_url, &request, cursor.as_deref())
+                    .await?;
+            if page.has_more && page.row_count == 0 {
+                return Err(V2AuthenticationError::EmptyContinuation {
+                    index: read.pages.len(),
+                }
+                .into());
+            }
+            if let Some(next) = &page.next_cursor
+                && !seen.insert(next.clone())
+            {
+                return Err(V2AuthenticationError::RepeatedCursor(next.clone()).into());
+            }
+            cursor = page.next_cursor;
+            read.rows.extend(page.rows);
+            read.anomalies.extend(page.anomalies);
+            read.pages.push(page.evidence);
+            if read.rows.len() + read.anomalies.len()
+                > usize::try_from(ACTIVITY_MAX_OFFSET + RECONCILIATION_PAGE_LIMIT - 1)
+                    .map_err(|_| ActivityReadError::RowCountOverflow)?
+            {
+                if hi == lo + 1 {
+                    return Err(ActivityReadError::SaturatedTerminalSecond {
+                        end: hi,
+                        offset: ACTIVITY_MAX_OFFSET,
+                    });
+                }
+                // Anomalies count toward capacity and the ASC sizing prefix too.
+                let mut seconds = read
+                    .rows
+                    .iter()
+                    .map(|row| row.source_time.0.unix_timestamp())
+                    .chain(
+                        read.anomalies
+                            .iter()
+                            .map(|row| row.source_time.0.unix_timestamp()),
+                    )
+                    .collect::<Vec<_>>();
+                let target = usize::try_from(ACTIVITY_MAX_OFFSET - 1)
+                    .map_err(|_| ActivityReadError::RowCountOverflow)?;
+                let (_, second, _) = seconds.select_nth_unstable(target);
+                return Ok(V2WindowRead::OverCapacity(*second));
+            }
+            if !page.has_more {
+                return Ok(V2WindowRead::Kept(read));
+            }
+        }
+    }
+
+    async fn read_v2(&mut self, skip_probe: bool) -> Result<WalkRead, BootstrapError> {
+        let mut top = self.end;
+        let mut exact = false;
+        if !skip_probe {
+            match self.window_v2(self.start, self.end).await {
+                Ok(V2WindowRead::Kept(read)) => return Ok(WalkRead::Probe(read)),
+                Ok(V2WindowRead::OverCapacity(second)) => {
+                    top = (second - 1).max(self.start + 1);
+                    exact = true;
+                }
+                Err(error) if excludes_wallet(&error) => {
+                    return Ok(WalkRead::NoProgress(error.to_string()));
+                }
+                Err(error) if recoverable_retry_wait(&error).is_some() => {}
+                Err(error) => return Err(activity_read_failure(self.wallet_hex, error)),
+            }
+        }
+        let mut read = pe_source_polymarket_public::CompleteActivityRead {
+            anomalies: Vec::new(),
+            requested_wallet: self.wallet,
+            fixed_end: self.start,
+            rows: Vec::new(),
+            pages: Vec::new(),
+        };
+        let mut reason = None;
+        loop {
+            // As in v1, the first proved window is attempted even after an expired probe.
+            if !read.pages.is_empty()
+                && (self.expired()
+                    || self.held.count.load(Ordering::SeqCst) >= ACTIVITY_WALK_HELD_ROWS)
+            {
+                reason = Some(
+                    if self.expired() {
+                        "acquisition budget exhausted"
+                    } else {
+                        "activity walk held-row limit reached"
+                    }
+                    .to_owned(),
+                );
+                break;
+            }
+            let lo = read.fixed_end;
+            match self.window_v2(lo, top).await {
+                Ok(V2WindowRead::Kept(window)) => {
+                    let count = window.rows.len() + window.anomalies.len();
+                    self.held.keep(count)?;
+                    read.fixed_end = window.fixed_end;
+                    read.rows.extend(window.rows);
+                    read.anomalies.extend(window.anomalies);
+                    read.pages.extend(window.pages);
+                    if read.fixed_end == self.end {
+                        break;
+                    }
+                    let width = top - lo;
+                    top = top
+                        .saturating_add(width.saturating_mul(if count < 2500 { 8 } else { 1 }))
+                        .min(self.end);
+                    exact = false;
+                }
+                Ok(V2WindowRead::OverCapacity(second)) => {
+                    if exact {
+                        reason = Some("activity window grew between reads".to_owned());
+                        break;
+                    }
+                    top = (second - 1).max(lo + 1);
+                    exact = true;
+                }
+                Err(error) if excludes_wallet(&error) => {
+                    reason = Some(error.to_string());
+                    break;
+                }
+                Err(error) => {
+                    let Some((deadline, wait)) = self.deadline.zip(recoverable_retry_wait(&error))
+                    else {
+                        return Err(activity_read_failure(self.wallet_hex, error));
+                    };
+                    if self.expired()
+                        || tokio::time::timeout_at(deadline, tokio::time::sleep(wait))
+                            .await
+                            .is_err()
+                        || self.expired()
+                    {
+                        reason = Some(format!("acquisition budget exhausted: {error}"));
+                        break;
+                    }
+                    tracing::warn!(wallet = self.wallet_hex, %error, "activity window failed; retrying within the wallet budget");
+                }
+            }
+        }
+        if read.pages.is_empty() {
+            Ok(WalkRead::NoProgress(
+                reason.ok_or(BootstrapError::Internal)?,
+            ))
+        } else {
+            Ok(WalkRead::Proved(read, reason))
+        }
     }
 
     async fn read(&mut self, skip_probe: bool) -> Result<WalkRead, BootstrapError> {
@@ -2207,7 +2379,12 @@ async fn collect_activity_v2(
                 row_acceptance: proof.identity.row_acceptance(),
                 held: HeldWalkRows { count: Arc::clone(held_rows), rows: 0 },
             };
-            match walk.read(proof.skip_probe(&wallet_hex)).await? {
+            let outcome = if proof.identity.version == 5 {
+                walk.read_v2(proof.skip_probe(&wallet_hex)).await?
+            } else {
+                walk.read(proof.skip_probe(&wallet_hex)).await?
+            };
+            match outcome {
                 WalkRead::Proved(complete, reason) => (complete, Some(walk.held), reason),
                 WalkRead::NoProgress(reason) => {
                     tracing::warn!(wallet = %wallet_hex, generation, %reason, "activity wallet acquisition stopped without progress");
@@ -2629,7 +2806,9 @@ pub fn commit_activity_batch_for_test(
 fn excludes_wallet(error: &ActivityReadError) -> bool {
     matches!(
         error,
-        ActivityReadError::Parse(_)
+        ActivityReadError::V2Envelope(_)
+            | ActivityReadError::V2Authentication(_)
+            | ActivityReadError::Parse(_)
             | ActivityReadError::Aggregate(_)
             | ActivityReadError::Identity(_)
             | ActivityReadError::RowOutsideBounds { .. }

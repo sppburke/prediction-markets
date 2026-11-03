@@ -57,7 +57,6 @@ EXPECTED_DEFAULT_HALF_LIFE = "30"
 CYCLE_SETTINGS = {
     "market_recurrences": "PE_BOOTSTRAP_MARKET_RECURRENCES",
     "rank_market_recurrences": "PE_RANK_MARKET_RECURRENCES",
-    "rank_market_series": "PE_RANK_MARKET_SERIES",
     "research_link_dir": "PE_RANK_RESEARCH_LINK_DIR",
 }
 
@@ -498,27 +497,17 @@ class RankAndPushScenario(unittest.TestCase):
                 scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
                 self.assertEqual(scope[scope.index("--recurrences") + 1], ranking or "15m")
 
-    def test_pinned_ranking_series_reach_market_scope_only_when_set(self):
-        pin = "10192:btc-up-or-down-15m,12518:zec-up-or-down-15m"
-        for series in (None, pin):
-            with self.subTest(series=series):
-                self.tearDown(); self.setUp()
-                env = {"PE_RANK_MARKET_RECURRENCES": "5m,15m"}
-                if series:
-                    env["PE_RANK_MARKET_SERIES"] = series
-                result = self._run(exit_env=env)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
-                discovery = shlex.split(self._log("pe_bootstrap.log").splitlines()[0])
-                for call in (scope, discovery):
-                    if series:
-                        self.assertEqual(call[call.index("--series") + 1], pin)
-                    else:
-                        self.assertNotIn("--series", call)
-                    self.assertEqual(call[call.index("--recurrences") + 1], "5m,15m")
-                    self.assertEqual(call[call.index("--end-date-min") + 1],
-                                     scope[scope.index("--end-date-min") + 1])
-        print("PASS: discovery and ranking share their pin, recurrences and market floor")
+    def test_schema_one_scope_lists_the_catalog_with_discoverys_recurrences_and_floor(self):
+        result = self._run(exit_env={"PE_RANK_MARKET_RECURRENCES": "5m,15m",
+                                     "PE_RANK_MARKET_SERIES": "7:ignored"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
+        discovery = shlex.split(self._log("pe_bootstrap.log").splitlines()[0])
+        for call in (scope, discovery):
+            self.assertNotIn("--series", call)
+            self.assertEqual(call[call.index("--recurrences") + 1], "5m,15m")
+            self.assertEqual(call[call.index("--end-date-min") + 1],
+                             scope[scope.index("--end-date-min") + 1])
 
     def test_refresh_crossing_utc_midnight_keeps_cycle_day_and_parameterized_today(self):
         sys.path.insert(0, str(WRAPPER.parent))
@@ -1260,7 +1249,7 @@ class RankAndPushScenario(unittest.TestCase):
                     self.tearDown(); self.setUp()
                     self._install_cycle_probe()
                     settings = dict(zip(CYCLE_SETTINGS.values(), (
-                        "15m,5m", "", "10192:btc-up-or-down-15m",
+                        "15m,5m", "",
                         str(self.root / "research 'links $(literal)"),
                     ), strict=True)) if recorded else {}
                     with (self.root / ".env").open("a") as handle:
@@ -1704,6 +1693,9 @@ class RankAndPushScenario(unittest.TestCase):
                     singleton INTEGER PRIMARY KEY, ranker_projection_count INTEGER,
                     ranker_projection_digest TEXT, ranker_classifier_version INTEGER,
                     phase TEXT, fresh_collection_json TEXT);
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta VALUES ('participant_discovery_coverage',
+                    '{"version":1,"scope":{"recurrences":["15m"],"series":[{"id":"7","slug":"seven"}]},"market_floor_unix":0,"covered_from_unix":0,"covered_through_unix":253402300799}');
                 INSERT INTO wallets VALUES ('0xabc', 1, 0);
                 INSERT INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count, group_count) VALUES
                     (1, '[]', 20, 'aa', 1, 'bb', 'cc', 1, 1);
@@ -1740,6 +1732,8 @@ class RankAndPushScenario(unittest.TestCase):
             operations,
             ["market-scope", "cache-finalize-v2", "cache-activate"],
         )
+        scope = shlex.split(bootstrap[0])
+        self.assertEqual(scope[scope.index("--series") + 1], "7:seven")
         print("PASS: schema-two request preparation precedes activation and exact resume")
 
     def test_operator_stage_record_missing_or_symlink_fails_before_step_zero(self):
@@ -2202,7 +2196,7 @@ class RankAndPushScenario(unittest.TestCase):
             connection.execute("ALTER TABLE wallets ADD COLUMN source_bits INTEGER DEFAULT 0")
             connection.execute("UPDATE wallets SET wallet_hex=?", ("0x" + "a" * 40,))
             connection.execute("INSERT INTO meta VALUES ('participant_discovery_coverage', ?)",
-                               (json.dumps(dict(version=1, scope=dict(recurrences=["15m"], series=None),
+                               (json.dumps(dict(version=1, scope=dict(recurrences=["15m"], series=[dict(id="7", slug="seven")]),
                                                 market_floor_unix=0, covered_from_unix=0,
                                                 covered_through_unix=253402300799)),))
             if schema == 2:
@@ -2262,8 +2256,7 @@ class RankAndPushScenario(unittest.TestCase):
             "sub, db = a[0], opt('--db')\n"
             "if sub == 'winner-discovery':\n"
             "    from rank_cycle_manifest import _participant_scope\n"
-            "    pin = opt('--series')\n"
-            "    scope = _participant_scope(opt('--recurrences').split(','), None if not pin else [dict(zip(('id', 'slug'), item.split(':', 1))) for item in pin.split(',')])\n"
+            "    scope = _participant_scope(opt('--recurrences').split(','), [dict(id='7', slug='seven')])\n"
             "    # Through the end of today's UTC day: any same-day cycle's print tail is covered whatever the clock reads.\n"
             "    coverage = dict(version=1, scope=scope, market_floor_unix=int(opt('--end-date-min')), covered_from_unix=0, covered_through_unix=(now // 86400 + 1) * 86400)\n"
             "    if os.environ.get('STUB_COVERAGE'): coverage = json.loads(os.environ['STUB_COVERAGE'])\n"
@@ -2504,6 +2497,45 @@ class RankAndPushScenario(unittest.TestCase):
         with (self.root / ".env").open("a") as handle:
             handle.write("PE_RANK_SCHEMA_TWO_CUTOVER=prepare\n")
         return fixed
+
+    def test_retained_series_setting_is_inert_and_scope_comes_from_side_coverage(self):
+        fixed = self._prepare_incremental_fixture(two_file=True)
+        first = self._run(exit_env={"STUB_RECORD_ACTIVATION": "1", "STUB_EXIT_cache_populate_activity_v2": "75",
+                                    "PE_RANK_MARKET_SERIES": "99:ignored"})
+        self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+        out = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
+        configuration = out / "cycle_configuration.json"
+        recorded = json.loads(configuration.read_text())
+        self.assertNotIn("rank_market_series", recorded)
+        recorded["rank_market_series"] = "99:recorded-old-pin"
+        configuration.write_text(json.dumps(recorded))
+        before = configuration.read_bytes()
+        side = next(fixed.parent.glob("*.side.db"))
+        with sqlite3.connect(side) as c:
+            coverage = json.loads(c.execute("SELECT value FROM meta WHERE key='participant_discovery_coverage'").fetchone()[0])
+            coverage["scope"]["series"] = [dict(id="10", slug="ten"), dict(id="7", slug="seven")]
+            c.execute("UPDATE meta SET value=? WHERE key='participant_discovery_coverage'", (json.dumps(coverage),))
+        resumed = self._run(exit_env={"PE_RANK_MARKET_SERIES": "98:changed-env"})
+        self.assertEqual(resumed.returncode, 2, resumed.stderr + resumed.stdout)
+        self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
+        self.assertIn("[winner-discovery] skipped", resumed.stdout)
+        scope = shlex.split(self._bootstrap_lines("market-scope")[-1])
+        self.assertEqual(scope[scope.index("--series") + 1], "10:ten,7:seven")
+        for call in self._bootstrap_lines("winner-discovery"):
+            self.assertNotIn("--series", shlex.split(call))
+        self.assertEqual(configuration.read_bytes(), before)
+
+    def test_participant_series_failure_stops_before_scope_or_collection(self):
+        self._prepare_incremental_fixture(two_file=True)
+        helper = self.root / "scripts/rank_cycle_manifest.py"
+        body = helper.read_text().replace('    if args.command == "participant-series":',
+                                        '    if args.command == "participant-series":\n        raise SystemExit(47)')
+        helper.write_text(body)
+        result = self._run()
+        self.assertEqual(result.returncode, 47, result.stdout + result.stderr)
+        self.assertNotIn("market-scope", self._bootstrap_ops())
+        self.assertNotIn("cache-populate-activity-v2", self._bootstrap_ops())
+        self.assertIsNone(self._log("rank.log"))
 
     def test_fresh_cycles_never_clear_an_infra_mark(self):
         # #826: infra marks are permanent; an old release's reviewed-clear list is ignored.
@@ -2780,6 +2812,7 @@ Path('scope_done').write_text('yes')
         scope = shlex.split(self._bootstrap_lines("market-scope")[0])
         self.assertEqual(scope[scope.index("--out") + 1], scope_file)
         self.assertEqual(scope[scope.index("--recurrences") + 1], "15m")
+        self.assertEqual(scope[scope.index("--series") + 1], "7:seven")
         descriptors = (self.root / "scope_fds").read_text().splitlines()
         for lock in ("data/eval-results/.rank_and_push.lock", "loop.lock"):
             self.assertNotIn(str((self.root / lock).resolve()), descriptors, lock)
@@ -2933,7 +2966,7 @@ Path('scope_done').write_text('yes')
                     elif kind == "tombstoned":
                         c.execute("INSERT INTO purged_wallets VALUES (?, 'proven_loser')", ("0x" + "a" * 40,))
                     else:
-                        env["STUB_COVERAGE"] = json.dumps(dict(version=1, scope=dict(recurrences=["15m"], series=None),
+                        env["STUB_COVERAGE"] = json.dumps(dict(version=1, scope=dict(recurrences=["15m"], series=[dict(id="7", slug="seven")]),
                                                                market_floor_unix=0, covered_from_unix=0, covered_through_unix=1))
                 result = self._run(exit_env=env)
                 self._assert_candidate_held(result, "print tail" if kind == "coverage" else kind + " participant")
