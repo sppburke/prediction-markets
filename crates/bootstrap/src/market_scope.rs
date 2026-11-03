@@ -215,7 +215,7 @@ pub(crate) async fn list_market_series(
     Ok((series.into_values().collect(), pages))
 }
 
-/// Parse `id:slug,...`, the series a scope must list exactly (the research period pins gen 26's).
+/// Parse `id:slug,...`, the exact series a scope reads by id (schema two passes discovery's covered set).
 pub fn parse_pinned_series(text: &str) -> Result<Vec<ScopeSeries>, BootstrapError> {
     let mut pinned: Vec<ScopeSeries> = Vec::new();
     for item in text.split(',') {
