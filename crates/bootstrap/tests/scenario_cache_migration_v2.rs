@@ -3443,6 +3443,14 @@ async fn missing_side_resume_rejects_classifier_one_installed_cache() {
     retained_classifier_activity(&dir, &current).await;
     damage_unused_page(&current);
     let current_hash = sha256_file(&current).unwrap();
+    let log = CheckLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
     let refused = activate_cache_v2(&CacheActivationRequest {
         stage_evidence_sha256: None,
         fixed_path: current.clone(),
@@ -3451,7 +3459,17 @@ async fn missing_side_resume_rejects_classifier_one_installed_cache() {
         expected_side_sha256: current_hash.clone(),
     })
     .unwrap_err();
+    drop(guard);
     assert_structural_error(&refused);
+    // The single-file resume prefetches too; SQLite's failing verdict stays the result.
+    let size = current.metadata().unwrap().len();
+    assert_check_event(
+        &log.take(),
+        "activation_missing_side",
+        &current,
+        size,
+        false,
+    );
     assert_eq!(sha256_file(&current).unwrap(), current_hash);
     assert_eq!(sha256_file(&prior).unwrap(), fixed_hash);
     assert!(!side.exists());
@@ -8641,7 +8659,12 @@ fn assert_check_event(
     assert_eq!(fields["file_size_bytes"], size);
     assert!(fields["elapsed_ms"].as_u64().is_some(), "{fields}");
     assert_eq!(fields["success"], success);
-    if cfg!(target_os = "linux") && matches!(role, "activation_candidate" | "staging_fixed") {
+    if cfg!(target_os = "linux")
+        && matches!(
+            role,
+            "activation_candidate" | "staging_fixed" | "activation_missing_side"
+        )
+    {
         // Damage the helper reads first makes its advice unavailable; the verdict stays SQLite's.
         let prefetch = fields["prefetch"].as_str();
         assert!(

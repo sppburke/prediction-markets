@@ -1142,10 +1142,10 @@ full-read repair. This release adds no automatic reconciliation.
 With `RUST_LOG=info` (or `pe_bootstrap::cache_migration=info`) in the loop environment,
 each completed check emits one JSON event to stderr, inherited by the loop journal
 (`journalctl --user -u pe-rank-loop`), with `role`, `path`, `file_size_bytes`, integer
-`elapsed_ms` and `success`. The `activation_candidate` and `staging_fixed` events also carry
-`prefetch` (`done`, `cancelled`, or `unavailable`); an unavailable event includes
-the advice error. Their duration includes prefetch setup, the pragma, and the worker
-join. Other roles measure only the pragma. A check returning an error still emits
+`elapsed_ms` and `success`. The `activation_candidate`, `activation_missing_side` and
+`staging_fixed` events also carry `prefetch` (`done`, `cancelled`, or `unavailable`); an
+unavailable event includes the advice error. Their duration includes prefetch setup, the pragma,
+and the worker join. Other roles measure only the pragma. A check returning an error still emits
 an event with `success = false`; only a killed process emits none. Duration excludes
 copying, hashing, collection and ranking. Staging stdout remains the single report in
 `$OUT_DIR/cache_stage.json`; `$OUT_DIR/cache_build_manifest.json` and
