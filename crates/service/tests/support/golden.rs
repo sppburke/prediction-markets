@@ -3700,6 +3700,7 @@ impl BracketFinancialHarness {
         let preparing = preparer.prepare(wallets);
         tokio::pin!(preparing);
         let mut data_api_v2 = data_api_v2::DataApiV2::default();
+        let mut activity_reads = HashMap::new();
         loop {
             tokio::select! {
                 result = &mut preparing => { result.unwrap(); break; }
@@ -3715,7 +3716,11 @@ impl BracketFinancialHarness {
                         let query = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
                         if matches!(url.path(), "/v2/activity" | "/v2/positions") {
                             let stored = if url.path() == "/v2/activity" {
-                                assert_eq!(query["start"], "1", "runtime validation requires full history");
+                                let read = activity_reads.entry(*wallet).or_insert(0);
+                                let start = if *read == 0 { 1 } else { epoch - pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS + 1 };
+                                assert_eq!(query["start"], start.to_string(), "runtime validation reads a baseline then overlapping tails");
+                                assert_eq!(query["end"], epoch.to_string());
+                                *read += 1;
                                 rows.as_array().unwrap().clone()
                             } else {
                                 assert_eq!(query["status"], "OPEN");
@@ -3761,7 +3766,23 @@ impl BracketFinancialHarness {
                     .proof_json
             );
             let proof: serde_json::Value = serde_json::from_str(&status.proof_json).unwrap();
-            assert_eq!(proof["activity_walks"].as_array().unwrap().len(), 3);
+            assert_eq!(activity_reads[wallet], 4);
+            assert_eq!(proof["baseline_walk"]["fixed_end"], epoch);
+            assert_eq!(
+                proof["baseline_walk"]["pages"][0]["bounds"],
+                serde_json::json!({"start":0,"end":epoch})
+            );
+            assert!(pe_service::position_seeder::anchor_proves_full_history(
+                &status.proof_json
+            ));
+            let walks = proof["activity_walks"].as_array().unwrap();
+            assert_eq!(walks.len(), 3);
+            for walk in walks {
+                assert_eq!(
+                    walk["pages"][0]["bounds"],
+                    serde_json::json!({"start":epoch - pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS,"end":epoch})
+                );
+            }
             assert!(
                 paper.gate_history().unwrap()[wallet].contains(&pe_core_types::MarketId(
                     pe_core_types::VenueMarketId(history.condition.0.clone())

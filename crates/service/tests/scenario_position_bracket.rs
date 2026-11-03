@@ -799,6 +799,40 @@ fn assert_full_history_proof(document: &str) {
     }
 }
 
+fn assert_baseline_history_proof(document: &str, baseline_end: i64, tail_end: i64) {
+    assert!(anchor_proves_full_history(document));
+    let proof: Value = serde_json::from_str(document).unwrap();
+    assert_eq!(
+        proof["baseline_walk"]["pages"][0]["bounds"],
+        json!({"start":0,"end":baseline_end})
+    );
+    let walks = proof["activity_walks"].as_array().unwrap();
+    assert_eq!(walks.len(), 3);
+    for (index, walk) in std::iter::once(&proof["baseline_walk"])
+        .chain(walks)
+        .enumerate()
+    {
+        let (start, end) = if index == 0 {
+            (0, baseline_end)
+        } else {
+            (
+                baseline_end
+                    .saturating_sub(pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS),
+                tail_end,
+            )
+        };
+        assert_eq!(walk["fixed_end"], end);
+        assert!(walk["pages"].as_array().unwrap().iter().any(|page| {
+            page["offset"] == 0
+                && page["bounds"] == json!({"start":start,"end":end})
+                && page["request_url"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("&start={}&", (start + 1).max(1)))
+        }));
+    }
+}
+
 fn older_market_responses(wallet: WalletAddress, attempts: usize) -> HashMap<String, Vec<Vec<u8>>> {
     let rows = (1..=3)
         .rev()
@@ -818,7 +852,7 @@ fn older_market_responses(wallet: WalletAddress, attempts: usize) -> HashMap<Str
     HashMap::from([
         (
             activity_url(wallet),
-            vec![serde_json::to_vec(&rows).unwrap(); 3 * attempts],
+            vec![serde_json::to_vec(&rows).unwrap(); 4 * attempts],
         ),
         (
             position_url(wallet, PositionPartition::NotRedeemable),
@@ -863,10 +897,7 @@ fn stable_responses(specs: &[(WalletAddress, u8, &str)]) -> HashMap<String, Vec<
         )])
         .unwrap();
         let positions = serde_json::to_vec(&vec![position(*wallet, *byte, amount)]).unwrap();
-        responses.insert(
-            activity_url(*wallet),
-            vec![activity.clone(), activity.clone(), activity],
-        );
+        responses.insert(activity_url(*wallet), vec![activity; 4]);
         responses.insert(
             position_url(*wallet, PositionPartition::NotRedeemable),
             vec![positions.clone(), positions],
@@ -2236,7 +2267,7 @@ async fn row_older_than_the_previous_end_is_fetched_and_triggers_the_bounded_ret
 }
 
 #[tokio::test]
-async fn runtime_control_bracket_uses_three_full_history_walks() {
+async fn runtime_control_bracket_reads_one_full_baseline_then_three_tails() {
     let wallet = wallet(0x78);
     let (_dir, paper, engine) = fresh(&[wallet]);
     let activity = serde_json::to_vec(&vec![activity(
@@ -2244,14 +2275,15 @@ async fn runtime_control_bracket_uses_three_full_history_walks() {
         1,
         "1.000000",
         "0xvarying-control",
-        90,
+        3900,
     )])
     .unwrap();
     let positions = serde_json::to_vec(&vec![position(wallet, 1, "1.000000")]).unwrap();
     let responses = HashMap::from([
-        (activity_url_at(wallet, 100), vec![activity.clone()]),
-        (activity_url_at(wallet, 101), vec![activity.clone()]),
-        (activity_url_at(wallet, 102), vec![activity]),
+        (activity_url_at(wallet, 4000), vec![activity.clone()]),
+        (tail_url(wallet, 4000, 4001), vec![activity.clone()]),
+        (tail_url(wallet, 4000, 4002), vec![activity.clone()]),
+        (tail_url(wallet, 4000, 4003), vec![activity]),
         (
             position_url(wallet, PositionPartition::NotRedeemable),
             vec![positions.clone(), positions],
@@ -2262,14 +2294,14 @@ async fn runtime_control_bracket_uses_three_full_history_walks() {
         ),
     ]);
     let fetcher = Arc::new(QueueFetcher::new(responses));
-    let ends = Arc::new(Mutex::new(VecDeque::from([100, 101, 102, 102])));
+    let ends = Arc::new(Mutex::new(VecDeque::from([4000, 4001, 4002, 4003, 4003])));
     let clock_ends = Arc::clone(&ends);
     let validator = validator_from_fetcher(Arc::clone(&fetcher)).with_clock(Arc::new(move || {
         clock_ends
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop_front()
-            .unwrap_or(102)
+            .unwrap_or(4003)
     }));
     let (control_tx, control_rx) = mpsc::channel(2);
     let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
@@ -2285,8 +2317,21 @@ async fn runtime_control_bracket_uses_three_full_history_walks() {
         .await;
     assert!(accepted.shared.is_none());
     assert!(accepted.deferred.is_empty());
-    assert_eq!(accepted.accepted[0].cutoff, 101);
-    assert_full_history_proof(&accepted.accepted[0].proof.document);
+    assert_eq!(accepted.accepted[0].cutoff, 4002);
+    let document = &accepted.accepted[0].proof.document;
+    assert!(anchor_proves_full_history(document));
+    let proof: Value = serde_json::from_str(document).unwrap();
+    assert_eq!(proof["baseline_walk"]["fixed_end"], 4000);
+    assert_eq!(
+        proof["baseline_walk"]["pages"][0]["bounds"],
+        json!({"start":0,"end":4000})
+    );
+    let walks = proof["activity_walks"].as_array().unwrap();
+    assert_eq!(walks.len(), 3);
+    for (walk, end) in walks.iter().zip([4001, 4002, 4003]) {
+        assert_eq!(walk["fixed_end"], end);
+        assert_eq!(walk["pages"][0]["bounds"], json!({"start":400,"end":end}));
+    }
     let activity_urls = fetcher
         .urls()
         .into_iter()
@@ -2295,12 +2340,18 @@ async fn runtime_control_bracket_uses_three_full_history_walks() {
     assert_eq!(
         activity_urls,
         vec![
-            activity_url_at(wallet, 100),
-            activity_url_at(wallet, 101),
-            activity_url_at(wallet, 102),
+            activity_url_at(wallet, 4000),
+            tail_url(wallet, 4000, 4001),
+            tail_url(wallet, 4000, 4002),
+            tail_url(wallet, 4000, 4003),
         ]
     );
-    assert!(activity_urls.iter().all(|url| url.contains("&start=1&")));
+    assert!(activity_urls[0].contains("&start=1&"));
+    assert!(
+        activity_urls[1..]
+            .iter()
+            .all(|url| url.contains("&start=401&"))
+    );
     drop(control_tx);
     actor.await.unwrap();
 }
@@ -3349,7 +3400,14 @@ async fn control_missing_mapping_waits_for_next_walk_then_retries() {
     let (_dir, paper, engine) = fresh(&[wallet]);
     let (control_tx, control_rx) = mpsc::channel(8);
     let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
-    let fetcher = Arc::new(QueueFetcher::new(mapping_arrives_on_next_walk(wallet)));
+    let mut responses = mapping_arrives_on_next_walk(wallet);
+    responses
+        .get_mut(&activity_url(wallet))
+        .unwrap()
+        .insert(0, b"[]".to_vec());
+    let reads = responses.get_mut(&activity_url(wallet)).unwrap();
+    reads.push(reads.last().unwrap().clone());
+    let fetcher = Arc::new(QueueFetcher::new(responses));
     let outcomes = validator_from_fetcher(Arc::clone(&fetcher))
         .validate_via_control(
             &[wallet],
@@ -3371,7 +3429,7 @@ async fn control_missing_mapping_waits_for_next_walk_then_retries() {
             .iter()
             .filter(|url| **url == activity_url(wallet))
             .count(),
-        5
+        7
     );
     drop(control_tx);
     actor.await.unwrap();
@@ -3497,10 +3555,7 @@ async fn metadata_unresolved_activity_only_asset_is_raw_only_and_wallet_anchors(
     )])
     .unwrap();
     let responses = HashMap::from([
-        (
-            activity_url(wallet),
-            vec![activity.clone(), activity.clone(), activity],
-        ),
+        (activity_url(wallet), vec![activity; 4]),
         (
             position_url(wallet, PositionPartition::NotRedeemable),
             vec![b"[]".to_vec(), b"[]".to_vec()],
@@ -3549,10 +3604,7 @@ async fn conflicting_stamped_identities_without_metadata_are_raw_only_and_anchor
     second["outcomeIndex"] = json!(1);
     let activity = serde_json::to_vec(&vec![first, second]).unwrap();
     let responses = HashMap::from([
-        (
-            activity_url(wallet),
-            vec![activity.clone(), activity.clone(), activity],
-        ),
+        (activity_url(wallet), vec![activity; 4]),
         (
             position_url(wallet, PositionPartition::NotRedeemable),
             vec![b"[]".to_vec(), b"[]".to_vec()],
@@ -3771,7 +3823,7 @@ async fn paper_service_rollout_periodic_refresh_recovers_a_stable_revision_on_bo
     let mut responses = stable_responses(&[(wallet, 1, "2.000000")]);
     responses.insert(
         activity_url(wallet),
-        vec![serde_json::to_vec(&vec![revised]).unwrap(); 4],
+        vec![serde_json::to_vec(&vec![revised]).unwrap(); 5],
     );
     let fetcher = Arc::new(QueueFetcher::new(responses));
     let (control_tx, control_rx) = mpsc::channel(2);
@@ -3793,7 +3845,7 @@ async fn paper_service_rollout_periodic_refresh_recovers_a_stable_revision_on_bo
     assert_eq!(&anchors[..anchors_before.len()], anchors_before);
     let anchor = anchors.last().unwrap();
     assert_eq!(anchor.activity_cutoff_unix, END);
-    assert_full_history_proof(&anchor.proof_json);
+    assert_baseline_history_proof(&anchor.proof_json, END, END);
     let proof: Value = serde_json::from_str(&anchor.proof_json).unwrap();
     assert!(proof["cleared_fence"].is_null());
     assert_eq!(
@@ -3828,7 +3880,7 @@ async fn paper_service_rollout_periodic_refresh_recovers_a_stable_revision_on_bo
             .iter()
             .filter(|url| url.contains("/activity?"))
             .count(),
-        4
+        5
     );
     drop(preparer);
     actor.await.unwrap();
@@ -4312,7 +4364,7 @@ async fn five_wallet_prepare_defers_mapping_failure_and_preserves_accepted_order
     let mut responses = stable_responses(&healthy.map(|wallet| (wallet, 1, "1.000000")));
     let raced_activity =
         serde_json::to_vec(&vec![activity(raced, 1, "1.000000", "0xraced", 10)]).unwrap();
-    responses.insert(activity_url(raced), vec![raced_activity; 6]);
+    responses.insert(activity_url(raced), vec![raced_activity; 8]);
     responses.insert(
         position_url(raced, PositionPartition::NotRedeemable),
         ["1", "2", "3", "4"]
@@ -4372,11 +4424,11 @@ async fn five_wallet_prepare_defers_mapping_failure_and_preserves_accepted_order
                 .filter(|url| url.as_str() == activity.as_str())
                 .count(),
             if wallet == deferred {
-                2 // The missing mapping is checked against the next required full walk.
+                3 // The missing mapping is checked against the next required tail.
             } else if wallet == raced {
-                6
+                8
             } else {
-                3
+                4
             },
             "wallet {wallet} was bracketed more than once"
         );
@@ -4740,7 +4792,7 @@ async fn routine_refresh_defers_read(read_index: usize) {
     .unwrap();
     let stable = Arc::new(QueueFetcher::with_gamma(
         HashMap::from([
-            (activity_url(wallet), vec![payload; 3]),
+            (activity_url(wallet), vec![payload; 4]),
             (
                 position_url(wallet, PositionPartition::NotRedeemable),
                 vec![positions; 2],
@@ -4769,25 +4821,30 @@ async fn routine_refresh_defers_read(read_index: usize) {
 }
 
 #[tokio::test]
-async fn routine_refresh_defers_first_read_entry_until_ordinary_commit() {
+async fn routine_refresh_defers_baseline_read_entry_until_ordinary_commit() {
     routine_refresh_defers_read(0).await;
 }
 
 #[tokio::test]
-async fn routine_refresh_defers_second_read_entry_until_ordinary_commit() {
+async fn routine_refresh_defers_first_read_entry_until_ordinary_commit() {
     routine_refresh_defers_read(1).await;
 }
 
 #[tokio::test]
-async fn routine_refresh_defers_final_read_entry_until_ordinary_commit() {
+async fn routine_refresh_defers_second_read_entry_until_ordinary_commit() {
     routine_refresh_defers_read(2).await;
 }
 
+#[tokio::test]
+async fn routine_refresh_defers_final_read_entry_until_ordinary_commit() {
+    routine_refresh_defers_read(3).await;
+}
+
 /// PASS: preflight reaches an unseen group after a known post-anchor group, within and across
-/// buckets, at each of the three reads; it writes neither covered history nor the unseen entry.
+/// buckets, in the baseline and each tail; it writes neither covered history nor the unseen entry.
 #[tokio::test]
 async fn routine_refresh_preflights_every_group_after_known_activity() {
-    for read_index in 0..3 {
+    for read_index in 0..4 {
         for same_bucket in [false, true] {
             let wallet = wallet(0x91);
             let (_dir, paper, mut engine) = fresh(&[wallet]);
@@ -4912,7 +4969,7 @@ async fn routine_refresh_anchors_past_a_restamped_redemption() {
     let fetcher = Arc::new(QueueFetcher::new(HashMap::from([
         (
             activity_url(wallet),
-            vec![serde_json::to_vec(&vec![restamp]).unwrap(); 3],
+            vec![serde_json::to_vec(&vec![restamp]).unwrap(); 4],
         ),
         (
             position_url(wallet, PositionPartition::NotRedeemable),
@@ -5020,9 +5077,7 @@ async fn runtime_completion_case(
             .unwrap()
             .proof_json
     );
-    let proof: Value = serde_json::from_str(&complete.proof_json).unwrap();
-    assert_eq!(proof["activity_walks"].as_array().unwrap().len(), 3);
-    assert_full_history_proof(&complete.proof_json);
+    assert_baseline_history_proof(&complete.proof_json, END, END);
     assert_eq!(
         h.live.snapshot().entries.len(),
         1,
@@ -5186,13 +5241,8 @@ async fn runtime_repairs_stored_history_before_membership_and_preserves_financia
             paper.activity_groups_after(&newcomer, -1).unwrap(),
             old_groups
         );
-        assert_full_history_proof(
-            &paper
-                .position_validation(&newcomer)
-                .unwrap()
-                .unwrap()
-                .proof_json,
-        );
+        let validation = paper.position_validation(&newcomer).unwrap().unwrap();
+        assert_baseline_history_proof(&validation.proof_json, END, END);
         assert_eq!(h.live.snapshot().entries[0].wallet, incumbent);
         assert_eq!(h.mutations(), 1);
         preparer
@@ -5367,7 +5417,7 @@ async fn runtime_empty_history_and_positions_refuses_without_initializing_cursor
     let wallet = wallet(0x84);
     let (_dir, paper, engine) = fresh(&[]);
     let responses = HashMap::from([
-        (activity_url(wallet), vec![b"[]".to_vec(); 3]),
+        (activity_url(wallet), vec![b"[]".to_vec(); 4]),
         (
             position_url(wallet, PositionPartition::NotRedeemable),
             vec![b"[]".to_vec(); 2],
@@ -6212,6 +6262,8 @@ async fn routine_refresh_retries_covered_history_intervention() {
             activity_url(wallet),
             vec![
                 b"[]".to_vec(),
+                b"[]".to_vec(),
+                late.clone(),
                 late.clone(),
                 late.clone(),
                 late.clone(),
@@ -6245,7 +6297,7 @@ async fn routine_refresh_retries_covered_history_intervention() {
             .iter()
             .filter(|url| **url == activity_url(wallet))
             .count(),
-        5
+        7
     );
     assert!(paper.decision_pending_history().unwrap().is_empty());
     assert_eq!(
@@ -6612,7 +6664,7 @@ fn rollout_fence(
 
 fn rollout_empty_reads(wallet: WalletAddress, attempts: usize) -> HashMap<String, Vec<Vec<u8>>> {
     HashMap::from([
-        (activity_url(wallet), vec![b"[]".to_vec(); 3 * attempts]),
+        (activity_url(wallet), vec![b"[]".to_vec(); 4 * attempts]),
         (
             position_url(wallet, PositionPartition::NotRedeemable),
             vec![b"[]".to_vec(); 2 * attempts],
@@ -6663,7 +6715,7 @@ async fn paper_service_rollout_recorded_union_repairs_buys_and_refuses_unsafe_ef
         let mut reads = rollout_empty_reads(wallet, 1);
         reads.insert(
             activity_url(wallet),
-            vec![serde_json::to_vec(&vec![zero.clone()]).unwrap(); 3],
+            vec![serde_json::to_vec(&vec![zero.clone()]).unwrap(); 4],
         );
         let preparer =
             AdmissionPreparer::with_validator(tx.clone(), paper.clone(), validator(reads));
@@ -6753,7 +6805,7 @@ async fn paper_service_rollout_fresh_metadata_rejects_previously_raw_only_unsafe
         let mut reads = rollout_empty_reads(wallet, 1);
         reads.insert(
             activity_url(wallet),
-            vec![serde_json::to_vec(&vec![row]).unwrap(); 3],
+            vec![serde_json::to_vec(&vec![row]).unwrap(); 4],
         );
         let preparer =
             AdmissionPreparer::with_validator(tx.clone(), paper.clone(), validator(reads));
@@ -6951,18 +7003,18 @@ async fn paper_service_rollout_recovery_cutoff_before_recorded_revision_defers()
     let coverage = paper.wallet_coverage(&wallet).unwrap();
     let history = rollout_history(&dir);
 
-    // All three new bounds increase, but the accepted second-read cutoff is only 150.
+    // The baseline and three tail bounds increase, but the accepted second-read cutoff is only 150.
     // The older row retains the same asset's metadata mapping below that cutoff.
     let mut responses = rollout_empty_reads(wallet, 1);
     responses.remove(&activity_url(wallet));
-    for end in [149, 150, 151] {
+    for end in [148, 149, 150, 151] {
         responses.insert(
             activity_url_at(wallet, end),
             vec![serde_json::to_vec(&vec![older_row.clone()]).unwrap()],
         );
     }
     let fetcher = Arc::new(QueueFetcher::new(responses));
-    let ends = Arc::new(Mutex::new(VecDeque::from([149, 150, 151, 151])));
+    let ends = Arc::new(Mutex::new(VecDeque::from([148, 149, 150, 151, 151])));
     let validator = validator_from_fetcher(fetcher.clone()).with_clock(Arc::new(move || {
         ends.lock().unwrap().pop_front().unwrap_or(151)
     }));
@@ -6985,7 +7037,7 @@ async fn paper_service_rollout_recovery_cutoff_before_recorded_revision_defers()
             .into_iter()
             .filter(|url| url.contains("/activity?"))
             .collect::<Vec<_>>(),
-        [149, 150, 151].map(|end| activity_url_at(wallet, end))
+        [148, 149, 150, 151].map(|end| activity_url_at(wallet, end))
     );
     assert_eq!(paper.wallet_fence(&wallet).unwrap(), fence);
     assert!(paper.position_anchors(&wallet).unwrap().is_empty());
@@ -7170,7 +7222,7 @@ async fn paper_service_rollout_deadline_suppresses_optional_retry_and_maps_filte
             .iter()
             .filter(|url| url.contains("/activity?") && url.contains(&wallets[1].to_string()))
             .count(),
-        3
+        4
     );
     assert!(started.try_recv().is_err());
     assert!(paper.position_anchors(&wallets[5]).unwrap().is_empty());
@@ -7204,7 +7256,7 @@ async fn paper_service_rollout_novel_revision_on_first_read_refuses_then_safe_re
     let revised =
         serde_json::to_vec(&vec![activity(wallet, 1, "2", "0xretained-first", 10)]).unwrap();
     let mut responses = rollout_empty_reads(wallet, 2);
-    responses.insert(activity_url(wallet), vec![revised; 4]);
+    responses.insert(activity_url(wallet), vec![revised; 5]);
     let fetcher = Arc::new(QueueFetcher::new(responses));
     let validator = validator_from_reconciliation(fetcher.clone());
     let before = paper.wallet_coverage(&wallet).unwrap().coverage_generation;
@@ -7241,7 +7293,7 @@ async fn paper_service_rollout_novel_revision_on_first_read_refuses_then_safe_re
             .iter()
             .filter(|url| url.contains("/activity?"))
             .count(),
-        4
+        5
     );
     drop(tx);
     actor.await.unwrap();
@@ -7649,7 +7701,7 @@ async fn reentry_attempts(
             &[wallet],
             tx,
             paper,
-            pe_service::position_seeder::ValidationPurpose::Reentry,
+            pe_service::position_seeder::ValidationPurpose::CatchUp,
             None,
         )
         .with_subscriber(subscriber)
@@ -7659,7 +7711,7 @@ async fn reentry_attempts(
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|line| line["fields"]["message"] == "reentry bracket attempt")
+        .filter(|line| line["fields"]["message"] == "bracket attempt")
         .map(|line| line["fields"]["outcome"].as_str().unwrap().to_owned())
         .collect();
     (outcomes, attempts)
@@ -7955,7 +8007,7 @@ async fn accepted_brackets_install_newest_activity_clock_from_pre_recorded_late_
                 Some(KnockoutReason::Inactivity)
             );
             let positions = vec![position(wallet, 1, "1")];
-            let reads = if path == "reentry" {
+            let reads = if path != "direct" {
                 reentry_reads(
                     wallet,
                     1_000_000,
@@ -8040,49 +8092,93 @@ async fn accepted_brackets_install_newest_activity_clock_from_pre_recorded_late_
     }
 }
 
-/// PASS: catch-up admission, routine refresh and boot retain exactly three full reads and
-/// their legacy proof shape, with no baseline field.
-/// FAIL: re-entry routing leaks into another path or a full read becomes an incremental tail.
+/// PASS: direct boot retains exactly three full reads and its legacy proof without a baseline.
+/// FAIL: a full read becomes an incremental tail or runtime proof routing leaks into boot.
 #[tokio::test]
-async fn non_reentry_paths_keep_three_full_walks_and_legacy_proofs() {
-    for path in ["catch_up", "refresh", "direct"] {
+async fn direct_boot_keeps_three_full_walks_and_legacy_proofs() {
+    let wallet = wallet(0xe7);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    let fetcher = Arc::new(QueueFetcher::new(stable_responses(&[(wallet, 1, "1")])));
+    validator_from_fetcher(fetcher.clone())
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert_eq!(
+        fetcher
+            .urls()
+            .into_iter()
+            .filter(|url| url.contains("/activity?"))
+            .collect::<Vec<_>>(),
+        vec![activity_url(wallet); 3]
+    );
+    assert_full_history_proof(&paper.position_anchors(&wallet).unwrap()[0].proof_json);
+}
+
+/// PASS: catch-up and routine refresh read one full baseline, then three overlapping tails.
+/// FAIL: runtime admission omits the baseline proof or reads full history for stability.
+#[tokio::test]
+async fn catch_up_and_routine_refresh_read_one_baseline_then_three_tails() {
+    for path in ["catch_up", "refresh"] {
         let wallet = wallet(0xe7);
         let (_dir, paper, mut engine) = fresh(&[wallet]);
-        let fetcher = Arc::new(QueueFetcher::new(stable_responses(&[(wallet, 1, "1")])));
-        let validator = validator_from_fetcher(fetcher.clone());
-        if path == "direct" {
-            validator
-                .validate_direct(&[wallet], &mut engine, &paper)
-                .await
-                .unwrap();
-        } else {
-            let (tx, rx) = mpsc::channel(2);
-            let actor = spawn_control_actor(rx, engine, paper.clone());
-            let preparer = AdmissionPreparer::with_validator(tx, paper.clone(), validator);
-            if path == "catch_up" {
-                assert_eq!(
-                    preparer.prepare(&[wallet]).await.unwrap().admitted,
-                    vec![wallet]
-                );
-            } else {
-                assert_eq!(
-                    preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
-                    AnchorRefreshOutcome::Anchored
-                );
-            }
-            drop(preparer);
-            actor.await.unwrap();
+        if path == "refresh" {
+            install_empty_anchor(&mut engine, &paper, wallet, 10);
         }
+        let row = activity(wallet, 1, "1", "0xbase1", 10);
+        let fetcher = Arc::new(QueueFetcher::new(reentry_reads(
+            wallet,
+            4000,
+            [4001, 4002, 4003],
+            &[row],
+            [&[]; 3],
+            &[position(wallet, 1, "1")],
+        )));
+        let validator = clocked_validator(fetcher.clone(), vec![4000, 4001, 4002, 4003, 4003]);
+        let (tx, rx) = mpsc::channel(2);
+        let actor = spawn_control_actor(rx, engine, paper.clone());
+        let preparer = AdmissionPreparer::with_validator(tx, paper.clone(), validator);
+        if path == "catch_up" {
+            assert_eq!(
+                preparer.prepare(&[wallet]).await.unwrap().admitted,
+                vec![wallet]
+            );
+        } else {
+            assert_eq!(
+                preparer.prepare_if_due(wallet, 4003, 1).await.unwrap(),
+                AnchorRefreshOutcome::Anchored
+            );
+        }
+        drop(preparer);
+        actor.await.unwrap();
         assert_eq!(
             fetcher
                 .urls()
                 .into_iter()
                 .filter(|url| url.contains("/activity?"))
                 .collect::<Vec<_>>(),
-            vec![activity_url(wallet); 3],
+            vec![
+                activity_url_at(wallet, 4000),
+                tail_url(wallet, 4000, 4001),
+                tail_url(wallet, 4000, 4002),
+                tail_url(wallet, 4000, 4003)
+            ],
             "{path}"
         );
-        assert_full_history_proof(&paper.position_anchors(&wallet).unwrap()[0].proof_json);
+        let anchor = paper.position_anchors(&wallet).unwrap().pop().unwrap();
+        assert_eq!(anchor.activity_cutoff_unix, 4002);
+        assert!(anchor_proves_full_history(&anchor.proof_json));
+        let proof: Value = serde_json::from_str(&anchor.proof_json).unwrap();
+        assert_eq!(proof["baseline_walk"]["fixed_end"], 4000);
+        assert_eq!(
+            proof["baseline_walk"]["pages"][0]["bounds"],
+            json!({"start":0,"end":4000})
+        );
+        let walks = proof["activity_walks"].as_array().unwrap();
+        assert_eq!(walks.len(), 3);
+        for (walk, end) in walks.iter().zip([4001, 4002, 4003]) {
+            assert_eq!(walk["fixed_end"], end);
+            assert_eq!(walk["pages"][0]["bounds"], json!({"start":400,"end":end}));
+        }
     }
 }
 
@@ -8109,7 +8205,7 @@ async fn reentry_rejects_non_monotonic_bounds_including_baseline() {
             &[wallet],
             &tx,
             &paper,
-            pe_service::position_seeder::ValidationPurpose::Reentry,
+            pe_service::position_seeder::ValidationPurpose::CatchUp,
             None,
         )
         .await;
@@ -8192,7 +8288,7 @@ async fn reentry_attempt_logs_separate_baseline_and_stability_timing() {
                 &[wallet],
                 &tx,
                 &paper,
-                pe_service::position_seeder::ValidationPurpose::Reentry,
+                pe_service::position_seeder::ValidationPurpose::CatchUp,
                 None,
             )
             .with_subscriber(subscriber)
@@ -8207,7 +8303,7 @@ async fn reentry_attempt_logs_separate_baseline_and_stability_timing() {
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .filter(|line| line["fields"]["message"] == "reentry bracket attempt")
+            .filter(|line| line["fields"]["message"] == "bracket attempt")
             .collect::<Vec<_>>();
         assert_eq!(logs.len(), 1);
         let fields = &logs[0]["fields"];
@@ -8262,7 +8358,7 @@ async fn reentry_union_mapping_rejects_baseline_tail_classification_conflict() {
             &[wallet],
             &tx,
             &paper,
-            pe_service::position_seeder::ValidationPurpose::Reentry,
+            pe_service::position_seeder::ValidationPurpose::CatchUp,
             None,
         )
         .await;

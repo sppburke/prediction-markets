@@ -4372,23 +4372,22 @@ async fn routine_refresh_retries_unreadable_activity_replies_without_owner_exit(
     }
 }
 
-/// PASS: on a genuine refresh proof rewritten into the re-entry tail shape, the previous binary
-/// serves but rejects the tail anchor, re-bracketing or deferring the wallet without changing
-/// finances, gate history or decisions; the new binary reuses it.
-/// FAIL: a crash, refused boot, silent reuse by the previous binary, proof decoding ERROR,
-/// changed durable finances/history/decisions, or a new-binary boot bracket for the wallet.
+/// PASS: current and optional rollback binaries reuse an authentic runtime baseline-plus-tails
+/// anchor at boot, preserving finances, gate history, decisions and live membership.
+/// FAIL: either binary walks the wallet at boot, replaces its anchor, fails to decode its proof,
+/// refuses boot or changes durable finances, gate history or decisions.
 #[tokio::test]
-async fn previous_binary_rejects_tail_anchor() {
-    let Some(previous) = std::env::var_os("PE_ROLLBACK_SERVICE_BINARY") else {
+async fn previous_binary_reuses_runtime_tail_anchor() {
+    let previous = std::env::var_os("PE_ROLLBACK_SERVICE_BINARY").map(PathBuf::from);
+    if let Some(previous) = &previous {
+        assert!(previous.is_absolute());
+    } else {
         eprintln!(
-            "SKIP previous_binary_rejects_tail_anchor: PE_ROLLBACK_SERVICE_BINARY is unset; rollback compatibility is unproven"
+            "SKIP previous_binary_reuses_runtime_tail_anchor: PE_ROLLBACK_SERVICE_BINARY is unset; rollback compatibility is unproven"
         );
-        return;
-    };
-    let previous = PathBuf::from(previous);
-    assert!(previous.is_absolute());
+    }
     let current = Path::new(env!("CARGO_BIN_EXE_pe-service"));
-    for binary in [current, previous.as_path()] {
+    for binary in std::iter::once(current).chain(previous.as_deref()) {
         let output = std::process::Command::new("sha256sum")
             .arg(binary)
             .output()
@@ -4469,9 +4468,7 @@ async fn previous_binary_rejects_tail_anchor() {
     assert!(replayed.post_start_record_replayed);
     assert_eq!(replayed.watchlist.entries[0].wallet, wallet);
 
-    // The fixture's helper anchor carries a synthetic proof. As in the rollback matrix, an
-    // age-due anchor makes the new binary's routine refresh re-bracket the wallet, so the tail
-    // rewrite below starts from a genuine validator proof in the production shape.
+    // An age-due helper anchor makes the current binary install a genuine runtime refresh proof.
     let helper_seq = fixture
         .paper
         .wallet_coverage(&wallet)
@@ -4509,29 +4506,40 @@ async fn previous_binary_rejects_tail_anchor() {
     assert!(fixture.paper.cursor(&wallet).unwrap().is_some());
     assert!(fixture.paper.wallet_history_complete(&wallet).unwrap());
     assert!(!fixture.paper.is_wallet_fenced(&wallet).unwrap());
-    // The refreshed anchor is not age-due, so neither rollback boot refreshes it and the proof
-    // shape is the sole reason the old reader refuses.
+    // The refreshed anchor is not age-due, so neither restart needs a runtime refresh.
     assert!(
         coverage.anchored_at_unix.unwrap()
             + i64::try_from(pe_service::trade_poller::ANCHOR_REFRESH_SECS).unwrap()
             > OffsetDateTime::now_utc().unix_timestamp()
     );
-    // Boot selects position_anchors.proof_json by coverage.anchor_seq. Mirror any surviving
-    // validation (the genuine copy can invalidate it); history-status completeness is true.
-    let mut proof: serde_json::Value = serde_json::from_str(
-        &fixture
-            .paper
-            .position_anchor_proof(&wallet, anchor_seq)
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
-    // The genuine full-history proof that finish() writes: top-level evidence and real pages.
+    let document = fixture
+        .paper
+        .position_anchor_proof(&wallet, anchor_seq)
+        .unwrap()
+        .unwrap();
+    let proof: serde_json::Value = serde_json::from_str(&document).unwrap();
     assert_eq!(proof["version"], 1);
     assert_eq!(proof["positions_reads"].as_array().unwrap().len(), 2);
     assert!(proof["metadata_reads"].is_array());
-    assert!(proof.get("baseline_walk").is_none());
-    for walk in proof["activity_walks"].as_array().unwrap() {
+    let baseline = &proof["baseline_walk"];
+    let baseline_end = baseline["fixed_end"].as_i64().unwrap();
+    let tail_start = baseline_end
+        .checked_sub(pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS)
+        .unwrap();
+    assert!(tail_start > 0);
+    let walks = proof["activity_walks"].as_array().unwrap();
+    assert_eq!(walks.len(), 3);
+    for (index, walk) in std::iter::once(baseline).chain(walks).enumerate() {
+        let start = if index == 0 { 0 } else { tail_start };
+        let end = walk["fixed_end"].as_i64().unwrap();
+        assert!(walk["pages"].as_array().unwrap().iter().any(|page| {
+            page["offset"] == 0
+                && page["bounds"] == serde_json::json!({"start":start,"end":end})
+                && page["request_url"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("&start={}&", start + 1))
+        }));
         for page in walk["pages"].as_array().unwrap() {
             serde_json::from_value::<pe_source_polymarket_public::ReconciliationPageEvidence>(
                 page.clone(),
@@ -4539,70 +4547,21 @@ async fn previous_binary_rejects_tail_anchor() {
             .unwrap();
         }
     }
-    let baseline = proof["activity_walks"][0].clone();
-    let baseline_end = baseline["fixed_end"].as_i64().unwrap();
-    let tail_start = baseline_end
-        .checked_sub(pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS)
-        .unwrap();
-    assert!(tail_start > 0);
-    let walks = proof["activity_walks"].as_array_mut().unwrap();
-    assert_eq!(walks.len(), 3);
-    for walk in walks {
-        let end = walk["fixed_end"].as_i64().unwrap();
-        let page = walk["pages"]
-            .as_array_mut()
-            .unwrap()
-            .iter_mut()
-            .find(|page| {
-                page["offset"] == 0 && page["bounds"]["start"] == 0 && page["bounds"]["end"] == end
-            })
-            .unwrap();
-        page["bounds"]["start"] = tail_start.into();
-    }
-    assert!(!pe_service::position_seeder::anchor_proves_full_history(
-        &proof.to_string()
-    ));
-    proof["baseline_walk"] = baseline;
-    let document = proof.to_string();
     assert!(pe_service::position_seeder::anchor_proves_full_history(
         &document
     ));
-    let had_validation = fixture
-        .paper
-        .position_validation(&wallet)
-        .unwrap()
-        .is_some();
-    let connection = Connection::open(&fixture.cfg.paper_state_db_path).unwrap();
-    let transaction = connection.unchecked_transaction().unwrap();
-    assert_eq!(transaction.execute(
-        "UPDATE position_anchors SET proof_json = ?3 WHERE wallet_hex = ?1 AND anchor_seq = ?2",
-        rusqlite::params![wallet.to_string(), anchor_seq, document],
-    ).unwrap(), 1);
-    assert_eq!(transaction.execute(
-        "UPDATE position_validations SET proof_json = ?2, activity_bounds_json = ?3 WHERE wallet_hex = ?1",
-        rusqlite::params![wallet.to_string(), document, proof["activity_walks"].to_string()],
-    ).unwrap(), usize::from(had_validation));
-    transaction.commit().unwrap();
-    assert_eq!(
-        fixture
-            .paper
-            .position_anchor_proof(&wallet, anchor_seq)
-            .unwrap()
-            .unwrap(),
-        document
-    );
 
     // Include the genuine current-time fill, not merely facts before the historical NOW_UNIX.
     let finances = fixture.paper.financial_snapshot(i64::MAX).unwrap();
     let history = fixture.paper.gate_history().unwrap();
     let decisions = fixture.paper.decision_pending_history().unwrap();
-    let copied_db = fixture.dir.path().join("before-rollback.db");
+    let copied_db = fixture.dir.path().join("before-restart.db");
+    let connection = Connection::open(&fixture.cfg.paper_state_db_path).unwrap();
     connection
         .execute("VACUUM INTO ?1", [copied_db.to_str().unwrap()])
         .unwrap();
     drop(connection);
-    // Preserve log and checkpoint path bindings. Both runs use identical log/sidecar bytes;
-    // the new run uses the SQLite copy made before the previous binary can re-bracket.
+    // Preserve log and checkpoint path bindings; each binary starts from identical durable state.
     let state_files = std::fs::read_dir(fixture.dir.path())
         .unwrap()
         .filter_map(|entry| {
@@ -4612,20 +4571,22 @@ async fn previous_binary_rejects_tail_anchor() {
                 .then(|| (path.clone(), std::fs::read(path).unwrap()))
         })
         .collect::<Vec<_>>();
-    for (label, binary) in [("previous", previous.as_path()), ("new", current)] {
-        let config_path = if label == "new" {
+    for (label, binary) in std::iter::once(("current", current))
+        .chain(previous.as_deref().map(|binary| ("previous", binary)))
+    {
+        let config_path = if label == "previous" {
             for (path, bytes) in &state_files {
                 std::fs::write(path, bytes).unwrap();
             }
             let mut cfg = fixture.cfg.clone();
             cfg.paper_state_db_path = copied_db.clone();
-            let path = fixture.dir.path().join("new-service.toml");
+            let path = fixture.dir.path().join("previous-service.toml");
             std::fs::write(&path, toml::to_string(&cfg).unwrap()).unwrap();
             path
         } else {
             fixture.config_path.clone()
         };
-        let paper = if label == "new" {
+        let paper = if label == "previous" {
             Arc::new(PaperStateDb::open(&copied_db).unwrap())
         } else {
             Arc::clone(&fixture.paper)
@@ -4674,32 +4635,10 @@ async fn previous_binary_rejects_tail_anchor() {
         });
         let live: Vec<String> =
             serde_json::from_str(events[listening]["live_wallet_list"].as_str().unwrap()).unwrap();
-        if label == "previous" {
-            assert_eq!(census["reused"], 0, "{logs}");
-            assert_eq!(census["walked"], 1, "{logs}");
-            assert!(
-                boot.iter().any(
-                    |event| event["message"] == "boot anchor requires history walk"
-                        && event["wallet"] == wallet.to_string()
-                        && event["reason"] == "no_full_history_proof"
-                ),
-                "{logs}"
-            );
-            assert!(
-                !live.contains(&wallet.to_string())
-                    || boot.iter().any(|event| {
-                        event["message"] == "wallet bracket completed"
-                            && event["wallet"] == wallet.to_string()
-                            && event["outcome"] == "accepted"
-                    }),
-                "{logs}"
-            );
-        } else {
-            assert_eq!(census["reused"], 1, "{logs}");
-            assert_eq!(census["walked"], 0, "{logs}");
-            assert!(!bracketed, "new binary must reuse the tail anchor: {logs}");
-            assert_eq!(live, vec![wallet.to_string()]);
-        }
+        assert_eq!(census["reused"], 1, "{label}: {logs}");
+        assert_eq!(census["walked"], 0, "{label}: {logs}");
+        assert!(!bracketed, "{label} must reuse the tail anchor: {logs}");
+        assert_eq!(live, vec![wallet.to_string()], "{label}: {logs}");
         let mut all_logs = format!(
             "{logs}\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
@@ -4734,6 +4673,16 @@ async fn previous_binary_rejects_tail_anchor() {
         );
         assert!(paper.wallet_history_complete(&wallet).unwrap());
         assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+        assert_eq!(
+            paper.wallet_coverage(&wallet).unwrap().anchor_seq,
+            Some(anchor_seq),
+            "{label}"
+        );
+        assert_eq!(
+            paper.position_anchor_proof(&wallet, anchor_seq).unwrap(),
+            Some(document.clone()),
+            "{label}"
+        );
         for event in boot.iter().filter(|event| {
             matches!(
                 event["message"].as_str(),
@@ -7259,12 +7208,24 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
         )
         .url(base, None)
         .unwrap();
+        let tail_url = V2ActivityRequest::position_changes(
+            wallet,
+            Some(now - pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS),
+            now,
+            ActivityRowAcceptance::StrictWithAnomalies,
+        )
+        .url(base, None)
+        .unwrap();
         let positions_url = positions_v2_url(base, wallet, None);
         let fetcher: Arc<dyn ReconciliationFetcher> =
             Arc::new(FixtureFetcher::new(HashMap::from([
                 (
                     activity_url.clone(),
                     data_api_v2::fixture_page(&activity_url, activity),
+                ),
+                (
+                    tail_url.clone(),
+                    data_api_v2::fixture_page(&tail_url, b"[]".to_vec()),
                 ),
                 (
                     positions_url.clone(),

@@ -57,7 +57,6 @@ pub const REENTRY_HISTORY_OVERLAP_SECS: i64 = 3_600;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationPurpose {
     CatchUp,
-    Reentry,
     RoutineRefresh { cutoff: i64 },
 }
 
@@ -1032,44 +1031,40 @@ impl CausalPositionValidator {
             let mut fresh_history = Vec::new();
             let mut metadata_reads = BTreeMap::new();
             let mut unresolved_assets = BTreeMap::new();
-            let mut baseline = if purpose == ValidationPurpose::Reentry {
-                baseline_started = Some(Instant::now());
-                let activity = self.activity(wallet).await?;
-                let twins = self.preflight_control_read(
-                    wallet,
-                    &activity,
-                    paper_state,
-                    purpose,
-                    ordinary_reconciliation_needed,
-                )?;
-                let mut prepared = self.prepare_activity(wallet, &activity).await?;
-                if expected_fence.is_some() {
-                    fresh_history.extend(recovery_fresh_history(wallet, &activity, &prepared)?);
-                }
-                metadata_reads.extend(std::mem::take(&mut prepared.metadata_reads));
-                unresolved_assets.extend(std::mem::take(&mut prepared.unresolved_assets));
-                self.commit_control(
-                    wallet,
-                    &activity,
-                    &prepared,
-                    twins,
-                    control_tx,
-                    paper_state,
-                    false,
-                )
-                .await?;
-                baseline_completed = Some(Instant::now());
-                Some(activity)
-            } else {
-                None
-            };
-            let start = baseline.as_ref().map_or(Some(0), |read| {
-                Some(read.fixed_end.saturating_sub(REENTRY_HISTORY_OVERLAP_SECS))
-            });
-            let first_fixed_end = (self.now)();
-            if baseline.is_some() {
-                stability_started = Some(Instant::now());
+            // One full read commits the history; three short tails from its end prove stability.
+            baseline_started = Some(Instant::now());
+            let mut baseline = self.activity(wallet).await?;
+            let twins = self.preflight_control_read(
+                wallet,
+                &baseline,
+                paper_state,
+                purpose,
+                ordinary_reconciliation_needed,
+            )?;
+            let mut prepared = self.prepare_activity(wallet, &baseline).await?;
+            if expected_fence.is_some() {
+                fresh_history.extend(recovery_fresh_history(wallet, &baseline, &prepared)?);
             }
+            metadata_reads.extend(std::mem::take(&mut prepared.metadata_reads));
+            unresolved_assets.extend(std::mem::take(&mut prepared.unresolved_assets));
+            self.commit_control(
+                wallet,
+                &baseline,
+                &prepared,
+                twins,
+                control_tx,
+                paper_state,
+                false,
+            )
+            .await?;
+            baseline_completed = Some(Instant::now());
+            let start = Some(
+                baseline
+                    .fixed_end
+                    .saturating_sub(REENTRY_HISTORY_OVERLAP_SECS),
+            );
+            let first_fixed_end = (self.now)();
+            stability_started = Some(Instant::now());
             let first_activity = self.activity_since(wallet, start, first_fixed_end).await?;
             let first_twins = self.preflight_control_read(
                 wallet,
@@ -1079,7 +1074,7 @@ impl CausalPositionValidator {
                 ordinary_reconciliation_needed,
             )?;
             let (mut first_prepared, first_mapping) = self
-                .prepare_bracket_activity(wallet, &first_activity, baseline.as_mut())
+                .prepare_bracket_activity(wallet, &first_activity, &mut baseline)
                 .await?;
             if expected_fence.is_some() {
                 fresh_history.extend(recovery_fresh_history(
@@ -1115,7 +1110,7 @@ impl CausalPositionValidator {
                 ordinary_reconciliation_needed,
             )?;
             let (mut second_prepared, second_mapping) = self
-                .prepare_bracket_activity(wallet, &second_activity, baseline.as_mut())
+                .prepare_bracket_activity(wallet, &second_activity, &mut baseline)
                 .await?;
             if expected_fence.is_some() {
                 fresh_history.extend(recovery_fresh_history(
@@ -1156,7 +1151,7 @@ impl CausalPositionValidator {
                 ordinary_reconciliation_needed,
             )?;
             let (mut final_prepared, final_mapping) = self
-                .prepare_bracket_activity(wallet, &final_activity, baseline.as_mut())
+                .prepare_bracket_activity(wallet, &final_activity, &mut baseline)
                 .await?;
             if expected_fence.is_some() {
                 fresh_history.extend(recovery_fresh_history(
@@ -1190,7 +1185,7 @@ impl CausalPositionValidator {
                 wallet,
                 BracketActivityEvidence {
                     walks: [&first_activity, &second_activity, &final_activity],
-                    baseline: baseline.map(ActivityEvidence::from).as_ref(),
+                    baseline: Some(&ActivityEvidence::from(baseline)),
                 },
                 [&first_ledger, &second_ledger, &final_ledger],
                 first_positions
@@ -1219,16 +1214,14 @@ impl CausalPositionValidator {
             Ok(install)
         }
         .await;
-        if purpose == ValidationPurpose::Reentry {
-            let ended = Instant::now();
-            tracing::info!(
-                wallet = %wallet,
-                outcome = result.as_ref().map_or_else(|error| error.kind(), |_| "accepted"),
-                baseline_ms = u64::try_from(baseline_started.map_or(0, |start| baseline_completed.unwrap_or(ended).duration_since(start).as_millis())).unwrap_or(u64::MAX),
-                stability_window_ms = u64::try_from(stability_started.map_or(0, |start| if result.is_err() { ended } else { stability_completed.unwrap_or(ended) }.duration_since(start).as_millis())).unwrap_or(u64::MAX),
-                "reentry bracket attempt"
-            );
-        }
+        let ended = Instant::now();
+        tracing::info!(
+            wallet = %wallet,
+            outcome = result.as_ref().map_or_else(|error| error.kind(), |_| "accepted"),
+            baseline_ms = u64::try_from(baseline_started.map_or(0, |start| baseline_completed.unwrap_or(ended).duration_since(start).as_millis())).unwrap_or(u64::MAX),
+            stability_window_ms = u64::try_from(stability_started.map_or(0, |start| if result.is_err() { ended } else { stability_completed.unwrap_or(ended) }.duration_since(start).as_millis())).unwrap_or(u64::MAX),
+            "bracket attempt"
+        );
         result
     }
 
@@ -1439,13 +1432,8 @@ impl CausalPositionValidator {
         &self,
         wallet: WalletAddress,
         activity: &CompleteActivityRead,
-        baseline: Option<&mut CompleteActivityRead>,
+        baseline: &mut CompleteActivityRead,
     ) -> Result<(PreparedActivity, ActivityAssetMapping), CausalPositionError> {
-        let Some(baseline) = baseline else {
-            let prepared = self.prepare_activity(wallet, activity).await?;
-            let mapping = prepared.mapping.clone();
-            return Ok((prepared, mapping));
-        };
         // Build the union in place before awaiting resolution; only the short tail is cloned.
         let baseline_len = baseline.rows.len();
         baseline.rows.extend_from_slice(&activity.rows);

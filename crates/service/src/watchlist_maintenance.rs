@@ -1696,6 +1696,9 @@ impl ScenarioMaintenanceState {
     }
 }
 
+/// Seconds between latest-batch checks while the maintenance loop sleeps after a tick.
+pub const BATCH_CHECK_SECS: u64 = 30;
+
 /// Run the maintenance tick loop until the process exits.
 ///
 /// `cfg.interval_secs == 0` disables the loop. The first tick fires at startup.
@@ -1740,6 +1743,7 @@ pub async fn run_maintenance_loop(
         boot_persistent_deferred,
         boot_cooldowns,
     );
+    let mut woken_for = None;
     loop {
         let capacity_epoch = applied_capacity.load();
         maintenance_tick(
@@ -1759,7 +1763,45 @@ pub async fn run_maintenance_loop(
             OffsetDateTime::now_utc().unix_timestamp(),
         )
         .await;
-        tokio::time::sleep(interval).await;
+        wait_for_next_tick(&sync, interval, &mut woken_for, || async {
+            supabase_reader::fetch_latest_batch_id(&client, &base_url, &anon_key, &secret_key)
+                .await
+                .ok()
+                .flatten()
+        })
+        .await;
+    }
+}
+
+/// Sleep `interval` after a tick, or less: wallets the tick left unstarted (only possible once its
+/// launch deadline passed) start the next tick at once, and a ranking batch that no tick has read
+/// and no earlier wait woke for ends the sleep at the next `BATCH_CHECK_SECS` check. A failed read
+/// (`None`) just waits for the next check.
+async fn wait_for_next_tick<F, Read>(
+    sync: &BatchSync,
+    interval: Duration,
+    woken_for: &mut Option<i64>,
+    mut latest_batch: F,
+) where
+    F: FnMut() -> Read,
+    Read: Future<Output = Option<i64>>,
+{
+    if sync.unstarted > 0 {
+        return;
+    }
+    let end = tokio::time::Instant::now() + interval;
+    loop {
+        let check = tokio::time::Instant::now() + Duration::from_secs(BATCH_CHECK_SECS);
+        if check >= end {
+            tokio::time::sleep_until(end).await;
+            return;
+        }
+        tokio::time::sleep_until(check).await;
+        let latest = latest_batch().await;
+        if latest.is_some() && latest != sync.parking_batch && latest != *woken_for {
+            *woken_for = latest;
+            return;
+        }
     }
 }
 
@@ -1923,6 +1965,7 @@ async fn maintenance_tick_inner(
     match supabase_reader::fetch_latest_batch_id(client, base_url, anon_key, secret_key).await {
         Ok(latest) => {
             if latest.is_some() && latest != sync.parking_batch {
+                info!(batch_id = latest, "ranking batch observed");
                 sync.knockout_deferred.clear();
                 sync.parking_batch = latest;
             }
@@ -5784,6 +5827,53 @@ mod tests {
             assert!(sync.cooling(&wallet));
             tokio::time::advance(Duration::from_secs(1)).await;
             assert!(!sync.cooling(&wallet));
+        }
+
+        /// PASS: a tick that left wallets unstarted is followed at once; otherwise the loop sleeps
+        /// its interval, ending at the first check that reads a batch no tick has read and no
+        /// earlier wait woke for; a failed read waits for the next check.
+        /// FAIL: a new batch waits out the interval, or a batch the ticks already read (applied or
+        /// failing) or one an earlier wait woke for wakes the loop again.
+        #[tokio::test(start_paused = true)]
+        async fn post_tick_wait_ends_for_unstarted_wallets_or_an_unseen_batch() {
+            let interval = Duration::from_secs(600);
+            let check = Duration::from_secs(BATCH_CHECK_SECS);
+            let mut woken_for = None;
+            let mut waited = async |sync: BatchSync, reads: Vec<Option<i64>>| {
+                let mut reads = reads.into_iter();
+                let start = tokio::time::Instant::now();
+                wait_for_next_tick(&sync, interval, &mut woken_for, || {
+                    std::future::ready(reads.next().flatten())
+                })
+                .await;
+                (start.elapsed(), woken_for)
+            };
+            let mut unstarted = admission_sync(5);
+            unstarted.unstarted = 1;
+            assert_eq!(waited(unstarted, Vec::new()).await, (Duration::ZERO, None));
+            // Unchanged: the whole interval, also for a read batch that failed to apply.
+            assert_eq!(
+                waited(admission_sync(5), vec![Some(5); 20]).await,
+                (interval, None)
+            );
+            let mut failing = admission_sync(4);
+            failing.parking_batch = Some(5);
+            assert_eq!(waited(failing, vec![Some(5); 20]).await, (interval, None));
+            // A new batch ends the sleep at the first check that reads it, past a failed read.
+            assert_eq!(
+                waited(admission_sync(5), vec![Some(5), None, Some(6)]).await,
+                (3 * check, Some(6))
+            );
+            // The next tick's read failed, so it never saw batch 6: no second wake for it, but a
+            // newer batch still wakes.
+            assert_eq!(
+                waited(admission_sync(5), vec![Some(6); 20]).await,
+                (interval, Some(6))
+            );
+            assert_eq!(
+                waited(admission_sync(5), vec![Some(6), Some(7)]).await,
+                (2 * check, Some(7))
+            );
         }
 
         #[tokio::test(start_paused = true)]
