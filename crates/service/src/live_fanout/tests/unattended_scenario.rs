@@ -126,24 +126,16 @@ async fn response(
                 pe_venue_polymarket::CanaryV2Client::negrisk_spender().unwrap(): UNLIMITED,
             },
         }),
-        "/positions" => {
-            let query: HashMap<String, String> =
-                reqwest::Url::parse(&format!("http://127.0.0.1{uri}"))
-                    .unwrap()
-                    .query_pairs()
-                    .into_owned()
-                    .collect();
-            let redeemable = query.get("redeemable").unwrap() == "true";
+        "/v2/positions" => {
             let rows = script
                 .markets
                 .iter()
                 .filter(|m| {
-                    (m.held || script.late_execution.as_deref() == Some(m.condition.as_str()))
-                        && m.redeemable == redeemable
+                    m.held || script.late_execution.as_deref() == Some(m.condition.as_str())
                 })
                 .map(Market::row)
                 .collect::<Vec<_>>();
-            json!(rows)
+            positions_v2_page(rows)
         }
         RELAYER_DEPOSIT_WALLET_NONCE_PATH => {
             assert_eq!(headers["RELAYER_API_KEY"], "scenario-key");
