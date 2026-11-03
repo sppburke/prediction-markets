@@ -2804,6 +2804,33 @@ fn is_untyped_object(raw: &str) -> bool {
         .is_ok_and(|row| !row.contains_key("type") && !row.contains_key("activity_type"))
 }
 
+/// The raw rows of one recorded reconciliation page, read in the format its schema selects (a v2
+/// envelope, pagination included, is validated), or `None` for a recorded positions page. The
+/// position bracket's recording fetcher writes its `/positions` pages under the activity envelope
+/// identity (position_seeder.rs `fetch`). Positions rows are objects without `type` and carry no
+/// trade; any other row shape, including a page mixing typed and untyped rows, is returned for the
+/// activity parser, which fails it closed.
+fn activity_page_rows(
+    schema_version: u32,
+    payload: &[u8],
+) -> Result<Option<Vec<&serde_json::value::RawValue>>, QualificationError> {
+    let json_failed = |error: String| {
+        QualificationError::InsufficientEvidence(format!(
+            "activity observation JSON failed: {error}"
+        ))
+    };
+    let raw_rows: Vec<&serde_json::value::RawValue> =
+        if crate::bucket_commit::is_v2_activity_page(schema_version) {
+            pe_source_polymarket_public::decode_v2_page(payload)
+                .map_err(|error| json_failed(error.to_string()))?
+                .data
+        } else {
+            serde_json::from_slice(payload).map_err(|error| json_failed(error.to_string()))?
+        };
+    let positions = !raw_rows.is_empty() && raw_rows.iter().all(|raw| is_untyped_object(raw.get()));
+    Ok((!positions).then_some(raw_rows))
+}
+
 fn fold_source_trade_universe(
     first: &mut HashMap<pe_core_types::SourceTradeId, u64>,
     binding_commitments: &mut BindingCommitments,
@@ -2849,29 +2876,10 @@ fn fold_source_trade_universe(
         content_type,
     )
     .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
-    let raw_rows: Vec<&serde_json::value::RawValue> =
-        if crate::bucket_commit::is_v2_activity_page(schema_version) {
-            pe_source_polymarket_public::decode_v2_page(payload)
-                .map_err(|error| {
-                    QualificationError::InsufficientEvidence(format!(
-                        "activity observation JSON failed: {error}"
-                    ))
-                })?
-                .data
-        } else {
-            serde_json::from_slice(payload).map_err(|error| {
-                QualificationError::InsufficientEvidence(format!(
-                    "activity observation JSON failed: {error}"
-                ))
-            })?
-        };
-    // The position bracket's recording fetcher writes its `/positions` pages under this same
-    // envelope identity (position_seeder.rs `fetch`). Positions rows are objects without `type`
-    // and carry no trade, so such a page adds nothing to the universe; any other row shape,
-    // including a page mixing typed and untyped rows, still fails closed below.
-    if !raw_rows.is_empty() && raw_rows.iter().all(|raw| is_untyped_object(raw.get())) {
+    // A recorded positions page adds nothing to the universe.
+    let Some(raw_rows) = activity_page_rows(schema_version, payload)? else {
         return Ok(());
-    }
+    };
     let context = ActivityParseContext {
         source_id: SourceId(source_id.to_owned()),
         observed_at: observed_at.clone(),
@@ -3408,6 +3416,11 @@ pub fn classify_activity_page_json(
         &source.content_type,
     )
     .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    // A recorded positions page holds no trade and so no anomaly row; its envelope is still
+    // validated, as the source universe reads it.
+    if activity_page_rows(source.schema_version, &source.payload)?.is_none() {
+        return Ok(serde_json::json!({"anomaly_rows": []}));
+    }
     let window = crate::bucket_commit::parse_recorded_activity_page(
         source.schema_version,
         &source.payload,
@@ -7101,6 +7114,17 @@ mod tests {
         }))
         .unwrap();
         let v1_page = serde_json::to_vec(&serde_json::json!([healthy])).unwrap();
+        // Migration boot records its positions pages under the activity identity.
+        let position = serde_json::json!({
+            "proxy_wallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "token_id": "123",
+            "condition_id": "0xc", "outcome_index": 0, "current_size": "5", "status": "OPEN"
+        });
+        let positions_page = |data: serde_json::Value, has_more: bool| {
+            serde_json::to_vec(&serde_json::json!({"data": data, "pagination":
+                {"limit": 1000, "offset": 0, "has_more": has_more, "next_cursor": null}}))
+            .unwrap()
+        };
+        let historical = crate::trade_poller::ACTIVITY_HISTORICAL_V2_PAGE_SCHEMA_VERSION;
         for (schema_version, payload) in [
             (
                 crate::trade_poller::ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION,
@@ -7109,6 +7133,18 @@ mod tests {
             (
                 crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION,
                 v1_page,
+            ),
+            (
+                historical,
+                positions_page(serde_json::json!([position]), false),
+            ),
+            (
+                historical,
+                positions_page(serde_json::json!([position]), true),
+            ),
+            (
+                historical,
+                positions_page(serde_json::json!([healthy, position]), false),
             ),
         ] {
             writer
@@ -7146,6 +7182,19 @@ mod tests {
             classify(&envelopes[1]).unwrap(),
             serde_json::json!({"anomaly_rows": []})
         );
+        // A positions page holds no anomaly row once its envelope validates; contradictory
+        // pagination, or a page mixing typed and untyped rows, still fails closed.
+        assert_eq!(
+            classify(&envelopes[2]).unwrap(),
+            serde_json::json!({"anomaly_rows": []})
+        );
+        let contradictory = classify(&envelopes[3]).unwrap_err().to_string();
+        assert!(
+            contradictory.contains("contradictory v2 pagination"),
+            "{contradictory}"
+        );
+        let mixed = classify(&envelopes[4]).unwrap_err().to_string();
+        assert!(mixed.contains("omitted type"), "{mixed}");
         let mut tampered = envelopes[0].clone();
         tampered.payload.push(b' ');
         assert!(classify(&tampered).is_err());

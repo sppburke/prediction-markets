@@ -9518,6 +9518,31 @@ async fn ac_c_receipt_census_query() {
         let echo = h
             .deliver_frame(&frame, |r| r["outcomeIndex"] = json!("0"))
             .await;
+        // Migration boot records its positions pages under the reconciliation identity
+        // (position_seeder.rs); the census skips such a page of untyped rows instead of stopping.
+        h.source
+            .append(EnvelopeIn {
+                source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                schema_version:
+                    pe_service::trade_poller::ACTIVITY_HISTORICAL_V2_PAGE_SCHEMA_VERSION,
+                parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                observed_at: SourceTimestamp(at()),
+                received_at: ReceivedAt(at()),
+                content_type: ContentType::Json,
+                payload: support::data_api_v2::fixture_page(
+                    &format!(
+                        "https://data.example/v2/positions?user={}&status=OPEN&filter_type=TOKENS\
+                         &filter_amount=0&include_archived=true&sort_by=TOKENS&sort_direction=ASC\
+                         &limit=1000",
+                        wallet()
+                    ),
+                    serde_json::to_vec(&json!([{"proxyWallet": wallet().to_string(),
+                        "asset": "asset", "conditionId": "0xc", "size": "5", "outcomeIndex": 0}]))
+                    .unwrap(),
+                ),
+            })
+            .await
+            .unwrap();
         h.stop().await;
         let snapshot = census_snapshot(&h, &logs);
         // This capture holds no membership record, yet the inspection still refuses to run
