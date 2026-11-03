@@ -3384,6 +3384,48 @@ pub fn canonical_membership_json(
     })
 }
 
+/// Offline inspection (docs/29): classify one captured reconciliation page envelope with the production
+/// parser, in the format its recorded schema selects, and name the rows held as non-executable anomalies
+/// (#822). Full source-log chain verification stays with the caller.
+pub fn classify_activity_page_json(
+    payload: &[u8],
+) -> Result<serde_json::Value, QualificationError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CapturedPage {
+        source: EventEnvelope,
+        wallet: pe_core_types::WalletAddress,
+    }
+    let captured: CapturedPage = serde_json::from_slice(payload)?;
+    let source = captured.source;
+    if blake3::hash(&source.payload) != source.raw_payload_hash {
+        return insufficient("activity page raw payload hash differs");
+    }
+    let (_, acceptance) = crate::bucket_commit::activity_page_generation(
+        &source.source_id.0,
+        source.schema_version,
+        source.parser_version,
+        &source.content_type,
+    )
+    .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    let window = crate::bucket_commit::parse_recorded_activity_page(
+        source.schema_version,
+        &source.payload,
+        captured.wallet,
+        &ActivityParseContext {
+            source_id: source.source_id.clone(),
+            observed_at: source.observed_at.clone(),
+            received_at: source.received_at.clone(),
+            transport: ActivityTransport::Replay,
+        },
+        acceptance,
+    )
+    .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    Ok(serde_json::json!({
+        "anomaly_rows": window.anomalies.iter().map(|anomaly| anomaly.row_index).collect::<Vec<_>>(),
+    }))
+}
+
 /// Offline inspection (docs/29): authenticate one frozen identity against its captured Gamma
 /// envelope through the shared verifier. Full source-log chain verification stays with the caller.
 pub fn verify_frame_identity_json(payload: &[u8]) -> Result<serde_json::Value, QualificationError> {
@@ -7037,6 +7079,76 @@ mod tests {
                 "schema {schema_version}"
             );
         }
+    }
+
+    #[test]
+    fn classify_activity_page_json_names_anomaly_rows_with_the_production_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let mut writer = Writer::open(&path).unwrap();
+        let at = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+        let healthy = v2_activity_row();
+        let mut anomaly = healthy.clone();
+        anomaly["price"] = serde_json::json!("2");
+        anomaly["transaction_hash"] = serde_json::json!("0xanomaly");
+        let mut sentinel = healthy.clone();
+        sentinel["type"] = serde_json::json!("REDEEM");
+        sentinel["outcome_index"] = serde_json::json!(999);
+        sentinel["transaction_hash"] = serde_json::json!("0xredeem");
+        let v2_page = serde_json::to_vec(&serde_json::json!({
+            "data": [healthy.clone(), anomaly, sentinel],
+            "pagination": {"limit": 1000, "offset": 0, "has_more": false, "next_cursor": null}
+        }))
+        .unwrap();
+        let v1_page = serde_json::to_vec(&serde_json::json!([healthy])).unwrap();
+        for (schema_version, payload) in [
+            (
+                crate::trade_poller::ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION,
+                v2_page,
+            ),
+            (
+                crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION,
+                v1_page,
+            ),
+        ] {
+            writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId(crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+                    schema_version,
+                    parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
+                    content_type: ContentType::Json,
+                    payload,
+                })
+                .unwrap();
+        }
+        drop(writer);
+        let envelopes = Reader::replay(&path)
+            .unwrap()
+            .map(|frame| frame.unwrap().1)
+            .collect::<Vec<_>>();
+        let classify = |source: &EventEnvelope| {
+            classify_activity_page_json(
+                &serde_json::to_vec(&serde_json::json!({
+                    "source": source,
+                    "wallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                }))
+                .unwrap(),
+            )
+        };
+        // The anomalous trade is held; the sentinel redemption is an accepted row, as in production.
+        assert_eq!(
+            classify(&envelopes[0]).unwrap(),
+            serde_json::json!({"anomaly_rows": [1]})
+        );
+        assert_eq!(
+            classify(&envelopes[1]).unwrap(),
+            serde_json::json!({"anomaly_rows": []})
+        );
+        let mut tampered = envelopes[0].clone();
+        tampered.payload.push(b' ');
+        assert!(classify(&tampered).is_err());
     }
 
     #[test]

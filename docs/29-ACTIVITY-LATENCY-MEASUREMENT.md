@@ -384,8 +384,9 @@ replace the Rust log verifier or authority-specific semantic verification. Do no
 preparation as part of this read-only audit. Set `PE_SERVICE_BIN` to the absolute path of the deployed
 `pe-service` binary: the inspection decodes membership records and artifacts only through its
 read-only `--canonical-membership-json` command, and authenticates frozen Gamma identities through
-its read-only `--verify-frame-identity-json` command. This preserves the service's JSON number
-parsing and canonical page hashes. The inspection stops without these commands. It also stops, naming the
+its read-only `--verify-frame-identity-json` command, and classifies anomaly-capable reconciliation pages
+(schemas 4–7) through its read-only `--classify-activity-page-json` command. This preserves the service's JSON number
+parsing, anomaly classification and canonical page hashes. The inspection stops without these commands. It also stops, naming the
 record, at a membership record that command cannot decode; AC-B, AC-C and AC16 are then incomplete.
 
 ```bash
@@ -729,24 +730,22 @@ for e in source.values("polymarket-activity-ws", "polymarket-public.activity-rec
     is_frame = e["source_id"] == "polymarket-activity-ws"
     if not is_frame and e["source_id"] != "polymarket-public.activity-reconciliation": continue
     # Dispatch by the recorded contract; historical pages remain identity-join evidence. Data API v2 pages
-    # (envelope schemas 6/7, #837) carry their rows in `data`; anomaly pages (4/5) stay outside this census.
+    # (envelope schemas 6/7, #837) carry their rows in `data`. Pages that can hold non-executable anomaly rows
+    # (schemas 4-7, #822) are classified by the deployed binary's production parser, and those rows are skipped.
     contract = (e["schema_version"], e["parser_version"])
-    if contract not in ((2, 2), (3, 2), (6, 2), (7, 2)):
+    if contract not in ((2, 2), (3, 2), (4, 2), (5, 2), (6, 2), (7, 2)):
         raise ValueError(f"unsupported reconciliation page contract {contract}")
-    v2 = not is_frame and contract in ((6, 2), (7, 2))
-    rows = payload(e)["data"] if v2 else [payload(e)] if is_frame else payload(e)
-    for r in rows:
+    rows = [payload(e)] if is_frame else payload(e)["data"] if contract[0] >= 6 else payload(e)
+    anomalies = set()
+    if not is_frame and contract[0] >= 4 and rows:
+        owner = rows[0].get("proxyWallet", rows[0].get("proxy_wallet", "")).strip().lower()
+        classified = subprocess.run([PE_SERVICE, "--classify-activity-page-json"],
+                                    input=json.dumps({"source": e, "wallet": owner}).encode(), capture_output=True)
+        assert classified.returncode == 0, classified.stderr.decode()
+        anomalies = set(json.loads(classified.stdout)["anomaly_rows"])
+    for index, r in enumerate(rows):
+        if index in anomalies: continue
         if r.get("type", r.get("activity_type", "TRADE" if is_frame else "")).strip().upper() != "TRADE": continue
-        # A v2 page no longer marks anomaly rows by schema: refuse a countable trade that could be one
-        # (exponent or over-28-digit decimals, a price outside [0, 1], an unlabeled 999 or non-u16 outcome).
-        if v2 and not r.get("is_combo", r.get("isCombo", False)) and Decimal(str(r.get("size", 0))) > 0:
-            numbers = [Decimal(str(r[k])) for k in ("price", "size", "usdc_size", "usdcSize") if r.get(k) is not None]
-            o = str(r.get("outcome_index", r.get("outcomeIndex", "0"))).strip()
-            if (any("e" in str(r.get(k)).lower() for k in ("price", "size", "usdc_size", "usdcSize") if r.get(k) is not None)
-                    or any(len(d.as_tuple().digits) > 28 or d.as_tuple().exponent < -28 for d in numbers)
-                    or not 0 <= Decimal(str(r.get("price", 0))) <= 1
-                    or not (o.isdigit() and int(o) <= 65535) or (o == "999" and not (r.get("outcome") or "").strip())):
-                raise ValueError(f"possible anomaly row in v2 page {e['seq']}: outside this census (#822)")
         wallet = r.get("proxyWallet", r.get("proxy_wallet", "")).strip().lower()
         tx = r.get("transactionHash", r.get("transaction_hash", "")).strip().lower()
         condition = r.get("conditionId", r.get("condition_id"))
