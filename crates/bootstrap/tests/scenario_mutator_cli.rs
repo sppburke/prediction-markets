@@ -1055,3 +1055,37 @@ fn participants_import_db_selection_locks_only_the_side_cache() {
         (10, 20)
     );
 }
+
+#[test]
+fn participant_series_flags_are_checked_before_cache_lock_or_creation() {
+    for args in [
+        vec!["winner-discovery", "--series", "7:seven"],
+        vec!["winner-discovery", "--series=7:seven"],
+        vec![
+            "participants-import",
+            "--wallets",
+            "participants.txt",
+            "--end-date-min",
+            "0",
+            "--covered-from",
+            "10",
+            "--covered-through",
+            "20",
+        ],
+    ] {
+        let dir = TempDir::new().unwrap();
+        let cache_path = dir.path().join("cache.db");
+        let refused = run_cli(dir.path(), &cache_path, &args);
+        assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("--series"));
+        assert!(!cache_path.exists());
+        drop(WalletCache::open(&cache_path).unwrap());
+        let before = std::fs::read(&cache_path).unwrap();
+        let _lock = CacheMutationLock::acquire(&cache_path).unwrap();
+        let refused = run_cli(dir.path(), &cache_path, &args);
+        assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("--series"));
+        assert!(!String::from_utf8_lossy(&refused.stderr).contains("cache mutation lock failed"));
+        assert_eq!(std::fs::read(&cache_path).unwrap(), before);
+    }
+}

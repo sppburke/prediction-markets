@@ -860,6 +860,16 @@ async fn main() {
 
         let participant_scope = if matches!(sub, "winner-discovery" | "participants-import") {
             let parsed = (|| {
+                if sub == "winner-discovery" && series_arg.is_some() {
+                    return Err(BootstrapError::Invalid {
+                        message: "winner-discovery does not accept --series".to_owned(),
+                    });
+                }
+                if sub == "participants-import" && series_arg.is_none() {
+                    return Err(BootstrapError::Invalid {
+                        message: "participants-import requires --series".to_owned(),
+                    });
+                }
                 if rest
                     .iter()
                     .any(|arg| *arg == "--end-date-min" || arg.starts_with("--end-date-min="))
@@ -1151,9 +1161,6 @@ async fn main() {
                     } else {
                         pile::ActivationPolicy::Immediate
                     },
-                    participant_scope
-                        .as_ref()
-                        .and_then(|scope| scope.series.as_deref()),
                     end_date_min_arg,
                 )
                 .await
@@ -1187,7 +1194,7 @@ async fn main() {
                         covered_through_arg,
                         participant_scope,
                     ) else {
-                        return Err(BootstrapError::Invalid { message: "participants-import requires --wallets, --end-date-min, --covered-from and --covered-through".to_owned() });
+                        return Err(BootstrapError::Invalid { message: "participants-import requires --wallets, --series, --end-date-min, --covered-from and --covered-through".to_owned() });
                     };
                     pe_bootstrap::wallet_discovery::import_participants(
                         &mut cache,

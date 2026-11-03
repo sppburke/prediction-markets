@@ -8,8 +8,11 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
+use futures::{StreamExt, stream};
 use pe_core_types::WalletAddress;
-use pe_source_polymarket_public::{RECONCILIATION_RATE_LIMIT_RETRY_SECS, ReqwestFetcher};
+use pe_source_polymarket_public::{
+    RECONCILIATION_RATE_LIMIT_RETRY_SECS, ReqwestFetcher, decode_v2_page,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -25,14 +28,17 @@ use crate::leaderboard_discovery::{
     LeaderboardDiscoveryReport, LeaderboardFetcher, run_leaderboard_discovery_with_policy,
 };
 use crate::market_scope::{
-    MarketScope, ScopeFetcher, ScopePage, ScopeSeries, canonical_recurrences, recent_market_scope,
+    MarketScope, ScopeFetcher, ScopePage, ScopeSeries, canonical_recurrences, list_market_series,
+    recent_market_scope,
 };
 use crate::pile::{self, ActivationPolicy, SRC_MARKET_PARTICIPANT};
 
 const PARTICIPANT_SOURCE_ID: &str = "polymarket-data-api-trades";
-const PARTICIPANT_MIN_INTERVAL_MS: u64 = 500;
-const PARTICIPANT_MARKET_CHUNK: usize = 40;
-const PARTICIPANT_PAGE_LIMIT: usize = 10_000;
+const PARTICIPANT_MIN_INTERVAL_MS: u64 = 100;
+const PARTICIPANT_MARKET_CHUNK: usize = 20;
+const PARTICIPANT_PAGE_LIMIT: usize = 1_000;
+const PARTICIPANT_CONCURRENCY: usize = 8;
+const PARTICIPANT_WINDOW_SECS: i64 = 1_065 * 86_400;
 
 /// Normalized ranking scope shared by participant discovery and accepted sweep imports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +98,21 @@ impl ParticipantDiscoveryCoverage {
 
     fn merge_import(&self, prior: Option<&Self>) -> Result<Self, BootstrapError> {
         self.validate()?;
+        if let Some(covered) = prior
+            .filter(|prior| prior.scope.recurrences == self.scope.recurrences)
+            .and_then(|prior| prior.scope.series.as_ref())
+            && covered.iter().any(|series| {
+                !self
+                    .scope
+                    .series
+                    .as_ref()
+                    .is_some_and(|imported| imported.contains(series))
+            })
+        {
+            return Err(BootstrapError::Invalid {
+                message: "participant import must retain every covered id:slug".to_owned(),
+            });
+        }
         let Some(prior) = prior.filter(|prior| prior.scope == self.scope) else {
             return Ok(self.clone());
         };
@@ -202,15 +223,7 @@ pub async fn run_source_discovery(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
 ) -> Result<SourceDiscoveryResult, BootstrapError> {
-    run_source_discovery_with_policy(
-        source,
-        config,
-        cache,
-        ActivationPolicy::Immediate,
-        None,
-        None,
-    )
-    .await
+    run_source_discovery_with_policy(source, config, cache, ActivationPolicy::Immediate, None).await
 }
 
 /// Source discovery with an explicit activation policy. The rank-and-push
@@ -220,7 +233,6 @@ pub async fn run_source_discovery_with_policy(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
     activation_policy: ActivationPolicy,
-    pinned: Option<&[ScopeSeries]>,
     market_floor: Option<i64>,
 ) -> Result<SourceDiscoveryResult, BootstrapError> {
     match source {
@@ -302,15 +314,16 @@ pub async fn run_source_discovery_with_policy(
                 cache,
                 activation_policy,
                 now,
-                pinned,
                 participant_fetcher,
-                |lo| {
+                || list_market_series(config, &config.market_recurrences),
+                |lo, subset| async move {
                     recent_market_scope(
                         config,
                         market_floor.unwrap_or(lo),
                         &config.market_recurrences,
-                        pinned,
+                        Some(&subset),
                     )
+                    .await
                 },
             )
             .await
@@ -326,25 +339,28 @@ struct ParticipantRecord {
     window_end_unix: i64,
     market_scope: Option<MarketScope>,
     trades_pages: Vec<ScopePage>,
+    chunks: Vec<ParticipantChunk>,
     wallet_count: usize,
     status: &'static str,
 }
 
-async fn run_participant_discovery<F, S, Fut>(
+async fn run_participant_discovery<F, L, S, Listed, Swept>(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
     policy: ActivationPolicy,
     now: i64,
-    pinned: Option<&[ScopeSeries]>,
     make_fetcher: impl FnOnce() -> Result<F, BootstrapError>,
-    scope: S,
+    list: L,
+    mut sweep: S,
 ) -> Result<SourceDiscoveryResult, BootstrapError>
 where
-    F: ScopeFetcher,
-    S: FnOnce(i64) -> Fut,
-    Fut: Future<Output = Result<MarketScope, BootstrapError>>,
+    F: ScopeFetcher + Sync,
+    L: FnOnce() -> Listed,
+    Listed: Future<Output = Result<(Vec<ScopeSeries>, Vec<ScopePage>), BootstrapError>>,
+    S: FnMut(i64, Vec<ScopeSeries>) -> Swept,
+    Swept: Future<Output = Result<MarketScope, BootstrapError>>,
 {
-    let normalized_scope = ParticipantScope::new(&config.market_recurrences, pinned)?;
+    let recurrences = canonical_recurrences(&config.market_recurrences)?;
     let prior = if config.participant_lookback_secs == 0 {
         None
     } else {
@@ -352,7 +368,7 @@ where
     };
     let matching = prior
         .as_ref()
-        .filter(|prior| prior.scope == normalized_scope);
+        .filter(|prior| prior.scope.recurrences == recurrences && prior.scope.series.is_some());
     let lo = i64::try_from(config.participant_lookback_secs)
         .ok()
         .and_then(|lookback| {
@@ -362,39 +378,102 @@ where
         });
     let mut record = ParticipantRecord {
         source_id: PARTICIPANT_SOURCE_ID,
-        schema_version: 1,
-        parser_version: 1,
+        schema_version: 2,
+        parser_version: 2,
         window_start_unix: lo,
         window_end_unix: now,
         market_scope: None,
         trades_pages: Vec::new(),
+        chunks: Vec::new(),
         wallet_count: 0,
         status: "disabled",
     };
+    let mut normalized_scope = None;
     let collected = async {
         if config.participant_lookback_secs == 0 {
             return Ok(Vec::new());
         }
         let lo = lo
-            .filter(|lo| *lo >= 0 && *lo < now)
+            .filter(|lo| valid_participant_window(*lo, now))
             .ok_or("failed:window")?;
-        let market_scope = scope(lo)
+        let (listed, listing_pages) = list()
             .await
             .map_err(|error| participant_failure("failed:gamma", &error))?;
-        record.market_scope = Some(market_scope);
+        let covered = matching
+            .and_then(|prior| prior.scope.series.clone())
+            .unwrap_or_default();
+        let additions: Vec<_> = listed
+            .into_iter()
+            .filter(|series| !covered.iter().any(|old| old.id == series.id))
+            .collect();
+        let mut series = covered.clone();
+        series.extend(additions.iter().cloned());
+        normalized_scope = Some(
+            ParticipantScope::new(&recurrences, Some(&series))
+                .map_err(|error| participant_failure("failed:gamma", &error))?,
+        );
+        let addition_lo = matching.map_or(lo, |prior| lo.min(prior.covered_from_unix));
+        if !additions.is_empty() && !valid_participant_window(addition_lo, now) {
+            return Err("failed:window");
+        }
+        if series.is_empty() {
+            return Err("failed:gamma");
+        }
         let fetcher =
             make_fetcher().map_err(|error| participant_failure("failed:client", &error))?;
-        let wallets = collect_participant_trades(
-            &fetcher,
-            &config.polymarket_base_url,
-            record.market_scope.as_ref().ok_or("failed:gamma")?,
-            lo,
-            now,
-            &mut record.trades_pages,
-        )
-        .await?;
+        let mut wallets = BTreeSet::new();
+        for (start, subset) in [(lo, covered), (addition_lo, additions)] {
+            if subset.is_empty() {
+                continue;
+            }
+            let market_scope = sweep(start, subset)
+                .await
+                .map_err(|error| participant_failure("failed:gamma", &error))?;
+            // Keep both subset sweeps in the summary's union, with all Gamma provenance.
+            if let Some(combined) = &mut record.market_scope {
+                combined.series.extend(market_scope.series.iter().cloned());
+                combined.pages.extend(market_scope.pages.iter().cloned());
+                combined
+                    .condition_ids
+                    .extend(market_scope.condition_ids.iter().cloned());
+                combined.condition_ids.sort();
+                combined.condition_ids.dedup();
+                combined.count =
+                    u64::try_from(combined.condition_ids.len()).map_err(|_| "failed:page-count")?;
+                combined.digest = format!(
+                    "{:x}",
+                    Sha256::digest(combined.condition_ids.join("\n").as_bytes())
+                );
+                combined.end_date_min_unix = combined
+                    .end_date_min_unix
+                    .max(market_scope.end_date_min_unix);
+                combined.completed_at_unix = market_scope.completed_at_unix;
+            } else {
+                let mut combined = market_scope.clone();
+                combined.pages.splice(0..0, listing_pages.iter().cloned());
+                record.market_scope = Some(combined);
+            }
+            wallets.extend(
+                collect_participant_trades(
+                    &fetcher,
+                    &config.polymarket_base_url,
+                    &market_scope,
+                    start,
+                    now,
+                    &mut record.trades_pages,
+                    &mut record.chunks,
+                )
+                .await?,
+            );
+        }
+        if let Some(scope) = &mut record.market_scope {
+            scope.series.sort_by(|a, b| a.id.cmp(&b.id));
+            for (ordinal, page) in scope.pages.iter_mut().enumerate() {
+                page.ordinal = u64::try_from(ordinal).map_err(|_| "failed:page-count")?;
+            }
+        }
         record.status = "ok";
-        Ok(wallets)
+        Ok(wallets.into_iter().collect())
     }
     .await;
     let wallets = match collected {
@@ -406,7 +485,7 @@ where
         }
     };
     record.wallet_count = wallets.len();
-    // One summary line plus one line per page: the whole record measured 179 KB, past journald's
+    // One summary line plus one line per page and chunk: the whole record measured 179 KB, past journald's
     // 48 KB LineMax. Each trades page URL lists its condition ids; the scope digest covers them all.
     let scope = record.market_scope.as_ref();
     let summary = serde_json::json!({
@@ -432,8 +511,12 @@ where
         })),
         "gamma_pages": scope.map_or(0, |s| s.pages.len()),
         "trades_pages": record.trades_pages.len(),
+        "chunks": record.chunks.len(),
     });
     tracing::info!(record = %summary, "winner_discovery: participants");
+    for chunk in &record.chunks {
+        tracing::info!(chunk = %serde_json::to_string(chunk)?, "winner_discovery: participant chunk");
+    }
     for page in scope
         .into_iter()
         .flat_map(|s| &s.pages)
@@ -455,7 +538,7 @@ where
     }
     let mut coverage = ParticipantDiscoveryCoverage {
         version: 1,
-        scope: normalized_scope,
+        scope: normalized_scope.ok_or(BootstrapError::Internal)?,
         market_floor_unix: record
             .market_scope
             .as_ref()
@@ -499,81 +582,166 @@ fn participant_failure(reason: &'static str, error: &impl std::fmt::Display) -> 
     reason
 }
 
-async fn collect_participant_trades<F: ScopeFetcher>(
+fn valid_participant_window(lo: i64, now: i64) -> bool {
+    lo >= 0 && lo < now && lo >= now.saturating_sub(PARTICIPANT_WINDOW_SECS)
+}
+
+#[derive(Serialize)]
+struct ParticipantChunk {
+    condition_ids: Vec<String>,
+    lo: i64,
+    newest_timestamp: Option<i64>,
+    oldest_timestamp: Option<i64>,
+    page_count: usize,
+    stop_reason: Option<&'static str>,
+}
+
+async fn collect_participant_trades<F: ScopeFetcher + Sync>(
     fetcher: &F,
     base_url: &str,
     scope: &MarketScope,
     lo: i64,
-    hi: i64,
+    now: i64,
     pages: &mut Vec<ScopePage>,
+    chunks: &mut Vec<ParticipantChunk>,
 ) -> Result<Vec<String>, &'static str> {
+    if !valid_participant_window(lo, now) {
+        return Err("failed:window");
+    }
+    let mut reads = stream::iter(
+        scope
+            .condition_ids
+            .chunks(PARTICIPANT_MARKET_CHUNK)
+            .map(|ids| collect_participant_chunk(fetcher, base_url, ids, lo)),
+    )
+    .buffered(PARTICIPANT_CONCURRENCY);
     let mut wallets = BTreeSet::new();
-    for ids in scope.condition_ids.chunks(PARTICIPANT_MARKET_CHUNK) {
-        let markets = ids.join(",");
-        let mut windows = vec![(lo, hi)];
-        while let Some((lo, hi)) = windows.pop() {
-            let mut window_wallets = BTreeSet::new();
-            let mut complete = false;
-            for offset in [0, PARTICIPANT_PAGE_LIMIT] {
-                let url = format!(
-                    "{base_url}/trades?market={markets}&limit={PARTICIPANT_PAGE_LIMIT}&offset={offset}&takerOnly=false&start={lo}&end={}",
-                    hi - 1
-                );
-                let page = fetcher
-                    .fetch(&url, "trades", PARTICIPANT_SOURCE_ID)
-                    .await
-                    .map_err(|error| participant_failure("failed:trades", &error))?;
-                let parsed = serde_json::from_slice::<Vec<Value>>(&page.body);
-                let rows = parsed.as_ref().map_or(0, Vec::len);
-                pages.push(ScopePage {
-                    ordinal: u64::try_from(pages.len()).map_err(|_| "failed:page-count")?,
-                    kind: "trades",
-                    series_id: None,
-                    url,
-                    request_cursor: None,
-                    returned_next_cursor: None,
-                    raw_sha256: format!("{:x}", Sha256::digest(&page.body)),
-                    rows: u64::try_from(rows).map_err(|_| "failed:page-count")?,
-                    observed_at_unix: page.observed_at_unix,
-                    received_at_unix: page.received_at_unix,
-                    source_at_unix: page.source_at_unix,
-                });
-                let trades =
-                    parsed.map_err(|error| participant_failure("failed:trades-json", &error))?;
-                if rows > PARTICIPANT_PAGE_LIMIT {
-                    return Err("failed:trades-limit");
-                }
-                for row in trades {
-                    let Some(wallet) = row.get("proxyWallet").and_then(Value::as_str) else {
-                        return Err("incomplete:proxy-wallet");
-                    };
-                    let wallet = wallet.to_ascii_lowercase();
-                    if wallet.len() == 42
-                        && wallet.starts_with("0x")
-                        && wallet[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
-                    {
-                        window_wallets.insert(wallet);
-                    } else {
-                        return Err("incomplete:proxy-wallet");
-                    }
-                }
-                if rows < PARTICIPANT_PAGE_LIMIT {
-                    complete = true;
-                    break;
-                }
-            }
-            if complete {
-                wallets.extend(window_wallets);
-            } else if hi - lo <= 1 {
-                return Err("incomplete");
-            } else {
-                let mid = lo + (hi - lo) / 2;
-                windows.push((mid, hi));
-                windows.push((lo, mid));
-            }
+    while let Some((result, chunk_pages, chunk)) = reads.next().await {
+        for mut page in chunk_pages {
+            page.ordinal = u64::try_from(pages.len()).map_err(|_| "failed:page-count")?;
+            pages.push(page);
         }
+        chunks.push(chunk);
+        wallets.extend(result?);
     }
     Ok(wallets.into_iter().collect())
+}
+
+async fn collect_participant_chunk<F: ScopeFetcher>(
+    fetcher: &F,
+    base_url: &str,
+    ids: &[String],
+    lo: i64,
+) -> (
+    Result<BTreeSet<String>, &'static str>,
+    Vec<ScopePage>,
+    ParticipantChunk,
+) {
+    let mut pages = Vec::new();
+    let mut chunk = ParticipantChunk {
+        condition_ids: ids.to_vec(),
+        lo,
+        newest_timestamp: None,
+        oldest_timestamp: None,
+        page_count: 0,
+        stop_reason: None,
+    };
+    let result = async {
+        let mut wallets = BTreeSet::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = BTreeSet::new();
+        let mut decreased = false;
+        loop {
+            let mut url = reqwest::Url::parse(&format!("{base_url}/v2/trades"))
+                .map_err(|error| participant_failure("failed:trades-url", &error))?;
+            url.query_pairs_mut()
+                .append_pair("condition", &ids.join(","))
+                .append_pair("taker_only", "false")
+                .append_pair("filter_amount", "0.0000001");
+            if let Some(cursor) = &cursor {
+                url.query_pairs_mut().append_pair("cursor", cursor);
+            } else {
+                url.query_pairs_mut()
+                    .append_pair("limit", &PARTICIPANT_PAGE_LIMIT.to_string());
+            }
+            let url = url.to_string();
+            let page = fetcher
+                .fetch(&url, "trades", PARTICIPANT_SOURCE_ID)
+                .await
+                .map_err(|error| participant_failure("failed:trades", &error))?;
+            let parsed = decode_v2_page(&page.body);
+            pages.push(ScopePage {
+                ordinal: u64::try_from(pages.len()).map_err(|_| "failed:page-count")?,
+                kind: "trades",
+                series_id: None,
+                url,
+                request_cursor: cursor.clone(),
+                returned_next_cursor: parsed
+                    .as_ref()
+                    .ok()
+                    .and_then(|page| page.pagination.next_cursor.clone()),
+                raw_sha256: format!("{:x}", Sha256::digest(&page.body)),
+                rows: u64::try_from(parsed.as_ref().map_or(0, |page| page.data.len()))
+                    .map_err(|_| "failed:page-count")?,
+                observed_at_unix: page.observed_at_unix,
+                received_at_unix: page.received_at_unix,
+                source_at_unix: page.source_at_unix,
+            });
+            chunk.page_count += 1;
+            let parsed =
+                parsed.map_err(|error| participant_failure("failed:trades-json", &error))?;
+            if parsed.pagination.has_more && parsed.data.is_empty() {
+                return Err("incomplete:empty-continuation");
+            }
+            if let Some(next) = &parsed.pagination.next_cursor
+                && !seen.insert(next.clone())
+            {
+                return Err("incomplete:repeated-cursor");
+            }
+            for raw in parsed.data {
+                let row: Value = serde_json::from_str(raw.get())
+                    .map_err(|error| participant_failure("failed:trades-json", &error))?;
+                let timestamp = row
+                    .get("timestamp")
+                    .and_then(Value::as_i64)
+                    .ok_or("incomplete:timestamp")?;
+                if let Some(previous) = chunk.oldest_timestamp {
+                    if timestamp > previous {
+                        return Err("incomplete:timestamp-order");
+                    }
+                    decreased |= timestamp < previous;
+                }
+                chunk.newest_timestamp.get_or_insert(timestamp);
+                chunk.oldest_timestamp = Some(timestamp);
+                let wallet = row
+                    .get("proxy_wallet")
+                    .and_then(Value::as_str)
+                    .ok_or("incomplete:proxy-wallet")?
+                    .to_ascii_lowercase();
+                if wallet.len() != 42
+                    || !wallet.starts_with("0x")
+                    || !wallet[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err("incomplete:proxy-wallet");
+                }
+                if timestamp >= lo {
+                    wallets.insert(wallet);
+                }
+            }
+            if !parsed.pagination.has_more {
+                chunk.stop_reason = Some("terminal");
+                break;
+            }
+            if decreased && chunk.oldest_timestamp.is_some_and(|oldest| oldest < lo) {
+                chunk.stop_reason = Some("threshold");
+                break;
+            }
+            cursor = parsed.pagination.next_cursor;
+        }
+        Ok(wallets)
+    }
+    .await;
+    (result, pages, chunk)
 }
 
 #[cfg(test)]
@@ -604,15 +772,20 @@ mod tests {
             .unwrap();
         assert_eq!((result.unique_wallets, result.activated), (0, 0));
         assert_eq!(cache.wallet_pile_size().unwrap(), 0);
-        let fetcher = fetcher(|_: &str| Ok(json!([{"proxyWallet": wallet(1)}])));
+        let fetcher = fetcher(|_: &str| {
+            Ok(envelope(
+                json!([{"proxy_wallet": wallet(1), "timestamp": 100}]),
+                None,
+            ))
+        });
         let participants = run_participant_discovery(
             &config,
             &mut cache,
             ActivationPolicy::Immediate,
             NOW,
-            None,
             || Ok(fetcher),
-            |_| async { Ok(scope(1)) },
+            listing,
+            |_, _| async { Ok(scope(1)) },
         )
         .await
         .unwrap();
@@ -702,7 +875,7 @@ mod tests {
             completed_at_unix: NOW,
             series: vec![ScopeSeries {
                 id: "2".into(),
-                slug: None,
+                slug: Some("two".into()),
             }],
             pages: Vec::new(),
             condition_ids: (0..markets).map(|n| format!("0x{n:064x}")).collect(),
@@ -719,11 +892,13 @@ mod tests {
         }
     }
 
-    fn full_page(n: u8, timestamp: i64) -> Value {
-        json!(vec![
-            json!({"proxyWallet": wallet(n), "timestamp": timestamp});
-            PARTICIPANT_PAGE_LIMIT
-        ])
+    fn envelope(rows: Value, next: Option<&str>) -> Value {
+        json!({"data": rows, "pagination": {"limit": 1000, "offset": 0,
+            "has_more": next.is_some(), "next_cursor": next}})
+    }
+
+    async fn listing() -> Result<(Vec<ScopeSeries>, Vec<ScopePage>), BootstrapError> {
+        Ok((scope(1).series, Vec::new()))
     }
 
     fn tmp_cache() -> (TempDir, WalletCache) {
@@ -733,152 +908,340 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn participants_chunk_ids_normalize_wallets_and_record_pages() {
-        let body = json!([
-            {"proxyWallet": wallet(0xbb).to_uppercase()},
-            {"proxyWallet": wallet(0xaa)},
-            {"proxyWallet": wallet(0xbb)},
-        ]);
-        let fetcher = fetcher(|_: &str| Ok(body.clone()));
-        let mut pages = Vec::new();
-        let wallets = collect_participant_trades(&fetcher, BASE, &scope(81), 100, NOW, &mut pages)
+    async fn participants_chunk_at_twenty_and_repeat_filters_with_cursor_evidence() {
+        for markets in [20, 21] {
+            let first = envelope(
+                json!([
+                    {"proxy_wallet": wallet(0xbb).to_uppercase(), "timestamp": 104, "size": "0.000001"},
+                    {"proxy_wallet": wallet(0xaa), "timestamp": 104}
+                ]),
+                Some("next /+?"),
+            );
+            let terminal = envelope(
+                json!([
+                    {"proxy_wallet": wallet(0xbb), "timestamp": 100}
+                ]),
+                None,
+            );
+            let fetcher = fetcher(|url: &str| {
+                Ok(if query(url).contains_key("cursor") {
+                    terminal.clone()
+                } else {
+                    first.clone()
+                })
+            });
+            let mut pages = Vec::new();
+            let mut chunks = Vec::new();
+            let wallets = collect_participant_trades(
+                &fetcher,
+                BASE,
+                &scope(markets),
+                100,
+                NOW,
+                &mut pages,
+                &mut chunks,
+            )
             .await
             .unwrap();
-        assert_eq!(wallets, vec![wallet(0xaa), wallet(0xbb)]);
-        let urls = fetcher.urls.lock().unwrap();
-        assert_eq!(urls.len(), 3);
-        for (i, url) in urls.iter().enumerate() {
-            let q = query(url);
-            assert_eq!(q["market"].split(',').count(), if i == 2 { 1 } else { 40 });
-            assert_eq!(q["limit"], "10000");
-            assert_eq!(q["offset"], "0");
-            assert_eq!(q["takerOnly"], "false");
-            assert_eq!(q["start"], "100");
-            assert_eq!(q["end"], "104");
-            let page = &pages[i];
-            assert_eq!(page.ordinal, u64::try_from(i).unwrap());
-            assert_eq!(page.url, *url);
-            assert_eq!(page.kind, "trades");
-            assert_eq!(page.rows, 3);
+            assert_eq!(wallets, [wallet(0xaa), wallet(0xbb)]);
+            assert_eq!(chunks.len(), markets.div_ceil(20));
+            let ids: Vec<_> = pages
+                .chunks(2)
+                .flat_map(|pair| {
+                    let first_query = query(&pair[0].url);
+                    assert_eq!(
+                        reqwest::Url::parse(&pair[0].url).unwrap().path(),
+                        "/v2/trades"
+                    );
+                    assert_eq!(
+                        first_query["condition"].split(',').count(),
+                        if markets == 21 && pair[0].ordinal == 2 {
+                            1
+                        } else {
+                            20
+                        }
+                    );
+                    assert_eq!(first_query["limit"], "1000");
+                    let mut next_query = query(&pair[1].url);
+                    assert_eq!(next_query.remove("cursor").as_deref(), Some("next /+?"));
+                    let mut expected = first_query.clone();
+                    expected.remove("limit");
+                    assert_eq!(next_query, expected);
+                    assert_eq!(first_query["taker_only"], "false");
+                    assert_eq!(first_query["filter_amount"], "0.0000001");
+                    assert!(
+                        !first_query.contains_key("start")
+                            && !first_query.contains_key("end")
+                            && !first_query.contains_key("offset")
+                    );
+                    assert_eq!(pair[0].request_cursor, None);
+                    assert_eq!(pair[0].returned_next_cursor.as_deref(), Some("next /+?"));
+                    assert_eq!(pair[1].request_cursor.as_deref(), Some("next /+?"));
+                    assert_eq!(pair[1].returned_next_cursor, None);
+                    assert_eq!(
+                        pair[0].raw_sha256,
+                        format!("{:x}", Sha256::digest(serde_json::to_vec(&first).unwrap()))
+                    );
+                    first_query["condition"]
+                        .split(',')
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(ids, scope(markets).condition_ids);
+            for (i, page) in pages.iter().enumerate() {
+                assert_eq!(page.ordinal, u64::try_from(i).unwrap());
+                assert_eq!(
+                    (
+                        page.observed_at_unix,
+                        page.received_at_unix,
+                        page.source_at_unix
+                    ),
+                    (200, 201, Some(199))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn participants_threshold_requires_a_strict_decrease_and_filters_old_rows() {
+        for equal_first_page in [false, true] {
+            let fetcher = fetcher(|url: &str| {
+                let cursor = query(url).get("cursor").cloned();
+                Ok(match cursor.as_deref() {
+                    None if equal_first_page => envelope(
+                        json!([
+                            {"proxy_wallet": wallet(1), "timestamp": 99},
+                            {"proxy_wallet": wallet(2), "timestamp": 99}
+                        ]),
+                        Some("second"),
+                    ),
+                    None => envelope(
+                        json!([
+                            {"proxy_wallet": wallet(1), "timestamp": 101},
+                            {"proxy_wallet": wallet(2), "timestamp": 100},
+                            {"proxy_wallet": wallet(3), "timestamp": 99}
+                        ]),
+                        Some("never-read"),
+                    ),
+                    Some("second") => envelope(
+                        json!([
+                            {"proxy_wallet": wallet(3), "timestamp": 99}
+                        ]),
+                        None,
+                    ),
+                    _ => panic!("unexpected page {url}"),
+                })
+            });
+            let mut pages = Vec::new();
+            let mut chunks = Vec::new();
+            let wallets = collect_participant_trades(
+                &fetcher,
+                BASE,
+                &scope(1),
+                100,
+                NOW,
+                &mut pages,
+                &mut chunks,
+            )
+            .await
+            .unwrap();
+            if equal_first_page {
+                assert!(wallets.is_empty());
+                assert_eq!(pages.len(), 2, "equal timestamps cannot prove direction");
+                assert_eq!(chunks[0].stop_reason, Some("terminal"));
+                assert_eq!(
+                    (chunks[0].newest_timestamp, chunks[0].oldest_timestamp),
+                    (Some(99), Some(99))
+                );
+            } else {
+                assert_eq!(wallets, [wallet(1), wallet(2)]);
+                assert_eq!(pages.len(), 1);
+                assert_eq!(chunks[0].stop_reason, Some("threshold"));
+                assert_eq!(
+                    (chunks[0].newest_timestamp, chunks[0].oldest_timestamp),
+                    (Some(101), Some(99))
+                );
+            }
+            assert_eq!(chunks[0].lo, 100);
+            assert_eq!(chunks[0].page_count, pages.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn participants_bad_cursor_walks_leave_wallets_and_coverage_unchanged() {
+        for failure in [
+            "within-page",
+            "across-pages",
+            "cursor",
+            "empty",
+            "wallet",
+            "envelope",
+            "fetch",
+        ] {
+            let (_dir, mut cache) = tmp_cache();
+            let prior = coverage(10, 100, 0);
+            cache.set_participant_discovery_coverage(&prior).unwrap();
+            let fetcher = fetcher(|url: &str| {
+                if !query(url).contains_key("cursor") {
+                    return Ok(envelope(
+                        json!([{"proxy_wallet": wallet(1), "timestamp": 100}]),
+                        Some("second"),
+                    ));
+                }
+                Ok(match failure {
+                    "within-page" => envelope(
+                        json!([
+                            {"proxy_wallet": wallet(2), "timestamp": 99},
+                            {"proxy_wallet": wallet(3), "timestamp": 100}
+                        ]),
+                        None,
+                    ),
+                    "across-pages" => {
+                        envelope(json!([{"proxy_wallet": wallet(2), "timestamp": 101}]), None)
+                    }
+                    "cursor" => envelope(
+                        json!([{"proxy_wallet": wallet(2), "timestamp": 100}]),
+                        Some("second"),
+                    ),
+                    "empty" => envelope(json!([]), Some("third")),
+                    "wallet" => envelope(json!([{"proxy_wallet": "bad", "timestamp": 100}]), None),
+                    "envelope" => {
+                        json!({"data": [], "pagination": {"limit":1000, "offset":0, "has_more":true, "next_cursor":null}})
+                    }
+                    "fetch" => {
+                        return Err(SourceError::Fatal {
+                            message: "fixture failed page".into(),
+                        });
+                    }
+                    _ => unreachable!(),
+                })
+            });
+            let error = run_participant_discovery(
+                &config(5),
+                &mut cache,
+                ActivationPolicy::Deferred,
+                NOW,
+                || Ok(fetcher),
+                listing,
+                |_, _| async { Ok(scope(1)) },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.exit_code(), 75, "{failure}: {error}");
+            assert_eq!(cache.wallet_pile_size().unwrap(), 0, "{failure}");
             assert_eq!(
-                page.raw_sha256,
-                format!("{:x}", Sha256::digest(serde_json::to_vec(&body).unwrap()))
-            );
-            assert_eq!(
-                (
-                    page.observed_at_unix,
-                    page.received_at_unix,
-                    page.source_at_unix
-                ),
-                (200, 201, Some(199))
+                cache.participant_discovery_coverage().unwrap(),
+                Some(prior),
+                "{failure}"
             );
         }
-        let ids: Vec<_> = urls
+    }
+
+    #[tokio::test]
+    async fn participants_window_guard_fails_before_listing_and_keeps_coverage() {
+        let (_dir, mut cache) = tmp_cache();
+        let prior = coverage(10, 100, 0);
+        cache.set_participant_discovery_coverage(&prior).unwrap();
+        let error = run_participant_discovery(
+            &config(5),
+            &mut cache,
+            ActivationPolicy::Deferred,
+            100 + PARTICIPANT_WINDOW_SECS,
+            || Ok(fetcher(|_: &str| panic!("guarded trades"))),
+            || async { panic!("guarded listing") },
+            |_, _| async { panic!("guarded sweep") },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 75);
+        assert!(error.to_string().contains("failed:window"));
+        assert_eq!(cache.participant_discovery_coverage().unwrap(), Some(prior));
+        assert_eq!(cache.wallet_pile_size().unwrap(), 0);
+        assert!(valid_participant_window(100, 100 + PARTICIPANT_WINDOW_SECS));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn participants_read_eight_chunks_concurrently_but_record_in_chunk_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ConcurrentFetcher {
+            active: AtomicUsize,
+            peak: AtomicUsize,
+        }
+        impl ScopeFetcher for ConcurrentFetcher {
+            async fn fetch(
+                &self,
+                url: &str,
+                _: &'static str,
+                _: &'static str,
+            ) -> Result<FetchedPage, SourceError> {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                let first = query(url)["condition"]
+                    .split(',')
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                tokio::time::sleep(Duration::from_millis(
+                    if first == scope(1).condition_ids[0] {
+                        100
+                    } else {
+                        1
+                    },
+                ))
+                .await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(FetchedPage {
+                    body: serde_json::to_vec(&envelope(json!([]), None)).unwrap(),
+                    observed_at_unix: 200,
+                    received_at_unix: 201,
+                    source_at_unix: None,
+                })
+            }
+        }
+        let fetcher = ConcurrentFetcher {
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        };
+        let mut pages = Vec::new();
+        collect_participant_trades(
+            &fetcher,
+            BASE,
+            &scope(181),
+            100,
+            NOW,
+            &mut pages,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetcher.peak.load(Ordering::SeqCst), PARTICIPANT_CONCURRENCY);
+        assert_eq!(pages.len(), 10);
+        let ids: Vec<_> = pages
             .iter()
-            .flat_map(|url| {
-                query(url)["market"]
+            .flat_map(|page| {
+                query(&page.url)["condition"]
                     .split(',')
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert_eq!(ids, scope(81).condition_ids);
-    }
-
-    #[tokio::test]
-    async fn participants_full_first_page_reads_terminal_offset() {
-        let fetcher = fetcher(|url: &str| {
-            Ok(if query(url)["offset"] == "0" {
-                full_page(1, 100)
-            } else {
-                json!([{"proxyWallet": wallet(2), "timestamp": 104}])
-            })
-        });
-        let mut pages = Vec::new();
-        let wallets = collect_participant_trades(&fetcher, BASE, &scope(1), 100, NOW, &mut pages)
-            .await
-            .unwrap();
-        assert_eq!(wallets, vec![wallet(1), wallet(2)]);
-        assert_eq!(pages.len(), 2);
-        assert_eq!(query(&pages[1].url)["offset"], "10000");
-        assert_eq!(pages[0].rows, 10_000);
-        assert_eq!(pages[1].rows, 1);
-    }
-
-    #[tokio::test]
-    async fn participants_full_terminal_page_splits_exact_half_open_bounds() {
-        let fetcher = fetcher(|url: &str| {
-            let q = query(url);
-            Ok(match (q["start"].as_str(), q["end"].as_str()) {
-                ("100", "104") => full_page(99, 102),
-                ("100", "101") => json!([{"proxyWallet": wallet(1), "timestamp": 101}]),
-                ("102", "104") => json!([{"proxyWallet": wallet(2), "timestamp": 102}]),
-                _ => unreachable!("unexpected window {url}"),
-            })
-        });
-        let mut pages = Vec::new();
-        let wallets = collect_participant_trades(&fetcher, BASE, &scope(1), 100, NOW, &mut pages)
-            .await
-            .unwrap();
-        assert_eq!(
-            wallets,
-            vec![wallet(1), wallet(2)],
-            "saturated parent rows are discarded"
-        );
-        let bounds: Vec<_> = pages
-            .iter()
-            .map(|page| {
-                let q = query(&page.url);
-                (q["start"].clone(), q["end"].clone(), q["offset"].clone())
-            })
-            .collect();
-        assert_eq!(
-            bounds,
-            [
-                ("100", "104", "0"),
-                ("100", "104", "10000"),
-                ("100", "101", "0"),
-                ("102", "104", "0")
-            ]
-            .map(|(lo, hi, offset)| (lo.into(), hi.into(), offset.into()))
-        );
-    }
-
-    #[tokio::test]
-    async fn participants_one_second_saturation_is_incomplete_without_upsert() {
-        let (_dir, mut cache) = tmp_cache();
-        let fetcher = fetcher(|_: &str| Ok(full_page(1, 100)));
-        let urls = Arc::clone(&fetcher.urls);
-        let r = run_participant_discovery(
-            &config(1),
-            &mut cache,
-            ActivationPolicy::Immediate,
-            101,
-            None,
-            || Ok(fetcher),
-            |_| async { Ok(scope(1)) },
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(r.exit_code(), 75);
-        assert!(r.to_string().contains("incomplete"));
-        assert_eq!(cache.wallet_pile_size().unwrap(), 0);
-        assert_eq!(urls.lock().unwrap().len(), 2);
+        assert_eq!(ids, scope(181).condition_ids);
     }
 
     #[tokio::test]
     async fn participants_gamma_failure_is_tempfail_and_does_not_fetch_or_upsert() {
         let (_dir, mut cache) = tmp_cache();
-        let fetcher = fetcher(|_: &str| Ok(json!([])));
+        let fetcher = fetcher(|_: &str| Ok(envelope(json!([]), None)));
         let urls = Arc::clone(&fetcher.urls);
         let r = run_participant_discovery(
             &config(5),
             &mut cache,
             ActivationPolicy::Immediate,
             NOW,
-            None,
             || Ok(fetcher),
-            |lo| async move {
+            listing,
+            |lo, _| async move {
                 assert_eq!(lo, 100);
                 Err(BootstrapError::Gamma {
                     message: "fixture outage".into(),
@@ -896,19 +1259,19 @@ mod tests {
     #[tokio::test]
     async fn participants_disabled_never_fetches_scope_or_trades() {
         let (_dir, mut cache) = tmp_cache();
-        let fetcher = fetcher(|_: &str| Ok(json!([])));
+        let fetcher = fetcher(|_: &str| Ok(envelope(json!([]), None)));
         let built = std::cell::Cell::new(false);
         let r = run_participant_discovery(
             &config(0),
             &mut cache,
             ActivationPolicy::Immediate,
             NOW,
-            None,
             || {
                 built.set(true);
                 Ok(fetcher)
             },
-            |_| async { panic!("disabled must not fetch Gamma") },
+            listing,
+            |_, _| async { panic!("disabled must not fetch Gamma") },
         )
         .await
         .unwrap();
@@ -921,16 +1284,16 @@ mod tests {
     #[tokio::test]
     async fn participants_future_markets_without_trades_are_ok() {
         let (_dir, mut cache) = tmp_cache();
-        let fetcher = fetcher(|_: &str| Ok(json!([])));
+        let fetcher = fetcher(|_: &str| Ok(envelope(json!([]), None)));
         let urls = Arc::clone(&fetcher.urls);
         let r = run_participant_discovery(
             &config(5),
             &mut cache,
             ActivationPolicy::Immediate,
             NOW,
-            None,
             || Ok(fetcher),
-            |_| async { Ok(scope(1)) },
+            listing,
+            |_, _| async { Ok(scope(1)) },
         )
         .await
         .unwrap();
@@ -945,8 +1308,11 @@ mod tests {
         for non_array in [true, false] {
             let (_dir, mut cache) = tmp_cache();
             let fetcher = fetcher(|url: &str| {
-                if query(url)["market"].split(',').count() == 40 {
-                    Ok(json!([{"proxyWallet": wallet(1)}]))
+                if query(url)["condition"].split(',').count() == 20 {
+                    Ok(envelope(
+                        json!([{"proxy_wallet": wallet(1), "timestamp": 100}]),
+                        None,
+                    ))
                 } else if non_array {
                     Ok(json!({"error": "not an array"}))
                 } else {
@@ -960,9 +1326,9 @@ mod tests {
                 &mut cache,
                 ActivationPolicy::Immediate,
                 NOW,
-                None,
                 || Ok(fetcher),
-                |_| async { Ok(scope(41)) },
+                listing,
+                |_, _| async { Ok(scope(21)) },
             )
             .await
             .unwrap_err();
@@ -980,11 +1346,15 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let ok_body = serde_json::to_vec(&json!([{"proxyWallet": wallet(0xaa)}])).unwrap();
+        let ok_body = serde_json::to_vec(&envelope(
+            json!([{"proxy_wallet": wallet(0xaa), "timestamp": 100}]),
+            None,
+        ))
+        .unwrap();
         let replies = [
             (
                 "429 Too Many Requests\r\nRetry-After: 1\r\nDate: Mon, 26 Oct 2026 00:00:00 GMT",
-                serde_json::to_vec(&json!([{"proxyWallet": wallet(0xcc)}])).unwrap(),
+                serde_json::to_vec(&json!([{"proxy_wallet": wallet(0xcc)}])).unwrap(),
             ),
             (
                 "200 OK\r\nDate: Mon, 26 Oct 2026 00:00:05 GMT",
@@ -1022,6 +1392,7 @@ mod tests {
             100,
             NOW,
             &mut pages,
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -1036,7 +1407,7 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], requests[1]);
-        assert!(requests[0].starts_with("GET /trades?market="));
+        assert!(requests[0].starts_with("GET /v2/trades?condition="));
     }
 
     #[tokio::test]
@@ -1046,15 +1417,20 @@ mod tests {
             cache
                 .upsert_wallet(&wallet(1), pile::SRC_TRADES, false, None, None, None)
                 .unwrap();
-            let fetcher = fetcher(|_: &str| Ok(json!([{"proxyWallet": wallet(1)}])));
+            let fetcher = fetcher(|_: &str| {
+                Ok(envelope(
+                    json!([{"proxy_wallet": wallet(1), "timestamp": 100}]),
+                    None,
+                ))
+            });
             let r = run_participant_discovery(
                 &config(5),
                 &mut cache,
                 policy,
                 NOW,
-                None,
                 || Ok(fetcher),
-                |_| async { Ok(scope(1)) },
+                listing,
+                |_, _| async { Ok(scope(1)) },
             )
             .await
             .unwrap();
@@ -1077,15 +1453,20 @@ mod tests {
         let (dir, cache) = tmp_cache();
         drop(cache);
         let mut cache = WalletCache::open_read_only(&dir.path().join("cache.db")).unwrap();
-        let fetcher = fetcher(|_: &str| Ok(json!([{"proxyWallet": wallet(1)}])));
+        let fetcher = fetcher(|_: &str| {
+            Ok(envelope(
+                json!([{"proxy_wallet": wallet(1), "timestamp": 100}]),
+                None,
+            ))
+        });
         let error = run_participant_discovery(
             &config(5),
             &mut cache,
             ActivationPolicy::Immediate,
             NOW,
-            None,
             || Ok(fetcher),
-            |_| async { Ok(scope(1)) },
+            listing,
+            |_, _| async { Ok(scope(1)) },
         )
         .await
         .unwrap_err();
@@ -1119,7 +1500,7 @@ mod tests {
             .with_writer(move || writer.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
-        let body = json!([{"proxyWallet": wallet(1)}]);
+        let body = envelope(json!([{"proxy_wallet": wallet(1), "timestamp": 100}]), None);
         let fetcher = fetcher(|_: &str| Ok(body.clone()));
         let mut gamma = scope(1);
         (gamma.version, gamma.schema_version, gamma.parser_version) = (7, 8, 9);
@@ -1144,9 +1525,12 @@ mod tests {
             &mut cache,
             ActivationPolicy::Deferred,
             NOW,
-            None,
             || Ok(fetcher),
-            |_| async { Ok(gamma) },
+            listing,
+            |_, _| {
+                let gamma = gamma.clone();
+                async { Ok(gamma) }
+            },
         )
         .await
         .unwrap();
@@ -1167,12 +1551,20 @@ mod tests {
         assert_eq!(records.len(), 1);
         let record = &records[0];
         assert_eq!(record["source_id"], PARTICIPANT_SOURCE_ID);
-        assert_eq!(record["schema_version"], 1);
-        assert_eq!(record["parser_version"], 1);
+        assert_eq!(record["schema_version"], 2);
+        assert_eq!(record["parser_version"], 2);
         assert_eq!(record["window_start_unix"], 100);
         assert_eq!(record["window_end_unix"], NOW);
         assert_eq!(record["status"], "ok");
         assert_eq!(record["wallet_count"], 1);
+        assert_eq!(record["chunks"], 1);
+        let chunks = field("winner_discovery: participant chunk", "chunk");
+        assert_eq!(
+            chunks,
+            [
+                json!({"condition_ids":scope(1).condition_ids, "lo":100, "newest_timestamp":100, "oldest_timestamp":100, "page_count":1, "stop_reason":"terminal"})
+            ]
+        );
         assert_eq!(record["scope"]["digest"], digest);
         assert_eq!(record["scope"]["count"], count);
         assert_eq!(record["scope"]["source_id"], "polymarket-gamma");
@@ -1224,15 +1616,20 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'fixture activation failure'); END;",
             )
             .unwrap();
-        let fetcher = fetcher(|_: &str| Ok(json!([{"proxyWallet": wallet(1)}])));
+        let fetcher = fetcher(|_: &str| {
+            Ok(envelope(
+                json!([{"proxy_wallet": wallet(1), "timestamp": 100}]),
+                None,
+            ))
+        });
         let error = run_participant_discovery(
             &config(5),
             &mut cache,
             ActivationPolicy::Immediate,
             NOW,
-            None,
             || Ok(fetcher),
-            |_| async { Ok(scope(1)) },
+            listing,
+            |_, _| async { Ok(scope(1)) },
         )
         .await
         .unwrap_err();
@@ -1246,7 +1643,7 @@ mod tests {
     fn coverage(from: i64, through: i64, floor: i64) -> ParticipantDiscoveryCoverage {
         ParticipantDiscoveryCoverage {
             version: 1,
-            scope: ParticipantScope::new(&["15m".into()], None).unwrap(),
+            scope: ParticipantScope::new(&["15m".into()], Some(&scope(1).series)).unwrap(),
             market_floor_unix: floor,
             covered_from_unix: from,
             covered_through_unix: through,
@@ -1256,12 +1653,12 @@ mod tests {
     #[tokio::test]
     async fn participants_invalid_wallet_refuses_the_chunk_and_logs_its_hash() {
         for invalid in [
-            json!({}),
-            json!({"proxyWallet": null}),
-            json!({"proxyWallet": "0x123"}),
-            json!({"proxyWallet": format!("0x{}", "g".repeat(40))}),
-            json!({"proxyWallet": "é".repeat(21)}),
-            json!({"proxyWallet": format!("1x{}", "a".repeat(40))}),
+            json!({"timestamp": 100}),
+            json!({"proxy_wallet": null, "timestamp": 100}),
+            json!({"proxy_wallet": "0x123", "timestamp": 100}),
+            json!({"proxy_wallet": format!("0x{}", "g".repeat(40)), "timestamp": 100}),
+            json!({"proxy_wallet": "é".repeat(21), "timestamp": 100}),
+            json!({"proxy_wallet": format!("1x{}", "a".repeat(40)), "timestamp": 100}),
         ] {
             let (_dir, mut cache) = tmp_cache();
             let prior = coverage(50, 90, 20);
@@ -1274,16 +1671,19 @@ mod tests {
                     .with_writer(move || writer.clone())
                     .finish(),
             );
-            let body = json!([{"proxyWallet": wallet(1)}, invalid]);
+            let body = envelope(
+                json!([{"proxy_wallet": wallet(1), "timestamp": 100}, invalid]),
+                None,
+            );
             let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&body).unwrap()));
             let error = run_participant_discovery(
                 &config(5),
                 &mut cache,
                 ActivationPolicy::Deferred,
                 NOW,
-                None,
                 || Ok(fetcher(|_: &str| Ok(body.clone()))),
-                |_| async { Ok(scope(1)) },
+                listing,
+                |_, _| async { Ok(scope(1)) },
             )
             .await
             .unwrap_err();
@@ -1334,8 +1734,7 @@ mod tests {
         let (_dir, mut cache) = tmp_cache();
         let prior = coverage(10, 105, 20);
         cache.set_participant_discovery_coverage(&prior).unwrap();
-        let broken = fetcher(|url: &str| {
-            assert_eq!(query(url)["start"], "100");
+        let broken = fetcher(|_url: &str| {
             Err(SourceError::Fatal {
                 message: "fixture page failure".into(),
             })
@@ -1345,9 +1744,9 @@ mod tests {
             &mut cache,
             ActivationPolicy::Deferred,
             1_000,
-            None,
             || Ok(broken),
-            |lo| async move {
+            listing,
+            |lo, _| async move {
                 assert_eq!(lo, 100);
                 Ok(scope(1))
             },
@@ -1361,9 +1760,11 @@ mod tests {
         );
         cache.raw_conn_for_test().execute_batch("CREATE TRIGGER stop_coverage BEFORE INSERT ON meta WHEN NEW.key='participant_discovery_coverage' BEGIN SELECT RAISE(ABORT, 'interrupted coverage commit'); END;").unwrap();
         let good = || {
-            Ok(fetcher(|url: &str| {
-                assert_eq!(query(url)["start"], "100");
-                Ok(json!([{"proxyWallet": wallet(1)}]))
+            Ok(fetcher(|_url: &str| {
+                Ok(envelope(
+                    json!([{"proxy_wallet": wallet(1), "timestamp": 100}]),
+                    None,
+                ))
             }))
         };
         let error = run_participant_discovery(
@@ -1371,9 +1772,12 @@ mod tests {
             &mut cache,
             ActivationPolicy::Deferred,
             1_000,
-            None,
             good,
-            |_| async { Ok(scope(1)) },
+            listing,
+            |lo, _| async move {
+                assert_eq!(lo, 100);
+                Ok(scope(1))
+            },
         )
         .await
         .unwrap_err();
@@ -1389,9 +1793,12 @@ mod tests {
             &mut cache,
             ActivationPolicy::Deferred,
             1_000,
-            None,
             good,
-            |_| async { Ok(scope(1)) },
+            listing,
+            |lo, _| async move {
+                assert_eq!(lo, 100);
+                Ok(scope(1))
+            },
         )
         .await
         .unwrap();
@@ -1405,14 +1812,10 @@ mod tests {
             &mut cache,
             ActivationPolicy::Deferred,
             1_005,
-            None,
-            || {
-                Ok(fetcher(|url: &str| {
-                    assert_eq!(query(url)["start"], "995");
-                    Ok(json!([]))
-                }))
-            },
-            |_| async {
+            || Ok(fetcher(|_url: &str| Ok(envelope(json!([]), None)))),
+            listing,
+            |lo, _| async move {
+                assert_eq!(lo, 995);
                 let mut scope = scope(1);
                 scope.end_date_min_unix = 20;
                 Ok(scope)
@@ -1436,9 +1839,9 @@ mod tests {
             &mut cache,
             ActivationPolicy::Deferred,
             NOW,
-            None,
             || Ok(fetcher(|_: &str| panic!("disabled fetch"))),
-            |_| async { panic!("disabled scope") },
+            listing,
+            |_, _| async { panic!("disabled scope") },
         )
         .await
         .unwrap();
@@ -1456,9 +1859,9 @@ mod tests {
                 &mut cache,
                 ActivationPolicy::Deferred,
                 NOW,
-                None,
                 || Ok(fetcher(|_: &str| panic!("bad coverage trades"))),
-                |_| async { panic!("bad coverage scope") }
+                listing,
+                |_, _| async { panic!("bad coverage scope") }
             )
             .await
             .is_err()
@@ -1473,9 +1876,9 @@ mod tests {
                 &mut cache,
                 ActivationPolicy::Deferred,
                 NOW,
-                None,
                 || Ok(fetcher(|_: &str| panic!("bad query trades"))),
-                |_| async { panic!("bad query scope") }
+                listing,
+                |_, _| async { panic!("bad query scope") }
             )
             .await
             .is_err()
@@ -1486,25 +1889,22 @@ mod tests {
     async fn participants_scope_change_replaces_coverage_on_schema_two_without_source_cursor() {
         let (_dir, mut cache) = tmp_cache();
         cache.raw_conn_for_test().execute_batch("ALTER TABLE source_cursor RENAME TO source_cursor_v1_sealed; PRAGMA user_version=2;").unwrap();
-        cache
-            .set_participant_discovery_coverage(&coverage(10, 20, 0))
-            .unwrap();
+        let mut legacy = coverage(10, 20, 0);
+        legacy.scope.series = None;
+        cache.set_participant_discovery_coverage(&legacy).unwrap();
         let pin = crate::market_scope::parse_pinned_series("8:eight,7:seven").unwrap();
         run_participant_discovery(
             &config(5),
             &mut cache,
             ActivationPolicy::Deferred,
             NOW,
-            Some(&pin),
-            || {
-                Ok(fetcher(|url: &str| {
-                    assert_eq!(query(url)["start"], "100");
-                    Ok(json!([]))
-                }))
-            },
-            |lo| async move {
+            || Ok(fetcher(|_url: &str| Ok(envelope(json!([]), None)))),
+            || async { Ok((pin.clone(), Vec::new())) },
+            |lo, subset| async move {
                 assert_eq!(lo, 100);
-                Ok(scope(1))
+                let mut scope = scope(1);
+                scope.series = subset;
+                Ok(scope)
             },
         )
         .await
@@ -1516,6 +1916,124 @@ mod tests {
             cache.participant_discovery_coverage().unwrap(),
             Some(expected)
         );
+    }
+
+    #[tokio::test]
+    async fn participants_union_preserves_ten_series_and_reads_additions_back_to_covered_from() {
+        let mut covered = crate::market_scope::parse_pinned_series(
+            &(1..=10)
+                .map(|id| format!("{id}:s{id}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+        .unwrap();
+        covered.sort_by(|a, b| a.id.cmp(&b.id));
+        for mode in ["same", "addition", "omission"] {
+            let (_dir, mut cache) = tmp_cache();
+            let mut prior = coverage(10, 100, 20);
+            prior.scope = ParticipantScope::new(&["15m".into()], Some(&covered)).unwrap();
+            cache.set_participant_discovery_coverage(&prior).unwrap();
+            let mut listed = covered.clone();
+            match mode {
+                "addition" => listed.push(ScopeSeries {
+                    id: "11".into(),
+                    slug: Some("s11".into()),
+                }),
+                "omission" => {
+                    listed.pop();
+                }
+                _ => {}
+            }
+            let sweeps = std::cell::RefCell::new(Vec::new());
+            let fetcher = fetcher(|url: &str| {
+                let ids = query(url)["condition"].clone();
+                let addition = ids == format!("0x{:064x}", 11);
+                Ok(envelope(
+                    json!([{"proxy_wallet": wallet(if addition { 2 } else { 1 }), "timestamp": if addition { 50 } else { 99 }}]),
+                    None,
+                ))
+            });
+            let result = run_participant_discovery(
+                &config(5),
+                &mut cache,
+                ActivationPolicy::Deferred,
+                200,
+                || Ok(fetcher),
+                || async { Ok((listed.clone(), Vec::new())) },
+                |lo, subset| {
+                    sweeps.borrow_mut().push((lo, subset.clone()));
+                    let mut scope = scope(0);
+                    scope.series = subset;
+                    scope.condition_ids = scope
+                        .series
+                        .iter()
+                        .map(|series| format!("0x{:064x}", series.id.parse::<u64>().unwrap()))
+                        .collect();
+                    scope.end_date_min_unix = 20;
+                    async { Ok(scope) }
+                },
+            )
+            .await
+            .unwrap();
+            let sweeps = sweeps.borrow();
+            assert_eq!(sweeps[0], (95, covered.clone()), "{mode}");
+            assert_eq!(sweeps.len(), if mode == "addition" { 2 } else { 1 });
+            let current = cache.participant_discovery_coverage().unwrap().unwrap();
+            let mut expected = prior;
+            expected.covered_through_unix = 200;
+            if mode == "addition" {
+                assert_eq!(
+                    sweeps[1],
+                    (
+                        10,
+                        vec![ScopeSeries {
+                            id: "11".into(),
+                            slug: Some("s11".into())
+                        }]
+                    )
+                );
+                expected.scope = ParticipantScope::new(&["15m".into()], Some(&listed)).unwrap();
+                assert_eq!(
+                    result.unique_wallets, 2,
+                    "the historical addition participant is collected"
+                );
+            } else {
+                assert_eq!(result.unique_wallets, 1);
+            }
+            assert_eq!(current, expected, "{mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn participants_addition_outside_v2_window_cannot_extend_coverage() {
+        let (_dir, mut cache) = tmp_cache();
+        let now = PARTICIPANT_WINDOW_SECS + 200;
+        let prior = coverage(10, now - 10, 0);
+        cache.set_participant_discovery_coverage(&prior).unwrap();
+        let error = run_participant_discovery(
+            &config(5),
+            &mut cache,
+            ActivationPolicy::Deferred,
+            now,
+            || {
+                Ok(fetcher(|_: &str| {
+                    panic!("old addition must not read trades")
+                }))
+            },
+            || async {
+                Ok((
+                    crate::market_scope::parse_pinned_series("2:two,3:three").unwrap(),
+                    Vec::new(),
+                ))
+            },
+            |_, _| async { panic!("old addition must not sweep") },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 75);
+        assert!(error.to_string().contains("failed:window"));
+        assert_eq!(cache.participant_discovery_coverage().unwrap(), Some(prior));
+        assert_eq!(cache.wallet_pile_size().unwrap(), 0);
     }
 
     #[test]
@@ -1597,14 +2115,10 @@ mod tests {
             &mut cache,
             ActivationPolicy::Deferred,
             NOW,
-            None,
-            || {
-                Ok(fetcher(|url: &str| {
-                    assert_eq!(query(url)["start"], "95");
-                    Ok(json!([]))
-                }))
-            },
-            |_| async {
+            || Ok(fetcher(|_url: &str| Ok(envelope(json!([]), None)))),
+            listing,
+            |lo, _| async move {
+                assert_eq!(lo, 95);
                 let mut scope = scope(1);
                 scope.end_date_min_unix = 20;
                 Ok(scope)
@@ -1720,9 +2234,16 @@ mod tests {
                 &mut cache,
                 ActivationPolicy::Deferred,
                 NOW,
-                None,
-                || Ok(fetcher(|_: &str| Ok(json!([{"proxyWallet": wallet(3)}])))),
-                |_| async { Ok(scope(1)) },
+                || {
+                    Ok(fetcher(|_: &str| {
+                        Ok(envelope(
+                            json!([{"proxy_wallet": wallet(3), "timestamp": 100}]),
+                            None,
+                        ))
+                    }))
+                },
+                listing,
+                |_, _| async { Ok(scope(1)) },
             )
             .await
             .unwrap();
