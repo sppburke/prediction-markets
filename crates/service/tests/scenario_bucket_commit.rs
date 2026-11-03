@@ -4558,6 +4558,8 @@ fn anomaly_only_seconds_commit_drops_and_cursors_once_across_restart_and_history
                 rows: Vec::new(),
                 anomalies: window.anomalies.clone(),
                 pages: vec![ReconciliationPageEvidence {
+                    has_more: None,
+                    next_cursor: None,
                     request_url: "test".to_owned(),
                     bounds: Some(ActivityRequestBounds {
                         start: Some(0),

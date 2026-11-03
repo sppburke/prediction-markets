@@ -73,7 +73,7 @@ Production budgets are conservative; they reduce automatically on 429/5xx. The "
 
 | Venue / surface | Documented limit | Production budget | Burst |
 |---|---|---|---|
-| Polymarket Data API | 200 req/10s on v2 `/activity`; legacy `/activity` is not listed separately on the official page; 100 req/s general on v1 | ≤ 20 req/s sustained on legacy `/activity` | page bursts DO return HTTP 429 with `Retry-After: 1` (observed 2026-09-02, #555; participant `/trades` pages on Forge 2026-10-24 and 2026-10-25, #800); the service's reconciliation fetcher, the bootstrap activity collection (`cache-populate-activity-v2`) and winner discovery's participant `/trades` reader wait out `Retry-After` ≤ `reconciliation_rate_limit_retry_secs` (1 s) inside the separate `reconciliation_rate_limit_max_retries` budget |
+| Polymarket Data API | 200 req/10s on `/v2/activity`; historical v1: legacy `/activity` not listed separately, 100 req/s general | ≤ 20 req/s sustained on pe-service `/v2/activity` | page bursts DO return HTTP 429 with `Retry-After: 1` (observed 2026-09-02, #555; participant `/trades` pages on Forge 2026-10-24 and 2026-10-25, #800); the service's reconciliation fetcher, the bootstrap activity collection (`cache-populate-activity-v2`) and winner discovery's participant `/trades` reader wait out `Retry-After` ≤ `reconciliation_rate_limit_retry_secs` (1 s) inside the separate `reconciliation_rate_limit_max_retries` budget |
 | Polymarket Gamma API | verify | ≤ 2 req/s sustained | 10-req burst |
 | Polymarket CLOB REST | verify | ≤ 5 req/s sustained | 10-req burst |
 | Polymarket WebSocket | per-account socket cap | ≤ 4 concurrent sockets | n/a |
@@ -308,7 +308,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `polymarket_base_url` | `https://data-api.polymarket.com` | Base URL for all five public REST endpoints |
+| `polymarket_base_url` | `https://data-api.polymarket.com` | Unchanged Data API host; pe-service appends the `/v2` paths in the [v2 contract](#data-api-v2-contract-pe-service-phase-1) |
 | `polymarket_request_timeout_secs` | 10 | Per-request HTTP timeout before the request is abandoned |
 | `polymarket_max_retries` | 3 | Retries on network errors, 5xx and a success reply that is not one complete JSON document (4 total attempts: initial + 3 retries). Such a reply stays in observed evidence as the `Response` it was; once the budget is spent the fetcher returns `Transient`. A cleanly framed reply can still be cut short upstream (#703). Valid JSON of an unexpected shape is the parser's concern |
 | `activity_collection_transient_retries` | 16 | **Binary const** `ACTIVITY_COLLECTION_TRANSIENT_RETRIES` in `pe-bootstrap`'s `main.rs` (not a TOML/env key). Overrides `polymarket_max_retries` for `cache-populate-activity-v2` only. Without a wallet budget, one failing page in a legacy read or identity-4 walk window ends the whole collection with exit 75 and cancels every unfinished wallet read (wallets the writer already accepted are kept and skipped on resume), costing the supervisor's 60 s wait, a restart and those unfinished reads. A recoverable identity-4 probe failure advances to the walk regardless of budget. With `bootstrap_polymarket_wallet_timeout_secs` set (#681), a page failure that exhausts these retries no longer ends the collection: identity 4 retries the failed window in place while its single deadline allows and keeps proved windows on expiry; identities 1–3 retry the whole read. Backoff is 200 ms doubling, capped at 30 s: eight retries wait about 51 s in total and sixteen about 291 s; historically, with the 10 s request timeout, a persistent failure exited after at most about eight minutes plus rate-gate waits (today's timeout is in the next row). Observed on Forge on 2026-09-18 with eight: five exits between 13:18Z and 15:41Z, each on one page 1,000 to 2,500 rows deep in a large wallet ("error sending request"), while the other wallets kept receiving 10 to 15 pages/s; four of the five wallets were then read in full without error right after the restart, and a DNS and TCP-connect probe of the venue host every 5 s saw no failure around the fifth. A stuck page holds only its own wallet slot. The cause, found afterwards, is the venue answering those pages just after the 10 s request timeout (see `activity_collection_request_timeout_secs`); a retry succeeds only once the venue has that answer warm (#588). |
@@ -336,9 +336,9 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `polymarket_clob_poll_interval_ms` | 100 | Interval between GET /order/{id} polls while waiting for terminal status |
 | `clob_book_request_timeout_secs` | 5 | Fixed `crates/service/src/clob_book.rs` constant `CLOB_REQUEST_TIMEOUT_SECS` (no env override): per-request timeout for public CLOB `/book` reads shared by the copy decision and liquidity-capture snapshot worker. The decision runs on the fill hot path under its own whole-fetch `clob_book_hot_path_timeout_secs` budget and fails closed on timeout; the snapshot worker degrades to a partial snapshot. Reuses `polymarket_clob_min_interval_ms`. |
 | `absorbable_depth_bps` | 100 | Fixed `crates/service/src/snapshot_worker.rs` constant `ABSORBABLE_DEPTH_BPS` (no env override): ask-depth band for `absorbable_usd_100bps` (issue #350 WS2 PR-H). Σ price·size over ask levels priced within this many basis points of the best ask. 100 bps = 1 %; baked into the column name `absorbable_usd_100bps`, so it is a constant rather than an operator knob. |
-| `reconciliation_page_limit` | 500 | **Module const** in `source-polymarket-public` (not a TOML/env key). Fixed page size for the #544 activity and current-position proof readers. |
-| `activity_max_offset` | 5,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). A full terminal `/activity` page at this offset is split at an integer-second boundary; a still-full one-second terminal window is typed-incomplete and blocks reconciliation (#544). |
-| `positions_max_offset` | 10,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). Each explicit `redeemable=false` and `redeemable=true` current-position partition is walked independently through this offset. A full terminal page is typed-incomplete (#544). |
+| `reconciliation_page_limit` | 500 | Historical v1 **module const** in `source-polymarket-public` (not a TOML/env key). Fixed page size for the #544 activity and current-position proof readers; retained for recorded v1 pages after retirement. Current pe-service uses the [v2 contract](#data-api-v2-contract-pe-service-phase-1). |
+| `activity_max_offset` | 5,000 | Historical v1 **module const** in `source-polymarket-public` (not a TOML/env key; v1 retired). For recorded v1 reads, a full terminal `/activity` page at this offset is split at an integer-second boundary; a still-full one-second terminal window is typed-incomplete and blocks reconciliation (#544). No v2 offset ceiling. |
+| `positions_max_offset` | 10,000 | Historical v1 **module const** in `source-polymarket-public` (not a TOML/env key; v1 retired). For recorded v1 reads, each explicit `redeemable=false` and `redeemable=true` current-position partition is walked independently through this offset. A full terminal page is typed-incomplete (#544). No v2 offset ceiling. |
 | <a id="anchor_refresh_secs"></a>`anchor_refresh_secs` | 3,600 | **Module const** `ANCHOR_REFRESH_SECS` in `service::trade_poller` (not a TOML/env key). Seconds between best-effort per-wallet position re-anchors and the refresh-only cooldown for every terminal `Deferred`. Refresh deadlines use monotonic time captured immediately after terminal completion, before coordinator handling, and gate normal selection, retry selection and queued launch. Successful anchoring clears the refresh deadline; cancelled, skipped and unstarted work create none. A queued wallet still busy or holding activity obligations when the next backstop round ends yields its turn to the next due wallet and comes round again with the cursor. Cooldowns survive membership/ranking-batch changes and reset on restart. Admission uses [`admission_retry_secs`](#admission_retry_secs). An owner-selected operational default, not a calibrated value. |
 | <a id="feed_history_skew_secs"></a>`feed_history_skew_secs` | 60 | **Module const** `FEED_HISTORY_SKEW_SECS` in `service::trade_poller` (not a TOML/env key). An obligation read starts this many seconds before the earliest unresolved feed observation's own second. The venue's history can stamp a trade earlier than the feed did: feed minus history was −2 to +9 s over 14,115 trades with one feed timestamp each (2026-10-08 to 10-10). Without the margin, a history row already behind the cursor never binds its observation, and the observation holds every later bucket of the wallet. Extra rows inside the margin route under the existing stored, twin, late and revision rules. An operational margin, not a calibrated value. |
 | <a id="admission_retry_secs"></a>`admission_retry_secs` | 300 | **Module const** `ADMISSION_RETRY_SECS` in `service::watchlist_admission` (not a TOML/env key). Base of the in-memory cooldown from a `WalletTransient` bracket failure's monotonic completion time until the wallet becomes eligible again (#749): after a wallet's n-th consecutive counted failure the cooldown is this value × 2^(n−1), capped at [`admission_retry_max_secs`](#admission_retry_max_secs) (`admission_retry_after`). A counted failure is a `WalletTransient` deferral of a started bracket in boot or maintenance admission (validation or anchor install, including one carried by a `Shared` abort); fence-check, seed, proof-capture and apply-time deferrals and re-parkings do not count, and the capacity worker neither counts nor reads cooldowns. Boot's `boot_transient_retry_at` in `main.rs` records a first failure and the maintenance loop seeds its count from boot's cooldowns; runtime maintenance's `BatchSync::completed` counts and `park_persistent` applies the cooldown. Each counted failure logs `admission retry backoff` (`wallet`, `kind`, `consecutive_failures`, `retry_after_secs`). A wallet's count clears when it is in the live set at a maintenance tick's start, logging `admission retry backoff cleared`; counts and cooldowns survive ranking-batch changes and reset on restart; successful preparation clears the wallet's cooldown but not its count. |
@@ -349,11 +349,65 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `redeem_residual_limit_atomic` | 100 | **Exclusive module const** `REDEEM_RESIDUAL_LIMIT_ATOMIC` in `position-ledger` (#557). A REDEEM underflow residual of 1..=99 atomic units clamps the position closed and is recorded in the version-3 effect document; 100 or more drops the resolved market under [classifier 6](#history-format-3-and-classifier-6-739). `ShareAmount` has six decimal places, so 100 atomic units equal one ten-thousandth of a position: the limit is one four-decimal `/positions` reporting quantum and accepts venue-display quantization residue without hiding a full reported quantum. SELL and MERGE remain strict, and the tolerance cannot stack within a bucket. |
 | `rehearsal_quiescence` | production unit policy at run time | The #545 rehearsal reads the production `pe-service` unit's `TimeoutStopSec` as its exact quiescence bound and requires `KillSignal` to be SIGINT, the signal handled by the service. The harness owns no separate numeric shutdown bound (#586). |
 
+### Data API v2 contract (pe-service, phase 1)
+
+Data API v1 is retired; verification provenance is in
+[`15-SOURCES.md`](15-SOURCES.md#data-api-v2-retirement-and-contract-phase-1).
+The host remains `polymarket_base_url` above. Both pe-service first pages set `limit=1000`;
+subsequent pages omit `limit` and send `cursor` equal to the preceding raw `next_cursor`,
+re-sending the same wallet anchor, filters, bounds and sort on every page. Requests never send
+`offset`; the response's `pagination.offset` is cosmetic.
+
+| Surface | Path | First-page filters (plus the shared limit above) |
+|---|---|---|
+| Activity | `/v2/activity` | `user=W&type=TRADE,SPLIT,MERGE,REDEEM,CONVERSION&start=S&end=E&sort_direction=DESC` |
+| Positions | `/v2/positions` | `user=W&status=OPEN&filter_type=TOKENS&filter_amount=0&include_archived=true&sort_by=TOKENS&sort_direction=ASC` |
+
+Activity wire bounds are inclusive epoch seconds: internal `(start, end]` sends `start + 1`,
+never below 1, and full history sends `start=1`. Ordering is keyset `(block_timestamp, sequence_id)`; the cursor
+binds the direction. Fields are snake_case; `token_id` supplies the activity asset identity.
+The former `market` query becomes `condition`, with at most 20 distinct condition ids.
+
+The positions route unifies the former position surfaces with statuses
+`OPEN | REDEEMABLE | REDEEMABLE_LOST | MERGEABLE | CLOSED`. `OPEN` is the default superset,
+including settled-but-unredeemed positions, so one walk replaces both v1 `redeemable` partitions.
+`filter_type`/`filter_amount` replaces `sizeThreshold`. Holding size is `current_size`, never
+lifetime `total_size`; `redeemable` and `negative_risk` remain required evidence. Wallet checks,
+verified token identity, exact amounts, duplicate rejection and the semantic position hash retain
+their existing meaning.
+
+A **complete v2 cursor read** requires `{data: [...], pagination: {limit, offset, has_more,
+next_cursor}}` on every page, with `data` an array. Economic rows retain their original numeric
+lexemes. Missing or null `data`, or invalid pagination, is incomplete evidence: record the page
+where recording applies, but advance no cursor and install no anchor. Complete means exactly one
+terminal page whose raw `has_more` is false and `next_cursor` is null; contradictory flags fail.
+Authentication checks acquisition order, exact request URLs and cursor links, bounds, row counts,
+anomalies and both page hashes against the raw bodies. Repeated cursors, reordered or omitted
+pages, pages after termination and mixed v1/v2 reads fail. V1 offset ceilings, window splits and
+saturated-second rules apply only to historical v1 activity page-evidence schema 2.
+
+V2 activity uses **page-evidence schema 3** (v2 cursor page); the activity row schema and parser
+remain 2. Evidence adds optional boolean `has_more` and string `next_cursor`, omitted when absent, preserving
+v1 evidence bytes and receipt digests. Evidence `offset` equals raw `pagination.offset`, and
+`request_url` includes the cursor. Service verifiers require the evidence values to equal those
+reparsed from the raw page. V2 positions use **position-proof schema 2**, with `partition = None`.
+Recorded generation selects the format; v1 bare-array parsing and historical hash formats and
+domains are unchanged.
+
+Live-inventory request descriptors are versioned with the response parser. **Parser 1** retains
+the v1 `redeemable=` family and request offset. **Parser 2** uses the `status=OPEN` family and
+descriptor offset equal to the zero-based page index, retaining the exact ordered query including the cursor
+in `SanitizedHttpRequestDescriptor`. Retained-response validation and both replay paths dispatch
+by parser version and reject mixed generations within a walk.
+
+Phase 1 covers pe-service activity and positions; bootstrap callers migrate in phase 2. Stopped
+canaries and other deferred v1 consumers still fail if started against the retired routes.
+
 ### Non-executable activity-row anomalies (#822)
 
 The shared REST API offers four `ActivityRowAcceptance` modes. `mapping_relaxed()` is true
 only for `Acquisition3` and `Acquisition4`; `salvage_enabled()` is true only for
-`StrictWithAnomalies` and `Acquisition4`. Every pe-service `/activity` read selects
+`StrictWithAnomalies` and `Acquisition4`. Every pe-service activity read selects
 `StrictWithAnomalies`: all seeder modes (installed and migration boot, admission and refresh) and
 the poller. Forge's activation is [identity 5, acquisition 4 and classifier
 7](#identity-5-acquisition-4-and-classifier-7-822). The websocket parser remains strict.
@@ -392,19 +446,26 @@ Service page envelopes select both producer generation and replay parse mode thr
 
 | Envelope schema | Generation | Parse mode | Recording producer |
 |---|---|---|---|
-| 2 | Historical | `Strict` | Migration boot's `DurableRecordingFetcher` |
-| 3 | Committed | `Strict` | Poller's `RecordingFetcher` |
-| 4 | Committed | `StrictWithAnomalies` | Poller's `RecordingFetcher` |
-| 5 | Historical | `StrictWithAnomalies` | Migration boot's `DurableRecordingFetcher` |
+| 2 | Historical (v1) | `Strict` | Migration boot (recorded pages only) |
+| 3 | Committed (v1) | `Strict` | Poller (recorded pages only) |
+| 4 | Committed (v1) | `StrictWithAnomalies` | Poller (recorded pages only) |
+| 5 | Historical (v1) | `StrictWithAnomalies` | Migration boot (recorded pages only) |
+| 6 | Historical (v2) | `StrictWithAnomalies` | Migration boot's activity and positions bodies |
+| 7 | Committed (v2) | `StrictWithAnomalies` | Poller's activity bodies |
 
-Both recording fetchers classify `/activity` payloads with the requested wallet before choosing
-the envelope; only a successfully parsed page containing an anomaly uses its anomaly schema.
-Healthy, empty, `/positions` and unparseable pages keep the producer's original schema; parse
-failures still fail the read. Envelope parser version and page-evidence schema/parser remain 2;
-continuation-generation matching is unchanged. All service page verifiers use this contract,
-retaining historical Strict failures and anomalies under the new schemas. Installed-boot,
-admission and refresh seeder reads remain unrecorded, retaining raw page hashes and anomaly-drop
-proofs in decision inputs.
+Schemas 2–5 retain their v1 meanings: only a successfully parsed activity page containing an
+anomaly used its producer's anomaly schema; healthy, empty, positions and unparseable pages kept
+the original schema. New v2 recordings use the v2 producer schema regardless of page contents,
+with the same source id and envelope row parser version; raw bodies append before parse. The
+[v2 contract](#data-api-v2-contract-pe-service-phase-1) defines page evidence separately.
+Continuation-generation matching is unchanged. All service page verifiers retain historical
+Strict failures and anomalies under their recorded schemas. Installed-boot, admission and refresh
+seeder reads remain unrecorded, retaining hash-only page and anomaly-drop proofs in decision inputs.
+
+The boundary predicate is unchanged: a v2 activity page preclassified with an anomaly durably
+records `meta.scope_drop_boundary_unix` before append, first write wins. Healthy, empty, positions,
+malformed and wallet-mismatched pages create no marker. A marker failure prevents append and read;
+parse failures still fail the read.
 
 `ActivityAssetMapping::from_rows_with_anomalies` includes anomaly ordinary/combo classification,
 registers anomaly assets without stamped outcome identity, and retains anomalous SPLIT/MERGE

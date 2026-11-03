@@ -1968,6 +1968,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decision_source_inputs_authenticates_recorded_v2_cursor_pages() {
+        use crate::bucket_commit::{
+            ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+            ACTIVITY_READ_COMMITMENT_SOURCE_ID, ActivityReadCommitmentReceipt,
+            PaperFreshnessPolicy, activity_read_commitment_payload_v2,
+            anomaly_page_tests::v2_read_fixture, parse_complete_activity_page,
+        };
+        use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp};
+        use pe_event_log::{ContentType, EnvelopeIn, Writer};
+
+        let mut fixture = v2_read_fixture(7, 1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2-replay.log");
+        let mut writer = Writer::open(&path).unwrap();
+        for (source, occurrence) in fixture.sources.iter().zip(&mut fixture.occurrences) {
+            occurrence.receipt = writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId(source.source_id.clone()),
+                    schema_version: source.schema_version,
+                    parser_version: source.parser_version,
+                    observed_at: source.observed_at.clone(),
+                    received_at: source.received_at.clone(),
+                    content_type: source.content_type.clone(),
+                    payload: source.payload.clone(),
+                })
+                .unwrap();
+        }
+        let at = time::OffsetDateTime::from_unix_timestamp(101).unwrap();
+        let commitment = writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId(ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned()),
+                schema_version: ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+                parser_version: ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+                observed_at: SourceTimestamp(at),
+                received_at: ReceivedAt(at),
+                content_type: ContentType::Json,
+                payload: activity_read_commitment_payload_v2(
+                    wallet(),
+                    101,
+                    &fixture.occurrences,
+                    &fixture.pages,
+                    &[],
+                )
+                .unwrap(),
+            })
+            .unwrap();
+        drop(writer);
+        let index = crate::risk_inputs::SourceReceiptIndex::replay(&path).unwrap();
+        let aggregate = parse_complete_activity_page(&fixture.sources[0], wallet(), "fixture")
+            .unwrap()
+            .aggregates()
+            .unwrap()
+            .remove(0);
+        let mut facts = legacy17_continuation(aggregate.group_id.key());
+        facts.semantic_revision = aggregate.semantic_revision.as_str().to_owned();
+        facts.transaction_hash = aggregate.group_id.components().transaction_hash.clone();
+        facts.market_id = MarketId(VenueMarketId("0xca".to_owned()));
+        facts.price = aggregate.volume_weighted_price().unwrap();
+        facts.share_amount = aggregate.share_sum;
+        facts.source_epoch = 100;
+        facts.paper_freshness_policy = Some(PaperFreshnessPolicy {
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 2,
+        });
+        facts.decision_inputs = json!({"fixed_end":101,"pages":fixture.pages});
+        let mut expected = fixture
+            .occurrences
+            .iter()
+            .map(|page| page.receipt)
+            .collect::<Vec<_>>();
+        expected.push(commitment);
+        let continuation = DecisionContinuationV3::new(
+            facts,
+            None,
+            fixture.occurrences,
+            Some(ActivityReadCommitmentReceipt::BindingsV2(commitment)),
+        )
+        .current_paper();
+        let row = DecisionPendingRow {
+            source_trade_id: continuation.facts.source_trade_id.clone(),
+            semantic_revision: continuation.facts.semantic_revision.clone(),
+            wallet: wallet(),
+            source_epoch: 100,
+            frozen_inputs_json: serde_json::to_string(&continuation).unwrap(),
+            post_commit_inputs_json: "{}".to_owned(),
+            state: DecisionPendingState::Open,
+            terminal_disposition: None,
+            updated_at_unix: 101,
+        };
+        assert_eq!(
+            decision_source_inputs(&row, &index).unwrap().receipts,
+            expected
+        );
+    }
+
     /// PASS: continuation generations four and five retain their exact fixture bytes; four
     /// replays the legacy terminal, while five requires its precise final-gate evidence.
     #[test]
@@ -2003,6 +2099,8 @@ mod tests {
                 receipt,
             };
             let evidence = ReconciliationPageEvidence {
+                has_more: None,
+                next_cursor: None,
                 anomalies: Vec::new(),
                 request_url: page.request_url.clone(),
                 bounds: Some(ActivityRequestBounds {

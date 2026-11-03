@@ -51,8 +51,8 @@ use pe_source_polymarket_public::{
     FixtureFetcher, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
     GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
     PositionClassification, ReconciliationFetcher, fetch_complete_positions,
-    parse_activity_trade_observation, parse_clob_market, validate_live_market,
-    validate_paper_market,
+    fetch_complete_positions_v2, parse_activity_trade_observation, parse_clob_market,
+    validate_live_market, validate_paper_market,
 };
 use pe_strategy_winner_follow::{
     ExecutionMode, SizingMode, WinnerFollowError, WinnerFollowStrategy,
@@ -5056,45 +5056,6 @@ fn produced_observation_index(
         .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
     let wallet = WalletAddress::from_hex(&projection.leader_wallet)
         .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
-    let raw_rows = serde_json::from_slice::<Vec<serde_json::Value>>(&bound.payload)
-        .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
-    let source_epoch = raw_rows
-        .iter()
-        .filter_map(|row| {
-            row.get("timestamp").and_then(|timestamp| {
-                timestamp
-                    .as_i64()
-                    .or_else(|| timestamp.as_str().and_then(|value| value.parse().ok()))
-            })
-        })
-        .max()
-        .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
-    let request_url = pe_source_polymarket_public::PolymarketEndpoint::UserPositionActivityPage {
-        user: wallet.to_string(),
-        end: source_epoch,
-        start: Some(source_epoch),
-        offset: 0,
-    }
-    .url("https://data-api.polymarket.com");
-    let raw_hash = bound.raw_payload_hash.to_hex().to_string();
-    let mut page = pe_source_polymarket_public::ReconciliationPageEvidence {
-        anomalies: Vec::new(),
-        request_url: request_url.clone(),
-        bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
-            start: Some(source_epoch.saturating_sub(1)),
-            end: source_epoch,
-        }),
-        partition: None,
-        offset: 0,
-        row_count: u32::try_from(raw_rows.len())
-            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?,
-        canonical_page_hash: pe_source_polymarket_public::canonical_page_hash(&bound.payload)
-            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?,
-        raw_page_hash: raw_hash.clone(),
-        received_at: bound.received_at.clone(),
-        schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
-        parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-    };
     let context = pe_source_polymarket_public::ActivityParseContext {
         source_id: bound.source_id.clone(),
         observed_at: bound.observed_at.clone(),
@@ -5108,13 +5069,96 @@ fn produced_observation_index(
         &bound.content_type,
     )
     .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
-    let window = pe_source_polymarket_public::parse_activity_response_with_acceptance(
+    let window = crate::bucket_commit::parse_recorded_activity_page(
+        bound.schema_version,
         &bound.payload,
         wallet,
         &context,
         acceptance,
     )
     .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+    let raw_hash = bound.raw_payload_hash.to_hex().to_string();
+    let mut page = if crate::bucket_commit::is_v2_activity_page(bound.schema_version) {
+        let timestamps = window
+            .rows
+            .iter()
+            .map(|row| row.source_time.0.unix_timestamp())
+            .chain(
+                window
+                    .anomalies
+                    .iter()
+                    .map(|row| row.source_time.0.unix_timestamp()),
+            )
+            .collect::<Vec<_>>();
+        let start = timestamps
+            .iter()
+            .min()
+            .ok_or(ProjectionReducerError::InvalidRiskEvidence)?
+            .saturating_sub(1);
+        let end = *timestamps
+            .iter()
+            .max()
+            .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+        let request = pe_source_polymarket_public::V2ActivityRequest::position_changes(
+            wallet,
+            Some(start),
+            end,
+            acceptance,
+        );
+        let request_url = request
+            .url("https://data-api.polymarket.com", None)
+            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+        pe_source_polymarket_public::parse_activity_page_v2(
+            &bound.payload,
+            &request_url,
+            &request,
+            &context,
+        )
+        .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?
+        .evidence
+    } else {
+        let raw_rows = serde_json::from_slice::<Vec<serde_json::Value>>(&bound.payload)
+            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+        let source_epoch = raw_rows
+            .iter()
+            .filter_map(|row| {
+                row.get("timestamp").and_then(|timestamp| {
+                    timestamp
+                        .as_i64()
+                        .or_else(|| timestamp.as_str().and_then(|value| value.parse().ok()))
+                })
+            })
+            .max()
+            .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+        let request_url =
+            pe_source_polymarket_public::PolymarketEndpoint::UserPositionActivityPage {
+                user: wallet.to_string(),
+                end: source_epoch,
+                start: Some(source_epoch),
+                offset: 0,
+            }
+            .url("https://data-api.polymarket.com");
+        pe_source_polymarket_public::ReconciliationPageEvidence {
+            has_more: None,
+            next_cursor: None,
+            anomalies: Vec::new(),
+            request_url,
+            bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
+                start: Some(source_epoch.saturating_sub(1)),
+                end: source_epoch,
+            }),
+            partition: None,
+            offset: 0,
+            row_count: u32::try_from(raw_rows.len())
+                .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?,
+            canonical_page_hash: pe_source_polymarket_public::canonical_page_hash(&bound.payload)
+                .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?,
+            raw_page_hash: raw_hash.clone(),
+            received_at: bound.received_at.clone(),
+            schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+        }
+    };
     page.anomalies = window.anomalies.clone();
     let aggregate = window
         .aggregates()
@@ -5128,7 +5172,7 @@ fn produced_observation_index(
         aggregate,
         vec![(
             PageOccurrence {
-                request_url,
+                request_url: page.request_url.clone(),
                 raw_hash,
                 receipt: observation.complete_bound_receipt,
             },
@@ -6883,6 +6927,7 @@ fn verify_account_binding(
 }
 
 struct RetainedPositionPage {
+    parser_version: u32,
     request_identity: String,
     body: Vec<u8>,
 }
@@ -6940,6 +6985,8 @@ fn position_request_identity(url: &str) -> Option<String> {
 fn position_request_descriptor(
     binding: &LiveAccountBindingAudit,
     url: &str,
+    parser_version: u32,
+    page_index: u64,
 ) -> Option<SanitizedHttpRequestDescriptor> {
     let parsed = reqwest::Url::parse(url).ok().or_else(|| {
         reqwest::Url::parse("https://offline.invalid")
@@ -6959,21 +7006,40 @@ fn position_request_descriptor(
         let value = values.next()?;
         values.next().is_none().then_some(value)
     };
-    let redeemable = exactly_one("redeemable")?;
-    if !matches!(redeemable, "true" | "false") {
-        return None;
-    }
-    let offset = exactly_one("offset")?.parse::<u64>().ok()?;
-    Some(binding.request_descriptor(
-        "GET",
-        parsed.path(),
-        format!("redeemable={redeemable}"),
-        offset,
-        ordered_query,
-    ))
+    let (family, offset) = match parser_version {
+        1 => {
+            let redeemable = exactly_one("redeemable")?;
+            if !matches!(redeemable, "true" | "false") {
+                return None;
+            }
+            (
+                format!("redeemable={redeemable}"),
+                exactly_one("offset")?.parse::<u64>().ok()?,
+            )
+        }
+        2 if exactly_one("status")? == "OPEN" => ("status=OPEN".to_owned(), page_index),
+        _ => return None,
+    };
+    Some(binding.request_descriptor("GET", parsed.path(), family, offset, ordered_query))
 }
 
-fn position_descriptor_identity(descriptor: &SanitizedHttpRequestDescriptor) -> Option<String> {
+fn position_descriptor_identity(
+    descriptor: &SanitizedHttpRequestDescriptor,
+    parser_version: u32,
+) -> Option<String> {
+    if parser_version == 2 {
+        let wallet = WalletAddress::from_hex(&descriptor.custody_wallet).ok()?;
+        let cursor = descriptor
+            .ordered_query
+            .iter()
+            .find(|(name, _)| name == "cursor")
+            .map(|(_, value)| value.as_str());
+        return position_request_identity(&pe_source_polymarket_public::positions_v2_url(
+            "https://offline.invalid",
+            wallet,
+            cursor,
+        ));
+    }
     let mut url = reqwest::Url::parse("https://offline.invalid").ok()?;
     url.set_path(&descriptor.path);
     {
@@ -6988,16 +7054,81 @@ fn position_descriptor_identity(descriptor: &SanitizedHttpRequestDescriptor) -> 
 fn retained_position_response(
     receipt: &AppendReceipt,
     source_envelopes: &[EventEnvelope],
-) -> Result<RetainedPositionResponse, ProjectionReducerError> {
+) -> Result<(u32, RetainedPositionResponse), ProjectionReducerError> {
+    let parser_version = source_envelopes
+        .iter()
+        .find(|envelope| {
+            envelope.seq == receipt.sequence && envelope.this_hash == receipt.this_hash
+        })
+        .map(|envelope| envelope.parser_version)
+        .filter(|version| matches!(version, 1 | 2))
+        .ok_or(ProjectionReducerError::InvalidPositionEvidence)?;
     let payload = retained_source_payload(
         receipt,
         source_envelopes,
         COMPLETE_POSITIONS_SOURCE_ID,
         COMPLETE_POSITIONS_SCHEMA_VERSION,
-        1,
+        parser_version,
         RetainedSourceKind::Position,
     )?;
-    serde_json::from_slice(payload).map_err(|_| ProjectionReducerError::InvalidPositionEvidence)
+    let response = serde_json::from_slice(payload)
+        .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?;
+    Ok((parser_version, response))
+}
+
+fn replay_retained_position_pages(
+    pages: VecDeque<RetainedPositionPage>,
+    requested_wallet: WalletAddress,
+    mapping: &ActivityAssetMapping,
+) -> Result<pe_source_polymarket_public::CompletePositionsRead, ProjectionReducerError> {
+    let parser_version = pages
+        .front()
+        .ok_or(ProjectionReducerError::InvalidPositionEvidence)?
+        .parser_version;
+    if pages
+        .iter()
+        .any(|page| page.parser_version != parser_version)
+    {
+        return Err(ProjectionReducerError::InvalidPositionEvidence);
+    }
+    let page_count = pages.len();
+    let fetcher = RetainedPositionFetcher {
+        pages: Mutex::new(pages),
+    };
+    let complete = futures::executor::block_on(async {
+        match parser_version {
+            1 => {
+                fetch_complete_positions(
+                    &fetcher,
+                    "https://offline.invalid",
+                    requested_wallet,
+                    mapping,
+                )
+                .await
+            }
+            2 => {
+                fetch_complete_positions_v2(
+                    &fetcher,
+                    "https://offline.invalid",
+                    requested_wallet,
+                    mapping,
+                )
+                .await
+            }
+            _ => return Err(ProjectionReducerError::InvalidPositionEvidence),
+        }
+        .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)
+    })?;
+    if complete.pages.len() != page_count
+        || !fetcher
+            .pages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    {
+        return Err(ProjectionReducerError::InvalidPositionEvidence);
+    }
+    Ok(complete)
 }
 
 fn replay_position_evidence(
@@ -7017,16 +7148,25 @@ fn replay_position_evidence(
     let pages = evidence
         .pages
         .iter()
-        .map(|page| {
-            let retained = retained_position_response(&page.receipt, source_envelopes)?;
-            let expected = position_request_descriptor(binding, &page.request_identity)
-                .ok_or(ProjectionReducerError::InvalidPositionEvidence)?;
+        .enumerate()
+        .map(|(index, page)| {
+            let (parser_version, retained) =
+                retained_position_response(&page.receipt, source_envelopes)?;
+            let expected = position_request_descriptor(
+                binding,
+                &page.request_identity,
+                parser_version,
+                u64::try_from(index)
+                    .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?,
+            )
+            .ok_or(ProjectionReducerError::InvalidPositionEvidence)?;
             if retained.request != expected
                 || retained.request.custody_wallet != evidence.requested_wallet
             {
                 return Err(ProjectionReducerError::InvalidPositionEvidence);
             }
             Ok(RetainedPositionPage {
+                parser_version,
                 request_identity: page.request_identity.clone(),
                 body: retained.body,
             })
@@ -7038,25 +7178,7 @@ fn replay_position_evidence(
         return Err(ProjectionReducerError::InvalidPositionEvidence);
     }
     let mapping = prepared_tokens.ok_or(ProjectionReducerError::InvalidPositionEvidence)?;
-    let fetcher = RetainedPositionFetcher {
-        pages: Mutex::new(pages),
-    };
-    let complete = futures::executor::block_on(fetch_complete_positions(
-        &fetcher,
-        "https://offline.invalid",
-        requested_wallet,
-        mapping,
-    ))
-    .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?;
-    if complete.pages.len() != evidence.pages.len()
-        || !fetcher
-            .pages
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-    {
-        return Err(ProjectionReducerError::InvalidPositionEvidence);
-    }
+    let complete = replay_retained_position_pages(pages, requested_wallet, mapping)?;
     complete
         .positions
         .into_iter()
@@ -7092,16 +7214,24 @@ fn replay_position_receipts_legacy(
     }
     let pages = receipts
         .iter()
-        .map(|receipt| {
-            let retained = retained_position_response(receipt, source_envelopes)?;
-            let request_identity = position_descriptor_identity(&retained.request)
+        .enumerate()
+        .map(|(index, receipt)| {
+            let (parser_version, retained) = retained_position_response(receipt, source_envelopes)?;
+            let request_identity = position_descriptor_identity(&retained.request, parser_version)
                 .ok_or(ProjectionReducerError::InvalidPositionEvidence)?;
-            let expected = position_request_descriptor(binding, &request_identity)
-                .ok_or(ProjectionReducerError::InvalidPositionEvidence)?;
+            let expected = position_request_descriptor(
+                binding,
+                &request_identity,
+                parser_version,
+                u64::try_from(index)
+                    .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?,
+            )
+            .ok_or(ProjectionReducerError::InvalidPositionEvidence)?;
             if retained.request != expected || retained.request.custody_wallet != requested_wallet {
                 return Err(ProjectionReducerError::InvalidPositionEvidence);
             }
             Ok(RetainedPositionPage {
+                parser_version,
                 request_identity,
                 body: retained.body,
             })
@@ -7110,25 +7240,7 @@ fn replay_position_receipts_legacy(
     let requested_wallet = WalletAddress::from_hex(requested_wallet)
         .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?;
     let mapping = prepared_tokens.ok_or(ProjectionReducerError::InvalidPositionEvidence)?;
-    let fetcher = RetainedPositionFetcher {
-        pages: Mutex::new(pages),
-    };
-    let complete = futures::executor::block_on(fetch_complete_positions(
-        &fetcher,
-        "https://offline.invalid",
-        requested_wallet,
-        mapping,
-    ))
-    .map_err(|_| ProjectionReducerError::InvalidPositionEvidence)?;
-    if complete.pages.len() != receipts.len()
-        || !fetcher
-            .pages
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-    {
-        return Err(ProjectionReducerError::InvalidPositionEvidence);
-    }
+    let complete = replay_retained_position_pages(pages, requested_wallet, mapping)?;
     complete
         .positions
         .into_iter()
@@ -9141,11 +9253,18 @@ impl ReconciliationFetcher for LivePositionFetcher {
         url: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
         Box::pin(async move {
-            let request =
-                position_request_descriptor(&self.account_binding, url).ok_or_else(|| {
-                    SourceError::Fatal {
-                        message: "complete-position request descriptor is invalid".to_owned(),
-                    }
+            let page_index = u64::try_from(
+                self.pages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+            )
+            .map_err(|_| SourceError::Fatal {
+                message: "complete-position page index overflow".to_owned(),
+            })?;
+            let request = position_request_descriptor(&self.account_binding, url, 2, page_index)
+                .ok_or_else(|| SourceError::Fatal {
+                    message: "complete-position request descriptor is invalid".to_owned(),
                 })?;
             let observed_at = (self.clock)();
             let response =
@@ -9177,7 +9296,7 @@ impl ReconciliationFetcher for LivePositionFetcher {
                 .append(EnvelopeIn {
                     source_id: SourceId(COMPLETE_POSITIONS_SOURCE_ID.to_owned()),
                     schema_version: COMPLETE_POSITIONS_SCHEMA_VERSION,
-                    parser_version: 1,
+                    parser_version: 2,
                     observed_at: SourceTimestamp(observed_at),
                     received_at: ReceivedAt(received_at),
                     content_type: ContentType::Json,
@@ -9236,9 +9355,10 @@ async fn fetch_complete_venue_inventory(
         account_binding: account_binding.clone(),
         pages: Mutex::new(Vec::new()),
     };
-    let complete = fetch_complete_positions(&fetcher, &state.config.data_base_url, wallet, mapping)
-        .await
-        .map_err(|_| "complete position read failed")?;
+    let complete =
+        fetch_complete_positions_v2(&fetcher, &state.config.data_base_url, wallet, mapping)
+            .await
+            .map_err(|_| "complete position read failed")?;
     let mut recorded = fetcher
         .pages
         .into_inner()
@@ -11543,6 +11663,8 @@ mod tests {
                 receipt,
             },
             pe_source_polymarket_public::ReconciliationPageEvidence {
+                has_more: None,
+                next_cursor: None,
                 anomalies: Vec::new(),
                 request_url,
                 bounds: Some(pe_source_polymarket_public::ActivityRequestBounds { start, end }),
@@ -15141,7 +15263,8 @@ mod tests {
             .iter()
             .zip(partition_bodies)
             .map(|(page, body)| {
-                let request = position_request_descriptor(binding, &page.request_identity).unwrap();
+                let request =
+                    position_request_descriptor(binding, &page.request_identity, 1, 0).unwrap();
                 let payload =
                     serde_json::to_vec(&RetainedPositionResponse { request, body }).unwrap();
                 let mut envelope = source_envelope(
@@ -16245,7 +16368,7 @@ mod tests {
             assert_eq!(deadline, Some(now + time::Duration::seconds(120)));
             let app = Router::new()
                 .route("/order", post(count_order_post))
-                .route("/positions", get(empty_positions))
+                .route("/v2/positions", get(empty_positions))
                 .with_state(posts.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -19931,9 +20054,13 @@ mod tests {
     async fn counting_fallback(
         State(hits): State<Arc<Mutex<Vec<String>>>>,
         uri: axum::http::Uri,
-    ) -> Json<Vec<serde_json::Value>> {
+    ) -> Json<serde_json::Value> {
         hits.lock().unwrap().push(uri.path().to_owned());
-        Json(Vec::new())
+        Json(if uri.path() == "/v2/positions" {
+            positions_v2_page(Vec::new())
+        } else {
+            serde_json::json!([])
+        })
     }
 
     async fn count_order_post(State(posts): State<Arc<AtomicUsize>>) -> StatusCode {
@@ -19941,41 +20068,37 @@ mod tests {
         StatusCode::BAD_REQUEST
     }
 
-    async fn empty_positions() -> Json<Vec<serde_json::Value>> {
-        Json(Vec::new())
+    async fn empty_positions() -> Json<serde_json::Value> {
+        Json(positions_v2_page(Vec::new()))
     }
 
-    async fn recovery_open_position(
-        Query(query): Query<HashMap<String, String>>,
-    ) -> Json<Vec<serde_json::Value>> {
-        if query.get("redeemable").map(String::as_str) == Some("false") {
-            return Json(vec![serde_json::json!({
-                "proxyWallet": "0x1111111111111111111111111111111111111111",
-                "asset": "123",
-                "conditionId": finality_prepared().economic.market.condition_id.0,
-                "outcomeIndex": 0,
-                "size": "3.125",
-                "negativeRisk": false,
-            })]);
-        }
-        Json(Vec::new())
+    async fn recovery_open_position() -> Json<serde_json::Value> {
+        Json(positions_v2_page(vec![serde_json::json!({
+            "proxyWallet": "0x1111111111111111111111111111111111111111",
+            "asset": "123",
+            "conditionId": finality_prepared().economic.market.condition_id.0,
+            "outcomeIndex": 0,
+            "size": "3.125",
+            "redeemable": false,
+            "negativeRisk": false,
+        })]))
     }
 
-    async fn recovery_positions(
-        State(include_unknown): State<bool>,
-        Query(query): Query<HashMap<String, String>>,
-    ) -> Json<Vec<serde_json::Value>> {
-        if include_unknown && query.get("redeemable").map(String::as_str) == Some("false") {
-            return Json(vec![serde_json::json!({
+    async fn recovery_positions(State(include_unknown): State<bool>) -> Json<serde_json::Value> {
+        let rows = if include_unknown {
+            vec![serde_json::json!({
                 "proxyWallet": "0x1111111111111111111111111111111111111111",
                 "asset": "999",
                 "conditionId": format!("0x{}", "99".repeat(32)),
                 "outcomeIndex": 0,
                 "size": "0.000001",
+                "redeemable": false,
                 "negativeRisk": false,
-            })]);
-        }
-        Json(Vec::new())
+            })]
+        } else {
+            Vec::new()
+        };
+        Json(positions_v2_page(rows))
     }
 
     /// PASS: unknown venue inventory, one-atomic cash drift, insufficient allowance, and a
@@ -19986,7 +20109,7 @@ mod tests {
     async fn recovery_fresh_portfolio_and_allowance_gate_zero_posts() {
         for case in ["unknown_position", "cash_drift", "allowance", "transient"] {
             let app = Router::new()
-                .route("/positions", get(recovery_positions))
+                .route("/v2/positions", get(recovery_positions))
                 .with_state(case == "unknown_position");
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -20075,7 +20198,7 @@ mod tests {
         let posts = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route("/order", post(count_order_post))
-            .route("/positions", get(empty_positions))
+            .route("/v2/positions", get(empty_positions))
             .with_state(posts.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -20205,7 +20328,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_rechecks_price_expiry_after_preparation() {
         let posts = Arc::new(AtomicUsize::new(0));
-        let app = Router::new().route("/positions", get(recovery_open_position));
+        let app = Router::new().route("/v2/positions", get(recovery_open_position));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -20304,7 +20427,7 @@ mod tests {
     /// FAIL: recovery reuses the pre-prepare freshness result or reaches the POST boundary.
     #[tokio::test]
     async fn recovery_rechecks_ladder_after_slow_preparation() {
-        let app = Router::new().route("/positions", get(empty_positions));
+        let app = Router::new().route("/v2/positions", get(empty_positions));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -20560,7 +20683,7 @@ mod tests {
                         "/balance-allowance" => serde_json::json!({"balance":"100000000","allowances":{
                             pe_venue_polymarket::CTF_EXCHANGE_V2.to_string():"100000000",
                         }}),
-                        "/positions" => serde_json::json!([]),
+                        "/v2/positions" => positions_v2_page(Vec::new()),
                         "/version" => serde_json::json!({"version":2}),
                         "/order" if method == axum::http::Method::POST => {
                             posts.fetch_add(1, Ordering::SeqCst);
@@ -20704,7 +20827,7 @@ mod tests {
 
     #[tokio::test]
     async fn scope_drop_after_approved_or_during_preparation_converges_without_posts() {
-        let app = Router::new().route("/positions", get(empty_positions));
+        let app = Router::new().route("/v2/positions", get(empty_positions));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -20893,7 +21016,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_activity_anomaly_drop_stops_approved_live_submission() {
-        let app = Router::new().route("/positions", get(empty_positions));
+        let app = Router::new().route("/v2/positions", get(empty_positions));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -20940,6 +21063,8 @@ mod tests {
         )
         .unwrap();
         let evidence = pe_source_polymarket_public::ReconciliationPageEvidence {
+            has_more: None,
+            next_cursor: None,
             request_url: "fixture".to_owned(),
             bounds: Some(pe_source_polymarket_public::ActivityRequestBounds {
                 start: None,
@@ -22717,7 +22842,10 @@ mod tests {
         assert!(db.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
     }
 
+    use self::inventory_v2::positions_v2_page;
+
     mod credit_and_custody;
+    mod inventory_v2;
     mod live_state;
     mod release_bench;
     mod resolution_and_cutoffs;

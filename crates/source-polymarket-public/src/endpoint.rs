@@ -2,7 +2,86 @@
 
 use serde::{Deserialize, Serialize};
 
+use pe_core_types::WalletAddress;
+
+use crate::activity::ActivityType;
+
 const POSITION_CHANGING_ACTIVITY_TYPES: &str = "TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION";
+
+/// Maximum first-page size on the v2 activity and positions endpoints.
+pub const V2_PAGE_LIMIT: u32 = 1_000;
+
+/// Keyset direction, repeated on every v2 activity request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivitySortDirection {
+    Asc,
+    Desc,
+}
+
+impl ActivitySortDirection {
+    fn as_param(self) -> &'static str {
+        match self {
+            Self::Asc => "ASC",
+            Self::Desc => "DESC",
+        }
+    }
+}
+
+/// Build a v2 activity page. `start` and `end` are inclusive wire bounds.
+/// Only the first page carries `limit`; cursors remain opaque query values.
+pub fn activity_v2_url(
+    base: &str,
+    user: WalletAddress,
+    types: &[ActivityType],
+    start: i64,
+    end: i64,
+    direction: ActivitySortDirection,
+    cursor: Option<&str>,
+) -> String {
+    let types = types
+        .iter()
+        .map(ActivityType::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut url = format!(
+        "{base}/v2/activity?user={user}&type={}&start={start}&end={end}&sort_direction={}",
+        query_value(&types),
+        direction.as_param(),
+    );
+    append_v2_page(&mut url, cursor);
+    url
+}
+
+/// Build one page of the complete OPEN positions superset, including redeemable rows.
+pub fn positions_v2_url(base: &str, user: WalletAddress, cursor: Option<&str>) -> String {
+    let mut url = format!(
+        "{base}/v2/positions?user={user}&status=OPEN&filter_type=TOKENS&filter_amount=0&include_archived=true&sort_by=TOKENS&sort_direction=ASC"
+    );
+    append_v2_page(&mut url, cursor);
+    url
+}
+
+fn append_v2_page(url: &mut String, cursor: Option<&str>) {
+    match cursor {
+        Some(cursor) => url.push_str(&format!("&cursor={}", query_value(cursor))),
+        None => url.push_str(&format!("&limit={V2_PAGE_LIMIT}")),
+    }
+}
+
+fn query_value(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    encoded
+}
 
 /// Explicit `/positions` partition used by a complete reconciliation read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

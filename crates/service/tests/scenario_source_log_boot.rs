@@ -12,6 +12,8 @@
 
 mod support;
 
+use support::data_api_v2;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -953,7 +955,7 @@ async fn pre_start_boot_membership_case(case: PreStartBootCase) {
         use serde_json::json;
         source.requests.lock().unwrap().push(uri.clone());
         let query = uri.query().unwrap_or_default();
-        Json(match uri.path() {
+        let response = match uri.path() {
             "/rest/v1/ranking_scope_drops" | "/rest/v1/ranking_neg_risk_group_spans" => json!([]),
             "/rest/v1/service_config" => {
                 let rows = [
@@ -999,19 +1001,19 @@ async fn pre_start_boot_membership_case(case: PreStartBootCase) {
             }
             "/rest/v1/paper_bankroll" => json!([{"bankroll_str":"1000"}]),
             "/rest/v1/paper_positions" => json!([]),
-            "/activity" => {
+            "/v2/activity" => {
                 assert!(
                     query.contains(&format!("user={}", source.selected)),
                     "{uri}"
                 );
                 json!([{"proxyWallet":source.selected,"timestamp":10,"conditionId":"condition-1","type":"TRADE","size":"1","usdcSize":"0.5","transactionHash":"0xboot-membership","price":"0.5","asset":"123","side":"BUY","outcomeIndex":0}])
             }
-            "/positions" => {
+            "/v2/positions" => {
                 assert!(
                     query.contains(&format!("user={}", source.selected)),
                     "{uri}"
                 );
-                if query.contains("redeemable=false") {
+                if query.contains("status=OPEN") {
                     json!([{"proxyWallet":source.selected,"asset":"123","conditionId":"condition-1","size":"1","outcomeIndex":0,"negativeRisk":false}])
                 } else {
                     json!([])
@@ -1019,7 +1021,14 @@ async fn pre_start_boot_membership_case(case: PreStartBootCase) {
             }
             "/markets" => json!([{"conditionId":"condition-1","clobTokenIds":["123","456"]}]),
             _ => panic!("unexpected boot request {uri}"),
-        })
+        };
+        Json(
+            serde_json::from_slice(&data_api_v2::fixture_page(
+                &format!("http://fixture{uri}"),
+                serde_json::to_vec(&response).unwrap(),
+            ))
+            .unwrap(),
+        )
     }
 
     let (dir, mut paths) = version_one_fixture();
@@ -1129,7 +1138,7 @@ async fn pre_start_boot_membership_case(case: PreStartBootCase) {
     );
     let brackets = boot_requests
         .iter()
-        .filter(|uri| uri.path() == "/activity")
+        .filter(|uri| uri.path() == "/v2/activity")
         .collect::<Vec<_>>();
     if matches!(case, PreStartBootCase::Empty) {
         assert!(!output.status.success());
@@ -3585,7 +3594,11 @@ async fn checkpoint_prefix_mismatch_invalidates_and_full_walks() {
     let output = child.finish_checkpoint(None).await;
     assert!(!output.status.success());
     assert_ne!(output.status.code(), Some(78));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("prefix mismatch"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("prefix mismatch"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         !pe_service::source_checkpoint::checkpoint_path(&fixture.cfg.source_event_log_path)
             .exists()
@@ -4801,7 +4814,7 @@ async fn progressive_boot_skips_waves_after_membership_record() {
         body: axum::body::Bytes,
     ) -> Json<serde_json::Value> {
         use serde_json::json;
-        Json(match uri.path() {
+        let response = match uri.path() {
             "/rest/v1/ranking_scope_drops" | "/rest/v1/ranking_neg_risk_group_spans" => json!([]),
             "/rest/v1/service_config" => {
                 let rows = [
@@ -4844,16 +4857,23 @@ async fn progressive_boot_skips_waves_after_membership_record() {
                 let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 json!([{"new_token":"fixture-token","count":request["entries"].as_array().unwrap().len()}])
             }
-            "/activity" => {
+            "/v2/activity" => {
                 if !source.first_activity.swap(true, Ordering::SeqCst) {
                     source.activity_requested.notify_one();
                 }
                 source.release_activity.acquire().await.unwrap().forget();
                 json!([])
             }
-            "/positions" => json!([]),
+            "/v2/positions" => json!([]),
             _ => panic!("unexpected progressive-boot request {uri}"),
-        })
+        };
+        Json(
+            serde_json::from_slice(&data_api_v2::fixture_page(
+                &format!("http://fixture{uri}"),
+                serde_json::to_vec(&response).unwrap(),
+            ))
+            .unwrap(),
+        )
     }
 
     struct BootChild(std::process::Child);
@@ -6988,8 +7008,8 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
     use pe_service::source_event_sink::SourceEventSink;
     use pe_service::watchlist_admission::AdmissionPreparer;
     use pe_source_polymarket_public::{
-        FixtureFetcher, GAMMA_BATCH_SIZE, PolymarketEndpoint, PositionPartition,
-        ReconciliationFetcher,
+        ActivityRowAcceptance, FixtureFetcher, GAMMA_BATCH_SIZE, ReconciliationFetcher,
+        V2ActivityRequest, positions_v2_url,
     };
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
@@ -7231,35 +7251,24 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
             "size":"25", "outcomeIndex":0, "negativeRisk":false
         }]))
         .unwrap();
+        let activity_url = V2ActivityRequest::position_changes(
+            wallet,
+            Some(0),
+            now,
+            ActivityRowAcceptance::StrictWithAnomalies,
+        )
+        .url(base, None)
+        .unwrap();
+        let positions_url = positions_v2_url(base, wallet, None);
         let fetcher: Arc<dyn ReconciliationFetcher> =
             Arc::new(FixtureFetcher::new(HashMap::from([
                 (
-                    PolymarketEndpoint::UserPositionActivityPage {
-                        user: wallet.to_string(),
-                        end: now,
-                        start: Some(1),
-                        offset: 0,
-                    }
-                    .url(base),
-                    activity,
+                    activity_url.clone(),
+                    data_api_v2::fixture_page(&activity_url, activity),
                 ),
                 (
-                    PolymarketEndpoint::CurrentPositionsReconciliationPage {
-                        user: wallet.to_string(),
-                        partition: PositionPartition::NotRedeemable,
-                        offset: 0,
-                    }
-                    .url(base),
-                    positions,
-                ),
-                (
-                    PolymarketEndpoint::CurrentPositionsReconciliationPage {
-                        user: wallet.to_string(),
-                        partition: PositionPartition::Redeemable,
-                        offset: 0,
-                    }
-                    .url(base),
-                    b"[]".to_vec(),
+                    positions_url.clone(),
+                    data_api_v2::fixture_page(&positions_url, positions),
                 ),
                 (
                     format!("{base}/markets?clob_token_ids=456&limit=500"),

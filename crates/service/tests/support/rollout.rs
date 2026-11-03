@@ -1,5 +1,8 @@
 //! The real service process, local HTTP authority, and unchanged production admission gates.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use crate::support::data_api_v2;
+
 use axum::{
     Json, Router,
     body::Bytes,
@@ -88,6 +91,8 @@ struct HttpState {
     authority: Mutex<Authority>,
     activity: Mutex<HashMap<String, Vec<Value>>>,
     positions: Mutex<Vec<Value>>,
+    data_api_v2: Mutex<data_api_v2::DataApiV2>,
+    activity_page_size_cap: Option<usize>,
     slow_started: Notify,
     slow: Semaphore,
     release_slow: std::sync::atomic::AtomicBool,
@@ -124,6 +129,8 @@ pub async fn boundary_mark() {
         authority: Mutex::new(Authority::default()),
         activity: Mutex::new(HashMap::new()),
         positions: Mutex::new(Vec::new()),
+        data_api_v2: Mutex::new(Default::default()),
+        activity_page_size_cap: None,
         slow_started: Notify::new(),
         slow: Semaphore::new(0),
         release_slow: AtomicBool::new(true),
@@ -175,7 +182,7 @@ async fn serve(
     let url = reqwest::Url::parse(&format!("http://localhost{uri}")).unwrap();
     let q = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
     let path = url.path();
-    if path == "/activity" {
+    if matches!(path, "/activity" | "/v2/activity") {
         let w = q.get("user").unwrap();
         if q.get("start").is_some_and(|start| start == "1") {
             let reads = {
@@ -215,6 +222,36 @@ async fn serve(
                     .is_some_and(|at| at >= start && at <= end)
             })
             .collect::<Vec<_>>();
+        if path == "/v2/activity" {
+            let body = match state.data_api_v2.lock().unwrap().reply(
+                path,
+                &data,
+                &q,
+                state.activity_page_size_cap,
+            ) {
+                Ok(body) => body,
+                Err(status) => return status.into_response(),
+            };
+            if q.get("start").is_some_and(|start| start == "1")
+                && !q.contains_key("cursor")
+                && state
+                    .cut_full_history_replies
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                assert_eq!(q["limit"], "1000");
+                assert_eq!(q["sort_direction"], "DESC");
+                assert_eq!(q["type"], "TRADE,SPLIT,MERGE,REDEEM,CONVERSION");
+                assert!(q["end"].parse::<i64>().is_ok());
+                let mut body = serde_json::to_string(&body).unwrap();
+                body.truncate(body.find("\":\"").unwrap() + 4);
+                return (StatusCode::OK, [("content-type", "application/json")], body)
+                    .into_response();
+            }
+            return (StatusCode::OK, Json(body)).into_response();
+        }
         if q.get("start").is_some_and(|start| start == "1")
             && q.get("offset").is_some_and(|offset| offset == "0")
             && state
@@ -234,6 +271,17 @@ async fn serve(
             return (StatusCode::OK, [("content-type", "application/json")], body).into_response();
         }
         return (StatusCode::OK, Json(json!(data))).into_response();
+    }
+    if path == "/v2/positions" {
+        return match state.data_api_v2.lock().unwrap().reply(
+            path,
+            &state.positions.lock().unwrap(),
+            &q,
+            None,
+        ) {
+            Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+            Err(status) => status.into_response(),
+        };
     }
     if path == "/positions" {
         let data = state
@@ -538,7 +586,8 @@ fn envelope(payload: Vec<u8>, source: &str, at: i64, schema: u32, parser: u32) -
     }
 }
 /// PASS: a real, fully configured binary copies during slow admission, clears only a safe fence,
-/// repairs first-entry history, settles once, and restores checkpoint+suffix and exact decisions.
+/// repairs first-entry history, settles once, and restores checkpoint+suffix and exact decisions
+/// from schema-7 v2 cursor pages with schema-3 evidence. FAIL: v1 acquisition or restart drift.
 pub async fn run() {
     run_case(false, false).await;
 }
@@ -550,6 +599,8 @@ pub async fn run_boot_waves() {
 /// PASS: runtime ranking imports and local anomalies exclude only their scopes; revised BUYs
 /// retain their original fill without fencing. Restart preserves drops, imports, dispositions,
 /// fills, balances and history, and the sealed CLI verifier reproduces every decision exactly.
+/// Schema-7 pages and schema-3 cursor evidence include a forced multi-page read.
+/// FAIL: a v1 fetch, missing cursor proof, lost state or inexact sealed replay.
 /// This short run does not meet the qualification duration or closed-copy sample thresholds.
 pub async fn scope_drops() {
     run_case(false, true).await;
@@ -623,6 +674,8 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
             ),
         ])),
         positions: Mutex::new(Vec::new()),
+        data_api_v2: Mutex::new(Default::default()),
+        activity_page_size_cap: (!boot_waves).then_some(1),
         slow_started: Notify::new(),
         slow: Semaphore::new(0),
         release_slow: AtomicBool::new(boot_waves || scope_drops),
@@ -858,7 +911,12 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         .await;
         let local = paper.wallet_scope_drops(&wallet(3), anomaly_epoch).unwrap();
         assert_eq!(local.len(), 1);
-        let raw_row_hash = blake3::hash(&serde_json::to_vec(&unrepresentable).unwrap())
+        // The v2 fake serves the row under v2 field names in a single terminal cursor page.
+        let served_row = data_api_v2::activity_row(&unrepresentable);
+        let served_page = json!({"data": [served_row.clone()],
+            "pagination": {"limit": state.activity_page_size_cap.unwrap_or(1000),
+                "offset": 0, "has_more": false, "next_cursor": null}});
+        let raw_row_hash = blake3::hash(&serde_json::to_vec(&served_row).unwrap())
             .to_hex()
             .to_string();
         let unrepresentable_id = pe_core_types::SourceTradeId(format!(
@@ -873,7 +931,7 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         assert_eq!(
             serde_json::from_str::<Value>(&local[0].proof_json).unwrap(),
             json!({
-                "page_raw_hash": blake3::hash(&serde_json::to_vec(std::slice::from_ref(&unrepresentable)).unwrap()).to_hex().to_string(),
+                "page_raw_hash": blake3::hash(&serde_json::to_vec(&served_page).unwrap()).to_hex().to_string(),
                 "page_row_index": 0,
                 "raw_row_hash": raw_row_hash,
                 "kind": "price_out_of_range"
@@ -1081,15 +1139,18 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
                     let (_, envelope) = frame.unwrap();
                     envelope.source_id.0 == pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID
                         && envelope.schema_version
-                            == pe_service::trade_poller::ACTIVITY_POLL_ANOMALY_PAGE_SCHEMA_VERSION
-                        && serde_json::from_slice::<Vec<Value>>(&envelope.payload)
-                            .unwrap()
-                            .contains(&unrepresentable)
+                            == pe_service::trade_poller::ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION
+                        && serde_json::from_slice::<Value>(&envelope.payload).unwrap()["data"]
+                            .as_array()
+                            .is_some_and(|rows| {
+                                rows.contains(&data_api_v2::activity_row(&unrepresentable))
+                            })
                 })
         );
         let financial = paper.financial_snapshot(now + 1000).unwrap();
         let history = paper.gate_history().unwrap();
         let decisions = paper.decision_pending_history().unwrap();
+        assert_v2_committed_reads(&paper, &cfg.source_event_log_path);
         let fills = paper.list_fills().unwrap();
         assert!(
             decisions
@@ -1152,10 +1213,19 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
                 .status()
                 .is_success()
         );
-        child.stop().await;
+        let restart_logs = child.stop().await;
+        assert!(
+            restart_logs.contains("source checkpoint verification completed"),
+            "{restart_logs}"
+        );
+        assert!(
+            restart_logs.contains("open decision continuations validated"),
+            "{restart_logs}"
+        );
         assert_eq!(paper.financial_snapshot(now + 1000).unwrap(), financial);
         assert_eq!(paper.gate_history().unwrap(), history);
         assert_eq!(paper.decision_pending_history().unwrap(), decisions);
+        assert_v2_committed_reads(&paper, &cfg.source_event_log_path);
         assert_eq!(paper.list_fills().unwrap(), fills);
         assert_eq!(*state.import_reads.lock().unwrap(), imports);
         assert!(paper.scope_drop_batch_imported(1).unwrap());
@@ -1522,6 +1592,7 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         .clone();
     let decisions = paper.decision_pending_history().unwrap();
     assert!(!decisions.is_empty());
+    assert_v2_committed_reads(&paper, &cfg.source_event_log_path);
     // Re-prepare against completed state, then force one wallet's boot walk to fail locally.
     SourceLogBoot::prepare_checkpoint(&cfg.paper_state_db_path).unwrap();
     Writer::open(&cfg.source_event_log_path)
@@ -1599,6 +1670,7 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         assert_eq!(paper.gate_history().unwrap().get(&w), history.get(&w));
     }
     assert_eq!(paper.decision_pending_history().unwrap(), decisions);
+    assert_v2_committed_reads(&paper, &cfg.source_event_log_path);
     assert_eq!(state.authority.lock().unwrap().settlements.len(), 1);
     for w in [wallet(1), wallet(2), wallet(3)] {
         assert_eq!(
@@ -1628,6 +1700,10 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
     until(|| paper.list_fills().unwrap().len() == 3).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     let second_logs = child.stop().await;
+    assert!(
+        second_logs.contains("open decision continuations validated"),
+        "{second_logs}"
+    );
     assert!(
         second_logs.contains("\"checkpoint_used\":true"),
         "{second_logs}"
@@ -1720,6 +1796,74 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
     server.abort();
 }
 
+fn assert_v2_committed_reads(paper: &PaperStateDb, source_path: &Path) {
+    use pe_service::bucket_commit::DecisionContinuationV3;
+    use pe_service::trade_poller::{ACTIVITY_POLL_SOURCE_ID, ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION};
+    use pe_source_polymarket_public::{
+        ACTIVITY_V2_PAGE_SCHEMA_VERSION, ReconciliationPageEvidence,
+    };
+
+    let frames = pe_event_log::Reader::replay(source_path)
+        .unwrap()
+        .map(|frame| frame.unwrap().1)
+        .collect::<Vec<_>>();
+    let mut multipage = false;
+    let decisions = paper.decision_pending_history().unwrap();
+    assert!(!decisions.is_empty());
+    for decision in decisions {
+        let continuation = DecisionContinuationV3::from_durable(&decision).unwrap();
+        let pages: Vec<ReconciliationPageEvidence> =
+            serde_json::from_value(continuation.facts.decision_inputs["pages"].clone()).unwrap();
+        assert!(!pages.is_empty());
+        assert_eq!(pages.len(), continuation.page_occurrences.len());
+        multipage |= pages.len() > 1;
+        for (index, occurrence) in continuation.page_occurrences.iter().enumerate() {
+            let frame = frames
+                .iter()
+                .find(|frame| frame.seq == occurrence.receipt.sequence)
+                .unwrap();
+            assert_eq!(frame.this_hash, occurrence.receipt.this_hash);
+            assert_eq!(frame.source_id.0, ACTIVITY_POLL_SOURCE_ID);
+            assert_eq!(frame.schema_version, ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION);
+            let page = pages
+                .iter()
+                .find(|page| {
+                    page.raw_page_hash == occurrence.raw_hash
+                        && page.request_url == occurrence.request_url
+                })
+                .unwrap();
+            assert_eq!(page.schema_version, ACTIVITY_V2_PAGE_SCHEMA_VERSION);
+            let url = reqwest::Url::parse(&occurrence.request_url).unwrap();
+            assert_eq!(url.path(), "/v2/activity");
+            let query = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
+            assert_eq!(
+                query.get("limit").map(String::as_str),
+                (index == 0).then_some("1000")
+            );
+            assert_eq!(query.contains_key("cursor"), index != 0);
+            if index != 0 {
+                let previous = &continuation.page_occurrences[index - 1];
+                let previous = pages
+                    .iter()
+                    .find(|page| page.request_url == previous.request_url)
+                    .unwrap();
+                assert_eq!(query.get("cursor"), previous.next_cursor.as_ref());
+            }
+            let raw: Value = serde_json::from_slice(&frame.payload).unwrap();
+            let pagination = &raw["pagination"];
+            assert!(pagination.get("has_more").is_some());
+            assert!(pagination.get("next_cursor").is_some());
+            assert_eq!(page.has_more, pagination["has_more"].as_bool());
+            assert_eq!(
+                page.next_cursor.as_deref(),
+                pagination["next_cursor"].as_str()
+            );
+            assert_eq!(page.has_more, Some(index + 1 < pages.len()));
+        }
+    }
+    assert!(multipage, "the capped fake forces a committed cursor read");
+}
+
 /// Minimal real-process checkpoint fixture reusing the rollout's local financial authority.
 pub struct CheckpointFixture {
     pub dir: tempfile::TempDir,
@@ -1786,6 +1930,8 @@ impl CheckpointFixture {
             }),
             activity: Mutex::new(HashMap::new()),
             positions: Mutex::new(Vec::new()),
+            data_api_v2: Mutex::new(Default::default()),
+            activity_page_size_cap: None,
             slow_started: Notify::new(),
             slow: Semaphore::new(0),
             release_slow: AtomicBool::new(true),
@@ -1969,5 +2115,145 @@ impl CheckpointFixture {
                 .any(|row| row["wallet_hex"] == wallet(1).to_string())
         );
         assert!(!self.paper.is_wallet_fenced(&wallet(1)).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod data_api_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+
+    fn state() -> Arc<HttpState> {
+        Arc::new(HttpState {
+            boot_waves: false,
+            ranking_batch: AtomicI64::new(1),
+            scope_drops: Mutex::new(Vec::new()),
+            group_spans: Mutex::new(Vec::new()),
+            import_reads: Mutex::new(Vec::new()),
+            rows: Vec::new(),
+            now: 0,
+            ranked_wallets: 0,
+            full_history_requests: Mutex::new(Vec::new()),
+            cut_full_history_replies: AtomicUsize::new(0),
+            start: Mutex::new(None),
+            authority: Mutex::new(Authority::default()),
+            activity: Mutex::new(HashMap::from([(
+                "wallet".to_owned(),
+                vec![
+                    json!({"proxyWallet":"wallet", "timestamp":20, "type":"REWARD", "asset":"7"}),
+                    json!({"proxyWallet":"wallet", "timestamp":10, "type":"TRADE", "asset":"8"}),
+                    json!({"proxyWallet":"wallet", "timestamp":9, "type":"TRADE", "asset":"9"}),
+                ],
+            )])),
+            positions: Mutex::new(vec![
+                json!({"proxyWallet":"wallet", "asset":"7", "size":"5", "redeemable":false}),
+                json!({"proxyWallet":"wallet", "asset":"8", "size":"1", "redeemable":true}),
+                json!({"proxyWallet":"other", "asset":"9", "size":"2", "redeemable":false}),
+            ]),
+            data_api_v2: Mutex::new(Default::default()),
+            activity_page_size_cap: None,
+            slow_started: Notify::new(),
+            slow: Semaphore::new(0),
+            release_slow: AtomicBool::new(true),
+            gamma_fails: AtomicBool::new(false),
+            stale_ranked_wallet_2: AtomicBool::new(false),
+            gamma_failures: AtomicUsize::new(0),
+            resolved: AtomicBool::new(false),
+        })
+    }
+
+    async fn reply(state: Arc<HttpState>, uri: &str) -> (StatusCode, Bytes) {
+        let response = serve(
+            State(state),
+            OriginalUri(uri.parse().unwrap()),
+            Bytes::new(),
+        )
+        .await;
+        let status = response.status();
+        (
+            status,
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn v1_reply_bytes_stay_fixed_and_v2_full_history_cut_is_a_real_prefix() {
+        let state = state();
+        let (status, body) = reply(
+            state.clone(),
+            "/activity?user=wallet&start=10&end=20&type=TRADE&sortDirection=DESC&offset=0&limit=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), br#"[{"asset":"7","proxyWallet":"wallet","timestamp":20,"type":"REWARD"},{"asset":"8","proxyWallet":"wallet","timestamp":10,"type":"TRADE"}]"#);
+        for (redeemable, expected) in [
+            (
+                "false",
+                br#"[{"asset":"7","proxyWallet":"wallet","redeemable":false,"size":"5"}]"#
+                    .as_slice(),
+            ),
+            (
+                "true",
+                br#"[{"asset":"8","proxyWallet":"wallet","redeemable":true,"size":"1"}]"#
+                    .as_slice(),
+            ),
+        ] {
+            let (status, body) = reply(
+                state.clone(),
+                &format!("/positions?user=wallet&redeemable={redeemable}&offset=0&limit=1"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body.as_ref(), expected);
+        }
+        let uri = "/v2/activity?user=wallet&start=1&end=20&type=TRADE,SPLIT,MERGE,REDEEM,CONVERSION&sort_direction=DESC&limit=1000";
+        let (status, complete) = reply(state.clone(), uri).await;
+        assert_eq!(status, StatusCode::OK);
+        state.cut_full_history_replies.store(1, Ordering::SeqCst);
+        let (status, cut) = reply(state.clone(), uri).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(complete.starts_with(&cut));
+        assert!(cut.len() < complete.len());
+        assert!(serde_json::from_slice::<Value>(&cut).is_err());
+        let complete = std::str::from_utf8(&complete).unwrap();
+        assert_eq!(cut.len(), complete.find("\":\"").unwrap() + 4);
+        let (_, retried) = reply(state.clone(), uri).await;
+        assert_eq!(retried.as_ref(), complete.as_bytes());
+        assert_eq!(
+            *state.full_history_requests.lock().unwrap(),
+            vec!["wallet"; 3]
+        );
+        assert_eq!(
+            reply(state.clone(), &format!("{uri}&offset=0")).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, body) = reply(state, "/v2/positions?user=wallet&status=OPEN&filter_type=TOKENS&filter_amount=0&include_archived=true&sort_by=TOKENS&sort_direction=ASC&limit=1000").await;
+        assert_eq!(status, StatusCode::OK);
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["data"].as_array().unwrap().len(), 2);
+        assert_eq!(body["data"][0]["current_size"], "1");
+        assert_eq!(body["data"][1]["current_size"], "5");
+    }
+
+    #[tokio::test]
+    async fn v2_activity_keeps_the_wallet_hold_and_full_history_accounting() {
+        let state = state();
+        state.release_slow.store(false, Ordering::SeqCst);
+        let held = state.clone();
+        let task = tokio::spawn(async move {
+            reply(held, &format!("/v2/activity?user={}&start=1&end=20&type=TRADE,SPLIT,MERGE,REDEEM,CONVERSION&sort_direction=DESC&limit=1000", wallet(2))).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), state.slow_started.notified())
+            .await
+            .unwrap();
+        assert!(!task.is_finished());
+        assert_eq!(
+            *state.full_history_requests.lock().unwrap(),
+            vec![wallet(2).to_string()]
+        );
+        state.slow.add_permits(1);
+        assert_eq!(task.await.unwrap().0, StatusCode::OK);
     }
 }

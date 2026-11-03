@@ -384,8 +384,9 @@ replace the Rust log verifier or authority-specific semantic verification. Do no
 preparation as part of this read-only audit. Set `PE_SERVICE_BIN` to the absolute path of the deployed
 `pe-service` binary: the inspection decodes membership records and artifacts only through its
 read-only `--canonical-membership-json` command, and authenticates frozen Gamma identities through
-its read-only `--verify-frame-identity-json` command. This preserves the service's JSON number
-parsing and canonical page hashes. The inspection stops without these commands. It also stops, naming the
+its read-only `--verify-frame-identity-json` command, and classifies anomaly-capable reconciliation pages
+(schemas 4–7) through its read-only `--classify-activity-page-json` command. This preserves the service's JSON number
+parsing, anomaly classification and canonical page hashes. The inspection stops without these commands. It also stops, naming the
 record, at a membership record that command cannot decode; AC-B, AC-C and AC16 are then incomplete.
 
 ```bash
@@ -728,17 +729,28 @@ def frame_row(identity, e):
 for e in source.values("polymarket-activity-ws", "polymarket-public.activity-reconciliation"):
     is_frame = e["source_id"] == "polymarket-activity-ws"
     if not is_frame and e["source_id"] != "polymarket-public.activity-reconciliation": continue
-    # Dispatch by the recorded contract; historical pages remain identity-join evidence.
+    # Dispatch by the recorded contract; historical pages remain identity-join evidence. Data API v2 pages
+    # (envelope schemas 6/7, #837) carry their rows in `data`. Pages that can hold non-executable anomaly rows
+    # (schemas 4-7, #822) are classified by the deployed binary's production parser, and those rows are skipped.
     contract = (e["schema_version"], e["parser_version"])
-    if contract not in ((2, 2), (3, 2)):
+    if contract not in ((2, 2), (3, 2), (4, 2), (5, 2), (6, 2), (7, 2)):
         raise ValueError(f"unsupported reconciliation page contract {contract}")
-    for r in ([payload(e)] if is_frame else payload(e)):
+    rows = [payload(e)] if is_frame else payload(e)["data"] if contract[0] >= 6 else payload(e)
+    anomalies = set()
+    if not is_frame and contract[0] >= 4 and rows:
+        owner = rows[0].get("proxyWallet", rows[0].get("proxy_wallet", "")).strip().lower()
+        classified = subprocess.run([PE_SERVICE, "--classify-activity-page-json"],
+                                    input=json.dumps({"source": e, "wallet": owner}).encode(), capture_output=True)
+        assert classified.returncode == 0, classified.stderr.decode()
+        anomalies = set(json.loads(classified.stdout)["anomaly_rows"])
+    for index, r in enumerate(rows):
+        if index in anomalies: continue
         if r.get("type", r.get("activity_type", "TRADE" if is_frame else "")).strip().upper() != "TRADE": continue
         wallet = r.get("proxyWallet", r.get("proxy_wallet", "")).strip().lower()
         tx = r.get("transactionHash", r.get("transaction_hash", "")).strip().lower()
         condition = r.get("conditionId", r.get("condition_id"))
         condition = None if condition is None else condition.strip() or None
-        asset = r.get("asset"); asset = None if asset is None else asset.strip() or None
+        asset = r.get("asset", r.get("token_id")); asset = None if asset is None else asset.strip() or None
         outcome = r.get("outcomeIndex", r.get("outcome_index")); label = (r.get("outcome") or "").strip()
         side = r.get("side"); side = None if side is None else side.strip() or None
         parts = [b"prediction-edge/source-polymarket-public/activity-group/v2\0", b"TRADE",

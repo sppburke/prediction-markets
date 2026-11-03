@@ -6,6 +6,8 @@ mod golden;
 
 use golden::support;
 
+use support::data_api_v2;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -112,14 +114,16 @@ impl PageFetcher for QueueFetcher {
         if url.contains("/activity?") && !url.contains("start=") {
             return Ok(b"[]".to_vec());
         }
-        self.responses
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(url)
-            .and_then(VecDeque::pop_front)
-            .ok_or_else(|| SourceError::Fatal {
-                message: format!("no queued fixture for {url}"),
-            })
+        data_api_v2::queued_fixture(
+            url,
+            &mut self
+                .responses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .ok_or_else(|| SourceError::Fatal {
+            message: format!("no queued fixture for {url}"),
+        })
     }
 }
 
@@ -790,7 +794,7 @@ fn assert_full_history_proof(document: &str) {
             page["offset"] == 0
                 && page["bounds"]["start"] == 0
                 && page["bounds"]["end"] == walk["fixed_end"]
-                && page["request_url"].as_str().unwrap().ends_with("&start=1")
+                && page["request_url"].as_str().unwrap().contains("&start=1&")
         }));
     }
 }
@@ -828,13 +832,14 @@ fn older_market_responses(wallet: WalletAddress, attempts: usize) -> HashMap<Str
 }
 
 fn activity_url_at(wallet: WalletAddress, end: i64) -> String {
-    PolymarketEndpoint::UserPositionActivityPage {
-        user: wallet.to_string(),
+    pe_source_polymarket_public::V2ActivityRequest::position_changes(
+        wallet,
+        Some(0),
         end,
-        start: Some(1),
-        offset: 0,
-    }
-    .url(BASE)
+        pe_source_polymarket_public::ActivityRowAcceptance::StrictWithAnomalies,
+    )
+    .url(BASE, None)
+    .unwrap()
 }
 
 fn position_url(wallet: WalletAddress, partition: PositionPartition) -> String {
@@ -1321,7 +1326,7 @@ async fn full_history_repairs_all_older_markets_and_preserves_old_records_on_res
                         == pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID
                 })
                 .count(),
-            14
+            10
         );
         drop(engine);
         drop(paper);
@@ -1699,7 +1704,7 @@ async fn corrected_bracket_records_metadata_reuses_provenance_and_keeps_full_rea
         .filter(|url| url.contains("/activity?"))
         .collect::<Vec<_>>();
     assert_eq!(activity_urls.len(), 6);
-    assert!(activity_urls.iter().all(|url| url.ends_with("&start=1")));
+    assert!(activity_urls.iter().all(|url| url.contains("&start=1&")));
     assert_eq!(
         urls.iter()
             .filter(|url| url.contains("/markets?clob_token_ids="))
@@ -2149,7 +2154,7 @@ async fn direct_bracket_uses_three_full_history_walks_and_step_three_cutoff() {
             activity_url_at(wallet, 102),
         ]
     );
-    assert!(activity_urls.iter().all(|url| url.ends_with("&start=1")));
+    assert!(activity_urls.iter().all(|url| url.contains("&start=1&")));
 }
 
 #[tokio::test]
@@ -2220,7 +2225,7 @@ async fn row_older_than_the_previous_end_is_fetched_and_triggers_the_bounded_ret
         ],
         "the second read detected the inserted old row and forced one full retry"
     );
-    assert!(activity_urls.iter().all(|url| url.ends_with("&start=1")));
+    assert!(activity_urls.iter().all(|url| url.contains("&start=1&")));
     assert!(
         paper
             .activity_group_state(&intervening_id)
@@ -2295,7 +2300,7 @@ async fn runtime_control_bracket_uses_three_full_history_walks() {
             activity_url_at(wallet, 102),
         ]
     );
-    assert!(activity_urls.iter().all(|url| url.ends_with("&start=1")));
+    assert!(activity_urls.iter().all(|url| url.contains("&start=1&")));
     drop(control_tx);
     actor.await.unwrap();
 }
@@ -4255,7 +4260,8 @@ async fn parse_and_fatal_fetch_errors_remain_boot_fatal() {
         assert!(matches!(
             error,
             CausalPositionError::Activity {
-                source: ActivityReadError::Parse(_)
+                source: ActivityReadError::V2Envelope(_)
+                    | ActivityReadError::Parse(_)
                     | ActivityReadError::Fetch {
                         source: SourceError::Fatal { .. },
                         ..
@@ -4375,7 +4381,7 @@ async fn five_wallet_prepare_defers_mapping_failure_and_preserves_accepted_order
             "wallet {wallet} was bracketed more than once"
         );
     }
-    let raced_positions = position_url(raced, PositionPartition::NotRedeemable);
+    let raced_positions = pe_source_polymarket_public::positions_v2_url(BASE, raced, None);
     assert_eq!(
         urls.iter()
             .filter(|url| url.as_str() == raced_positions.as_str())
@@ -5498,9 +5504,16 @@ async fn runtime_rejected_brackets_do_not_complete_history() {
             "partial" => {
                 // A full first page followed by a failed continuation is not complete history.
                 let rows = vec![activity(wallet, 1, "1", "0xpartial", 10); 500];
+                let raw = data_api_v2::fixture_page(
+                    &activity_url(wallet),
+                    serde_json::to_vec(&rows).unwrap(),
+                );
+                let mut page: Value = serde_json::from_slice(&raw).unwrap();
+                page["pagination"]["has_more"] = true.into();
+                page["pagination"]["next_cursor"] = "missing-tail".into();
                 responses.insert(
                     activity_url(wallet),
-                    vec![serde_json::to_vec(&rows).unwrap()],
+                    vec![serde_json::to_vec(&page).unwrap()],
                 );
             }
             "failed" => {
@@ -6329,7 +6342,7 @@ async fn unreadable_activity_reply_defers_only_that_wallet_at_boot() {
         let cut = cut.clone();
         async move {
             let url = format!("{BASE}{uri}");
-            let body = if uri.path() == "/activity" && url.contains(&unreadable.to_string()) {
+            let body = if uri.path() == "/v2/activity" && url.contains(&unreadable.to_string()) {
                 requested.fetch_add(1, Ordering::SeqCst);
                 cut
             } else {
@@ -6436,9 +6449,8 @@ async fn unparseable_venue_row_defers_only_that_wallet_at_boot() {
                     .unwrap()
                     .map(|frame| frame.unwrap().1)
                     .collect::<Vec<_>>();
-                assert!(frames.iter().any(|frame| frame.schema_version == 5
-                    && frame.payload
-                        == serde_json::to_vec(&[anomalous_row(salvaged, 2, kind)]).unwrap()));
+                assert!(frames.iter().any(|frame| frame.schema_version == 6
+                    && serde_json::from_slice::<Value>(&frame.payload).unwrap()["data"][0]["transaction_hash"] == "0xanomaly"));
             }
             let payload =
                 serde_json::to_vec(&[activity(salvaged, 3, "1", "0xlater", END + 1)]).unwrap();
@@ -7244,13 +7256,14 @@ async fn paper_service_rollout_novel_revision_on_first_read_refuses_then_safe_re
 }
 
 fn tail_url(wallet: WalletAddress, baseline_end: i64, end: i64) -> String {
-    PolymarketEndpoint::UserPositionActivityPage {
-        user: wallet.to_string(),
+    pe_source_polymarket_public::V2ActivityRequest::position_changes(
+        wallet,
+        Some(baseline_end - pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS),
         end,
-        start: Some(baseline_end - pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS + 1),
-        offset: 0,
-    }
-    .url(BASE)
+        pe_source_polymarket_public::ActivityRowAcceptance::StrictWithAnomalies,
+    )
+    .url(BASE, None)
+    .unwrap()
 }
 
 fn reentry_reads(
@@ -8213,7 +8226,7 @@ async fn reentry_attempt_logs_separate_baseline_and_stability_timing() {
             if failure == "none" {
                 "accepted"
             } else {
-                "activity.json"
+                "activity.v2_envelope"
             }
         );
         drop(bytes);

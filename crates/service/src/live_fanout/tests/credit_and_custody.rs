@@ -533,7 +533,7 @@ async fn append_reserved_order(
 /// FAIL: it rejects the surplus, writes a second credit, or leaves strict financial posture closed.
 #[tokio::test]
 async fn runtime_mark_gate_credits_surplus_once_and_passes_posture() {
-    let app = Router::new().route("/positions", get(empty_positions));
+    let app = Router::new().route("/v2/positions", get(empty_positions));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -593,7 +593,7 @@ async fn runtime_mark_gate_credits_surplus_once_and_passes_posture() {
 /// FAIL: the runtime credits reserved cash, tolerates the deficit, or appends any financial record.
 #[tokio::test]
 async fn runtime_mark_gate_rejects_reserved_surplus_and_atomic_deficit() {
-    let app = Router::new().route("/positions", get(empty_positions));
+    let app = Router::new().route("/v2/positions", get(empty_positions));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -732,7 +732,7 @@ async fn engage_absolute_loss_for_credit(
 /// FAIL: a credit rebases equity, releases or re-sends the halt, or lifts the latched snapshot.
 #[tokio::test]
 async fn runtime_credit_keeps_absolute_loss_latched() {
-    let app = Router::new().route("/positions", get(empty_positions));
+    let app = Router::new().route("/v2/positions", get(empty_positions));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -803,11 +803,11 @@ async fn runtime_credit_keeps_absolute_loss_latched() {
 /// FAIL: the floor moves with credit, unlatched PnL stays stale, or an AbsoluteLoss latch releases.
 #[tokio::test]
 async fn runtime_credit_crosses_fixed_absolute_loss_floor_with_and_without_latch() {
-    let app = Router::new().route("/positions", get(empty_positions));
+    let app = Router::new().route("/v2/positions", get(empty_positions));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let held_app = Router::new().route("/positions", get(recovery_open_position));
+    let held_app = Router::new().route("/v2/positions", get(recovery_open_position));
     let held_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let held_address = held_listener.local_addr().unwrap();
     let held_server =
@@ -1040,7 +1040,7 @@ fn collateral_credit_checked_overflow_fails_closed() {
 /// rejects the credit, counts it twice, or reserves the order from old cash.
 #[tokio::test]
 async fn runtime_credit_between_posture_and_mark_reads_allows_next_order() {
-    let app = Router::new().route("/positions", get(empty_positions));
+    let app = Router::new().route("/v2/positions", get(empty_positions));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1123,7 +1123,7 @@ async fn runtime_credit_between_posture_and_mark_reads_allows_next_order() {
 /// FAIL: a credit spends the outstanding payout or changes the journal while custody is pending.
 #[tokio::test]
 async fn runtime_mark_gate_defers_surplus_with_receivable() {
-    let app = Router::new().route("/positions", get(recovery_open_position));
+    let app = Router::new().route("/v2/positions", get(recovery_open_position));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1191,7 +1191,7 @@ async fn runtime_mark_gate_defers_surplus_with_receivable() {
 /// FAIL: reopening loses the credit, reapplies it, or requires the discarded in-memory projection.
 #[tokio::test]
 async fn runtime_credit_append_before_rederive_reopens_without_duplicate() {
-    let app = Router::new().route("/positions", get(empty_positions));
+    let app = Router::new().route("/v2/positions", get(empty_positions));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

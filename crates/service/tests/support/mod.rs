@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod data_api_v2;
+
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{PageFetcher, ReconciliationFetcher};
 use serde_json::Value;
@@ -93,6 +95,8 @@ pub fn producer_shaped_read_v1(
     assert!(row_count < pe_source_polymarket_public::RECONCILIATION_PAGE_LIMIT);
     let raw_hash = blake3::hash(payload).to_hex().to_string();
     let evidence = ReconciliationPageEvidence {
+        has_more: None,
+        next_cursor: None,
         anomalies: Vec::new(),
         request_url: request_url.clone(),
         bounds: Some(ActivityRequestBounds {
@@ -926,9 +930,12 @@ impl ReconciliationFetcher for GatedFetcher {
                 .map_err(|_| SourceError::Fatal {
                     message: "request barrier closed".to_owned(),
                 })?;
-            response.await.map_err(|_| SourceError::Fatal {
-                message: "response barrier closed".to_owned(),
-            })?
+            response
+                .await
+                .map_err(|_| SourceError::Fatal {
+                    message: "response barrier closed".to_owned(),
+                })?
+                .map(|raw| data_api_v2::fixture_page(url, raw))
         })
     }
 }
@@ -973,9 +980,9 @@ pub struct Page(pub Vec<u8>);
 impl ReconciliationFetcher for Page {
     fn fetch<'a>(
         &'a self,
-        _: &'a str,
+        url: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
-        Box::pin(async { Ok(self.0.clone()) })
+        Box::pin(async move { Ok(data_api_v2::fixture_page(url, self.0.clone())) })
     }
 }
 
@@ -1372,6 +1379,8 @@ pub fn producer_shaped_anomaly_read(
     .url("https://data-api.polymarket.com");
     let raw_hash = blake3::hash(payload).to_hex().to_string();
     let evidence = ReconciliationPageEvidence {
+        has_more: None,
+        next_cursor: None,
         request_url: request_url.clone(),
         bounds: Some(ActivityRequestBounds {
             start: None,

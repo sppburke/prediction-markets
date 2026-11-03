@@ -51,7 +51,8 @@ pub use clob_resolution::{
 pub use config::PollingConfig;
 pub use connector::PolymarketPublicConnector;
 pub use endpoint::{
-    LeaderboardCategory, LeaderboardSort, LeaderboardWindow, PolymarketEndpoint, PositionPartition,
+    ActivitySortDirection, LeaderboardCategory, LeaderboardSort, LeaderboardWindow,
+    PolymarketEndpoint, PositionPartition, V2_PAGE_LIMIT, activity_v2_url, positions_v2_url,
 };
 pub use fetcher::{
     FixtureFetcher, HttpRequestContext, PageFetcher, RECONCILIATION_RATE_LIMIT_RETRY_SECS,
@@ -70,14 +71,18 @@ pub use live_admission::{
     validate_paper_market,
 };
 pub use reconciliation::{
-    ACTIVITY_MAX_OFFSET, ActivityAssetIdentity, ActivityAssetMapping, ActivityReadError,
-    ActivityRequestBounds, CanonicalPosition, CompleteActivityRead, CompletePositionsRead,
-    POSITION_PROOF_VERSION, POSITIONS_MAX_OFFSET, PositionClassification, PositionReadError,
-    RECONCILIATION_PAGE_LIMIT, ReconciliationFetcher, ReconciliationPageEvidence,
-    ReconciliationPageFetcher, activity_window_end, activity_window_end_with_acceptance,
-    canonical_page_hash, fetch_activity_window_semantic,
+    ACTIVITY_MAX_OFFSET, ACTIVITY_V2_PAGE_SCHEMA_VERSION, ActivityAssetIdentity,
+    ActivityAssetMapping, ActivityReadError, ActivityRequestBounds, CanonicalPosition,
+    CompleteActivityRead, CompletePositionsRead, POSITION_PROOF_VERSION, POSITION_V2_PROOF_VERSION,
+    POSITIONS_MAX_OFFSET, PositionClassification, PositionReadError, RECONCILIATION_PAGE_LIMIT,
+    ReconciliationFetcher, ReconciliationPageEvidence, ReconciliationPageFetcher, V2ActivityPage,
+    V2ActivityRequest, V2AuthenticationError, V2Page, V2PageError, V2Pagination, V2RawPage,
+    activity_window_end, activity_window_end_with_acceptance, canonical_page_hash, decode_v2_page,
+    fetch_activity_page_v2, fetch_activity_window_semantic,
     fetch_activity_window_semantic_with_acceptance, fetch_complete_activity,
-    fetch_complete_activity_semantic, fetch_complete_activity_with_acceptance,
-    fetch_complete_positions,
+    fetch_complete_activity_semantic, fetch_complete_activity_v2,
+    fetch_complete_activity_with_acceptance, fetch_complete_positions, fetch_complete_positions_v2,
+    parse_activity_page_v2, parse_activity_response_v2_with_acceptance, reauthenticate_activity_v2,
+    reauthenticate_positions_v2,
 };
 pub mod canary;

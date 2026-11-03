@@ -464,19 +464,12 @@ fn winner_and_loser_custody_converge_in_both_orders() {
 /// FAIL: a flag-only difference blocks the gate, or the size difference passes it.
 #[tokio::test]
 async fn runtime_inventory_masks_redeemable_but_preserves_exact_size() {
-    async fn positions(
-        Query(query): Query<HashMap<String, String>>,
-        State(size): State<&'static str>,
-    ) -> Json<Vec<serde_json::Value>> {
-        if query.get("redeemable").map(String::as_str) == Some("true") {
-            Json(vec![serde_json::json!({
-                "proxyWallet": "0x1111111111111111111111111111111111111111",
-                "asset": "123", "conditionId": finality_prepared().prepared.condition_id.0,
-                "outcomeIndex": 0, "size": size, "negativeRisk": false,
-            })])
-        } else {
-            Json(Vec::new())
-        }
+    async fn positions(State(size): State<&'static str>) -> Json<serde_json::Value> {
+        Json(positions_v2_page(vec![serde_json::json!({
+            "proxyWallet": "0x1111111111111111111111111111111111111111",
+            "asset": "123", "conditionId": finality_prepared().prepared.condition_id.0,
+            "outcomeIndex": 0, "size": size, "redeemable": true, "negativeRisk": false,
+        })]))
     }
     for (size, expected) in [
         ("3.125", CheckOutcome::Pass),
@@ -486,7 +479,7 @@ async fn runtime_inventory_masks_redeemable_but_preserves_exact_size() {
         ),
     ] {
         let app = Router::new()
-            .route("/positions", get(positions))
+            .route("/v2/positions", get(positions))
             .with_state(size);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

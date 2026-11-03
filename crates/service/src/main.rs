@@ -401,6 +401,18 @@ async fn run() -> Result<()> {
         println!("{identity}");
         return Ok(());
     }
+    if args
+        .iter()
+        .any(|argument| argument == "--classify-activity-page-json")
+    {
+        let mut payload = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut payload)
+            .context("read the captured activity page from stdin")?;
+        let classified = pe_service::qualification::classify_activity_page_json(&payload)
+            .context("classify the captured activity page")?;
+        println!("{classified}");
+        return Ok(());
+    }
     if let Some(position) = args
         .iter()
         .position(|argument| argument == "--canonical-membership-json")

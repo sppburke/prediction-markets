@@ -11,6 +11,47 @@ disabled and stopped and a fresh process census is clear, followed by one start 
 Earlier releases swapped the binary under the running process and restarted once; that order is
 unsafe while a pre-#744 binary may run, because an already-loaded old checkpoint cannot be fenced.
 
+## Data API v2 phase-1 installation
+
+As of the owner's **2026-11-02, 7:03 PM CT** decision, `pe-service` is disabled and stopped
+after Data API v1 retirement. Before activation, capture read-only evidence of the unit's
+enablement/activity and MainPID, the installed database's `meta.scope_drop_boundary_unix`,
+account requested/effective modes, and the live-journal inventory. Recheck the supplied stopped
+state, existing boundary marker, off/off modes and header-only journal against the installed
+paths; retain the results with the deployment evidence.
+
+The guarded deploy script takes its step-3 baselines (`unit.preflight`, `config.sha`) and runs
+the staged checkpoint preparation only while the prior binary serves. On a unit that is already
+disabled and stopped it skips them, swaps the binary, and then refuses to start it ("unit baseline
+missing"). So run the **stopped-unit preflight** first, under the same deploy lock and with the
+deploy script's seven arguments; the launcher runs it and then, only on success, the deploy script.
+
+The preflight never touches the unit. Its gates come first:
+- it refuses baselines the deploy script took while serving;
+- it refuses any activation-attempt or recovery receipt, which stay with release-2 recovery (O2);
+- it requires the disabled, inactive state without a MainPID.
+
+It then withdraws its own earlier authorization (deleting `unit.preflight`, `config.sha` and its completion receipt,
+then syncing the directory) before any other check. It runs every check again on each run:
+- prior backup, unit policy, and the identity of the desired build;
+- the seal check and the `--prepare-source-checkpoint` run (the
+  [open-continuation census](#565-open-continuation-census-before-deployment));
+- a clear census.
+
+It publishes the authorization only when all of them pass, with the completion receipt first and the two baselines
+copied from the immutable baselines the first run recorded. Any failure, signal or failed write leaves nothing
+published, so the deploy script cannot start the unit. Each run keeps its outputs in its own attempt directory. If a
+deploy run already swapped the binary without authorization and began no activation, the preflight runs its checks
+with the installed build. The deploy script's stopped path then keeps the unit disabled and stopped through its seal
+check, cleared census and binary swap, and its guarded activation **enables and starts** the unit. Record the
+installed SHA, InvocationID, readiness, poll health and ERROR count for the acceptance window.
+Request and replay contracts are canonical in the
+[glossary](_GLOSSARY.md#data-api-v2-contract-pe-service-phase-1).
+
+**Fix forward only:** a pre-v2 binary cannot read the venue. A failed activation leaves the
+unit disabled and stopped, with all evidence retained, until a compatible fix ships. The older
+rollback procedures below do not authorize a return to v1.
+
 ## Historical issue #557 generation activation
 
 The procedure in this section applies only when a deployment creates a new paper-state generation;
@@ -1797,6 +1838,9 @@ Credential, venue, financial, resolver, source, risk, and redemption checks appl
 do not change the owner's requested mode.
 
 ## Rollback
+
+The [Data API v2 installation](#data-api-v2-phase-1-installation) requires fix-forward recovery;
+a pre-v2 target cannot read the retired venue routes regardless of the historical checks below.
 
 **#823 scope drops and #822 activity anomalies:** installed-mode rollback requires an absent
 `meta` `scope_drop_boundary_unix` and every prerequisite below. The previous binary ignores the

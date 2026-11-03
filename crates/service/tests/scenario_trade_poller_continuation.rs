@@ -5,6 +5,8 @@
 
 mod support;
 
+use support::data_api_v2;
+
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -48,6 +50,7 @@ struct QueueFetcher {
     pages: Mutex<VecDeque<Vec<u8>>>,
     calls: AtomicUsize,
     urls: Mutex<Vec<String>>,
+    cursor_rows: Mutex<Option<(data_api_v2::DataApiV2, Vec<Value>)>>,
 }
 
 impl QueueFetcher {
@@ -60,6 +63,14 @@ impl QueueFetcher {
             pages: Mutex::new(pages.into()),
             calls: AtomicUsize::new(0),
             urls: Mutex::new(Vec::new()),
+            cursor_rows: Mutex::new(None),
+        }
+    }
+
+    fn cursor_walk(rows: Vec<Value>) -> Self {
+        Self {
+            cursor_rows: Mutex::new(Some((data_api_v2::DataApiV2::default(), rows))),
+            ..Self::from_pages(Vec::new())
         }
     }
 
@@ -76,6 +87,14 @@ impl ReconciliationFetcher for QueueFetcher {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.urls.lock().unwrap().push(url.to_owned());
+            if let Some((api, rows)) = self.cursor_rows.lock().unwrap().as_mut() {
+                let parsed = reqwest::Url::parse(url).unwrap();
+                let query = parsed.query_pairs().into_owned().collect();
+                return Ok(serde_json::to_vec(
+                    &api.reply(parsed.path(), rows, &query, Some(500)).unwrap(),
+                )
+                .unwrap());
+            }
             self.pages
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -83,6 +102,7 @@ impl ReconciliationFetcher for QueueFetcher {
                 .ok_or_else(|| SourceError::Fatal {
                     message: "unexpected activity page fetch".to_owned(),
                 })
+                .map(|raw| data_api_v2::fixture_page(url, raw))
         })
     }
 }
@@ -543,6 +563,262 @@ async fn recorded_poll(
     control.await.unwrap()
 }
 
+// PASS: the last of eleven v2 pages binds a websocket BUY and proves an anomaly's scoped drop;
+// boot authenticates the open read, raw replay reproduces its drop, and the real owner resumes it.
+// FAIL: offset-ceiling truncation, a lost binding/drop, wrong page proof or restart/replay drift.
+#[tokio::test(start_paused = true)]
+async fn poller_5500_row_v2_binding_and_anomaly_survive_restart() {
+    use pe_service::bucket_commit::{
+        ActivityReadCommitment, DecisionContinuationV3, ReconciliationBucket,
+    };
+    use pe_service::risk_inputs::SourceReceiptIndex;
+    use pe_service::trade_poller::{ACTIVITY_POLL_SOURCE_ID, ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION};
+    use pe_source_polymarket_public::{
+        ACTIVITY_V2_PAGE_SCHEMA_VERSION, ActivityRowAcceptance, ReconciliationPageEvidence,
+        V2ActivityRequest, V2RawPage, reauthenticate_activity_v2,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.log");
+    let state_path = dir.path().join("paper.db");
+    let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let observed = stream_row(wallet(), "last-page", EPOCH - 1);
+    let observation_receipt = running.observe(observed.clone()).await;
+    let mut anomaly = activity_row(
+        "TRADE",
+        "last-page-anomaly",
+        MARKET_A,
+        "BUY",
+        "1",
+        "asset-a",
+        EPOCH,
+    );
+    anomaly["price"] = json!("2");
+    let mut combo = activity_row("TRADE", "bulk", MARKET_B, "BUY", "0.002", "asset-b", EPOCH);
+    combo["isCombo"] = json!(true);
+    // DESC leaves the older observed row last, after the equal-time bulk and anomaly rows.
+    let mut rows = vec![observed.clone(), anomaly];
+    rows.extend(vec![combo; 5_498]);
+    let mut api = data_api_v2::DataApiV2::default();
+    for page_index in 0..11 {
+        let request = running.requests.recv().await.unwrap();
+        let url = reqwest::Url::parse(&request.url).unwrap();
+        assert_eq!(url.path(), "/v2/activity");
+        let query = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
+        assert_eq!(query.contains_key("cursor"), page_index != 0);
+        assert_eq!(
+            query.get("limit").map(String::as_str),
+            (page_index == 0).then_some("1000")
+        );
+        let page = api.reply(url.path(), &rows, &query, Some(500)).unwrap();
+        assert_eq!(page["data"].as_array().unwrap().len(), 500);
+        assert_eq!(page["pagination"]["offset"], page_index * 500);
+        assert_eq!(page["pagination"]["has_more"], page_index != 10);
+        request
+            .respond
+            .send(serde_json::to_vec(&page).unwrap())
+            .unwrap();
+    }
+    running.completed(wallet()).await;
+    let commits = running.finish().await;
+    assert_eq!(commits.len(), 2);
+    let pending = paper.open_decision_pending().unwrap();
+    assert_eq!(pending.len(), 1, "committed result: {:#?}", commits[0].2);
+    let continuation = DecisionContinuationV3::from_durable(&pending[0]).unwrap();
+    let pages: Vec<ReconciliationPageEvidence> =
+        serde_json::from_value(continuation.facts.decision_inputs["pages"].clone()).unwrap();
+    assert_eq!(pages.len(), 11);
+    assert_eq!(pages.iter().map(|page| page.row_count).sum::<u32>(), 5_500);
+    assert!(
+        pages
+            .iter()
+            .all(|page| page.schema_version == ACTIVITY_V2_PAGE_SCHEMA_VERSION)
+    );
+    let last = pages.iter().find(|page| page.offset == 5_000).unwrap();
+    assert_eq!(last.has_more, Some(false));
+    assert_eq!(last.next_cursor, None);
+    assert_eq!(last.anomalies.len(), 1);
+    let frames = source_frames(&source_path);
+    let commitment_receipt = continuation.read_commitment.unwrap();
+    let commitment: ActivityReadCommitment = serde_json::from_slice(
+        &frames
+            .iter()
+            .find(|frame| frame.seq == commitment_receipt.sequence)
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    let bindings = commitment.bindings.as_ref().unwrap();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].stream_receipt, observation_receipt);
+    assert_eq!(
+        bindings[0].history_group_id,
+        *aggregate(observed).group_id.key()
+    );
+    assert_eq!(bindings[0].page_occurrence_index, 10);
+    assert_eq!(bindings[0].page_raw_hash, last.raw_page_hash);
+    for occurrence in &continuation.page_occurrences {
+        let frame = frames
+            .iter()
+            .find(|frame| frame.seq == occurrence.receipt.sequence)
+            .unwrap();
+        assert_eq!(frame.source_id.0, ACTIVITY_POLL_SOURCE_ID);
+        assert_eq!(frame.schema_version, ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION);
+    }
+    let drops = paper.wallet_scope_drops(&wallet(), EPOCH).unwrap();
+    assert_eq!(drops.len(), 1);
+    assert_eq!(drops[0].scope_kind, "market");
+    assert_eq!(drops[0].scope_id, MARKET_A);
+    assert_eq!(drops[0].cause, "unrepresentable_activity_row");
+    let proof: Value = serde_json::from_str(&drops[0].proof_json).unwrap();
+    assert_eq!(proof["page_raw_hash"], last.raw_page_hash);
+    assert_eq!(proof["page_row_index"], last.anomalies[0].row_index);
+    assert_eq!(proof["raw_row_hash"], last.anomalies[0].raw_row_hash);
+    let groups = paper.activity_groups_after(&wallet(), 0).unwrap();
+    let positions = paper.leader_positions().unwrap();
+    let recorded_buckets = commits
+        .iter()
+        .map(|(aggregates, context, _)| (aggregates.clone(), Arc::clone(context)))
+        .collect::<Vec<_>>();
+    drop(commits);
+    drop(paper);
+
+    let reopened = PaperStateDb::open(&state_path).unwrap();
+    let index = SourceReceiptIndex::replay(&source_path).unwrap();
+    assert_eq!(
+        pe_service::bucket_commit::validate_open_continuations(&reopened, &index).unwrap(),
+        1
+    );
+    let observation = continuation
+        .observation_from_receipt_index(&index)
+        .unwrap()
+        .unwrap();
+    assert_eq!(observation.source_receipt, observation_receipt);
+    assert_eq!(reopened.open_decision_pending().unwrap(), pending);
+    assert_eq!(
+        reopened.wallet_scope_drops(&wallet(), EPOCH).unwrap(),
+        drops
+    );
+    assert_eq!(
+        reopened.activity_groups_after(&wallet(), 0).unwrap(),
+        groups
+    );
+    assert_eq!(reopened.leader_positions().unwrap(), positions);
+    drop(reopened);
+
+    let raw_pages = continuation
+        .page_occurrences
+        .iter()
+        .map(|occurrence| V2RawPage {
+            request_url: &occurrence.request_url,
+            body: &frames
+                .iter()
+                .find(|frame| frame.seq == occurrence.receipt.sequence)
+                .unwrap()
+                .payload,
+        })
+        .collect::<Vec<_>>();
+    let bounds = pages[0].bounds.unwrap();
+    let read = reauthenticate_activity_v2(
+        BASE_URL,
+        &V2ActivityRequest::position_changes(
+            wallet(),
+            bounds.start,
+            bounds.end,
+            ActivityRowAcceptance::StrictWithAnomalies,
+        ),
+        &raw_pages,
+        &pages,
+    )
+    .unwrap();
+    assert_eq!(read.pages, pages);
+    let mut buckets = ReconciliationBucket::from_read(wallet(), &read).unwrap();
+    assert_eq!(buckets.len(), 2);
+    assert_eq!(buckets[1].anomalies, last.anomalies);
+    let replay_state = Arc::new(PaperStateDb::open(&dir.path().join("replay.db")).unwrap());
+    support::install_verified_empty_anchor(&replay_state, wallet(), EPOCH - 10);
+    replay_state
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: wallet(),
+            complete: true,
+            proof_json: "{}".to_owned(),
+            updated_at_unix: EPOCH - 10,
+        })
+        .unwrap();
+    for market in [MARKET_A, MARKET_B] {
+        replay_state.record_market_group(market, "").unwrap();
+    }
+    let mut replay_engine = BucketCommitEngine::load(
+        replay_state.clone(),
+        build_leader_ledger(&replay_state).unwrap(),
+    )
+    .unwrap()
+    .with_source_receipt_index(index.clone());
+    for (bucket, (aggregates, context)) in buckets.drain(..).zip(&recorded_buckets) {
+        assert_eq!(&bucket.aggregates, aggregates);
+        replay_engine
+            .commit_with_freshness_policy(
+                bucket,
+                context,
+                zero_basis(),
+                Some(pe_service::bucket_commit::PaperFreshnessPolicy {
+                    activity_ws_enabled: true,
+                    copy_latency_budget_secs: 2,
+                }),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        replay_state.wallet_scope_drops(&wallet(), EPOCH).unwrap(),
+        drops
+    );
+    assert_eq!(replay_state.open_decision_pending().unwrap(), pending);
+    assert_eq!(
+        replay_state.activity_groups_after(&wallet(), 0).unwrap(),
+        groups
+    );
+    assert_eq!(replay_state.leader_positions().unwrap(), positions);
+
+    let (mut restarted, paper) = start_recorded_poller_with_owner(&dir, &[wallet()], true);
+    restarted
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    restarted.round_completed().await;
+    restarted.finish().await;
+    let decisions = paper.decision_pending_history().unwrap();
+    assert_eq!(decisions.len(), 1);
+    let replay = pe_service::decision_replay::replay_decision_pending(&decisions[0]).unwrap();
+    assert_eq!(replay.continuation, continuation);
+    let index = SourceReceiptIndex::replay(&source_path).unwrap();
+    assert_eq!(
+        replay
+            .continuation
+            .observation_from_receipt_index(&index)
+            .unwrap()
+            .unwrap(),
+        observation
+    );
+    assert_eq!(paper.wallet_scope_drops(&wallet(), EPOCH).unwrap(), drops);
+    assert_eq!(paper.activity_groups_after(&wallet(), 0).unwrap(), groups);
+    assert_eq!(paper.leader_positions().unwrap(), positions);
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+}
+
 fn source_frames(path: &std::path::Path) -> Vec<pe_event_log::EventEnvelope> {
     pe_event_log::Reader::replay(path)
         .unwrap()
@@ -550,16 +826,17 @@ fn source_frames(path: &std::path::Path) -> Vec<pe_event_log::EventEnvelope> {
         .collect()
 }
 
-/// PASS: a real saturated poll writes schema-3 pages then one commitment and a V4 open row;
+/// PASS: a v2 cursor poll writes schema-7 pages then one commitment and a V7 open row;
 /// restart validates all references and reproduces every committed aggregate/effect. An empty
 /// read appends no commitment; an already-committed repeat read appends its own commitment but
 /// commits no new group and no pending row. FAIL: evidence or idempotency differs.
 #[tokio::test]
 async fn poller_multipage_commitment_survives_restart() {
     use pe_service::bucket_commit::{ACTIVITY_READ_COMMITMENT_SOURCE_ID, DecisionContinuationV3};
-    use pe_service::trade_poller::{ACTIVITY_POLL_PAGE_SCHEMA_VERSION, ACTIVITY_POLL_SOURCE_ID};
+    use pe_service::trade_poller::{ACTIVITY_POLL_SOURCE_ID, ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION};
     use pe_source_polymarket_public::{
-        ACTIVITY_MAX_OFFSET, PolymarketEndpoint, RECONCILIATION_PAGE_LIMIT, fetch_complete_activity,
+        ACTIVITY_MAX_OFFSET, ActivityRowAcceptance, RECONCILIATION_PAGE_LIMIT, V2ActivityRequest,
+        fetch_complete_activity_v2,
     };
     let dir = tempfile::tempdir().unwrap();
     let source_path = dir.path().join("source.log");
@@ -579,8 +856,7 @@ async fn poller_multipage_commitment_survives_restart() {
         .unwrap();
     let root_page_count = ACTIVITY_MAX_OFFSET / RECONCILIATION_PAGE_LIMIT + 1;
     assert_eq!(root_page_count, 11);
-    // The root contains 11 seconds of 500 identical members per group. Its saturated tail
-    // forces the real reader to refetch older, terminal-second and newer child windows.
+    // Eleven pages of 500 rows cross the old offset ceiling without splitting the window.
     let full_pages: Vec<Vec<u8>> = (0..root_page_count)
         .map(|index| {
             let epoch = EPOCH + 10 - i64::from(index);
@@ -601,13 +877,12 @@ async fn poller_multipage_commitment_survives_restart() {
         })
         .collect();
     let empty = b"[]".to_vec();
-    let mut pages = full_pages.clone();
-    pages.push(empty.clone()); // older child (-1, EPOCH-1]
-    pages.push(full_pages.last().unwrap().clone()); // terminal second, offset zero
-    pages.push(empty.clone()); // terminal second, offset 500
-    pages.extend(full_pages.iter().take(10).cloned()); // newer child, offsets 0..4500
-    pages.push(empty.clone()); // newer child, offset 5000
-    let fetcher = Arc::new(QueueFetcher::from_pages(pages.clone()));
+    let rows = full_pages
+        .iter()
+        .flat_map(|page| serde_json::from_slice::<Vec<Value>>(page).unwrap())
+        .collect();
+    let pages = full_pages;
+    let fetcher = Arc::new(QueueFetcher::cursor_walk(rows));
     let commits = recorded_poll(Arc::clone(&paper), &source_path, Arc::clone(&fetcher)).await;
     assert_eq!(fetcher.calls(), pages.len());
     assert_eq!(commits.len(), 11);
@@ -618,36 +893,15 @@ async fn poller_multipage_commitment_survives_restart() {
             .sum::<usize>(),
         1
     );
-    let mut expected_urls = Vec::new();
-    let mut request = |end, start, offset| {
-        expected_urls.push(
-            PolymarketEndpoint::UserPositionActivityPage {
-                user: wallet().to_string(),
-                end,
-                start,
-                offset,
-            }
-            .url(BASE_URL),
-        )
-    };
-    for offset in
-        (0..=ACTIVITY_MAX_OFFSET).step_by(usize::try_from(RECONCILIATION_PAGE_LIMIT).unwrap())
-    {
-        request(EPOCH + 10, Some(0), offset);
-    }
-    request(EPOCH - 1, Some(0), 0);
-    request(EPOCH, Some(EPOCH), 0);
-    request(EPOCH, Some(EPOCH), RECONCILIATION_PAGE_LIMIT);
-    for offset in
-        (0..=ACTIVITY_MAX_OFFSET).step_by(usize::try_from(RECONCILIATION_PAGE_LIMIT).unwrap())
-    {
-        request(EPOCH + 10, Some(EPOCH + 1), offset);
-    }
+    let expected_urls: Vec<_> = (0..pages.len()).map(|index| {
+        let suffix = if index == 0 { "limit=1000".to_owned() } else { format!("cursor=fake-v2-{}", index - 1) };
+        format!("{BASE_URL}/v2/activity?user={}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&start=1&end={}&sort_direction=DESC&{suffix}", wallet(), EPOCH + 10)
+    }).collect();
     assert_eq!(*fetcher.urls.lock().unwrap(), expected_urls);
     let frames = source_frames(&source_path);
     for frame in frames.iter().take(pages.len()) {
         assert_eq!(frame.source_id.0, ACTIVITY_POLL_SOURCE_ID);
-        assert_eq!(frame.schema_version, ACTIVITY_POLL_PAGE_SCHEMA_VERSION);
+        assert_eq!(frame.schema_version, ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION);
         assert_eq!(
             frame.parser_version,
             pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
@@ -722,10 +976,18 @@ async fn poller_multipage_commitment_survives_restart() {
             .map(|frame| frame.payload.clone())
             .collect(),
     );
-    let reconstructed =
-        fetch_complete_activity(&replay_fetcher, BASE_URL, wallet(), Some(-1), EPOCH + 10)
-            .await
-            .unwrap();
+    let reconstructed = fetch_complete_activity_v2(
+        &replay_fetcher,
+        BASE_URL,
+        &V2ActivityRequest::position_changes(
+            wallet(),
+            Some(0),
+            EPOCH + 10,
+            ActivityRowAcceptance::StrictWithAnomalies,
+        ),
+    )
+    .await
+    .unwrap();
     let buckets = reconstructed.buckets().unwrap();
     for (rebuilt, (committed, _, _)) in buckets.iter().zip(&commits) {
         assert_eq!(rebuilt, committed);
@@ -786,7 +1048,7 @@ async fn poller_multipage_commitment_survives_restart() {
     let repeat = recorded_poll(
         Arc::clone(&paper),
         &source_path,
-        Arc::new(QueueFetcher::from_pages(vec![full_pages[0].clone(), empty])),
+        Arc::new(QueueFetcher::from_pages(vec![pages[0].clone()])),
     )
     .await;
     assert_eq!(repeat.len(), 1);
@@ -1002,6 +1264,7 @@ impl RunningPoll {
                 return selected;
             }
         }
+        (&mut self.poller).await.unwrap().unwrap();
         unreachable!("poller completed channel closed");
     }
 
@@ -1015,6 +1278,7 @@ impl RunningPoll {
                 return;
             }
         }
+        (&mut self.poller).await.unwrap().unwrap();
         unreachable!("round completion channel closed");
     }
 
@@ -1466,7 +1730,11 @@ fn start_recorded_poller_with_membership(
             return std::task::Poll::Pending;
         }
         drop(gate);
-        run.as_mut().poll(cx)
+        let result = run.as_mut().poll(cx);
+        if let std::task::Poll::Ready(Err(error)) = &result {
+            eprintln!("poller failed: {error}");
+        }
+        result
     }));
     (
         RunningPoll {
@@ -1759,7 +2027,7 @@ async fn refresh_cooldown_clears_queued_wallet_so_other_wallet_refreshes() {
     running.round_completed().await;
     let activity = running.requests.recv().await.unwrap();
     assert!(activity.url.contains(&wallet().to_string()));
-    assert!(activity.url.ends_with("&start=1"));
+    assert!(activity.url.contains("&start=1&"));
     activity.respond.send(b"[]".to_vec()).unwrap();
     let positions = running.requests.recv().await.unwrap();
     assert!(positions.url.contains("/positions?"));
@@ -1776,7 +2044,7 @@ async fn refresh_cooldown_clears_queued_wallet_so_other_wallet_refreshes() {
     positions.respond.fail();
     let follow_up = running.requests.recv().await.unwrap();
     assert!(follow_up.url.contains(&wallet().to_string()));
-    assert!(!follow_up.url.ends_with("&start=1"));
+    assert!(!follow_up.url.contains("&start=1&"));
     running.clear_waits();
     follow_up.respond.send(b"[]".to_vec()).unwrap();
     running.completed(wallet()).await;
@@ -1796,7 +2064,7 @@ async fn refresh_cooldown_clears_queued_wallet_so_other_wallet_refreshes() {
     for expected in [wallet(), other] {
         let request = running.requests.recv().await.unwrap();
         assert!(request.url.contains(&expected.to_string()));
-        assert!(!request.url.ends_with("&start=1"));
+        assert!(!request.url.contains("&start=1&"));
         request.respond.send(b"[]".to_vec()).unwrap();
         running.completed(expected).await;
     }
@@ -1806,7 +2074,7 @@ async fn refresh_cooldown_clears_queued_wallet_so_other_wallet_refreshes() {
         .expect("B must refresh while A is cooling down")
         .unwrap();
     assert!(refresh.url.contains(&other.to_string()));
-    assert!(refresh.url.ends_with("&start=1"));
+    assert!(refresh.url.contains("&start=1&"));
     assert!(Instant::now() < deadline);
     refresh.respond.send(b"[]".to_vec()).unwrap();
     loop {
@@ -1839,7 +2107,7 @@ async fn queued_refresh_wallet_that_becomes_obligated_yields_its_turn() {
         Some(EPOCH),
     );
     let refresh_of = |url: &str, target: WalletAddress| {
-        url.contains(&target.to_string()) && url.ends_with("&start=1")
+        url.contains(&target.to_string()) && url.contains("&start=1&")
     };
     // Round 1 starts `first`'s refresh, held here; round 2 queues wallet() behind it.
     let mut held = None;
@@ -1946,7 +2214,7 @@ async fn refresh_cooldown_normal_selection_skips_before_and_selects_at_expiry() 
     for expected in [wallet(), other] {
         let request = running.requests.recv().await.unwrap();
         assert!(request.url.contains(&expected.to_string()));
-        assert!(!request.url.ends_with("&start=1"));
+        assert!(!request.url.contains("&start=1&"));
         running.clear_waits();
         request.respond.send(b"[]".to_vec()).unwrap();
         running.completed(expected).await;
@@ -1975,7 +2243,7 @@ async fn refresh_cooldown_normal_selection_skips_before_and_selects_at_expiry() 
     for expected in [wallet(), other] {
         let request = running.requests.recv().await.unwrap();
         assert!(request.url.contains(&expected.to_string()));
-        assert!(!request.url.ends_with("&start=1"));
+        assert!(!request.url.contains("&start=1&"));
         request.respond.send(b"[]".to_vec()).unwrap();
         running.completed(expected).await;
     }
@@ -1985,7 +2253,7 @@ async fn refresh_cooldown_normal_selection_skips_before_and_selects_at_expiry() 
         .expect("normal selection must skip cooling A and refresh eligible B")
         .unwrap();
     assert!(refresh.url.contains(&other.to_string()));
-    assert!(refresh.url.ends_with("&start=1"));
+    assert!(refresh.url.contains("&start=1&"));
     assert_eq!(Instant::now(), before_expiry);
     refresh.respond.send(b"[]".to_vec()).unwrap();
     loop {
@@ -2018,7 +2286,7 @@ async fn refresh_cooldown_normal_selection_skips_before_and_selects_at_expiry() 
     for expected in [wallet(), other] {
         let request = running.requests.recv().await.unwrap();
         assert!(request.url.contains(&expected.to_string()));
-        assert!(!request.url.ends_with("&start=1"));
+        assert!(!request.url.contains("&start=1&"));
         request.respond.send(b"[]".to_vec()).unwrap();
         running.completed(expected).await;
     }
@@ -2027,7 +2295,7 @@ async fn refresh_cooldown_normal_selection_skips_before_and_selects_at_expiry() 
         .await
         .expect("normal selection must launch a refresh at expiry")
         .unwrap();
-    assert!(refresh.url.ends_with("&start=1"));
+    assert!(refresh.url.contains("&start=1&"));
     assert!(
         refresh.url.contains(&wallet().to_string()),
         "normal selection must choose A exactly at expiry: {}",
@@ -2070,12 +2338,12 @@ async fn refresh_cooldown_uses_terminal_time_and_gates_normal_queued_and_retry_p
         running.completed(wallet()).await;
         running.round_completed().await;
         let activity = running.requests.recv().await.unwrap();
-        assert!(activity.url.ends_with("&start=1"));
+        assert!(activity.url.contains("&start=1&"));
         activity.respond.send(b"[]".to_vec()).unwrap();
         if !routine {
             // A re-anchoring refresh reads its first tail after the full baseline.
             let tail = running.requests.recv().await.unwrap();
-            assert!(tail.url.contains("/activity?") && !tail.url.ends_with("&start=1"));
+            assert!(tail.url.contains("/activity?") && !tail.url.contains("&start=1&"));
             tail.respond.send(b"[]".to_vec()).unwrap();
         }
         let positions = running.requests.recv().await.unwrap();
@@ -2119,7 +2387,7 @@ async fn refresh_cooldown_uses_terminal_time_and_gates_normal_queued_and_retry_p
             let follow_up = running.requests.recv().await.unwrap();
             assert!(follow_up.url.contains("/activity?"));
             assert!(
-                !follow_up.url.ends_with("&start=1"),
+                !follow_up.url.contains("&start=1&"),
                 "the follow-up is incremental"
             );
             running.clear_waits();
@@ -2134,7 +2402,7 @@ async fn refresh_cooldown_uses_terminal_time_and_gates_normal_queued_and_retry_p
         } else {
             // A non-routine deferral has no forced read; the overdue ordinary round still runs.
             let ordinary = running.requests.recv().await.unwrap();
-            assert!(!ordinary.url.ends_with("&start=1"));
+            assert!(!ordinary.url.contains("&start=1&"));
             ordinary.respond.send(b"[]".to_vec()).unwrap();
             running.completed(wallet()).await;
             running.round_completed().await;
@@ -2158,7 +2426,7 @@ async fn refresh_cooldown_uses_terminal_time_and_gates_normal_queued_and_retry_p
         );
         tokio::time::advance(before_expiry.duration_since(Instant::now())).await;
         let ordinary = running.requests.recv().await.unwrap();
-        assert!(!ordinary.url.ends_with("&start=1"));
+        assert!(!ordinary.url.contains("&start=1&"));
         ordinary.respond.send(b"[]".to_vec()).unwrap();
         running.completed(wallet()).await;
         running.round_completed().await;
@@ -2178,14 +2446,14 @@ async fn refresh_cooldown_uses_terminal_time_and_gates_normal_queued_and_retry_p
         assert_eq!(Instant::now(), deadline);
         if !routine {
             let ordinary = running.requests.recv().await.unwrap();
-            assert!(!ordinary.url.ends_with("&start=1"));
+            assert!(!ordinary.url.contains("&start=1&"));
             ordinary.respond.send(b"[]".to_vec()).unwrap();
             running.completed(wallet()).await;
             running.round_completed().await;
         }
         let retry = running.requests.recv().await.unwrap();
         assert!(
-            retry.url.ends_with("&start=1"),
+            retry.url.contains("&start=1&"),
             "refresh launches at expiry"
         );
         retry.respond.send(b"[]".to_vec()).unwrap();
@@ -2250,7 +2518,7 @@ async fn refresh_cooldown_resets_on_restart() {
     restarted.completed(wallet()).await;
     restarted.round_completed().await;
     let refresh = restarted.requests.recv().await.unwrap();
-    assert!(refresh.url.ends_with("&start=1"));
+    assert!(refresh.url.contains("&start=1&"));
     assert!(restarted.waiting().await.refresh_cooldown.is_empty());
     restarted.finish().await;
 }
@@ -2367,7 +2635,7 @@ async fn reanchor_refresh_finishes_through_its_wallets_observations() {
     running.completed(wallet()).await;
     running.round_completed().await;
     let baseline = running.requests.recv().await.unwrap();
-    assert!(baseline.url.ends_with("&start=1"));
+    assert!(baseline.url.contains("&start=1&"));
 
     // The harness validator's clock stays at EPOCH: the trade becomes visible after the baseline
     // read its window, so only the tails return it.
@@ -2386,7 +2654,7 @@ async fn reanchor_refresh_finishes_through_its_wallets_observations() {
         "outcomeIndex": 0,
         "negativeRisk": false
     });
-    let tail = format!("&start={}", EPOCH - REENTRY_HISTORY_OVERLAP_SECS + 1);
+    let tail = format!("&start={}&", EPOCH - REENTRY_HISTORY_OVERLAP_SECS + 1);
     let mut tails = 0;
     // The harness records the install before acknowledging it, so Anchored precedes any urgent read.
     loop {
@@ -2395,7 +2663,7 @@ async fn reanchor_refresh_finishes_through_its_wallets_observations() {
             event = running.controls.recv() => if matches!(event, Some(ControlCompletion::Anchored(w)) if w == wallet()) { break },
             request = running.requests.recv() => {
                 let request = request.unwrap();
-                let body = if request.url.ends_with(&tail) {
+                let body = if request.url.contains(&tail) {
                     tails += 1;
                     serde_json::to_vec(std::slice::from_ref(&row)).unwrap()
                 } else {
@@ -2404,7 +2672,7 @@ async fn reanchor_refresh_finishes_through_its_wallets_observations() {
                         "only re-entry tails and positions until it anchors: {}",
                         request.url
                     );
-                    if request.url.contains("redeemable=false") {
+                    if request.url.contains("status=OPEN") {
                         serde_json::to_vec(std::slice::from_ref(&position)).unwrap()
                     } else {
                         b"[]".to_vec()
@@ -2471,7 +2739,7 @@ async fn reanchor_refresh_yields_while_a_daily_boundary_waits_on_its_wallet() {
     running.completed(wallet()).await;
     running.round_completed().await;
     let baseline = running.requests.recv().await.unwrap();
-    assert!(baseline.url.ends_with("&start=1"));
+    assert!(baseline.url.contains("&start=1&"));
 
     running.now.store(cutoff - 1, Ordering::SeqCst);
     let row = stream_row(wallet(), "boundary-reanchor", cutoff - 1);
@@ -2482,7 +2750,7 @@ async fn reanchor_refresh_yields_while_a_daily_boundary_waits_on_its_wallet() {
         .await
         .expect("the pending boundary must make the refresh yield")
         .unwrap();
-    assert!(!urgent.url.ends_with("&start=1"));
+    assert!(!urgent.url.contains("&start=1&"));
     assert!(
         baseline.respond.send(b"[]".to_vec()).is_err(),
         "the baseline was cancelled"
@@ -2510,7 +2778,7 @@ async fn reanchor_refresh_yields_while_a_daily_boundary_waits_on_its_wallet() {
         .unwrap()
         .unwrap();
     assert!(
-        retry.url.ends_with("&start=1"),
+        retry.url.contains("&start=1&"),
         "a fresh full baseline: {}",
         retry.url
     );
@@ -2519,7 +2787,7 @@ async fn reanchor_refresh_yields_while_a_daily_boundary_waits_on_its_wallet() {
     let later_receipt = running.observe(later.clone()).await;
     retry.respond.send(b"[]".to_vec()).unwrap();
     // The harness's validator clock stays at EPOCH, so the retry's tails start from it.
-    let tail = format!("&start={}", EPOCH - REENTRY_HISTORY_OVERLAP_SECS + 1);
+    let tail = format!("&start={}&", EPOCH - REENTRY_HISTORY_OVERLAP_SECS + 1);
     let mut tails = 0;
     loop {
         tokio::select! {
@@ -2527,7 +2795,7 @@ async fn reanchor_refresh_yields_while_a_daily_boundary_waits_on_its_wallet() {
             event = running.controls.recv() => if matches!(event, Some(ControlCompletion::Anchored(w)) if w == wallet()) { break },
             request = running.requests.recv() => {
                 let request = request.unwrap();
-                if request.url.ends_with(&tail) {
+                if request.url.contains(&tail) {
                     tails += 1;
                 } else {
                     assert!(
@@ -3078,18 +3346,22 @@ async fn stalled_second_backstop_page_yields_to_new_same_wallet_obligation() {
     let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
     let first = running.requests.recv().await.unwrap();
     let older = stream_row(wallet(), "stalled-page", EPOCH - 1);
-    first
-        .respond
-        .send(
-            serde_json::to_vec(&vec![
-                older;
-                usize::try_from(RECONCILIATION_PAGE_LIMIT).unwrap()
-            ])
-            .unwrap(),
+    let url = reqwest::Url::parse(&first.url).unwrap();
+    let query = url.query_pairs().into_owned().collect();
+    let page = data_api_v2::DataApiV2::default()
+        .reply(
+            url.path(),
+            &vec![older; usize::try_from(RECONCILIATION_PAGE_LIMIT + 1).unwrap()],
+            &query,
+            Some(usize::try_from(RECONCILIATION_PAGE_LIMIT).unwrap()),
         )
         .unwrap();
+    first
+        .respond
+        .send(serde_json::to_vec(&page).unwrap())
+        .unwrap();
     let stalled = running.requests.recv().await.unwrap();
-    assert!(stalled.url.contains("offset=500"));
+    assert!(stalled.url.contains("cursor=fake-v2-0"));
     running.now.store(EPOCH + 1, Ordering::SeqCst);
     let row = stream_row(wallet(), "after-fixed-end", EPOCH + 1);
     let receipt = running.observe(row.clone()).await;
@@ -7443,7 +7715,7 @@ async fn poller_routes_valid_buckets_beside_each_anomaly_and_restarts_anomaly_on
                 assert!(
                     source_frames(&dir.path().join("source.log"))
                         .iter()
-                        .any(|frame| frame.schema_version == 4
+                        .any(|frame| frame.schema_version == 7
                             && frame.source_id.0
                                 == pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID)
                 );
@@ -7541,7 +7813,7 @@ async fn routine_refresh_with_each_anomaly_keeps_the_poller_copying() {
                 request = running.requests.recv() => {
                     let request = request.unwrap();
                     let body = if request.url.contains("/activity?") {
-                        assert!(request.url.ends_with("&start=1"), "{}", request.url);
+                        assert!(request.url.contains("&start=1&"), "{}", request.url);
                         activity_reads += 1;
                         payload.clone()
                     } else {
@@ -7573,7 +7845,7 @@ async fn routine_refresh_with_each_anomaly_keeps_the_poller_copying() {
         let receipt = running.observe(healthy.clone()).await;
         let poll = running.requests.recv().await.unwrap();
         assert!(poll.url.contains("/activity?"));
-        assert!(!poll.url.ends_with("&start=1"));
+        assert!(!poll.url.contains("&start=1&"));
         poll.respond
             .send(serde_json::to_vec(&[healthy]).unwrap())
             .unwrap();
@@ -8554,4 +8826,80 @@ async fn anomaly_counterpart_membership_retry_keeps_receipt_until_atomic_commit(
         .is_empty()
     );
     server.abort();
+}
+
+/// Acquisition records each raw cursor page before the complete read reaches verification.
+#[tokio::test(start_paused = true)]
+async fn v2_cursor_pages_are_recorded_in_acquisition_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, _) = start_recorded_poller(&dir, &[wallet()]);
+    let rows: Vec<_> = (1..=5)
+        .map(|index| {
+            activity_row(
+                "TRADE",
+                &format!("0xpage-{index}"),
+                MARKET_A,
+                "BUY",
+                "1",
+                "asset-a",
+                EPOCH - index,
+            )
+        })
+        .collect();
+    let mut api = data_api_v2::DataApiV2::default();
+    let mut bodies = Vec::new();
+    for index in 0..3 {
+        let request = running.requests.recv().await.unwrap();
+        let url = reqwest::Url::parse(&request.url).unwrap();
+        let query = url.query_pairs().into_owned().collect::<HashMap<_, _>>();
+        let suffix = if index == 0 {
+            "limit=1000".to_owned()
+        } else {
+            format!("cursor=fake-v2-{}", index - 1)
+        };
+        assert_eq!(
+            request.url,
+            format!(
+                "{BASE_URL}/v2/activity?user={}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&start={}&end={EPOCH}&sort_direction=DESC&{suffix}",
+                wallet(),
+                EPOCH - 10
+            )
+        );
+        let page = api.reply(url.path(), &rows, &query, Some(2)).unwrap();
+        assert_eq!(
+            page["data"].as_array().unwrap().len(),
+            if index == 2 { 1 } else { 2 }
+        );
+        let body = serde_json::to_vec(&page).unwrap();
+        bodies.push(body.clone());
+        request.respond.send(body).unwrap();
+    }
+    while running
+        .source_receipts
+        .receipt_at(pe_core_types::EventSeq(2))
+        .unwrap()
+        .is_none()
+    {
+        tokio::task::yield_now().await;
+    }
+
+    let frames = source_frames(&dir.path().join("source.log"));
+    let pages: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame.source_id.0 == pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID)
+        .collect();
+    assert_eq!(pages.len(), 3);
+    for (page, body) in pages.iter().zip(bodies) {
+        assert_eq!(
+            page.schema_version,
+            pe_service::trade_poller::ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            page.parser_version,
+            pe_source_polymarket_public::ACTIVITY_PARSER_VERSION
+        );
+        assert_eq!(page.payload, body);
+    }
+    assert!(pages.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+    running.finish().await;
 }

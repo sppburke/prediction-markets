@@ -38,6 +38,29 @@
 
 ## Polymarket
 
+<a id="data-api-v2-retirement-and-contract-phase-1"></a>
+
+> **Data API v2 retirement and contract (phase 1).** Last checked: **2026-11-02**;
+> re-verify by **2027-01-01**. The official
+> [v1→v2 migration guide](https://docs.polymarket.com/migrate/data-api-v1-to-v2.md)
+> announces v1 retirement on November 2, 2026. Supplied live checks (T2) on that date found
+> every v1 Data API route returning HTTP 410:
+> `{"error":"Data API v1 has been retired","migration":"https://data-api.polymarket.com/v2/","docs":"https://docs.polymarket.com/api-reference/data-api/overview"}`.
+> `/v2/activity`, `/v2/positions` and `/v2/trades` returned HTTP 200 with `data` arrays and
+> `pagination`. Following the raw `next_cursor` with the same filters returned the next page.
+>
+> The downloaded official [OpenAPI spec](https://data-api.polymarket.com/v2/openapi.json)
+> (version 0.1.0, captured 2026-11-02; T3) requires cursor-only paging; an `offset` query is
+> rejected with HTTP 400. Fields are snake_case, `market` becomes `condition`, and the former
+> position surfaces fold into `/v2/positions` with status selection. The canonical condition-id
+> bound, status set, pe-service request defaults, cursor completeness and replay schemas live in
+> the [glossary's v2 contract](_GLOSSARY.md#data-api-v2-contract-pe-service-phase-1).
+> V2 HTTP 429 carries `Retry-After` and uses the existing retry policy.
+>
+> Phase 1 migrates pe-service activity and positions; bootstrap callers are phase 2. V1 endpoint
+> and offset contracts below are historical. These dates retain the supplied source-pass and live
+> check provenance; this documentation pass read the local spec and made no network requests.
+
 > **Scheduled-end day and leaderboard paging (#757).** Last checked: **2026-10-09** for
 > CLOB `end_date_iso`: the supplied issue evidence measured UTC-midnight markers in 99.19% of
 > 1,442,086 markets. The marker names the scheduled end's UTC day; scoring and gate C use its
@@ -332,16 +355,18 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 > `redeemable` partitions with `sizeThreshold=0&includeArchived=true`, reports the wallet's true
 > current balances and is the authority for absolute balances at an anchor (issue #555).
 
-> **Data API v2 captured official contracts (2026-09-10, issue #588).** The
+> **Historical Data API v2 captured official contracts (2026-09-10, issue #588).** The
 > [account activity feed](https://docs.polymarket.com/api-reference/feeds/list-account-activity)
 > uses keyset pagination on `(block_timestamp, sequence_id)`.
 > [Data freshness](https://docs.polymarket.com/api-reference/service/get-data-freshness)
 > is served from a background-refreshed snapshot; `computed_at` and `age_seconds` expose the
 > snapshot's age, and the endpoint returns `503` before its first refresh. The
 > [migration guide](https://docs.polymarket.com/api-reference/data-api/migrating-from-v1)
-> says the original routes remain available and this Data API migration is unrelated to CLOB V2.
+> said the original routes remained available at that time; the retirement verified above
+> supersedes that availability claim. This Data API migration is unrelated to CLOB V2.
 > Neither the activity nor freshness page establishes immutable bucket closure or two-second
-> execution. The service retains its existing `/activity` interface. Captured pages:
+> execution. The service then retained its v1 `/activity` interface; current pe-service reads use
+> the [canonical v2 contract](_GLOSSARY.md#data-api-v2-contract-pe-service-phase-1). Captured pages:
 > `/home/sean/reports/issue-588-plan-2026-09-10/review/{list-account-activity,get-data-freshness,migrating-from-v1}.md`.
 
 > **Gamma `/markets?clob_token_ids=` is the asset identity authority (Last checked: 2026-10-09; issue #555 addendum, live probes 2026-09-02).** The venue's activity feed mis-stamps individual rows: on wallet `0x0857…` / market `0xba9968…` six TRADE rows carried asset `9361629…` as `outcomeIndex 0` ("Yes") and one row carried the same asset as `outcomeIndex 1` while still labeled "Yes". Gamma resolves the token unambiguously (`clobTokenIds[0]` = that asset on a binary market), so a token's `(conditionId, outcome index)` comes from the market's `clobTokenIds` array position, never from activity rows alone. Query form: repeat-key `clob_token_ids=A&clob_token_ids=B…` (comma-joined ids are a validation error, `{"type":"validation error","error":"invalid clob token ids"}`); the plain query returned nothing for the sampled closed tokens and `&closed=true` returned their markets, so the open variant is tried first and the closed variant for leftovers. Gamma carries no combo classification: `Ordinary|Combo` stays activity-derived and must be unanimous per asset. When the wallet has SPLIT/MERGE activity naming a condition, its outcome tokens are discovered through repeat-key `/markets?condition_ids=` pages, with an open lookup first and a closed lookup for unresolved conditions. SPLIT/MERGE combo flags must be unanimous per condition; disagreement leaves it unresolved. These pages are recorded and verified through the same resolver, combined-page conflict checks, durable rejection markers, and provenance as token lookups; cached identities cannot bypass fresh discovery evidence, and discovery cannot overwrite an activity-derived mapping. Completed condition discoveries, including empty results, are remembered once per resolver process lifetime and reuse token-cache identities and original provenance subject to later rejections, so bracket stability reads make no further condition requests or page recordings. A position-only asset whose market has no wallet activity is deferred, not guessed. Every fetched metadata page is recorded through the source log before its identities are used, and accepted discovery provenance joins the bracket proof's `metadata_reads`. The [official list-markets contract](https://docs.polymarket.com/api-reference/markets/list-markets) documents `condition_ids` (checked 2026-10-09).
@@ -386,12 +411,18 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/api-reference/relayer/get-relayer-address-and-nonce | 2026-10-26 | 2026-12-25 |
 | https://docs.polymarket.com/api-reference/relayer/get-a-transaction-by-id | 2026-10-26 | 2026-12-25 |
 | https://docs.polymarket.com/programs/taker-rebates | 2026-10-26 | 2026-12-25 |
-| https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-10-10 | 2026-12-09 |
-| https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets | 2026-10-23 | 2026-12-22 |
-| https://docs.polymarket.com/api-reference/core/get-user-activity (`TAKER_REBATE` type) | 2026-10-26 | 2026-12-25 |
-| https://docs.polymarket.com/api-reference/feeds/list-account-activity | 2026-09-10 | 2026-11-09 |
+| https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings (v1 route retired, HTTP 410) | 2026-11-02 | 2027-01-01 |
+| https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets (v1 route retired, HTTP 410) | 2026-11-02 | 2027-01-01 |
+| https://docs.polymarket.com/api-reference/core/get-user-activity (v1 route retired, HTTP 410; historical `TAKER_REBATE` check above) | 2026-11-02 | 2027-01-01 |
+| https://docs.polymarket.com/api-reference/data-api/overview (linked by the v1 HTTP 410 body) | 2026-11-02 | 2027-01-01 |
+| https://docs.polymarket.com/migrate/data-api-v1-to-v2.md | 2026-11-02 | 2027-01-01 |
+| https://data-api.polymarket.com/v2/openapi.json (downloaded official spec, version 0.1.0) | 2026-11-02 | 2027-01-01 |
+| https://data-api.polymarket.com/v2/activity | 2026-11-02 | 2027-01-01 |
+| https://data-api.polymarket.com/v2/positions | 2026-11-02 | 2027-01-01 |
+| https://data-api.polymarket.com/v2/trades | 2026-11-02 | 2027-01-01 |
+| https://docs.polymarket.com/api-reference/feeds/list-account-activity (v2 contract checked against captured OpenAPI) | 2026-11-02 | 2027-01-01 |
 | https://docs.polymarket.com/api-reference/service/get-data-freshness | 2026-09-10 | 2026-11-09 |
-| https://docs.polymarket.com/api-reference/data-api/migrating-from-v1 | 2026-09-10 | 2026-11-09 |
+| https://docs.polymarket.com/api-reference/data-api/migrating-from-v1 (historical capture; availability claim superseded above) | 2026-09-10 | 2026-11-09 |
 | https://clob.polymarket.com/markets?closed=true | 2026-10-09 | 2026-12-08 |
 | https://docs.polymarket.com/api-reference/markets/list-markets | 2026-10-13 | 2026-12-12 |
 | https://docs.polymarket.com/api-reference/events/list-events | 2026-07-28 | 2026-09-26 |
@@ -400,7 +431,7 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/api-reference/market-data/get-order-book | 2026-09-27 | 2026-11-26 |
 | https://docs.polymarket.com/api-reference/trade/get-user-orders | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/trade/get-trades | 2026-07-17 | 2026-09-15 |
-| https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-10-13 | 2026-12-12 |
+| https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user (v1 route retired, HTTP 410) | 2026-11-02 | 2027-01-01 |
 | https://docs.polymarket.com/concepts/resolution | 2026-09-01 | 2026-10-31 |
 | https://docs.polygon.technology/pos/reference/rpc-endpoints | 2026-09-05 | 2026-12-04 |
 | https://docs.polygon.technology/pos/concepts/finality/finality | 2026-09-05 | 2026-12-04 |

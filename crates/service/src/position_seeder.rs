@@ -23,10 +23,10 @@ use pe_position_ledger::LedgerEffect;
 use pe_position_ledger::PositionLedger;
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAssetMapping, ActivityParseError,
-    ActivityReadError, ActivityRowAcceptance, ActivityValidationError, CompleteActivityRead,
-    CompletePositionsRead, PositionClassification, PositionReadError, ReconciliationFetcher,
-    ReqwestFetcher, fetch_complete_activity_with_acceptance, fetch_complete_positions,
+    ACTIVITY_PARSER_VERSION, ActivityAssetMapping, ActivityParseError, ActivityReadError,
+    ActivityRowAcceptance, ActivityValidationError, CompleteActivityRead, CompletePositionsRead,
+    PositionClassification, PositionReadError, ReconciliationFetcher, ReqwestFetcher,
+    V2ActivityRequest, fetch_complete_activity_v2, fetch_complete_positions_v2,
 };
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -264,6 +264,9 @@ fn classify_activity_read(error: &pe_source_polymarket_public::ActivityReadError
         },
         ActivityReadError::SaturatedTerminalSecond { .. } => FailureClass::WalletPersistent,
         ActivityReadError::InvalidOffset { .. }
+        | ActivityReadError::V2Envelope(_)
+        | ActivityReadError::V2Authentication(_)
+        | ActivityReadError::InvalidBounds { .. }
         | ActivityReadError::RowOutsideBounds { .. }
         | ActivityReadError::InvalidSplit { .. }
         | ActivityReadError::CanonicalPage(_)
@@ -284,6 +287,8 @@ fn classify_position_read(error: &pe_source_polymarket_public::PositionReadError
         | PositionReadError::DuplicateAsset { .. }
         | PositionReadError::SaturatedTerminalPage { .. } => FailureClass::WalletPersistent,
         PositionReadError::MetadataUnresolved { .. }
+        | PositionReadError::V2Envelope(_)
+        | PositionReadError::V2Authentication(_)
         | PositionReadError::ProofComponentTooLong
         | PositionReadError::PageTooLarge { .. }
         | PositionReadError::Json(_)
@@ -439,6 +444,18 @@ impl CausalPositionError {
                 ..
             } => "activity.invalid_offset",
             Self::Activity {
+                source: ActivityReadError::V2Envelope(_),
+                ..
+            } => "activity.v2_envelope",
+            Self::Activity {
+                source: ActivityReadError::V2Authentication(_),
+                ..
+            } => "activity.v2_authentication",
+            Self::Activity {
+                source: ActivityReadError::InvalidBounds { .. },
+                ..
+            } => "activity.invalid_bounds",
+            Self::Activity {
                 source: ActivityReadError::RowOutsideBounds { .. },
                 ..
             } => "activity.row_outside_bounds",
@@ -466,6 +483,14 @@ impl CausalPositionError {
                 source: PositionReadError::Json(_),
                 ..
             } => "positions.json",
+            Self::Positions {
+                source: PositionReadError::V2Envelope(_),
+                ..
+            } => "positions.v2_envelope",
+            Self::Positions {
+                source: PositionReadError::V2Authentication(_),
+                ..
+            } => "positions.v2_authentication",
             Self::Positions {
                 source: PositionReadError::MissingField { .. },
                 ..
@@ -1382,13 +1407,15 @@ impl CausalPositionValidator {
         start: Option<i64>,
         fixed_end: i64,
     ) -> Result<CompleteActivityRead, CausalPositionError> {
-        fetch_complete_activity_with_acceptance(
+        fetch_complete_activity_v2(
             self.fetcher.as_ref(),
             &self.base_url,
-            wallet,
-            start,
-            fixed_end,
-            ActivityRowAcceptance::StrictWithAnomalies,
+            &V2ActivityRequest::position_changes(
+                wallet,
+                start,
+                fixed_end,
+                ActivityRowAcceptance::StrictWithAnomalies,
+            ),
         )
         .await
         .map_err(|source| CausalPositionError::Activity { wallet, source })
@@ -1612,7 +1639,7 @@ impl CausalPositionValidator {
         wallet: WalletAddress,
         mapping: &pe_source_polymarket_public::ActivityAssetMapping,
     ) -> Result<CompletePositionsRead, CausalPositionError> {
-        fetch_complete_positions(self.fetcher.as_ref(), &self.base_url, wallet, mapping)
+        fetch_complete_positions_v2(self.fetcher.as_ref(), &self.base_url, wallet, mapping)
             .await
             .map_err(|source| CausalPositionError::Positions { wallet, source })
     }
@@ -2058,11 +2085,7 @@ impl ReconciliationFetcher for DurableRecordingFetcher {
             }
             let envelope = EnvelopeIn {
                 source_id: SourceId(ACTIVITY_POLL_SOURCE_ID.to_owned()),
-                schema_version: if anomalous {
-                    crate::trade_poller::ACTIVITY_HISTORICAL_ANOMALY_PAGE_SCHEMA_VERSION
-                } else {
-                    ACTIVITY_SCHEMA_VERSION
-                },
+                schema_version: crate::trade_poller::ACTIVITY_HISTORICAL_V2_PAGE_SCHEMA_VERSION,
                 parser_version: ACTIVITY_PARSER_VERSION,
                 observed_at: SourceTimestamp(received_at),
                 received_at: ReceivedAt(received_at),
@@ -2706,7 +2729,7 @@ mod tests {
             &'a self,
             _url: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
-            Box::pin(async { Ok(b"[]".to_vec()) })
+            Box::pin(async { Ok(crate::trade_poller::test_v2_page(json!([]))) })
         }
     }
 
@@ -2722,7 +2745,7 @@ mod tests {
         };
 
         let error = fetcher
-            .fetch("https://api.example.com/activity")
+            .fetch("https://api.example.com/v2/activity")
             .await
             .unwrap_err();
         assert!(matches!(
@@ -3022,11 +3045,81 @@ mod anomaly_recording_tests {
         }
     }
     fn payload(wallet: WalletAddress, anomalous: bool) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!([{
+        serde_json::to_vec(&serde_json::json!({"data":[{
             "proxyWallet": wallet, "timestamp": 100, "type":"TRADE", "transactionHash":"0xanomaly",
-            "conditionId":"0xca", "asset":"asset-a", "side":"BUY", "isCombo":false,
+            "conditionId":"0xca", "token_id":"asset-a", "side":"BUY", "isCombo":false,
             "outcomeIndex":0, "outcome":"Yes", "price":if anomalous {"2"} else {"0.5"}, "size":"1", "usdcSize":"1"
-        }])).unwrap()
+        }], "pagination":{"limit":1000,"offset":0,"has_more":false,"next_cursor":null}})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn v2_migration_reads_record_activity_and_positions_under_schema_six() {
+        struct Requests(std::sync::Mutex<Vec<String>>);
+        impl ReconciliationFetcher for Requests {
+            fn fetch<'a>(
+                &'a self,
+                url: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    self.0.lock().unwrap().push(url.to_owned());
+                    Ok(crate::trade_poller::test_v2_page(json!([])))
+                })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.log");
+        let sink = Arc::new(tokio::sync::Mutex::new(
+            SourceEventSink::open(&source).unwrap(),
+        ));
+        let inner = Arc::new(Requests(std::sync::Mutex::new(Vec::new())));
+        let wallet = WalletAddress([0xaa; 20]);
+        let validator = CausalPositionValidator::new_recording(
+            inner.clone(),
+            "https://example.test",
+            "test",
+            sink.clone(),
+            Arc::new(AssetIdentityResolver::new(
+                inner.clone(),
+                "https://example.test".to_owned(),
+                100,
+                sink,
+            )),
+            Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap()),
+        );
+        validator
+            .activity_since(wallet, Some(0), 100)
+            .await
+            .unwrap();
+        validator
+            .positions(wallet, &ActivityAssetMapping::from_rows(&[]))
+            .await
+            .unwrap();
+        assert_eq!(
+            *inner.0.lock().unwrap(),
+            vec![
+                format!(
+                    "https://example.test/v2/activity?user={wallet}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&start=1&end=100&sort_direction=DESC&limit=1000"
+                ),
+                format!(
+                    "https://example.test/v2/positions?user={wallet}&status=OPEN&filter_type=TOKENS&filter_amount=0&include_archived=true&sort_by=TOKENS&sort_direction=ASC&limit=1000"
+                ),
+            ]
+        );
+        let frames: Vec<_> = pe_event_log::Reader::replay(&source)
+            .unwrap()
+            .map(|frame| frame.unwrap().1)
+            .collect();
+        assert_eq!(frames.len(), 2);
+        for frame in frames {
+            assert_eq!(
+                frame.schema_version,
+                crate::trade_poller::ACTIVITY_HISTORICAL_V2_PAGE_SCHEMA_VERSION
+            );
+            assert_eq!(frame.parser_version, ACTIVITY_PARSER_VERSION);
+            assert_eq!(frame.source_id.0, ACTIVITY_POLL_SOURCE_ID);
+            assert_eq!(frame.payload, crate::trade_poller::test_v2_page(json!([])));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3057,7 +3150,7 @@ mod anomaly_recording_tests {
             ));
             let wallet = WalletAddress([0xaa; 20]);
             let bytes = match case {
-                "empty" | "empty_existing" => b"[]".to_vec(),
+                "empty" | "empty_existing" => br#"{"data":[],"pagination":{"limit":1000,"offset":0,"has_more":false,"next_cursor":null}}"#.to_vec(),
                 "bad_payload" => b"[".to_vec(),
                 "mismatched_wallet" => payload(WalletAddress([0xbb; 20]), true),
                 _ => payload(wallet, !matches!(case, "healthy" | "healthy_existing")),
@@ -3079,13 +3172,13 @@ mod anomaly_recording_tests {
                 "activity"
             };
             let prefix = if case.starts_with("prefixed_") {
-                "api/v1/"
+                "api/"
             } else {
                 ""
             };
             let result = fetcher
                 .fetch(&format!(
-                    "https://example.test/{prefix}{endpoint}?user={wallet}"
+                    "https://example.test/{prefix}v2/{endpoint}?user={wallet}"
                 ))
                 .await;
             assert_eq!(
@@ -3109,11 +3202,7 @@ mod anomaly_recording_tests {
             } else {
                 assert_eq!(
                     frames[0].schema_version,
-                    if matches!(case, "success" | "prefixed_success") {
-                        5
-                    } else {
-                        ACTIVITY_SCHEMA_VERSION
-                    }
+                    crate::trade_poller::ACTIVITY_HISTORICAL_V2_PAGE_SCHEMA_VERSION
                 );
             }
             if case.ends_with("_existing") {
@@ -3180,7 +3269,7 @@ mod anomaly_recording_tests {
         assert_ne!(boot.active_main, paths.fixed_main);
         let side_path = boot.active_main.clone();
         let wallet = WalletAddress([0xaa; 20]);
-        let url = format!("https://example.test/activity?user={wallet}");
+        let url = format!("https://example.test/v2/activity?user={wallet}");
         let paper = Arc::new(PaperStateDb::open(&side_path).unwrap());
         let mut source = SourceEventSink::open(&paths.source_log).unwrap();
         source.fail_next_append();
@@ -3240,7 +3329,7 @@ mod anomaly_recording_tests {
         assert!(
             pe_event_log::Reader::replay(&paths.source_log)
                 .unwrap()
-                .any(|frame| frame.unwrap().1.schema_version == 5)
+                .any(|frame| frame.unwrap().1.schema_version == 6)
         );
     }
 
@@ -3283,7 +3372,7 @@ mod anomaly_recording_tests {
             ("activity", second),
         ] {
             fetcher
-                .fetch(&format!("https://example.test/{endpoint}?user={wallet}"))
+                .fetch(&format!("https://example.test/v2/{endpoint}?user={wallet}"))
                 .await
                 .unwrap();
         }
@@ -3291,7 +3380,7 @@ mod anomaly_recording_tests {
             .unwrap()
             .map(|frame| frame.unwrap().1.schema_version)
             .collect::<Vec<_>>();
-        assert_eq!(schemas, vec![5, 2, 5, 2]);
+        assert_eq!(schemas, vec![6, 6, 6, 6]);
         assert!(paper.scope_drop_boundary_unix().unwrap().is_some());
     }
 }

@@ -4307,23 +4307,22 @@ mod paper_log_tests {
 
         impl PageFetcher for MappingFetcher {
             async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
-                if url.contains("/activity?") {
-                    return Ok(b"[]".to_vec());
+                if url.contains("/v2/activity?") {
+                    return Ok(crate::trade_poller::test_v2_page(serde_json::json!([])));
                 }
                 if url.contains("/positions?") {
                     if url.contains(&self.deferred.to_string()) {
-                        return serde_json::to_vec(&vec![serde_json::json!({
-                            "proxyWallet": self.deferred,
-                            "asset": "asset-unmapped",
-                            "conditionId": format!("0x{}", "a".repeat(40)),
-                            "size": "1",
-                            "outcomeIndex": 0
-                        })])
-                        .map_err(|error| SourceError::Fatal {
-                            message: error.to_string(),
-                        });
+                        return Ok(crate::trade_poller::test_v2_page(serde_json::json!([{
+                            "proxy_wallet": self.deferred,
+                            "token_id": "asset-unmapped",
+                            "condition_id": format!("0x{}", "a".repeat(40)),
+                            "current_size": "1",
+                            "outcome_index": 0,
+                            "redeemable": false,
+                            "negative_risk": false
+                        }])));
                     }
-                    return Ok(b"[]".to_vec());
+                    return Ok(crate::trade_poller::test_v2_page(serde_json::json!([])));
                 }
                 Err(SourceError::Fatal {
                     message: format!("unexpected admission fixture URL: {url}"),
