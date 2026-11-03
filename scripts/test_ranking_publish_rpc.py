@@ -240,6 +240,10 @@ def test_v2(url, suffix, batch, entries):
                          "has_function_privilege('service_role', 'publish_ranking_batch_v2(text,jsonb,jsonb,jsonb)', 'EXECUTE');").stdout.strip()
         if privileges != "f|f|t":
             raise AssertionError(f"v2 execute privilege mismatch: {privileges}")
+        settings = psql(url, "select proconfig from pg_proc "
+                        "where oid = 'publish_ranking_batch_v2(text,jsonb,jsonb,jsonb)'::regprocedure;").stdout.strip()
+        if settings != "{statement_timeout=120s}":
+            raise AssertionError(f"v2 statement timeout mismatch: {settings}")
         failures = (
             [{**drops[0], "cause": "bad-cause"}],
             [drops[0], drops[0]],
