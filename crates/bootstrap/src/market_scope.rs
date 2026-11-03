@@ -192,7 +192,30 @@ pub(crate) async fn recent_market_scope(
     .await
 }
 
-/// Parse `id:slug,...`, the series a scope must list exactly (the research period pins gen 26's).
+/// List the current recurrence catalog, retaining its page provenance for discovery.
+pub(crate) async fn list_market_series(
+    config: &BootstrapConfig,
+    recurrences: &[String],
+) -> Result<(Vec<ScopeSeries>, Vec<ScopePage>), BootstrapError> {
+    let recurrences = canonical_recurrences(recurrences)?;
+    let client = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| BootstrapError::Internal)?;
+    let fetcher = ReqwestFetcher::new(client).with_min_interval_ms(SCOPE_MIN_INTERVAL_MS);
+    let mut pages = Vec::new();
+    let series = list_series(
+        &fetcher,
+        &config.gamma_base_url,
+        &recurrences,
+        PAGE_RETRY_BASE,
+        &mut pages,
+    )
+    .await?;
+    Ok((series.into_values().collect(), pages))
+}
+
+/// Parse `id:slug,...`, the exact series a scope reads by id (schema two passes discovery's covered set).
 pub fn parse_pinned_series(text: &str) -> Result<Vec<ScopeSeries>, BootstrapError> {
     let mut pinned: Vec<ScopeSeries> = Vec::new();
     for item in text.split(',') {

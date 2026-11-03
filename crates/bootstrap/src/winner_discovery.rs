@@ -17,7 +17,6 @@
 use crate::cache::WalletCache;
 use crate::config::BootstrapConfig;
 use crate::error::BootstrapError;
-use crate::market_scope::ScopeSeries;
 use crate::pile::ActivationPolicy;
 use crate::wallet_discovery::{
     SourceDiscoveryResult, WalletDiscoverySource, run_source_discovery_with_policy,
@@ -40,7 +39,7 @@ pub async fn run_winner_discovery(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
 ) -> Result<WinnerDiscoveryReport, BootstrapError> {
-    run_winner_discovery_with_policy(config, cache, ActivationPolicy::Immediate, None, None).await
+    run_winner_discovery_with_policy(config, cache, ActivationPolicy::Immediate, None).await
 }
 
 /// Winner discovery with an explicit activation policy. The full rank-and-push
@@ -49,7 +48,6 @@ pub async fn run_winner_discovery_with_policy(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
     activation_policy: ActivationPolicy,
-    pinned: Option<&[ScopeSeries]>,
     market_floor: Option<i64>,
 ) -> Result<WinnerDiscoveryReport, BootstrapError> {
     let lb = run_source_discovery_with_policy(
@@ -57,7 +55,6 @@ pub async fn run_winner_discovery_with_policy(
         config,
         cache,
         activation_policy,
-        pinned,
         market_floor,
     )
     .await?;
@@ -69,7 +66,6 @@ pub async fn run_winner_discovery_with_policy(
         config,
         cache,
         activation_policy,
-        pinned,
         market_floor,
     )
     .await
@@ -90,7 +86,6 @@ pub async fn run_winner_discovery_with_policy(
         config,
         cache,
         activation_policy,
-        pinned,
         market_floor,
     )
     .await?;

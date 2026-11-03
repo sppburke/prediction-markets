@@ -36,9 +36,9 @@ use pe_core_types::{
 use pe_position_ledger::{EntryClassification, LedgerMutation, PositionLedger, SecondVerdict};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    ActivityParseContext, ActivityTransport, CLOB_RESOLUTION_PARSER_VERSION,
+    ActivityParseContext, ActivityReadError, ActivityTransport, CLOB_RESOLUTION_PARSER_VERSION,
     CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageManifest, ClobCoveragePage, FixtureFetcher,
-    PageFetcher, parse_activity_response,
+    PageFetcher, V2AuthenticationError, V2PageError, parse_activity_response,
 };
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -528,7 +528,7 @@ async fn finalize_empty_activity_side(
         side,
         &FixtureFetcher::new(HashMap::from([(
             activity_url(WALLET, watermark + 1),
-            b"[]".to_vec(),
+            activity_response(&activity_url(WALLET, watermark + 1), b"[]".to_vec()),
         )])),
         "https://data.example",
         2,
@@ -1770,7 +1770,10 @@ async fn redemption_noops_and_verified_identity_shape_the_projection() {
             rows.sort_by_key(|row| std::cmp::Reverse(row["timestamp"].as_i64().unwrap()));
             (
                 activity_url(wallet, fixed_end),
-                serde_json::to_vec(&rows).unwrap(),
+                activity_response(
+                    &activity_url(wallet, fixed_end),
+                    serde_json::to_vec(&rows).unwrap(),
+                ),
             )
         })
         .collect::<HashMap<_, _>>();
@@ -2166,8 +2169,16 @@ async fn retained_classifier_activity_at_version(
         populate_activity_fresh_v2(
             side,
             &FixtureFetcher::new(HashMap::from([(
-                activity_url(WALLET, fixed_end),
-                raw.clone(),
+                if classifier_version == 6 {
+                    activity_v1_url(WALLET, fixed_end)
+                } else {
+                    activity_url(WALLET, fixed_end)
+                },
+                if classifier_version == 6 {
+                    raw.clone()
+                } else {
+                    activity_response(&activity_url(WALLET, fixed_end), raw.clone())
+                },
             )])),
             "https://data.example",
             7,
@@ -4198,12 +4209,28 @@ const WALLET_D: &str = "0x4444444444444444444444444444444444444444";
 const WALLET_E: &str = "0x5555555555555555555555555555555555555555";
 const FRESH_END: i64 = 1_800_000_000;
 
-// Fresh collection reaches full history: the exclusive bound 0 is `start=1`
-// on the wire, where an omitted `start` returns only the venue's recent window.
-fn activity_url(wallet: &str, end: i64) -> String {
+// Frozen identities retain their v1 offset requests and proof bytes.
+fn activity_v1_url(wallet: &str, end: i64) -> String {
     format!(
         "https://data.example/activity?user={wallet}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={end}&start=1"
     )
+}
+
+// Fresh collection reaches full history: the exclusive bound 0 is `start=1`.
+fn activity_url(wallet: &str, end: i64) -> String {
+    format!(
+        "https://data.example/v2/activity?user={wallet}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&start=1&end={end}&sort_direction=ASC&limit=1000"
+    )
+}
+
+fn activity_response(url: &str, body: Vec<u8>) -> Vec<u8> {
+    if reqwest::Url::parse(url).unwrap().path() == "/v2/activity" {
+        let mut rows: Vec<Value> = serde_json::from_slice(&body).unwrap();
+        rows.sort_by_key(|row| row["timestamp"].as_i64().unwrap());
+        v2_activity_envelope(&rows.iter().collect::<Vec<_>>(), 0, 0, false)
+    } else {
+        body
+    }
 }
 
 // Every wallet other than the original trades one distinct market per epoch.
@@ -4241,18 +4268,17 @@ fn activity_rows(wallet: &str, epochs: &[i64], revised: bool) -> Vec<u8> {
     serde_json::to_vec(&rows).unwrap()
 }
 
-fn fresh_fetcher(wallets: &[&str], end: i64, epochs: &[i64], revised: bool) -> FixtureFetcher {
-    FixtureFetcher::new(
-        wallets
+fn fresh_fetcher(wallets: &[&str], epochs: &[i64], revised: bool) -> DatasetFetcher {
+    DatasetFetcher {
+        rows: wallets
             .iter()
-            .map(|wallet| {
-                (
-                    activity_url(wallet, end),
-                    activity_rows(wallet, epochs, revised),
-                )
+            .flat_map(|wallet| {
+                serde_json::from_slice::<Vec<Value>>(&activity_rows(wallet, epochs, revised))
+                    .unwrap()
             })
             .collect(),
-    )
+        ..Default::default()
+    }
 }
 
 fn fresh_record(path: &std::path::Path) -> Value {
@@ -4320,13 +4346,20 @@ async fn finalize_fresh_initial(dir: &TempDir, side: &std::path::Path) -> String
 }
 
 async fn prepare_fresh_initial(dir: &TempDir, side: &std::path::Path) {
+    prepare_fresh_initial_with_identity(dir, side, false).await;
+}
+
+async fn prepare_fresh_initial_with_identity(dir: &TempDir, side: &std::path::Path, frozen: bool) {
     seed_initial_candidate(side);
     let manifest = write_build_manifest(dir, side);
     migrate_cache_v2(side, &manifest).unwrap();
+    if frozen {
+        collection_admit_v1(side, 1, FRESH_END, &[]).await;
+    }
     let union = [WALLET, WALLET_B, WALLET_C, WALLET_D];
     let manifest = populate_activity_fresh_v2(
         side,
-        &fresh_fetcher(&union, FRESH_END, &[FRESH_END - 1, FRESH_END - 101], false),
+        &fresh_fetcher(&union, &[FRESH_END - 1, FRESH_END - 101], false),
         "https://data.example",
         1,
         FRESH_END,
@@ -4693,12 +4726,7 @@ async fn condition_index_is_optional_through_collection_resume_finalize_and_acti
         };
         let manifest = populate_activity_fresh_v2(
             &side,
-            &fresh_fetcher(
-                &wallets,
-                FRESH_END,
-                &[FRESH_END - 1, FRESH_END - 101],
-                false,
-            ),
+            &fresh_fetcher(&wallets, &[FRESH_END - 1, FRESH_END - 101], false),
             "https://data.example",
             1,
             FRESH_END,
@@ -4821,7 +4849,10 @@ impl PageFetcher for InterruptAfterFirst {
         let url = url.to_owned();
         async move {
             if url.contains(first) {
-                return Ok(activity_rows(first, &[FRESH_END + 50], false));
+                return Ok(activity_response(
+                    &url,
+                    activity_rows(first, &[FRESH_END + 50], false),
+                ));
             }
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
@@ -4882,6 +4913,7 @@ impl PageFetcher for RecordingFetcher {
                 .collect::<Vec<_>>(),
         )
         .unwrap();
+        let body = activity_response(url, body);
         async move { Ok(body) }
     }
 }
@@ -4932,14 +4964,7 @@ impl WriteLockedFetcher {
             .map(|wallet| activity_url(wallet, FRESH_END + 100))
             .to_vec();
         if self.fail_last_read {
-            expected.push(
-                pe_source_polymarket_public::PolymarketEndpoint::UserPositionActivityWindowEnd {
-                    user: WALLET_D.to_owned(),
-                    start: 1,
-                    end: FRESH_END + 100,
-                }
-                .url("https://data.example"),
-            );
+            expected.push(activity_url(WALLET_D, FRESH_END + 100));
         }
         assert_eq!(*self.calls.lock().unwrap(), expected);
     }
@@ -4963,7 +4988,10 @@ impl PageFetcher for WriteLockedFetcher {
             .into_iter()
             .find(|wallet| url.contains(wallet))
             .unwrap();
-        Ok(activity_rows(wallet, &[FRESH_END + 50], false))
+        Ok(activity_response(
+            url,
+            activity_rows(wallet, &[FRESH_END + 50], false),
+        ))
     }
 }
 
@@ -5117,7 +5145,7 @@ impl PageFetcher for PendingActivityReads {
             // Ensure the other three reads are in flight before the writer
             // can fail. They never answer, so only writer failure can wake us.
             tokio::task::yield_now().await;
-            return Ok(activity_rows(WALLET, &[], false));
+            return Ok(activity_response(url, activity_rows(WALLET, &[], false)));
         }
         let _pending = PendingActivityRead(&self.dropped);
         std::future::pending().await
@@ -5154,7 +5182,7 @@ impl PageFetcher for BudgetedReads {
                 .into_iter()
                 .find(|wallet| url.contains(wallet))
                 .unwrap();
-            return Ok(activity_rows(wallet, &[], false));
+            return Ok(activity_response(url, activity_rows(wallet, &[], false)));
         }
         self.attempts.fetch_add(1, Ordering::SeqCst);
         match self.behaviour {
@@ -5164,7 +5192,10 @@ impl PageFetcher for BudgetedReads {
             TargetBehaviour::Hang => {
                 let _pending = PendingActivityRead(&self.dropped);
                 self.release.notified().await;
-                Ok(activity_rows(self.target, &[], false))
+                Ok(activity_response(
+                    url,
+                    activity_rows(self.target, &[], false),
+                ))
             }
         }
     }
@@ -5190,6 +5221,7 @@ fn excluded_receipt(side: &std::path::Path, wallet: &str) -> (Option<String>, i6
 async fn wallet_budget_finishes_an_identity4_page_after_its_deadline() {
     let dir = TempDir::new().unwrap();
     let side = budgeted_candidate(&dir);
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     let fetcher = BudgetedReads::new(WALLET_B, TargetBehaviour::Hang);
     let config = collection_config(&side);
     let run = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
@@ -5384,6 +5416,7 @@ async fn activity_writer_error_cancels_pending_reads_and_rolls_back_wallet() {
 async fn interrupt_fresh_candidate_after_one_receipt(dir: &TempDir, side: &std::path::Path) {
     seed_initial_candidate(side);
     migrate_cache_v2(side, &write_build_manifest(dir, side)).unwrap();
+    collection_admit_v1(side, 1, FRESH_END + 100, &[]).await;
     let error = populate_activity_fresh_v2(
         side,
         &InterruptAfterFirst {
@@ -5488,7 +5521,7 @@ async fn activity_resume_validates_receipt_identity_shape_and_counts_before_sour
     assert_eq!(manifest.wallet_count, 4);
     assert_eq!(
         *fetcher.calls.lock().unwrap(),
-        [WALLET, WALLET_C, WALLET_D].map(|wallet| activity_url(wallet, FRESH_END + 100))
+        [WALLET, WALLET_C, WALLET_D].map(|wallet| activity_v1_url(wallet, FRESH_END + 100))
     );
 }
 
@@ -5521,7 +5554,7 @@ async fn activity_resume_defers_completed_wallet_content_corruption_to_completio
     // despite its deleted group. The old startup content scan makes no calls.
     assert_eq!(
         *fetcher.calls.lock().unwrap(),
-        [WALLET, WALLET_C, WALLET_D].map(|wallet| activity_url(wallet, FRESH_END + 100))
+        [WALLET, WALLET_C, WALLET_D].map(|wallet| activity_v1_url(wallet, FRESH_END + 100))
     );
     assert_eq!(generation_rows(&side, 1), 7);
     assert_eq!(
@@ -5809,6 +5842,7 @@ impl PageFetcher for UnparseableWalletFetcher {
                 .unwrap();
             activity_rows(wallet, &[FRESH_END - 1], false)
         };
+        let body = activity_response(url, body);
         async move { Ok(body) }
     }
 }
@@ -5943,10 +5977,10 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_parsed() {
                             (pe_source_polymarket_public::PolymarketEndpoint::UserPositionActivityWindowEnd {
                                 user: wallet.to_owned(), start: 1, end: next_end,
                             }.url("https://data.example"), b"[]".to_vec()),
-                            (activity_url(wallet, next_end), activity_rows(wallet, &[FRESH_END - 1, FRESH_END - 101], false)),
+                            (activity_url(wallet, next_end), activity_response(&activity_url(wallet, next_end), activity_rows(wallet, &[FRESH_END - 1, FRESH_END - 101], false))),
                         ]
                     } else {
-                        vec![(activity_url(wallet, next_end).replace("start=1", &format!("start={}", FRESH_END + 1)), b"[]".to_vec())]
+                        vec![(activity_url(wallet, next_end).replace("start=1", &format!("start={}", FRESH_END + 1)), activity_response(&activity_url(wallet, next_end), b"[]".to_vec()))]
                     }
                 })
                 .collect(),
@@ -5980,10 +6014,13 @@ impl PageFetcher for InterruptAfterAmbiguous {
         let url = url.to_owned();
         async move {
             if url.contains(WALLET_B) {
-                return Ok(ambiguous_fill_rows(WALLET_B));
+                return Ok(activity_response(&url, ambiguous_fill_rows(WALLET_B)));
             }
             if url.contains(WALLET_D) {
-                return Ok(activity_rows(WALLET_D, &[FRESH_END - 1], false));
+                return Ok(activity_response(
+                    &url,
+                    activity_rows(WALLET_D, &[FRESH_END - 1], false),
+                ));
             }
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
@@ -6042,9 +6079,16 @@ fn receipt(side: &std::path::Path, generation: i64, wallet: &str) -> Option<(i64
 /// resume fetches only wallets without a receipt, validation and finalization
 /// accept the receipt set, the ranker projects nothing for the wallet, and the
 /// next generation's union keeps the wallet even though it is inactive and
-/// retains no history, so a valid history is collected again.
+/// retains no history, so a valid history is collected again. Identity 5 reads
+/// v2; the frozen identity 4 also carries an authentic pre-649 exclusion.
 #[tokio::test]
 async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated() {
+    for frozen in [false, true] {
+        excluded_aggregation_successor(frozen).await;
+    }
+}
+
+async fn excluded_aggregation_successor(frozen: bool) {
     let dir = tempfile::Builder::new()
         .prefix("pe-fresh-excluded-")
         .tempdir_in(std::env::current_dir().unwrap())
@@ -6055,6 +6099,9 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
     let manifest = write_build_manifest(&dir, &side);
     migrate_cache_v2(&side, &manifest).unwrap();
 
+    if frozen {
+        collection_admit_v1(&side, 1, FRESH_END, &[]).await;
+    }
     let interrupted = populate_activity_fresh_v2(
         &side,
         &InterruptAfterAmbiguous { side: side.clone() },
@@ -6087,7 +6134,6 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
         &side,
         &fresh_fetcher(
             &[WALLET, WALLET_C],
-            FRESH_END,
             &[FRESH_END - 1, FRESH_END - 101],
             false,
         ),
@@ -6123,7 +6169,8 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
     );
     assert!(!classifier_projection_rows(&side).is_empty());
 
-    for legacy in [false, true] {
+    let legacies: &[bool] = if frozen { &[false, true] } else { &[false] };
+    for &legacy in legacies {
         // The finalized cache is the next cycle's prior: the excluded wallet is
         // inactive and retains no history there, and only its excluded receipt
         // can carry it into the next union.
@@ -6168,13 +6215,16 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
                         if wallet == WALLET_B {
                             (
                                 activity_url(wallet, next_end),
-                                activity_rows(wallet, &[FRESH_END - 1, FRESH_END - 101], false),
+                                activity_response(
+                                    &activity_url(wallet, next_end),
+                                    activity_rows(wallet, &[FRESH_END - 1, FRESH_END - 101], false),
+                                ),
                             )
                         } else {
                             (
                                 activity_url(wallet, next_end)
                                     .replace("start=1", &format!("start={}", FRESH_END + 1)),
-                                b"[]".to_vec(),
+                                activity_response(&activity_url(wallet, next_end), b"[]".to_vec()),
                             )
                         }
                     })
@@ -8109,7 +8159,7 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
     finalize_against_unfused_reference(&side, &dir.path().join("retained.json"), FRESH_END + 2);
     // Collection already installed the manifest, before payout/projection finalization.
     let unfinalized_legacy = dir.path().join("unfinalized-legacy.db");
-    std::fs::copy(&unfinalized, &unfinalized_legacy).unwrap();
+    prepare_fresh_initial_with_identity(&dir, &unfinalized_legacy, true).await;
     install_legacy_receipt_manifest(&unfinalized_legacy, 1);
     let legacy = dir.path().join("legacy.db");
     std::fs::copy(&unfinalized_legacy, &legacy).unwrap();
@@ -8696,7 +8746,7 @@ async fn lifecycle_check_counts_and_diagnostics_preserve_json_reports() {
             &side,
             &FixtureFetcher::new(HashMap::from([(
                 activity_url(WALLET, FRESH_END),
-                b"[]".to_vec(),
+                activity_response(&activity_url(WALLET, FRESH_END), b"[]".to_vec()),
             )])),
             "https://data.example",
             u64::try_from(initial_schema).unwrap(),
@@ -8936,6 +8986,8 @@ struct DatasetFetcher {
     rows: Vec<Value>,
     calls: Mutex<Vec<(String, i64, i64)>>,
     index: Mutex<DatasetIndex>,
+    urls: Mutex<Vec<String>>,
+    v2_page_sizes: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -8947,13 +8999,41 @@ struct DatasetIndex {
 
 impl PageFetcher for DatasetFetcher {
     async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        self.urls.lock().unwrap().push(url.to_owned());
         let url = reqwest::Url::parse(url).unwrap();
         let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        let v2 = url.path() == "/v2/activity";
         let wallet = query["user"].clone();
         let start = query["start"].parse::<i64>().unwrap();
         let end = query["end"].parse::<i64>().unwrap();
-        let offset = query["offset"].parse::<usize>().unwrap();
-        let limit = query["limit"].parse::<usize>().unwrap();
+        let (offset, page_index, limit) = if v2 {
+            assert_eq!(query["type"], "TRADE,SPLIT,MERGE,REDEEM,CONVERSION");
+            assert_eq!(query["sort_direction"], "ASC");
+            assert!(!query.contains_key("offset"));
+            if let Some(cursor) = query.get("cursor") {
+                assert!(!query.contains_key("limit"));
+                let parts = cursor
+                    .strip_prefix("activity:")
+                    .unwrap()
+                    .split(':')
+                    .collect::<Vec<_>>();
+                (parts[0].parse().unwrap(), parts[1].parse().unwrap(), 1000)
+            } else {
+                assert_eq!(query["limit"], "1000");
+                (0, 0, 1000)
+            }
+        } else {
+            (
+                query["offset"].parse::<usize>().unwrap(),
+                0,
+                query["limit"].parse::<usize>().unwrap(),
+            )
+        };
+        let limit = if v2 {
+            self.v2_page_sizes.get(page_index).copied().unwrap_or(limit)
+        } else {
+            limit
+        };
         self.calls
             .lock()
             .unwrap()
@@ -8990,7 +9070,11 @@ impl PageFetcher for DatasetFetcher {
             index.newest_end = end.max(index.newest_end);
         }
         let Some(positions) = index.wallets.get(&wallet) else {
-            return Ok(b"[]".to_vec());
+            return Ok(if v2 {
+                v2_activity_envelope(&[], offset, page_index, false)
+            } else {
+                b"[]".to_vec()
+            });
         };
         let lo = positions.partition_point(|position| {
             self.rows[*position]["timestamp"].as_i64().unwrap() < start
@@ -8998,7 +9082,7 @@ impl PageFetcher for DatasetFetcher {
         let hi = positions
             .partition_point(|position| self.rows[*position]["timestamp"].as_i64().unwrap() <= end);
         let window = &positions[lo..hi];
-        let rows = if query["sortDirection"] == "ASC" {
+        let rows = if v2 || query["sortDirection"] == "ASC" {
             window
                 .iter()
                 .skip(offset)
@@ -9032,8 +9116,48 @@ impl PageFetcher for DatasetFetcher {
             }
             selected
         };
-        Ok(serde_json::to_vec(&rows).unwrap())
+        Ok(if v2 {
+            v2_activity_envelope(
+                &rows,
+                offset,
+                page_index,
+                offset + rows.len() < window.len(),
+            )
+        } else {
+            serde_json::to_vec(&rows).unwrap()
+        })
     }
+}
+
+fn v2_activity_envelope(
+    rows: &[&Value],
+    offset: usize,
+    page_index: usize,
+    has_more: bool,
+) -> Vec<u8> {
+    let data = rows
+        .iter()
+        .map(|row| {
+            let mut row = (*row).clone();
+            for (old, new) in [
+                ("proxyWallet", "proxy_wallet"),
+                ("conditionId", "condition_id"),
+                ("asset", "token_id"),
+                ("transactionHash", "transaction_hash"),
+                ("outcomeIndex", "outcome_index"),
+                ("usdcSize", "usdc_size"),
+            ] {
+                if let Some(value) = row.as_object_mut().unwrap().remove(old) {
+                    row[new] = value;
+                }
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&serde_json::json!({
+        "data":data, "pagination":{"limit":1000,"offset":offset,"has_more":has_more,
+        "next_cursor":has_more.then(|| format!("activity:{}:{}", offset + rows.len(), page_index + 1))}
+    })).unwrap()
 }
 
 fn fixture_market(market: &str) -> String {
@@ -10243,6 +10367,7 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
     assert_eq!(generation_rows(&side, 7), 0);
     // The clock is not sampled on a damaged predecessor, and no successor identity is written.
     let damaged = dataset_candidate(&dir, "clock.db", &[]);
+    collection_admit_v1(&damaged, 1, FRESH_END, &[]).await;
     populate_activity_fresh_v2(
         &damaged,
         &source,
@@ -10324,6 +10449,7 @@ async fn retained_wallet_without_a_predecessor_receipt_refuses_a_successor_befor
         rows: vec![dataset_row(WALLET, "0xmarket", "base", "BUY", FRESH_END)],
         ..Default::default()
     };
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     populate_activity_fresh_v2(
         &side,
         &source,
@@ -10527,6 +10653,7 @@ async fn incremental_authentic_v1_resume_and_old_reader_proof_boundary() {
         )],
         ..Default::default()
     };
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     populate_activity_fresh_v2(
         &side,
         &source,
@@ -10870,6 +10997,7 @@ async fn incremental_equal_revision_collision_still_excludes_instead_of_upsertin
         rows: vec![old.clone()],
         ..Default::default()
     };
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     populate_activity_fresh_v2(
         &side,
         &source,
@@ -11324,6 +11452,7 @@ async fn acquisition_failure_authentic_649_resume_preserves_proofs_and_recovers_
         ..Default::default()
     };
     source.rows[1]["side"] = Value::from("invalid");
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     populate_activity_fresh_v2(
         &side,
         &source,
@@ -12875,7 +13004,7 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
                     "&start=1",
                     &format!("&start={}", if cycle == 1 { 1 } else { FRESH_END + cycle }),
                 ),
-                b"[]".to_vec(),
+                activity_response(&activity_url(WALLET, FRESH_END + cycle), b"[]".to_vec()),
             )])),
             "https://data.example",
             u64::try_from(cycle).unwrap(),
@@ -13738,6 +13867,7 @@ async fn incremental_interrupted_v2_resume_preserves_identity_and_receipts() {
     assert_eq!(stored_receipt_proofs(&conn, 1), proofs);
     assert!(empty.calls.lock().unwrap().is_empty());
 
+    collection_admit_v1(&side, 2, FRESH_END + 2, &[]).await;
     populate_activity_fresh_v2(
         &side,
         &source,
@@ -14159,6 +14289,8 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
     );
     let interrupted_anomaly_root = scenario == PublicationScenario::InterruptedAnomalyRoot;
     let legacy_root = scenario == PublicationScenario::LegacyRoot;
+    // Only the unfinished format-two root resumes a frozen v1 walk.
+    let frozen_activity = legacy_root;
     let recovery = scenario == PublicationScenario::Recovery;
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let quiet = format!(
@@ -14395,6 +14527,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         markets,
         serde_json::json!([{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"}]),
         scope_events,
+        frozen_activity,
     );
     let (address, requests, batches) = (
         venue.address,
@@ -14422,7 +14555,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
     )
     .unwrap();
     std::fs::write(dir.path().join(".env"), format!(
-        "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_CATEGORIES='[\"OVERALL\"]'\nPE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER={}\nPE_RANKER_ENGINE=duck\nPE_RANK_MARKET_SERIES=7:btc-up-or-down-15m\nWIN_END={}\n",
+        "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_TOP_N=0\nPE_BOOTSTRAP_LEADERBOARD_CATEGORIES='[\"OVERALL\"]'\nPE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER={}\nPE_RANKER_ENGINE=duck\nWIN_END={}\n",
         dir.path().join("watchlist.json").display(), if scenario == PublicationScenario::Unrepresentable || anomalies { "prepare" } else { "1" }, time::OffsetDateTime::from_unix_timestamp(now - 86_400).unwrap().date())).unwrap();
     if scenario == PublicationScenario::ParticipantHold {
         let path = dir.path().join(".env");
@@ -14451,14 +14584,16 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         let name = format!("cron-{stamp}");
         let out = data.join("eval-results").join(&name);
         std::fs::create_dir_all(&out).unwrap();
+        let mut configuration = serde_json::json!({"cache_lane":"fresh_v2"});
+        // A retained pin stays recorded but cannot override the coverage set.
+        if scenario == PublicationScenario::Transition {
+            configuration["rank_market_series"] = Value::from("999:obsolete-pin");
+        }
         for (file, value) in [
-            (
-                "cycle_configuration.json",
-                serde_json::json!({"cache_lane":"fresh_v2", "rank_market_series":"7:btc-up-or-down-15m"}),
-            ),
+            ("cycle_configuration.json", configuration.clone()),
             (
                 "cycle_manifest.json",
-                serde_json::json!({"version":1,"configuration":{"cache_lane":"fresh_v2", "rank_market_series":"7:btc-up-or-down-15m"}}),
+                serde_json::json!({"version":1,"configuration":configuration}),
             ),
         ] {
             std::fs::write(out.join(file), serde_json::to_vec(&value).unwrap()).unwrap();
@@ -14616,6 +14751,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 ),
                 0
             );
+            assert_wrapper_v2_requests(&requests.lock().unwrap(), frozen_activity);
             venue.stop();
             return;
         }
@@ -14716,6 +14852,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                     source,
                     overrides: BTreeMap::from([(WALLET_C.to_owned(), b"{}".to_vec())]),
                     walk_wallet: None,
+                    probe_failed: std::sync::atomic::AtomicBool::new(false),
                     end: now - 120,
                 };
                 collection_run(
@@ -14727,8 +14864,9 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 )
                 .await
                 .unwrap();
-                hold(&[WALLET_C, "activity response json:"]);
+                hold(&[WALLET_C, "v2 activity envelope:"]);
                 assert_eq!(fresh_record(&side)["generation"], 1);
+                assert_wrapper_v2_requests(&requests.lock().unwrap(), frozen_activity);
                 venue.stop();
                 return;
             }
@@ -14816,6 +14954,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 source,
                 overrides: BTreeMap::new(),
                 walk_wallet: Some(WALLET_D.to_owned()),
+                probe_failed: std::sync::atomic::AtomicBool::new(false),
                 end: now - 120,
             };
             if interrupted_anomaly_root {
@@ -14919,6 +15058,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         };
         assert_eq!(output.status.code(), expected, "{output:?}");
         assert!(request.exists());
+        assert_wrapper_scope(&out, if expected == Some(2) { &side } else { &fixed });
         let identity = fresh_record(
             if scenario == PublicationScenario::Unrepresentable || anomalies {
                 &side
@@ -15065,6 +15205,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 assert_eq!(identity["deferred_wallets"], serde_json::json!([]));
             }
         }
+        assert_wrapper_v2_requests(&requests.lock().unwrap(), frozen_activity);
         venue.stop();
         return;
     }
@@ -15098,6 +15239,9 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         assert_eq!(fresh_record(&side)["version"], 2);
         assert_eq!(count(&side, "PRAGMA user_version"), -2);
         assert!(out.join("cache_stage.json").exists());
+    }
+    if scenario == PublicationScenario::Transition {
+        prepare_cycle(0);
     }
     let mut cycles = Vec::new();
     let mut infra_certificate = None;
@@ -15513,6 +15657,18 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
             ).unwrap();
             assert_eq!(changed, 3);
         }
+        assert_wrapper_scope(&out, &fixed);
+        if scenario == PublicationScenario::Transition {
+            let configuration: Value = serde_json::from_slice(
+                &std::fs::read(out.join("cycle_configuration.json")).unwrap(),
+            )
+            .unwrap();
+            if cycle == 0 {
+                assert_eq!(configuration["rank_market_series"], "999:obsolete-pin");
+            } else {
+                assert!(configuration.get("rank_market_series").is_none());
+            }
+        }
         assert!(!cycles.contains(&out));
         cycles.push(out);
     }
@@ -15544,6 +15700,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         );
         assert_eq!(before.stdout, after.stdout);
     }
+    assert_wrapper_v2_requests(&requests.lock().unwrap(), frozen_activity);
     venue.stop();
 }
 
@@ -15552,6 +15709,7 @@ struct WrapperActivityFixture {
     overrides: BTreeMap<String, Vec<u8>>,
     walk_wallet: Option<String>,
     end: i64,
+    probe_failed: std::sync::atomic::AtomicBool,
 }
 
 impl PageFetcher for WrapperActivityFixture {
@@ -15567,7 +15725,11 @@ impl PageFetcher for WrapperActivityFixture {
         if self.walk_wallet.as_ref() == Some(&query["user"])
             && query["start"] == "1"
             && query["end"] == self.end.to_string()
-            && query["sortDirection"] == "DESC"
+            && (if parsed.path() == "/v2/activity" {
+                !self.probe_failed.swap(true, Ordering::SeqCst)
+            } else {
+                query["sortDirection"] == "DESC"
+            })
         {
             return Err(SourceError::Transient {
                 message: "fixture exhausted probe retries".to_owned(),
@@ -15579,12 +15741,13 @@ impl PageFetcher for WrapperActivityFixture {
 
 // PASS: real parser failures match the wrapper's named E11 constants exactly as
 // recorded in collector receipts; a non-array response matches none; the wrapper's
-// page-parse prefix and exchange-contract set equal the Rust owners'. FAIL: drift.
+// page-parse and v2 envelope/cursor-proof prefixes and exchange-contract set equal
+// the Rust owners'. FAIL: drift.
 #[tokio::test]
 async fn unrepresentable_parser_text_matches_receipt_reasons_and_wrapper_constants() {
     let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let constants = Command::new("python3").current_dir(repository).args(["-c",
-        "import json,sys; sys.path.insert(0, 'scripts'); import rank_cycle_manifest as m; print(json.dumps([m.UNREPRESENTABLE_PRICE,m.UNREPRESENTABLE_MAPPING,m.UNREPRESENTABLE_DECIMAL,m.ACTIVITY_RESPONSE_JSON,m.ACTIVITY_PAGE_PARSE_FAILURE]+sorted(m.EXCHANGE_CONTRACTS)))"])
+        "import json,sys; sys.path.insert(0, 'scripts'); import rank_cycle_manifest as m; print(json.dumps([m.UNREPRESENTABLE_PRICE,m.UNREPRESENTABLE_MAPPING,m.UNREPRESENTABLE_DECIMAL,m.ACTIVITY_RESPONSE_JSON,m.ACTIVITY_PAGE_PARSE_FAILURE,m.V2_ACTIVITY_ENVELOPE,m.V2_ACTIVITY_CURSOR_PROOF]+sorted(m.EXCHANGE_CONTRACTS)))"])
         .output().unwrap();
     assert!(
         constants.status.success(),
@@ -15597,7 +15760,20 @@ async fn unrepresentable_parser_text_matches_receipt_reasons_and_wrapper_constan
         .map(|address| format!("{address:#x}"))
         .collect();
     contracts.sort();
-    assert_eq!(constants[5..], contracts[..]);
+    assert_eq!(constants[7..], contracts[..]);
+    // The wrapper holds a v2 walk's envelope and cursor-proof exclusions by these prefixes.
+    for (error, prefix) in [
+        (
+            ActivityReadError::from(V2PageError::InvalidLimit(1001)),
+            &constants[5],
+        ),
+        (
+            ActivityReadError::from(V2AuthenticationError::EmptyContinuation { index: 0 }),
+            &constants[6],
+        ),
+    ] {
+        assert!(error.to_string().starts_with(prefix.as_str()), "{error}");
+    }
     let mut price = dataset_row(WALLET, "0xa", "price", "BUY", FRESH_END);
     price["price"] = Value::from("3.1968021978");
     let mut mapping = price.clone();
@@ -15634,7 +15810,7 @@ async fn unrepresentable_parser_text_matches_receipt_reasons_and_wrapper_constan
         freeze_identity_four(&side);
         populate_activity_fresh_v2(
             &side,
-            &FixtureFetcher::new(HashMap::from([(activity_url(WALLET, FRESH_END), body)])),
+            &FixtureFetcher::new(HashMap::from([(activity_v1_url(WALLET, FRESH_END), body)])),
             "https://data.example",
             1,
             FRESH_END,
@@ -15690,6 +15866,43 @@ fn fixture_participant_coverage(path: &std::path::Path, now: i64) {
     .unwrap();
 }
 
+fn assert_wrapper_scope(out: &std::path::Path, cache: &std::path::Path) {
+    let coverage = WalletCache::open_read_only(cache)
+        .unwrap()
+        .participant_discovery_coverage()
+        .unwrap()
+        .unwrap();
+    let series = serde_json::to_value(coverage.scope.series.unwrap()).unwrap();
+    assert_eq!(
+        series,
+        serde_json::json!([{"id":"7","slug":"btc-up-or-down-15m"}])
+    );
+    let scope: Value =
+        serde_json::from_slice(&std::fs::read(out.join("market_scope.json")).unwrap()).unwrap();
+    assert_eq!(scope["series"], series);
+    let reads = scope["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|page| page["kind"] == "series")
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 1);
+    assert_eq!(reads[0]["series_id"], "7");
+    assert!(reads[0]["url"].as_str().unwrap().ends_with("/series/7"));
+}
+
+fn assert_wrapper_v2_requests(requests: &[String], frozen_activity: bool) {
+    for request in requests {
+        let route = request.split_whitespace().nth(1).unwrap();
+        let url = reqwest::Url::parse(&format!("http://fixture{route}")).unwrap();
+        assert!(
+            !matches!(url.path(), "/trades" | "/v1/leaderboard"),
+            "{request}"
+        );
+        assert!(frozen_activity || url.path() != "/activity", "{request}");
+    }
+}
+
 /// A loopback stand-in for the data API, CLOB, Gamma and Supabase that the real wrapper calls.
 struct FixtureVenue {
     address: std::net::SocketAddr,
@@ -15705,6 +15918,7 @@ impl FixtureVenue {
         markets: Vec<Value>,
         series: Value,
         scope_events: Vec<Value>,
+        frozen_activity: bool,
     ) -> Self {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
@@ -15764,7 +15978,14 @@ impl FixtureVenue {
                 let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
                 server_requests.lock().unwrap().push(first.to_owned());
                 let (status, body) = match url.path() {
-                    "/v1/leaderboard" => ("200 OK", serde_json::json!([{"proxyWallet":WALLET}])),
+                    "/activity" | "/trades" | "/v1/leaderboard"
+                        if url.path() != "/activity" || !frozen_activity =>
+                    {
+                        (
+                            "410 Gone",
+                            serde_json::json!({"error":"Data API v1 retired"}),
+                        )
+                    }
                     "/activity" => {
                         let start = query["start"].parse::<i64>().unwrap();
                         let end = query["end"].parse::<i64>().unwrap();
@@ -15796,13 +16017,37 @@ impl FixtureVenue {
                             ),
                         )
                     }
-                    "/trades" => {
-                        assert_eq!(query["takerOnly"], "false");
-                        let start = query["start"].parse::<i64>().unwrap();
-                        let end = query["end"].parse::<i64>().unwrap();
-                        let offset = query["offset"].parse::<usize>().unwrap();
-                        let conditions = query["market"].split(',').collect::<Vec<_>>();
-                        let selected = server_rows
+                    "/v2/activity" => {
+                        let source = DatasetFetcher {
+                            rows: server_rows.lock().unwrap().clone(),
+                            ..Default::default()
+                        };
+                        let body = tokio::runtime::Builder::new_current_thread()
+                            .build()
+                            .unwrap()
+                            .block_on(source.fetch_page(url.as_str()))
+                            .unwrap();
+                        ("200 OK", serde_json::from_slice(&body).unwrap())
+                    }
+                    "/v2/trades" => {
+                        assert_eq!(query["taker_only"], "false");
+                        assert_eq!(query["filter_amount"], "0.0000001");
+                        assert!(!query.contains_key("start") && !query.contains_key("end"));
+                        let offset = query.get("cursor").map_or(0, |cursor| {
+                            cursor
+                                .strip_prefix("trades:")
+                                .unwrap()
+                                .parse::<usize>()
+                                .unwrap()
+                        });
+                        if offset == 0 {
+                            assert_eq!(query["limit"], "1000");
+                        } else {
+                            assert!(!query.contains_key("limit"));
+                        }
+                        let conditions = query["condition"].split(',').collect::<Vec<_>>();
+                        assert!(conditions.len() <= 20);
+                        let mut selected = server_rows
                             .lock()
                             .unwrap()
                             .iter()
@@ -15811,21 +16056,25 @@ impl FixtureVenue {
                                     && row["conditionId"]
                                         .as_str()
                                         .is_some_and(|id| conditions.contains(&id))
-                                    && row["timestamp"].as_i64().unwrap() >= start
-                                    && row["timestamp"].as_i64().unwrap() <= end
                             })
-                            .skip(offset)
-                            .take(10_000)
                             .cloned()
                             .collect::<Vec<_>>();
-                        ("200 OK", Value::from(selected))
+                        selected.sort_by_key(|row| {
+                            std::cmp::Reverse(row["timestamp"].as_i64().unwrap())
+                        });
+                        let has_more = offset + 1000 < selected.len();
+                        let data = selected.iter().skip(offset).take(1000).map(|row| serde_json::json!({"proxy_wallet":row["proxyWallet"],"timestamp":row["timestamp"]})).collect::<Vec<_>>();
+                        (
+                            "200 OK",
+                            serde_json::json!({"data":data,"pagination":{"limit":1000,"offset":offset,"has_more":has_more,"next_cursor":has_more.then(||format!("trades:{}",offset+1000))}}),
+                        )
                     }
                     "/markets" => (
                         "200 OK",
                         serde_json::json!({"data":markets,"next_cursor":"LTE="}),
                     ),
                     "/series" => ("200 OK", series.clone()),
-                    // A pinned series read by id (`market-scope --series`).
+                    // Read the explicit coverage set by id (`market-scope --series`).
                     path if path.starts_with("/series/") => series
                         .as_array()
                         .unwrap()
@@ -18586,7 +18835,7 @@ async fn history_v3_collection_reports_run_timing_and_writer_counts() {
     impl PageFetcher for LastReadFetcher<'_> {
         async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
             let bytes = self.source.fetch_page(url).await?;
-            if self.source.calls.lock().unwrap().len() == 36 {
+            if self.source.calls.lock().unwrap().len() == 35 {
                 self.barrier.wait();
             }
             Ok(bytes)
@@ -18625,7 +18874,7 @@ async fn history_v3_collection_reports_run_timing_and_writer_counts() {
     )
     .await
     .unwrap();
-    assert_eq!(source.calls.lock().unwrap().len(), 36);
+    assert_eq!(source.calls.lock().unwrap().len(), 35);
     let fields = take(7, 1, 33, 0, 1, 0, 0, 2);
     assert!(
         fields["producer_blocked_ms"].as_u64().unwrap() > 0,
@@ -19048,8 +19297,17 @@ async fn collection_766_zero_row_full_partial_deletes_certified_tail() {
     struct EmptyPrefix<'a>(&'a DatasetFetcher);
     impl PageFetcher for EmptyPrefix<'_> {
         async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
-            if url.contains("sortDirection=ASC") {
-                return Ok(serde_json::to_vec(&vec![self.0.rows[0].clone()]).unwrap());
+            let parsed = reqwest::Url::parse(url).unwrap();
+            let end = parsed
+                .query_pairs()
+                .find(|(key, _)| key == "end")
+                .unwrap()
+                .1
+                .parse::<i64>()
+                .unwrap();
+            // The over-cap probe is discarded; the exact retry now has no rows.
+            if end < FRESH_END {
+                return Ok(activity_response(url, b"[]".to_vec()));
             }
             self.0.fetch_page(url).await
         }
@@ -19082,7 +19340,7 @@ async fn collection_766_zero_row_full_partial_deletes_certified_tail() {
     assert_eq!(proof["aggregate_count"], 0);
     assert_eq!(proof["source_row_count"], 0);
     assert_eq!(proof["acquisition"]["fetched_source_row_count"], 0);
-    assert_eq!(proof["acquisition"]["fixed_end_unix"], FRESH_END - 20_001);
+    assert_eq!(proof["acquisition"]["fixed_end_unix"], FRESH_END - 15_002);
     assert_eq!(history_v3_wallet_count(&side), 0);
     let fields = collection_766_events(&log, "activity wallet excluded from generation");
     assert_eq!(fields.len(), 1);
@@ -19867,6 +20125,11 @@ async fn collection_admit(side: &std::path::Path, generation: u64, end: i64, ful
     .unwrap_err();
 }
 
+async fn collection_admit_v1(side: &std::path::Path, generation: u64, end: i64, full: &[String]) {
+    collection_admit(side, generation, end, full).await;
+    freeze_identity_four(side);
+}
+
 async fn collection_run(
     side: &std::path::Path,
     fetcher: &dyn pe_source_polymarket_public::ReconciliationFetcher,
@@ -19954,7 +20217,7 @@ async fn collection_747_progress_resume_never_ranked_early_and_same_head_equalit
     let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
     for generation in 1..=3 {
         let end = FRESH_END + i64::try_from(generation).unwrap() - 1;
-        collection_admit(&side, generation, end, &[]).await;
+        collection_admit_v1(&side, generation, end, &[]).await;
         source.source.calls.lock().unwrap().clear();
         collection_run(
             &side,
@@ -20023,6 +20286,7 @@ async fn collection_747_progress_resume_never_ranked_early_and_same_head_equalit
         } else {
             Vec::new()
         };
+        collection_admit_v1(&comparator, generation, end, &full).await;
         history_v3_collect(&comparator, &fast, generation, end, &full)
             .await
             .unwrap();
@@ -20056,7 +20320,7 @@ async fn collection_747_expired_probe_and_mid_window_deadlines_keep_first_window
         if let Some(call) = failure {
             source.failures.insert(call, 0);
         }
-        collection_admit(&side, 1, FRESH_END, &[]).await;
+        collection_admit_v1(&side, 1, FRESH_END, &[]).await;
         collection_run(
             &side,
             &source,
@@ -20087,7 +20351,7 @@ async fn collection_747_retry_after_is_deadline_bounded_and_no_progress_keeps_mo
     let mut source = CollectionDataset::new(collection_rows(WALLET, 6000), 1);
     source.failures.insert(1, 0); // Probe falls through after internal retries exhaust.
     source.failures.insert(2, 300); // Lookup's Retry-After exceeds the remaining budget.
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     let began = tokio::time::Instant::now();
     collection_run(
         &side,
@@ -20103,7 +20367,7 @@ async fn collection_747_retry_after_is_deadline_bounded_and_no_progress_keeps_mo
     let proof = collection_proof(&side, 1, WALLET);
     assert_eq!(proof["acquisition"]["aggregation_status"], "not_attempted");
     assert_eq!(proof["acquisition"]["fixed_end_unix"], FRESH_END);
-    collection_admit(&side, 2, FRESH_END + 1, &[]).await;
+    collection_admit_v1(&side, 2, FRESH_END + 1, &[]).await;
     let resumed = CollectionDataset::new(source.source.rows.clone(), 1);
     collection_run(
         &side,
@@ -20143,7 +20407,7 @@ async fn collection_747_zero_row_partial_is_an_authenticated_history_part() {
         rows: collection_rows(WALLET, 6000),
         ..Default::default()
     };
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     let held = Arc::new(std::sync::atomic::AtomicU64::new(2_000_000));
     collection_run(
         &side,
@@ -20167,7 +20431,7 @@ async fn collection_747_zero_row_partial_is_an_authenticated_history_part() {
     )
     .await
     .unwrap();
-    collection_admit(&side, 2, FRESH_END + 1, &[]).await;
+    collection_admit_v1(&side, 2, FRESH_END + 1, &[]).await;
     collection_run(
         &side,
         &source,
@@ -20201,7 +20465,7 @@ async fn collection_747_partial_full_incremental_no_progress_completion_and_expl
         } else {
             Vec::new()
         };
-        collection_admit(&side, generation, end, &full).await;
+        collection_admit_v1(&side, generation, end, &full).await;
         assert_eq!(
             fresh_record(&side)["deferred_wallets"],
             serde_json::json!([])
@@ -20275,7 +20539,7 @@ async fn collection_747_growing_history_completes_when_progress_exceeds_arrivals
                 end,
             ));
         }
-        collection_admit(&side, generation, end, &[]).await;
+        collection_admit_v1(&side, generation, end, &[]).await;
         let held = Arc::new(std::sync::atomic::AtomicU64::new(2_000_000));
         collection_run(&side, &source, end, Arc::clone(&held), None)
             .await
@@ -20346,7 +20610,7 @@ async fn collection_747_shared_count_bounds_and_releases_more_than_64_wallets_be
             .collect(),
         ..Default::default()
     };
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     assert_eq!(fresh_record(&side)["wallets"].as_array().unwrap().len(), 66);
     let held = Arc::new(std::sync::atomic::AtomicU64::new(2_000_000));
     let fetcher = WatchedDataset {
@@ -20418,7 +20682,7 @@ async fn collection_747_partial_insert_replace_rollback_and_release_count() {
         } else {
             Vec::new()
         };
-        collection_admit(&side, generation, FRESH_END, &full).await;
+        collection_admit_v1(&side, generation, FRESH_END, &full).await;
         let before = query_values(
             &side,
             "SELECT * FROM activity_groups_v2 ORDER BY source_trade_id",
@@ -20477,7 +20741,7 @@ async fn collection_747_completed_wallet_detects_tampered_partial_rows_at_finali
     let dir = TempDir::new().unwrap();
     let side = dataset_candidate(&dir, "tamper.db", &[]);
     let source = CollectionDataset::new(collection_rows(WALLET, 6000), 1);
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     collection_run(
         &side,
         &source,
@@ -20488,7 +20752,7 @@ async fn collection_747_completed_wallet_detects_tampered_partial_rows_at_finali
     .await
     .unwrap();
     history_v3_damage_connection(&side).execute("UPDATE activity_groups_v2 SET share_amount_str = '2.250001' WHERE source_time_unix = ?1", [FRESH_END - 20_000]).unwrap();
-    collection_admit(&side, 2, FRESH_END + 1, &[]).await;
+    collection_admit_v1(&side, 2, FRESH_END + 1, &[]).await;
     collection_run(
         &side,
         &source.source,
@@ -20535,8 +20799,8 @@ async fn collection_747_probe_complete_urls_and_fixed_receipts_match_existing_re
         },
         urls: Mutex::new(Vec::new()),
     };
-    collection_admit(&side, 1, FRESH_END, &[]).await;
-    collection_admit(&other, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&other, 1, FRESH_END, &[]).await;
     let wallet = WalletAddress::from_hex(WALLET).unwrap();
     let mut prior = pe_source_polymarket_public::fetch_complete_activity_semantic(
         &source,
@@ -20604,7 +20868,7 @@ async fn collection_747_large_certificate_skips_probe_when_full_history_has_shru
         rows: source.rows[..3].to_vec(),
         ..Default::default()
     };
-    collection_admit(&side, 2, FRESH_END + 1, &[WALLET.to_owned()]).await;
+    collection_admit_v1(&side, 2, FRESH_END + 1, &[WALLET.to_owned()]).await;
     let comparator = dir.path().join("hint-probe.db");
     std::fs::copy(&side, &comparator).unwrap();
     collection_run(
@@ -20759,7 +21023,7 @@ async fn collection_747_receipt_shapes_reject_short_complete_bad_partial_and_sho
         } else {
             let side = dataset_candidate(&dir, "shape.db", &[]);
             let source = CollectionDataset::new(collection_rows(WALLET, 6000), 1);
-            collection_admit(&side, 1, FRESH_END, &[]).await;
+            collection_admit_v1(&side, 1, FRESH_END, &[]).await;
             collection_run(
                 &side,
                 &source,
@@ -20894,7 +21158,7 @@ async fn collection_747_group_across_windows_fails_aggregation_at_partial_end() 
     // A later row of the same group that is not an exact copy stays ambiguous.
     rows[4999]["size"] = serde_json::json!("2.500002");
     let source = CollectionDataset::new(rows, 1);
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     collection_run(
         &side,
         &source,
@@ -20912,7 +21176,7 @@ async fn collection_747_group_across_windows_fails_aggregation_at_partial_end() 
     );
     assert!(proof["acquisition"]["fixed_end_unix"].as_i64().unwrap() < FRESH_END);
     assert_eq!(history_v3_wallet_count(&side), 0);
-    collection_admit(&side, 2, FRESH_END + 1, &[]).await;
+    collection_admit_v1(&side, 2, FRESH_END + 1, &[]).await;
     assert_eq!(
         fresh_record(&side)["full_read_wallets"],
         serde_json::json!([WALLET])
@@ -21000,7 +21264,7 @@ async fn collection_747_lookup_disagreement_keeps_earlier_windows_only() {
         },
         lookups: AtomicUsize::new(0),
     };
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     collection_run(
         &side,
         &source,
@@ -21031,7 +21295,7 @@ async fn collection_747_cross_generation_collision_records_partial_end_and_reads
     let source = CollectionDataset::new(rows, 1);
     for generation in 1..=2 {
         let end = FRESH_END + i64::try_from(generation).unwrap() - 1;
-        collection_admit(&side, generation, end, &[]).await;
+        collection_admit_v1(&side, generation, end, &[]).await;
         collection_run(
             &side,
             &source,
@@ -21049,7 +21313,7 @@ async fn collection_747_cross_generation_collision_records_partial_end_and_reads
     );
     assert!(proof["acquisition"]["fixed_end_unix"].as_i64().unwrap() < FRESH_END + 1);
     assert_eq!(history_v3_wallet_count(&side), 4999);
-    collection_admit(&side, 3, FRESH_END + 2, &[]).await;
+    collection_admit_v1(&side, 3, FRESH_END + 2, &[]).await;
     assert_eq!(
         fresh_record(&side)["full_read_wallets"],
         serde_json::json!([WALLET])
@@ -21112,7 +21376,7 @@ async fn collection_747_quiet_certificate_partial_then_empty_completion_stays_ac
             FRESH_END + index,
         ));
     }
-    collection_admit(&side, 2, FRESH_END + 6001, &[WALLET.to_owned()]).await;
+    collection_admit_v1(&side, 2, FRESH_END + 6001, &[WALLET.to_owned()]).await;
     collection_run(
         &side,
         &source,
@@ -21193,7 +21457,7 @@ async fn collection_747_external_write_refuses_partial_commit_and_releases_count
         rows: collection_rows(WALLET, 6000),
         ..Default::default()
     };
-    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_admit_v1(&side, 1, FRESH_END, &[]).await;
     let fetcher = OutsideWrite {
         source: &source,
         side: &side,
@@ -21232,7 +21496,7 @@ async fn collection_747_window_retry_keeps_bounds_and_finishes_internal_backoff_
         let side = dataset_candidate(&dir, "window-retry.db", &[]);
         let mut source = CollectionDataset::new(collection_rows(WALLET, 12_000), 1);
         source.failures.insert(24, retry_after);
-        collection_admit(&side, 1, FRESH_END, &[]).await;
+        collection_admit_v1(&side, 1, FRESH_END, &[]).await;
         let began = tokio::time::Instant::now();
         collection_run(
             &side,
@@ -22047,8 +22311,8 @@ async fn seeded_cache_publishes_exact_entries() {
 /// FAIL (end to end, real wrapper): a cache provisioned by `cache-init` (carrying drops) does not
 /// collect a bulk root with complete histories, stop at `prepare` with nothing published, publish the
 /// saved request on resume, run an ordinary successor, and keep a research link for each cycle; or
-/// the leaderboard is still requested, discovery walks an unpinned 5-minute series, or ranking leaves
-/// the pinned 15-minute series.
+/// any retired v1 route is requested, discovery walks a 5-minute series, or ranking differs from
+/// the explicit participant coverage set.
 #[tokio::test]
 async fn real_wrapper_seeded_loop_prepares_and_publishes() {
     real_wrapper_seeded_publication(false).await;
@@ -22183,6 +22447,7 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
         serde_json::json!([{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"},
                            {"id":"8","slug":"btc-up-or-down-5m","recurrence":"5m"}]),
         scope_events,
+        false,
     );
     let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for tree in ["scripts", "deploy"] {
@@ -22207,7 +22472,7 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
     let address = venue.address;
     let env = |cutover: &str| {
         std::fs::write(dir.path().join(".env"), format!(
-            "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_TOP_N=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER={cutover}\nPE_RANKER_ENGINE=duck\nPE_BOOTSTRAP_MARKET_RECURRENCES='[\"15m\",\"5m\"]'\nPE_RANK_MARKET_RECURRENCES=15m\nPE_RANK_MARKET_SERIES=7:btc-up-or-down-15m\nPE_RANK_RESEARCH_LINK_DIR={}\nWIN_END={}\nPE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS={}\n",
+            "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_TOP_N=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER={cutover}\nPE_RANKER_ENGINE=duck\nPE_BOOTSTRAP_MARKET_RECURRENCES='[\"15m\",\"5m\"]'\nPE_RANK_MARKET_RECURRENCES=15m\nPE_RANK_RESEARCH_LINK_DIR={}\nWIN_END={}\nPE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS={}\n",
             dir.path().join("watchlist.json").display(), research.display(), time::OffsetDateTime::from_unix_timestamp(cycle_end).unwrap().date(), if supersession { 0 } else { 20_000 })).unwrap();
     };
     let python = Command::new("python3")
@@ -22261,7 +22526,7 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
         let prior = data.join(format!("wallet_cache.{name}.prior.db"));
         let build = out.join("cache_build_manifest.json");
         let configuration = serde_json::json!({"cache_lane":"fresh_v2",
-            "rank_market_series":"7:btc-up-or-down-15m", "rank_market_recurrences":"15m",
+            "rank_market_recurrences":"15m",
             "market_recurrences":"[\"15m\",\"5m\"]", "research_link_dir":research});
         std::fs::write(
             out.join("cycle_configuration.json"),
@@ -22488,8 +22753,6 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
             &[
                 "winner-discovery",
                 "--defer-activation",
-                "--series",
-                "7:btc-up-or-down-15m",
                 "--end-date-min",
                 &floor,
                 "--recurrences",
@@ -22692,6 +22955,8 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
         );
         assert!(!pending.exists());
         assert!(linked(&out));
+        assert_wrapper_scope(&out, &fixed);
+        assert_wrapper_v2_requests(&venue.requests.lock().unwrap(), false);
         venue.stop();
         return;
     }
@@ -22711,15 +22976,16 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
     assert!(first.join("ranking_publish_request.json").is_file());
     assert!(data.join("eval-results/rank_and_push.pending").exists());
     assert!(linked(&first));
+    assert_wrapper_scope(&first, &fixed);
     let scope: Value =
         serde_json::from_slice(&std::fs::read(first.join("market_scope.json")).unwrap()).unwrap();
     assert_eq!(scope["recurrence"], "15m");
-    // The research period's pin: exactly the pinned series, as the frozen merger requires.
+    // The ranking scope is exactly the set certified by participant coverage.
     assert_eq!(
         scope["series"],
         serde_json::json!([{"id": "7", "slug": "btc-up-or-down-15m"}])
     );
-    // Read by id, not listed: one series read, for the pinned series.
+    // Ranking reads every covered series by id.
     let reads: Vec<&Value> = scope["pages"]
         .as_array()
         .unwrap()
@@ -22755,7 +23021,7 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
     assert!(linked(&run_dir(&stdout)));
     let requests = venue.requests.lock().unwrap().clone();
     assert!(
-        !requests.iter().any(|request| request.contains("/series?")),
+        requests.iter().any(|request| request.contains("/series?")),
         "{requests:?}"
     );
     let expected_floor = time::OffsetDateTime::from_unix_timestamp(cycle_end - 181 * DAY).unwrap();
@@ -22779,7 +23045,7 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
     assert!(
         requests
             .iter()
-            .any(|request| request.contains("/trades?") && request.contains("takerOnly=false"))
+            .any(|request| request.contains("/v2/trades?") && request.contains("taker_only=false"))
     );
     assert!(
         !requests
@@ -22793,6 +23059,7 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
             .any(|request| request.contains("/events/keyset") && request.contains("series_id=8")),
         "{requests:?}"
     );
+    assert_wrapper_v2_requests(&venue.requests.lock().unwrap(), false);
     venue.stop();
 }
 
@@ -23447,4 +23714,1142 @@ async fn forge_822_seed_carries_unrepresentable_drop_without_trigger_rows() {
         report["differences_by_rule"]["certified_cumulative_scope_drop"],
         1
     );
+}
+
+// Data API v2 activity: identity 5 / acquisition 4 retains only complete cursor windows.
+#[tokio::test]
+async fn collection_v2_probe_complete_and_single_second_capacity() {
+    for count in [0_usize, 1000, 5000, 5001, 5499, 5500] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "v2-capacity.db", &[]);
+        let source = DatasetFetcher {
+            rows: (0..count)
+                .map(|index| dataset_row(WALLET, "0xa", &format!("row-{index:08}"), "BUY", 1))
+                .collect(),
+            ..Default::default()
+        };
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let result = collection_run(&side, &source, FRESH_END, Arc::clone(&held), None).await;
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+        if count == 5500 {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("one-second activity window")
+            );
+            assert!(receipt(&side, 1, WALLET).is_none());
+            assert_eq!(history_v3_wallet_count(&side), 0);
+        } else {
+            result.unwrap();
+            let proof = collection_proof(&side, 1, WALLET);
+            assert_eq!(proof["acquisition"]["version"], 4);
+            assert_eq!(proof["acquisition"]["disposition"], "complete");
+            assert_eq!(proof["source_row_count"], count);
+            let pages = proof["pages"].as_array().unwrap();
+            assert_eq!(pages.len(), count.div_ceil(1000).max(1));
+            assert!(
+                pages
+                    .iter()
+                    .all(|page| page["schema_version"] == 3 && page["parser_version"] == 2)
+            );
+            assert_eq!(pages.last().unwrap()["has_more"], false);
+            assert!(pages.last().unwrap()["next_cursor"].is_null());
+            let before = query_values(
+                &side,
+                "SELECT page_evidence_json, acquisition_json FROM activity_wallet_coverage_staging_v2",
+            );
+            collection_run(
+                &side,
+                &HistoryV3StopFetcher,
+                FRESH_END,
+                Arc::clone(&held),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                before,
+                query_values(
+                    &side,
+                    "SELECT page_evidence_json, acquisition_json FROM activity_wallet_coverage_staging_v2"
+                )
+            );
+        }
+        let urls = source.urls.lock().unwrap();
+        assert!(
+            urls.iter()
+                .all(|url| reqwest::Url::parse(url).unwrap().path() == "/v2/activity")
+        );
+        assert_eq!(
+            urls.len(),
+            if count == 5500 {
+                12
+            } else {
+                count.div_ceil(1000).max(1)
+            }
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_v2_expired_and_failed_probe_still_keeps_exact_first_window() {
+    for (budget, failure, expected_rows, calls) in [
+        (0, None, 4999, 11),
+        (1, Some(1), 4999, 12),
+        (1, Some(6), 4999, 17),
+        (18, None, 9998, 22),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "v2-deadline.db", &[]);
+        let mut source = CollectionDataset::new(collection_rows(WALLET, 12_000), 1);
+        if let Some(call) = failure {
+            source.failures.insert(call, 0);
+        }
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        collection_run(
+            &side,
+            &source,
+            FRESH_END,
+            Arc::clone(&held),
+            Some(std::time::Duration::from_secs(budget)),
+        )
+        .await
+        .unwrap();
+        let proof = collection_proof(&side, 1, WALLET);
+        assert_eq!(
+            proof["acquisition"]["fetched_source_row_count"], expected_rows,
+            "budget={budget}, failure={failure:?}"
+        );
+        assert_eq!(proof["acquisition"]["aggregation_status"], "complete");
+        assert_eq!(history_v3_wallet_count(&side), expected_rows);
+        assert_eq!(source.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+        let pages = proof["pages"].as_array().unwrap();
+        assert_eq!(pages[0]["bounds"]["end"], FRESH_END - 15_002);
+        assert!(pages.iter().all(|page| page["bounds"]["end"] != FRESH_END));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_v2_retry_after_is_deadline_bounded_and_no_progress_keeps_full_mode() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "v2-retry.db", &[]);
+    let mut source = CollectionDataset::new(collection_rows(WALLET, 6000), 1);
+    source.failures.insert(1, 0);
+    source.failures.insert(2, 300);
+    collection_admit(&side, 1, FRESH_END, &[]).await;
+    let began = tokio::time::Instant::now();
+    collection_run(
+        &side,
+        &source,
+        FRESH_END,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Some(std::time::Duration::from_secs(10)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(began.elapsed(), std::time::Duration::from_secs(10));
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    let proof = collection_proof(&side, 1, WALLET);
+    assert_eq!(proof["acquisition"]["aggregation_status"], "not_attempted");
+    assert!(proof["pages"].as_array().unwrap().is_empty());
+    collection_admit(&side, 2, FRESH_END + 1, &[]).await;
+    let resumed = CollectionDataset::new(source.source.rows.clone(), 1);
+    collection_run(
+        &side,
+        &resumed,
+        FRESH_END + 1,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Some(std::time::Duration::from_secs(1)),
+    )
+    .await
+    .unwrap();
+    let proof = collection_proof(&side, 2, WALLET);
+    assert_eq!(proof["acquisition"]["mode"], "full");
+    assert_eq!(proof["acquisition"]["start_exclusive"], 0);
+    assert_eq!(proof["acquisition"]["fetched_source_row_count"], 4999);
+    assert_eq!(resumed.calls.load(Ordering::SeqCst), 11);
+}
+
+#[tokio::test]
+async fn collection_v2_terminal_crossing_page_is_discarded_and_inflight_stays_below_6500() {
+    for sizes in [
+        vec![],
+        vec![1000, 1000, 1000, 1000, 1000, 499, 1000],
+        vec![1; 5500],
+    ] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "v2-crossing.db", &[]);
+        let source = DatasetFetcher {
+            rows: collection_rows(WALLET, 6499),
+            v2_page_sizes: sizes,
+            ..Default::default()
+        };
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        collection_run(
+            &side,
+            &source,
+            FRESH_END,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            None,
+        )
+        .await
+        .unwrap();
+        let proof = collection_proof(&side, 1, WALLET);
+        assert_eq!(proof["source_row_count"], 6499);
+        assert!(
+            proof["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|page| !(page["bounds"]["start"] == 0 && page["bounds"]["end"] == FRESH_END))
+        );
+        // The next request's seek offset proves how many rows the current attempt retained.
+        // Include the discarded crossing response, including the largest possible 6,499-row attempt.
+        let urls = source.urls.lock().unwrap();
+        let mut peak = 0;
+        let mut crossing = false;
+        for url in urls.iter() {
+            let url = reqwest::Url::parse(url).unwrap();
+            let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+            let (offset, index) = query.get("cursor").map_or((0, 0), |cursor| {
+                let parts = cursor
+                    .strip_prefix("activity:")
+                    .unwrap()
+                    .split(':')
+                    .collect::<Vec<_>>();
+                (
+                    parts[0].parse::<usize>().unwrap(),
+                    parts[1].parse::<usize>().unwrap(),
+                )
+            });
+            let start = query["start"].parse::<i64>().unwrap();
+            let end = query["end"].parse::<i64>().unwrap();
+            let available = source
+                .rows
+                .iter()
+                .filter(|row| (start..=end).contains(&row["timestamp"].as_i64().unwrap()))
+                .count();
+            let retained =
+                (offset + source.v2_page_sizes.get(index).copied().unwrap_or(1000)).min(available);
+            assert!(offset <= 5499);
+            assert!(retained < 6500);
+            peak = peak.max(retained);
+            crossing |= retained > 5499;
+        }
+        assert!(crossing);
+        if source.v2_page_sizes.get(5) == Some(&499) {
+            assert_eq!(peak, 6499);
+        }
+    }
+}
+
+#[tokio::test]
+async fn collection_v2_exact_retry_growth_stops_without_committing_discarded_pages() {
+    struct Growing {
+        source: DatasetFetcher,
+    }
+    impl PageFetcher for Growing {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            let query = parsed
+                .query_pairs()
+                .into_owned()
+                .collect::<BTreeMap<_, _>>();
+            if query["end"] == FRESH_END.to_string() {
+                return self.source.fetch_page(url).await;
+            }
+            let mut changed = parsed;
+            let pairs = query
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        if key == "end" {
+                            FRESH_END.to_string()
+                        } else {
+                            value
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            changed.query_pairs_mut().clear().extend_pairs(pairs);
+            let mut body: Value =
+                serde_json::from_slice(&self.source.fetch_page(changed.as_str()).await?).unwrap();
+            let end = reqwest::Url::parse(url)
+                .unwrap()
+                .query_pairs()
+                .find(|(key, _)| key == "end")
+                .unwrap()
+                .1
+                .parse::<i64>()
+                .unwrap();
+            for row in body["data"].as_array_mut().unwrap() {
+                row["timestamp"] = Value::from(end);
+            }
+            Ok(serde_json::to_vec(&body).unwrap())
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "v2-grew.db", &[]);
+    let source = Growing {
+        source: DatasetFetcher {
+            rows: collection_rows(WALLET, 6000),
+            ..Default::default()
+        },
+    };
+    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_run(
+        &side,
+        &source,
+        FRESH_END,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        None,
+    )
+    .await
+    .unwrap();
+    let proof = collection_proof(&side, 1, WALLET);
+    assert_eq!(
+        proof["exclusion_reason"],
+        "activity window grew between reads"
+    );
+    assert_eq!(proof["acquisition"]["aggregation_status"], "not_attempted");
+    assert!(proof["pages"].as_array().unwrap().is_empty());
+    assert_eq!(history_v3_wallet_count(&side), 0);
+}
+
+#[tokio::test]
+async fn collection_v2_width_growth_and_shared_held_row_partial() {
+    for sparse in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "v2-width.db", &[]);
+        let rows = if sparse {
+            (0..5500)
+                .map(|index| {
+                    dataset_row(
+                        WALLET,
+                        "0xa",
+                        &format!("width-{index}"),
+                        "BUY",
+                        if index < 100 { 1 } else { 2 },
+                    )
+                })
+                .collect()
+        } else {
+            collection_rows(WALLET, 12_000)
+        };
+        let source = DatasetFetcher {
+            rows,
+            ..Default::default()
+        };
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        let held = Arc::new(std::sync::atomic::AtomicU64::new(if sparse {
+            0
+        } else {
+            1_995_001
+        }));
+        collection_run(&side, &source, FRESH_END, Arc::clone(&held), None)
+            .await
+            .unwrap();
+        let proof = collection_proof(&side, 1, WALLET);
+        let pages = proof["pages"].as_array().unwrap();
+        if sparse {
+            assert_eq!(pages[0]["bounds"], serde_json::json!({"start":0,"end":1}));
+            assert_eq!(pages[1]["bounds"], serde_json::json!({"start":1,"end":9}));
+            assert_eq!(pages[7]["bounds"], serde_json::json!({"start":9,"end":17}));
+            assert_eq!(pages[8]["bounds"], serde_json::json!({"start":17,"end":81}));
+            assert_eq!(proof["source_row_count"], 5500);
+            assert_eq!(held.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(proof["acquisition"]["fetched_source_row_count"], 4999);
+            assert_eq!(
+                proof["exclusion_reason"],
+                "activity walk held-row limit reached"
+            );
+            assert_eq!(held.load(Ordering::SeqCst), 1_995_001);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_v2_window_retry_restarts_bounds_and_finishes_page_backoff_after_deadline() {
+    struct InternalBackoff<'a>(&'a CollectionDataset);
+    impl PageFetcher for InternalBackoff<'_> {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            if self.0.calls.load(Ordering::SeqCst) == 18 {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            }
+            self.0.fetch_page(url).await
+        }
+    }
+    for retry_after in [0, 90] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "v2-window-retry.db", &[]);
+        let mut source = CollectionDataset::new(collection_rows(WALLET, 12_000), 1);
+        source.failures.insert(18, retry_after);
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        let began = tokio::time::Instant::now();
+        collection_run(
+            &side,
+            &InternalBackoff(&source),
+            FRESH_END,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Some(std::time::Duration::from_secs(55)),
+        )
+        .await
+        .unwrap();
+        let proof = collection_proof(&side, 1, WALLET);
+        assert_eq!(
+            proof["acquisition"]["fetched_source_row_count"],
+            if retry_after == 0 { 9998 } else { 4999 }
+        );
+        assert_eq!(
+            source.calls.load(Ordering::SeqCst),
+            if retry_after == 0 { 23 } else { 18 }
+        );
+        assert_eq!(
+            began.elapsed(),
+            std::time::Duration::from_secs(if retry_after == 0 { 73 } else { 55 })
+        );
+        let urls = source.source.urls.lock().unwrap();
+        if retry_after == 0 {
+            let last = reqwest::Url::parse(&urls[17]).unwrap();
+            let query = last.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+            assert_eq!(query["start"], (FRESH_END - 15_001).to_string());
+            assert_eq!(query["end"], (FRESH_END - 10_003).to_string());
+            assert!(!query.contains_key("cursor"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn collection_v2_schema_3_tampered_receipts_reject_before_any_write() {
+    for damage in [
+        "mixed",
+        "broken_cursor",
+        "repeated_cursor",
+        "after_terminal",
+        "missing_terminal",
+        "empty_continuation",
+        "user",
+        "type",
+        "start",
+        "end",
+        "direction",
+        "path",
+        "limit",
+        "first_cursor",
+        "later_limit",
+        "large_page",
+        "large_window",
+        "gap",
+        "overlap",
+    ] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "v2-proof.db", &[]);
+        let source = DatasetFetcher {
+            rows: collection_rows(WALLET, 2501),
+            ..Default::default()
+        };
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        let mut proof = collection_proof(&side, 1, WALLET);
+        let pages = proof["pages"].as_array_mut().unwrap();
+        match damage {
+            "mixed" => pages[1]["schema_version"] = Value::from(2),
+            "broken_cursor" | "user" | "type" | "start" | "end" | "direction" | "path"
+            | "limit" | "first_cursor" | "later_limit" => {
+                let index = usize::from(matches!(damage, "broken_cursor" | "later_limit"));
+                let mut url =
+                    reqwest::Url::parse(pages[index]["request_url"].as_str().unwrap()).unwrap();
+                let mut query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+                let (key, value) = match damage {
+                    "broken_cursor" => ("cursor", "broken"),
+                    "user" => ("user", WALLET_B),
+                    "type" => ("type", "TRADE"),
+                    "start" => ("start", "2"),
+                    "end" => ("end", "5"),
+                    "direction" => ("sort_direction", "DESC"),
+                    "limit" => ("limit", "500"),
+                    "first_cursor" => ("cursor", "unexpected"),
+                    _ => ("limit", "1000"),
+                };
+                query.insert(key.to_owned(), value.to_owned());
+                url.query_pairs_mut().clear().extend_pairs(query);
+                if damage == "path" {
+                    url.set_path("/activity");
+                }
+                pages[index]["request_url"] = Value::from(url.to_string());
+            }
+            "repeated_cursor" => pages[1]["next_cursor"] = pages[0]["next_cursor"].clone(),
+            "after_terminal" => {
+                pages[0]["has_more"] = Value::from(false);
+                pages[0]["next_cursor"] = Value::Null;
+            }
+            "missing_terminal" => {
+                pages.pop();
+            }
+            "empty_continuation" => pages[0]["row_count"] = Value::from(0),
+            "large_page" => pages[0]["row_count"] = Value::from(1001),
+            "large_window" => {
+                let terminal = pages.last().unwrap().clone();
+                pages.pop();
+                while pages.len() < 5 {
+                    let page = pages[0].clone();
+                    pages.push(page);
+                }
+                pages.push(terminal);
+                for (index, page) in pages.iter_mut().enumerate() {
+                    let mut url =
+                        reqwest::Url::parse(page["request_url"].as_str().unwrap()).unwrap();
+                    let mut query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+                    query.remove("cursor");
+                    query.remove("limit");
+                    if index == 0 {
+                        query.insert("limit".to_owned(), "1000".to_owned());
+                    } else {
+                        query.insert("cursor".to_owned(), format!("proof-{index}"));
+                    }
+                    url.query_pairs_mut().clear().extend_pairs(query);
+                    page["request_url"] = Value::from(url.to_string());
+                    page["row_count"] = Value::from(if index == 5 { 500 } else { 1000 });
+                    page["has_more"] = Value::from(index != 5);
+                    page["next_cursor"] = if index == 5 {
+                        Value::Null
+                    } else {
+                        Value::from(format!("proof-{}", index + 1))
+                    };
+                }
+            }
+            "gap" | "overlap" => {
+                let hi = FRESH_END - 2;
+                for page in pages.iter_mut() {
+                    collection_page_bounds(page, 0, hi);
+                }
+                let mut extra = pages.last().unwrap().clone();
+                extra["row_count"] = Value::from(0);
+                let mut url = reqwest::Url::parse(extra["request_url"].as_str().unwrap()).unwrap();
+                let mut query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+                query.remove("cursor");
+                query.insert("limit".to_owned(), "1000".to_owned());
+                url.query_pairs_mut().clear().extend_pairs(query);
+                extra["request_url"] = Value::from(url.to_string());
+                collection_page_bounds(
+                    &mut extra,
+                    if damage == "gap" { hi + 1 } else { hi - 1 },
+                    FRESH_END,
+                );
+                pages.push(extra);
+            }
+            _ => unreachable!(),
+        }
+        for page in pages.iter_mut() {
+            if page["next_cursor"].is_null() {
+                page.as_object_mut().unwrap().remove("next_cursor");
+            }
+        }
+        collection_read_commitment(&mut proof);
+        collection_reseal_receipt(&side, &proof);
+        // Resume an unfinished head to isolate page authentication from manifest commitments.
+        history_v3_damage_connection(&side)
+            .execute(
+                "DELETE FROM activity_coverage_manifests_v2 WHERE generation = 1",
+                [],
+            )
+            .unwrap();
+        let before = query_values(&side, "SELECT * FROM activity_wallet_coverage_staging_v2");
+        let history = query_values(&side, "SELECT * FROM activity_groups_v2");
+        let error = collection_run(
+            &side,
+            &HistoryV3StopFetcher,
+            FRESH_END,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            None,
+        )
+        .await
+        .unwrap_err();
+        // Each case fails its own structural rule, before the read commitment is compared.
+        let expected = match damage {
+            "mixed" => "activity receipt identity mismatch",
+            "repeated_cursor" | "after_terminal" | "missing_terminal" | "empty_continuation" => {
+                "activity page cursor chain is incomplete"
+            }
+            "large_page" => "activity page is outside the frozen read window",
+            "large_window" => "activity window exceeds capacity",
+            "gap" | "overlap" => "activity terminal windows have a gap or overlap",
+            _ => "activity page request does not match its proof",
+        };
+        assert!(error.to_string().contains(expected), "{damage}: {error}");
+        assert_eq!(
+            before,
+            query_values(&side, "SELECT * FROM activity_wallet_coverage_staging_v2"),
+            "{damage}"
+        );
+        assert_eq!(
+            history,
+            query_values(&side, "SELECT * FROM activity_groups_v2"),
+            "{damage}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn collection_v2_malformed_envelopes_and_cursor_proofs_exclude_without_or_after_progress() {
+    struct Malformed {
+        source: DatasetFetcher,
+        kind: &'static str,
+        partial: bool,
+    }
+    impl PageFetcher for Malformed {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            let query = parsed
+                .query_pairs()
+                .into_owned()
+                .collect::<BTreeMap<_, _>>();
+            let fail = !self.partial || query["start"] != "1";
+            if !fail {
+                return self.source.fetch_page(url).await;
+            }
+            if self.kind == "envelope" {
+                return Ok(b"[]".to_vec());
+            }
+            let cursor = query
+                .get("cursor")
+                .cloned()
+                .unwrap_or_else(|| "bad-cursor".to_owned());
+            if self.kind == "empty" {
+                return Ok(
+                    serde_json::to_vec(&serde_json::json!({"data":[], "pagination":{
+                    "limit":1000,"offset":0,"has_more":true,"next_cursor":cursor}}))
+                    .unwrap(),
+                );
+            }
+            let row = dataset_row(
+                WALLET,
+                "0xa",
+                "repeated",
+                "BUY",
+                query["start"].parse().unwrap(),
+            );
+            let mut body: Value =
+                serde_json::from_slice(&v2_activity_envelope(&[&row], 0, 0, true)).unwrap();
+            body["pagination"]["next_cursor"] = Value::from(cursor);
+            Ok(serde_json::to_vec(&body).unwrap())
+        }
+    }
+    for kind in ["envelope", "repeated", "empty"] {
+        for partial in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let side = dataset_candidate(&dir, "v2-malformed.db", &[]);
+            let source = Malformed {
+                source: DatasetFetcher {
+                    rows: collection_rows(WALLET, 12_000),
+                    ..Default::default()
+                },
+                kind,
+                partial,
+            };
+            collection_admit(&side, 1, FRESH_END, &[]).await;
+            collection_run(
+                &side,
+                &source,
+                FRESH_END,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                None,
+            )
+            .await
+            .unwrap();
+            let proof = collection_proof(&side, 1, WALLET);
+            let reason = proof["exclusion_reason"].as_str().unwrap();
+            assert!(
+                reason.starts_with(if kind == "envelope" {
+                    "v2 activity envelope:"
+                } else {
+                    "v2 activity cursor proof:"
+                }),
+                "{reason}"
+            );
+            assert_eq!(proof["acquisition"]["disposition"], "excluded");
+            assert_eq!(
+                proof["acquisition"]["aggregation_status"],
+                if partial { "complete" } else { "not_attempted" }
+            );
+            assert_eq!(
+                proof["acquisition"]["fetched_source_row_count"],
+                if partial { 4999 } else { 0 }
+            );
+            assert_eq!(
+                history_v3_wallet_count(&side),
+                if partial { 4999 } else { 0 }
+            );
+            assert_eq!(proof["aggregate_count"], 0);
+            assert_eq!(count(&side, "SELECT COUNT(*) FROM ranker_entries_v2"), 0);
+            collection_run(
+                &side,
+                &HistoryV3StopFetcher,
+                FRESH_END,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+}
+
+// Counterpart of the interrupted identity-five root wrapper fixture: acquisition and replay only.
+#[tokio::test]
+async fn collection_v2_14085_interrupted_identity_five_root_preserves_anomaly_receipt_bytes() {
+    struct Interrupt<'a> {
+        source: &'a DatasetFetcher,
+        side: &'a std::path::Path,
+    }
+    impl PageFetcher for Interrupt<'_> {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            if reqwest::Url::parse(url)
+                .unwrap()
+                .query_pairs()
+                .any(|(key, value)| key == "user" && value == WALLET_B)
+            {
+                while receipt(self.side, 1, WALLET).is_none() {
+                    tokio::task::yield_now().await;
+                }
+                return Err(SourceError::Transient {
+                    message: "interrupted after committed anomaly receipt".to_owned(),
+                });
+            }
+            self.source.fetch_page(url).await
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "v2-interrupted.db", &[WALLET_B]);
+    let source = DatasetFetcher {
+        rows: vec![
+            forge_822_anomaly(0, FRESH_END - 1),
+            dataset_row(WALLET_B, "0xa", "healthy", "BUY", FRESH_END),
+        ],
+        ..Default::default()
+    };
+    collection_admit(&side, 1, FRESH_END, &[]).await;
+    collection_run(
+        &side,
+        &Interrupt {
+            source: &source,
+            side: &side,
+        },
+        FRESH_END,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        None,
+    )
+    .await
+    .unwrap_err();
+    let before = query_values(
+        &side,
+        &format!(
+            "SELECT page_evidence_json, acquisition_json FROM activity_wallet_coverage_staging_v2 WHERE wallet_hex = '{WALLET}'"
+        ),
+    );
+    source.calls.lock().unwrap().clear();
+    collection_run(
+        &side,
+        &source,
+        FRESH_END,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        source
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|call| call.0 == WALLET_B)
+    );
+    assert_eq!(
+        before,
+        query_values(
+            &side,
+            &format!(
+                "SELECT page_evidence_json, acquisition_json FROM activity_wallet_coverage_staging_v2 WHERE wallet_hex = '{WALLET}'"
+            )
+        )
+    );
+    projection_v3_payouts(&side);
+    let report = pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_chunk_for_test(
+        &side,
+        FRESH_END + 1,
+        1,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.drops_by_cause["unrepresentable"], 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_v2_progress_resume_never_ranked_early_and_same_head_equality() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "partial.db", &[]);
+    let comparator = dataset_candidate(&dir, "comparator.db", &[]);
+    let source = CollectionDataset::new(collection_rows(WALLET, 12_000), 1);
+    let fast = DatasetFetcher {
+        rows: source.source.rows.clone(),
+        ..Default::default()
+    };
+    let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    for generation in 1..=3 {
+        let end = FRESH_END + i64::try_from(generation).unwrap() - 1;
+        collection_admit(&side, generation, end, &[]).await;
+        source.source.calls.lock().unwrap().clear();
+        collection_run(
+            &side,
+            &source,
+            end,
+            Arc::clone(&held),
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+        let proof = collection_proof(&side, generation, WALLET);
+        if generation < 3 {
+            assert_eq!(proof["acquisition"]["disposition"], "excluded");
+            assert_eq!(proof["acquisition"]["aggregation_status"], "complete");
+            assert_eq!(
+                proof["acquisition"]["exclusion_reason"],
+                "acquisition_failure"
+            );
+            assert_eq!(proof["aggregate_count"], 0);
+            assert_eq!(proof["source_row_count"], 0);
+            assert_eq!(proof["acquisition"]["fetched_source_row_count"], 4999);
+            assert_eq!(
+                count(
+                    &side,
+                    &format!(
+                        "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = {generation} AND fixed_end_unix = {end} AND exclusion_reason IS NOT NULL"
+                    )
+                ),
+                1
+            );
+        } else {
+            assert_eq!(proof["acquisition"]["disposition"], "complete");
+        }
+        if generation > 1 {
+            assert_eq!(proof["acquisition"]["mode"], "incremental");
+            assert_eq!(
+                proof["acquisition"]["start_exclusive"],
+                collection_proof(&side, generation - 1, WALLET)["acquisition"]["fixed_end_unix"]
+            );
+            assert!(source.source.calls.lock().unwrap()[0].1 > 1);
+        }
+        // Restart validates the frozen receipt before and after finalization.
+        collection_run(&side, &HistoryV3StopFetcher, end, Arc::clone(&held), None)
+            .await
+            .unwrap();
+        dataset_payouts(&side, &source.source.rows).await;
+        finalize_cache_v2_unbound(&side, None, end + 1).unwrap();
+        collection_run(&side, &HistoryV3StopFetcher, end, Arc::clone(&held), None)
+            .await
+            .unwrap();
+        if generation < 3 {
+            assert_eq!(
+                count(
+                    &side,
+                    &format!(
+                        "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE generation = {generation}"
+                    )
+                ),
+                0
+            );
+            assert!(projection_v3_rows(&side).is_empty());
+        }
+        let full = if generation == 3 {
+            vec![WALLET.to_owned()]
+        } else {
+            Vec::new()
+        };
+        history_v3_collect(&comparator, &fast, generation, end, &full)
+            .await
+            .unwrap();
+        dataset_payouts(&comparator, &fast.rows).await;
+        finalize_cache_v2_unbound(&comparator, None, end + 1).unwrap();
+    }
+    assert_eq!(
+        serde_json::to_vec(&collection_decoded_history(&side)).unwrap(),
+        serde_json::to_vec(&collection_decoded_history(&comparator)).unwrap()
+    );
+    assert_eq!(
+        query_values(
+            &side,
+            "SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex"
+        ),
+        query_values(
+            &comparator,
+            "SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex"
+        )
+    );
+    assert_eq!(projection_v3_rows(&side), projection_v3_rows(&comparator));
+}
+
+#[tokio::test]
+async fn collection_v2_shared_count_bounds_and_releases_more_than_64_wallets_behind_failing_writer()
+{
+    struct WatchedDataset<'a> {
+        source: &'a DatasetFetcher,
+        held: Arc<std::sync::atomic::AtomicU64>,
+    }
+    impl PageFetcher for WatchedDataset<'_> {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            assert!(self.held.load(Ordering::SeqCst) <= 2_000_000 + 65 * 5500);
+            tokio::task::yield_now().await;
+            let parsed = reqwest::Url::parse(url).unwrap();
+            let query = parsed
+                .query_pairs()
+                .into_owned()
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(parsed.path(), "/v2/activity");
+            assert_eq!(query["sort_direction"], "ASC");
+            self.source.fetch_page(url).await
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    let wallets = std::iter::once(WALLET.to_owned())
+        .chain((1..=65).map(|index| format!("0x{index:040x}")))
+        .collect::<Vec<_>>();
+    let refs = wallets.iter().map(String::as_str).collect::<Vec<_>>();
+    let side = dataset_candidate(&dir, "memory.db", &refs);
+    let source = DatasetFetcher {
+        rows: wallets
+            .iter()
+            .flat_map(|wallet| {
+                (0..5500).map(move |index| {
+                    dataset_row(
+                        wallet,
+                        "0xa",
+                        if index < 5499 { "head" } else { "tail" },
+                        "BUY",
+                        1 + i64::from(index >= 5499),
+                    )
+                })
+            })
+            .collect(),
+        ..Default::default()
+    };
+    collection_admit(&side, 1, FRESH_END, &[]).await;
+    assert_eq!(fresh_record(&side)["wallets"].as_array().unwrap().len(), 66);
+    let held = Arc::new(std::sync::atomic::AtomicU64::new(2_000_000));
+    let fetcher = WatchedDataset {
+        source: &source,
+        held: Arc::clone(&held),
+    };
+    let connection = Connection::open(&side).unwrap();
+    let (release, wait) = std::sync::mpsc::sync_channel(1);
+    let mut first = true;
+    connection
+        .commit_hook(Some(move || {
+            if first {
+                first = false;
+                wait.recv().unwrap();
+                true
+            } else {
+                false
+            }
+        }))
+        .unwrap();
+    let run = pe_bootstrap::cache_migration::collect_activity_v2_with_limits_for_test(
+        connection,
+        &fetcher,
+        "https://data.example",
+        FRESH_END + 1,
+        Arc::clone(&held),
+        None,
+    );
+    let mut run = std::pin::pin!(run);
+    tokio::select! {
+        result = &mut run => {
+            release.send(()).ok();
+            panic!("collection stopped before filling the writer queue: {result:?}, held={}", held.load(Ordering::SeqCst));
+        }
+        () = async {
+            while held.load(Ordering::SeqCst) < 2_000_000 + 65 * 5499 {
+                tokio::task::yield_now().await;
+            }
+        } => {}
+    }
+    assert_eq!(held.load(Ordering::SeqCst), 2_000_000 + 65 * 5499);
+    release.send(()).unwrap();
+    let result = run.await;
+    let error = result.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            pe_bootstrap::error::BootstrapError::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_COMMITHOOK
+        ),
+        "{error}"
+    );
+    assert_eq!(held.load(Ordering::SeqCst), 2_000_000);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE json_extract(acquisition_json, '$.fetched_source_row_count') = 5499 AND exclusion_reason IS NOT NULL"
+        ),
+        0
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_v2_receipt_shapes_reject_short_complete_bad_partial_and_short_unattempted() {
+    for shape in [
+        "complete",
+        "partial_at_end",
+        "partial_at_start",
+        "partial_past_end",
+        "not_attempted",
+        "acquisition2",
+    ] {
+        let dir = TempDir::new().unwrap();
+        let (side, mut proof) = if shape == "acquisition2" {
+            let (side, _) =
+                history_v3_legacy_seed(&dir, vec![dataset_row(WALLET, "0xa", "head", "BUY", 1)])
+                    .await;
+            let proof = collection_proof(&side, 1, WALLET);
+            assert_eq!(fresh_record(&side)["version"], 2);
+            assert_eq!(proof["acquisition"]["version"], 2);
+            assert_eq!(proof["acquisition"]["disposition"], "complete");
+            assert_eq!(proof["acquisition"]["aggregation_status"], "complete");
+            (side, proof)
+        } else {
+            let side = dataset_candidate(&dir, "shape.db", &[]);
+            let source = CollectionDataset::new(collection_rows(WALLET, 6000), 1);
+            collection_admit(&side, 1, FRESH_END, &[]).await;
+            collection_run(
+                &side,
+                &source,
+                FRESH_END,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Some(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+            let proof = collection_proof(&side, 1, WALLET);
+            (side, proof)
+        };
+        match shape {
+            "complete" => {
+                proof["acquisition"]["disposition"] = Value::from("complete");
+                proof["acquisition"]["exclusion_reason"] = Value::Null;
+                proof.as_object_mut().unwrap().remove("exclusion_reason");
+                proof["aggregate_count"] = proof["acquisition"]["fetched_aggregate_count"].clone();
+                proof["source_row_count"] =
+                    proof["acquisition"]["fetched_source_row_count"].clone();
+                proof["ordered_aggregate_digest"] =
+                    proof["acquisition"]["fetched_aggregate_digest"].clone();
+            }
+            "not_attempted" => {
+                proof["pages"] = serde_json::json!([]);
+                proof["acquisition"]["aggregation_status"] = Value::from("not_attempted");
+                proof["acquisition"]["fetched_aggregate_count"] = Value::Null;
+                proof["acquisition"]["fetched_aggregate_digest"] = Value::Null;
+                proof["acquisition"]["fetched_source_row_count"] = Value::from(0);
+            }
+            "acquisition2" => {
+                proof["acquisition"]["disposition"] = Value::from("excluded");
+                proof["acquisition"]["exclusion_reason"] = Value::from("acquisition_failure");
+                proof["acquisition"]["fixed_end_unix"] = Value::from(FRESH_END - 1);
+                proof["exclusion_reason"] = Value::from("fixture acquisition failure");
+                proof["aggregate_count"] = Value::from(0);
+                proof["source_row_count"] = Value::from(0);
+                proof["ordered_aggregate_digest"] =
+                    Value::from(whole_json_digest(&serde_json::json!([])));
+                for page in proof["pages"].as_array_mut().unwrap() {
+                    collection_page_bounds(page, 0, FRESH_END - 1);
+                }
+            }
+            _ => {
+                let end = match shape {
+                    "partial_at_end" => FRESH_END,
+                    "partial_at_start" => 0,
+                    _ => FRESH_END + 1,
+                };
+                proof["acquisition"]["fixed_end_unix"] = Value::from(end);
+                for page in proof["pages"].as_array_mut().unwrap() {
+                    collection_page_bounds(page, 0, end);
+                }
+            }
+        }
+        collection_read_commitment(&mut proof);
+        collection_reseal_receipt(&side, &proof);
+        let error = collection_run(
+            &side,
+            &HistoryV3StopFetcher,
+            FRESH_END,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(if shape == "partial_at_end" {
+                "invalid excluded activity receipt"
+            } else {
+                "activity acquisition identity mismatch"
+            }),
+            "{shape}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn collection_v2_terminal_window_proofs_reject_gaps_overlaps_and_outside_pages() {
+    for damage in ["gap", "overlap", "outside"] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "pages.db", &[]);
+        let source = DatasetFetcher {
+            rows: collection_rows(WALLET, 12_000),
+            ..Default::default()
+        };
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        let mut proof = collection_proof(&side, 1, WALLET);
+        for page in proof["pages"].as_array_mut().unwrap() {
+            let lo = page["bounds"]["start"].as_i64().unwrap();
+            let hi = page["bounds"]["end"].as_i64().unwrap();
+            if damage == "gap" && lo == 0 {
+                collection_page_bounds(page, 1, hi);
+            }
+            if damage == "overlap" && lo != 0 {
+                collection_page_bounds(page, lo - 1, hi);
+            }
+            if damage == "outside" && hi == FRESH_END {
+                collection_page_bounds(page, lo, hi + 1);
+            }
+        }
+        collection_read_commitment(&mut proof);
+        collection_reseal_receipt(&side, &proof);
+        let error = collection_run(
+            &side,
+            &HistoryV3StopFetcher,
+            FRESH_END,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(if damage == "outside" {
+                "outside the frozen read window"
+            } else {
+                "gap or overlap"
+            }),
+            "{damage}: {error}"
+        );
+    }
 }

@@ -26,6 +26,8 @@ fn start_server(events_series_id: &'static str) -> String {
             let body = if request.starts_with("GET /series?") {
                 r#"[{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"},{"id":"8","recurrence":"daily"}]"#
                     .to_owned()
+            } else if request.starts_with("GET /series/7 ") {
+                r#"{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"}"#.to_owned()
             } else if request.starts_with("GET /events/keyset?series_id=7&") {
                 format!(
                     r#"{{"events":[{{"series":[{{"id":"{events_series_id}","recurrence":"15m"}}],"markets":[{{"conditionId":"{CONDITION}"}}]}}]}}"#
@@ -44,16 +46,19 @@ fn start_server(events_series_id: &'static str) -> String {
     format!("http://{address}")
 }
 
-fn run(dir: &Path, base_url: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"))
+fn run(dir: &Path, base_url: &str, series: Option<&str>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"));
+    command
         .args(["market-scope", "--out"])
         .arg(dir.join("market_scope.json"))
         .args(["--end-date-min", "1776384000"])
         .env("PE_BOOTSTRAP_CACHE_PATH", dir.join("wallet_cache.db"))
         .env("PE_BOOTSTRAP_OUTPUT", dir.join("out.json"))
-        .env("PE_BOOTSTRAP_GAMMA_BASE_URL", base_url)
-        .output()
-        .unwrap()
+        .env("PE_BOOTSTRAP_GAMMA_BASE_URL", base_url);
+    if let Some(series) = series {
+        command.args(["--series", series]);
+    }
+    command.output().unwrap()
 }
 
 fn entries(dir: &Path) -> Vec<String> {
@@ -68,7 +73,7 @@ fn entries(dir: &Path) -> Vec<String> {
 #[test]
 fn writes_the_scope_file_without_touching_the_cache() {
     let dir = TempDir::new().unwrap();
-    let output = run(dir.path(), &start_server("7"));
+    let output = run(dir.path(), &start_server("7"), None);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let scope: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("market_scope.json")).unwrap())
@@ -86,7 +91,7 @@ fn writes_the_scope_file_without_touching_the_cache() {
 #[test]
 fn a_reply_anomaly_exits_one_and_writes_nothing() {
     let dir = TempDir::new().unwrap();
-    let output = run(dir.path(), &start_server("9"));
+    let output = run(dir.path(), &start_server("9"), None);
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(entries(dir.path()).is_empty());
 }
@@ -119,4 +124,25 @@ fn market_scope_invalid_recurrences_exit_one_before_fetching() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("market recurrences"));
         assert!(entries(dir.path()).is_empty());
     }
+}
+
+#[test]
+fn market_scope_keeps_explicit_series_and_reads_them_by_id() {
+    let dir = TempDir::new().unwrap();
+    let output = run(dir.path(), &start_server("7"), Some("7:btc-up-or-down-15m"));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let scope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("market_scope.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        scope["series"],
+        serde_json::json!([{"id":"7", "slug":"btc-up-or-down-15m"}])
+    );
+    assert!(
+        scope["pages"][0]["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/series/7")
+    );
+    assert_eq!(entries(dir.path()), ["market_scope.json"]);
 }
