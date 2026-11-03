@@ -8243,24 +8243,29 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BracketLogs {
 struct TimedBracketFetcher {
     inner: QueueFetcher,
     calls: AtomicUsize,
+    /// The first tail never answers, so the attempt is cancelled inside its stability window.
+    hang_tail: bool,
 }
 impl PageFetcher for TimedBracketFetcher {
     async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
         if url.contains("/activity?") {
             let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            if !first && self.hang_tail {
+                std::future::pending::<()>().await;
+            }
             tokio::time::advance(std::time::Duration::from_secs(if first { 20 } else { 1 })).await;
         }
         self.inner.fetch_page(url).await
     }
 }
 
-/// PASS: each accepted or failed attempt emits its outcome and separate baseline/stability
-/// durations; the first-tail sample starts the window and no tail means a zero window.
+/// PASS: each accepted, failed or cancelled attempt emits its outcome and separate
+/// baseline/stability durations; the first-tail sample starts the window and no tail means a zero
+/// window; a cancelled attempt's window runs to its cancellation.
 /// FAIL: missing attempt logs, lifetime baseline time counted as stability, or failure time omitted.
 #[tokio::test(start_paused = true)]
 async fn reentry_attempt_logs_separate_baseline_and_stability_timing() {
-    use tracing::instrument::WithSubscriber;
-    for failure in ["none", "baseline", "tail"] {
+    for failure in ["none", "baseline", "tail", "cancelled"] {
         let wallet = wallet(0xe9);
         let (_dir, paper, engine) = fresh(&[wallet]);
         let mut reads = reentry_reads(wallet, 4000, [4000; 3], &[], [&[]; 3], &[]);
@@ -8273,6 +8278,7 @@ async fn reentry_attempt_logs_separate_baseline_and_stability_timing() {
         let fetcher = Arc::new(TimedBracketFetcher {
             inner: QueueFetcher::new(reads),
             calls: AtomicUsize::new(0),
+            hang_tail: failure == "cancelled",
         });
         let validator = clocked_validator(fetcher, vec![4000]);
         let bytes = Arc::new(Mutex::new(Vec::new()));
@@ -8283,20 +8289,24 @@ async fn reentry_attempt_logs_separate_baseline_and_stability_timing() {
             .finish();
         let (tx, rx) = mpsc::channel(2);
         let actor = spawn_control_actor(rx, engine, paper.clone());
-        let outcomes = validator
-            .validate_via_control(
+        // A thread-wide capture also sees the log a cancelled attempt emits while it is dropped.
+        let capture = tracing::subscriber::set_default(subscriber);
+        let outcomes = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            validator.validate_via_control(
                 &[wallet],
                 &tx,
                 &paper,
                 pe_service::position_seeder::ValidationPurpose::CatchUp,
                 None,
-            )
-            .with_subscriber(subscriber)
-            .await;
-        if failure == "none" {
-            assert_eq!(outcomes.accepted.len(), 1);
-        } else {
-            assert!(outcomes.shared.is_some());
+            ),
+        )
+        .await;
+        drop(capture);
+        match failure {
+            "none" => assert_eq!(outcomes.unwrap().accepted.len(), 1),
+            "cancelled" => assert!(outcomes.is_err()),
+            _ => assert!(outcomes.unwrap().shared.is_some()),
         }
         let bytes = bytes.lock().unwrap().clone();
         let logs = std::str::from_utf8(&bytes)
@@ -8314,15 +8324,16 @@ async fn reentry_attempt_logs_separate_baseline_and_stability_timing() {
             match failure {
                 "baseline" => 0,
                 "tail" => 1000,
+                "cancelled" => 5000,
                 _ => 3000,
             }
         );
         assert_eq!(
             fields["outcome"],
-            if failure == "none" {
-                "accepted"
-            } else {
-                "activity.v2_envelope"
+            match failure {
+                "none" => "accepted",
+                "cancelled" => "cancelled",
+                _ => "activity.v2_envelope",
             }
         );
         drop(bytes);

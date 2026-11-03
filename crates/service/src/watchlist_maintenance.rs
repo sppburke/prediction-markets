@@ -1776,7 +1776,7 @@ pub async fn run_maintenance_loop(
 /// Sleep `interval` after a tick, or less: wallets the tick left unstarted (only possible once its
 /// launch deadline passed) start the next tick at once, and a ranking batch that no tick has read
 /// and no earlier wait woke for ends the sleep at the next `BATCH_CHECK_SECS` check. A failed read
-/// (`None`) just waits for the next check.
+/// (`None`) just waits for the next check; a read still pending at the interval's end is dropped.
 async fn wait_for_next_tick<F, Read>(
     sync: &BatchSync,
     interval: Duration,
@@ -1797,7 +1797,9 @@ async fn wait_for_next_tick<F, Read>(
             return;
         }
         tokio::time::sleep_until(check).await;
-        let latest = latest_batch().await;
+        let Ok(latest) = tokio::time::timeout_at(end, latest_batch()).await else {
+            return;
+        };
         if latest.is_some() && latest != sync.parking_batch && latest != *woken_for {
             *woken_for = latest;
             return;
@@ -5831,7 +5833,8 @@ mod tests {
 
         /// PASS: a tick that left wallets unstarted is followed at once; otherwise the loop sleeps
         /// its interval, ending at the first check that reads a batch no tick has read and no
-        /// earlier wait woke for; a failed read waits for the next check.
+        /// earlier wait woke for; a failed read waits for the next check, a slow read delays the
+        /// next check by its duration, and a stalled read ends with the interval.
         /// FAIL: a new batch waits out the interval, or a batch the ticks already read (applied or
         /// failing) or one an earlier wait woke for wakes the loop again.
         #[tokio::test(start_paused = true)]
@@ -5874,6 +5877,27 @@ mod tests {
                 waited(admission_sync(5), vec![Some(6), Some(7)]).await,
                 (2 * check, Some(7))
             );
+            // A read that never answers cannot hold the next tick past the interval.
+            let start = tokio::time::Instant::now();
+            wait_for_next_tick(&admission_sync(5), interval, &mut None, || {
+                std::future::pending::<Option<i64>>()
+            })
+            .await;
+            assert_eq!(start.elapsed(), interval);
+            // Each check starts one check period after the previous read finished, so slow reads
+            // add their time: reads at 30-50 s and 80-100 s, the second one seeing batch 6.
+            let slow = Duration::from_secs(20);
+            let mut reads = vec![Some(5), Some(6)].into_iter();
+            let start = tokio::time::Instant::now();
+            wait_for_next_tick(&admission_sync(5), interval, &mut None, || {
+                let read = reads.next().flatten();
+                async move {
+                    tokio::time::sleep(slow).await;
+                    read
+                }
+            })
+            .await;
+            assert_eq!(start.elapsed(), 2 * (check + slow));
         }
 
         #[tokio::test(start_paused = true)]

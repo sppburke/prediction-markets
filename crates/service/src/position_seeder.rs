@@ -54,6 +54,40 @@ pub const BRACKET_CONCURRENCY: usize = 4;
 pub const REENTRY_HISTORY_OVERLAP_SECS: i64 = 3_600;
 
 /// Routine refresh yields unseen post-anchor activity to ordinary reconciliation.
+/// One runtime attempt's timing, logged as `bracket attempt` when the attempt ends, including
+/// when its future is dropped before returning (outcome `cancelled`).
+struct BracketAttemptLog {
+    wallet: WalletAddress,
+    outcome: &'static str,
+    baseline_started: Option<Instant>,
+    baseline_completed: Option<Instant>,
+    stability_started: Option<Instant>,
+    stability_completed: Option<Instant>,
+}
+
+impl Drop for BracketAttemptLog {
+    fn drop(&mut self) {
+        let ended = Instant::now();
+        let millis = |start: Option<Instant>, end: Option<Instant>| {
+            start.map_or(0, |start| {
+                u64::try_from(end.unwrap_or(ended).duration_since(start).as_millis())
+                    .unwrap_or(u64::MAX)
+            })
+        };
+        // A failed or cancelled attempt's stability window runs to its end.
+        let stability_end = (self.outcome == "accepted")
+            .then_some(self.stability_completed)
+            .flatten();
+        tracing::info!(
+            wallet = %self.wallet,
+            outcome = self.outcome,
+            baseline_ms = millis(self.baseline_started, self.baseline_completed),
+            stability_window_ms = millis(self.stability_started, stability_end),
+            "bracket attempt"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationPurpose {
     CatchUp,
@@ -1017,10 +1051,14 @@ impl CausalPositionValidator {
         purpose: ValidationPurpose,
         ordinary_reconciliation_needed: &mut bool,
     ) -> Result<AnchorInstall, CausalPositionError> {
-        let mut baseline_started = None;
-        let mut baseline_completed = None;
-        let mut stability_started = None;
-        let mut stability_completed = None;
+        let mut attempt = BracketAttemptLog {
+            wallet,
+            outcome: "cancelled",
+            baseline_started: None,
+            baseline_completed: None,
+            stability_started: None,
+            stability_completed: None,
+        };
         let result = async {
             let expected_fence = paper_state.wallet_fence(&wallet)?;
             if let Some(fence) = &expected_fence
@@ -1032,7 +1070,7 @@ impl CausalPositionValidator {
             let mut metadata_reads = BTreeMap::new();
             let mut unresolved_assets = BTreeMap::new();
             // One full read commits the history; three short tails from its end prove stability.
-            baseline_started = Some(Instant::now());
+            attempt.baseline_started = Some(Instant::now());
             let mut baseline = self.activity(wallet).await?;
             let twins = self.preflight_control_read(
                 wallet,
@@ -1057,14 +1095,14 @@ impl CausalPositionValidator {
                 false,
             )
             .await?;
-            baseline_completed = Some(Instant::now());
+            attempt.baseline_completed = Some(Instant::now());
             let start = Some(
                 baseline
                     .fixed_end
                     .saturating_sub(REENTRY_HISTORY_OVERLAP_SECS),
             );
             let first_fixed_end = (self.now)();
-            stability_started = Some(Instant::now());
+            attempt.stability_started = Some(Instant::now());
             let first_activity = self.activity_since(wallet, start, first_fixed_end).await?;
             let first_twins = self.preflight_control_read(
                 wallet,
@@ -1178,7 +1216,7 @@ impl CausalPositionValidator {
             {
                 return Err(CausalPositionError::InterveningActivity { wallet });
             }
-            stability_completed = Some(Instant::now());
+            attempt.stability_completed = Some(Instant::now());
             let final_ledger = capture_control(wallet, control_tx).await?;
             let final_activity = ActivityEvidence::from(final_activity);
             let mut install = self.finish(
@@ -1214,14 +1252,9 @@ impl CausalPositionValidator {
             Ok(install)
         }
         .await;
-        let ended = Instant::now();
-        tracing::info!(
-            wallet = %wallet,
-            outcome = result.as_ref().map_or_else(|error| error.kind(), |_| "accepted"),
-            baseline_ms = u64::try_from(baseline_started.map_or(0, |start| baseline_completed.unwrap_or(ended).duration_since(start).as_millis())).unwrap_or(u64::MAX),
-            stability_window_ms = u64::try_from(stability_started.map_or(0, |start| if result.is_err() { ended } else { stability_completed.unwrap_or(ended) }.duration_since(start).as_millis())).unwrap_or(u64::MAX),
-            "bracket attempt"
-        );
+        attempt.outcome = result
+            .as_ref()
+            .map_or_else(|error| error.kind(), |_| "accepted");
         result
     }
 

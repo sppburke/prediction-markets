@@ -787,9 +787,11 @@ This repair does not create a new financial activation, state generation, table,
 key or migration marker.
 
 Before accepting rollout, verify the running revision and record which old omitted-start anchors
-were revalidated or excluded. Inspect the selected durable `position_anchors` proof for all three
-original page-zero activity requests: exclusive start zero, wire `start=1`, and each walk's fixed
-end. An old complete flag alone cannot justify reuse; failed or deferred boot validation leaves
+were revalidated or excluded. Inspect the selected durable `position_anchors` proof against the
+canonical reuse rule ([glossary](_GLOSSARY.md)): either all three original page-zero activity
+requests (exclusive start zero, wire `start=1`, each walk's fixed end), as direct boot writes, or
+a full `baseline_walk` with that evidence plus three tails, as every runtime bracket writes. An old
+complete flag alone cannot justify reuse; failed or deferred boot validation leaves
 that wallet excluded. Record activity and metadata request counts, actual validation duration,
 total boot duration, and accepted and deferred wallet counts. Every revalidated old anchor performs
 at least seven source requests (three activity walks and two position reads over both partitions)

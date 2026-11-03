@@ -1421,12 +1421,13 @@ impl TradePoller {
                             .admission_preparer
                             .as_ref()
                             .is_some_and(AdmissionPreparer::admission_waiting);
+                    let already_cancelled = handoff.is_cancelled();
                     if ((refresh_yields || self.obligations.pending_boundary().is_some())
                         && self.obligations.by_wallet.contains_key(wallet)
                         || admission_waiting)
                         && handoff.cancel_before_handoff()
                     {
-                        if admission_waiting {
+                        if admission_waiting && !already_cancelled {
                             info!(wallet = %wallet, "routine refresh yielded to a waiting admission");
                         }
                         handle.abort();

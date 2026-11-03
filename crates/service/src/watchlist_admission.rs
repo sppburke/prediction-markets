@@ -733,8 +733,15 @@ struct AdmissionLaunchLog {
     context: AdmissionContext,
     eligible: Vec<String>,
     started_previous_keys: Vec<(String, u64)>,
-    /// Time spent waiting for the bracket lock; `None` when no lock was needed.
-    lock_wait_ms: Option<u64>,
+    /// The wait for the bracket lock, logged as `lock_wait_started_unix_ms` and `lock_wait_ms`.
+    lock_wait: Option<LockWait>,
+}
+
+/// A wait still pending when the preparation is dropped runs to the drop.
+struct LockWait {
+    started_unix_ms: i64,
+    started: Instant,
+    acquired: Option<Instant>,
 }
 
 impl AdmissionLaunchLog {
@@ -758,9 +765,20 @@ impl Drop for AdmissionLaunchLog {
             AdmissionContext::Capacity => ("capacity", None),
             AdmissionContext::Other => ("other", None),
         };
+        let (lock_wait_started_unix_ms, lock_wait_ms) = self
+            .lock_wait
+            .as_ref()
+            .map(|wait| {
+                let waited = wait.acquired.unwrap_or_else(Instant::now) - wait.started;
+                (
+                    wait.started_unix_ms,
+                    u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                )
+            })
+            .unzip();
         info!(path, first, eligible = %serde_json::json!(self.eligible), started = self.started_previous_keys.len(),
-            started_previous_keys = %serde_json::json!(self.started_previous_keys), lock_wait_ms = self.lock_wait_ms,
-            "admission launch order");
+            started_previous_keys = %serde_json::json!(self.started_previous_keys), lock_wait_started_unix_ms,
+            lock_wait_ms, "admission launch order");
     }
 }
 
@@ -942,7 +960,7 @@ impl AdmissionPreparer {
             context,
             eligible: Vec::new(),
             started_previous_keys: Vec::new(),
-            lock_wait_ms: None,
+            lock_wait: None,
         };
         // Nothing to admit needs no lock, so it never waits behind a refresh.
         if additions.is_empty() {
@@ -955,13 +973,18 @@ impl AdmissionPreparer {
         }
         preparer.admissions_waiting.fetch_add(1, Ordering::AcqRel);
         let waiting = WaitingAdmission(&preparer.admissions_waiting);
-        let wait_started = Instant::now();
-        let waited = || u64::try_from(wait_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        launch.lock_wait = Some(LockWait {
+            started_unix_ms: i64::try_from(
+                time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
+            )
+            .unwrap_or(i64::MAX),
+            started: Instant::now(),
+            acquired: None,
+        });
         let mut attempt = if let Some(end) = deadline {
             match tokio::time::timeout_at(end, preparer.attempt.lock()).await {
                 Ok(guard) => guard,
                 Err(_) => {
-                    launch.lock_wait_ms = Some(waited());
                     return Ok(AdmissionOutcome {
                         started,
                         unstarted: additions.to_vec(),
@@ -974,7 +997,9 @@ impl AdmissionPreparer {
             preparer.attempt.lock().await
         };
         drop(waiting);
-        launch.lock_wait_ms = Some(waited());
+        if let Some(wait) = &mut launch.lock_wait {
+            wait.acquired = Some(Instant::now());
+        }
         let mut admitted = Vec::new();
         let mut deferred = Vec::new();
         let mut eligible = Vec::new();
