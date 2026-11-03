@@ -1454,12 +1454,14 @@ to the owner. Record each completed step and resume it, rather than starting ano
    classifier-6 spool bytes, positions and print-pricing demand at the [shared floor](_GLOSSARY.md#ranking-horizon-floor).
    Set `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS` to the owner's ordinary-cycle choice. **Explicit owner
    restart consent** is required before setting flag `run` and starting the loop unit. Ordinary
-   cycles keep the [interim freshness override](_GLOSSARY.md#catch-up-freshness) through the
+   cycles kept the [interim freshness override](_GLOSSARY.md#catch-up-freshness) through the
    historical quiet-wallet re-read wave. **2026-10-31 update (#821):** new admissions defer no
    wallets; complete predecessors read incrementally each generation, historical deferred
-   predecessors read in full, and older venue revisions require explicit full-read repair. Remove
-   the override by a `.env` edit between cycles once its glossary removal condition holds. Observe three ordinary publications under the existing batch-application,
-   membership-policy and service-health checks.
+   predecessors read in full, and older venue revisions require explicit full-read repair.
+   **2026-11-03 update (#815):** the 15/5-minute loop's `.env` dropped the override between cycles
+   once its glossary removal condition held, so its cycles use the canonical freshness bound.
+   Observe three ordinary publications under the existing batch-application, membership-policy and
+   service-health checks.
 
 For each cycle record stage durations, rows read/written and commitments, drops and ignored records,
 peak RSS, spool/export/spill/WAL bytes and both drives' free space. Collection timing separates fetch
@@ -1657,9 +1659,10 @@ prepared request through acceptance and resume rather than recreating it.
 Classifier 6 / format 3 changes no loop unit, flag or lock lifecycle. Its
 [catch-up procedure](#classifier-6-catch-up-and-coordinated-release-739) owns the stopped installation,
 detached one-shot acceptance, exact pending-request handoff and explicit owner restart consent.
-The [interim `.env` freshness bound](_GLOSSARY.md#catch-up-freshness) covers catch-up and the
+The [interim `.env` freshness bound](_GLOSSARY.md#catch-up-freshness) covered catch-up and the
 historical quiet-wallet re-read wave. As of 2026-10-31 (#821), no new quiet deferrals or weekly
-full reads are scheduled; remove the override between cycles once its glossary condition holds.
+full reads are scheduled, and on 2026-11-03 the 15/5-minute loop's `.env` dropped the override once
+its glossary condition held.
 Normal cycles use the canonical freshness checks, the owner's frozen activation batch and the one
 [`MIN_TTR_SECS` scoring value](_GLOSSARY.md#ranking-horizon-floor), with batch limits taken from the
 validated oracle manifest. Scope/coverage publication is atomic; the supervisor adds no special stage.
