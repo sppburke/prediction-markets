@@ -4038,7 +4038,15 @@ async fn previous_binary_rollback_matrix() {
         let mut record = pe_service::source_checkpoint::checkpoint_path(source).into_os_string();
         record.push(".invalidation");
         let record = PathBuf::from(record);
-        let finances = fixture.paper.financial_snapshot(NOW_UNIX).unwrap();
+        // copy() stamps its fill with the real clock; a cutoff after it keeps every fill in view, so
+        // a duplicated fill changes the snapshot instead of being added back to starting cash.
+        let cutoff = OffsetDateTime::now_utc().unix_timestamp() + 86_400;
+        let finances = fixture.paper.financial_snapshot(cutoff).unwrap();
+        assert_eq!(
+            finances.fills_for_open_and_7d.len(),
+            1,
+            "{row}: the seeded fill"
+        );
         let history = fixture.paper.gate_history().unwrap();
         let decisions = fixture.paper.decision_pending_history().unwrap();
         for (direction, binary) in [("previous", previous.as_path()), ("new", current)] {
@@ -4261,7 +4269,7 @@ async fn previous_binary_rollback_matrix() {
                 );
             }
             assert_eq!(
-                fixture.paper.financial_snapshot(NOW_UNIX).unwrap(),
+                fixture.paper.financial_snapshot(cutoff).unwrap(),
                 finances,
                 "{direction} {row}"
             );
