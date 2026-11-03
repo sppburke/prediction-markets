@@ -200,9 +200,10 @@ The import canonicalizes/deduplicates addresses,
 logs the file SHA-256 and count, and requires `0 ≤ from < through ≤ now`. It uses the same
 participant upsert and exclusion rules under `CacheMutationLock`; it does not activate wallets.
 
-An absent, other-recurrence or legacy null-set record is replaced. An interval for the same
-recurrences and a set containing all covered series must overlap or touch the
-record: the merged interval keeps the earliest start, latest end and later floor. A disjoint
+An absent, other-recurrence or legacy null-set record is replaced, and so is the record when the
+import names a strict superset of its series: that interval alone must cover the required window
+for the whole set. An interval for the same recurrences and the same series set must overlap or
+touch the record: the merged interval keeps the earliest start, latest end and later floor. A disjoint
 interval is refused unchanged, naming the missing bridge. An earlier-floor import repairs a
 floor hold only when its interval contains the record's entire interval; otherwise it is refused
 unchanged, naming the coverage needed. All inputs and the resulting record are validated before

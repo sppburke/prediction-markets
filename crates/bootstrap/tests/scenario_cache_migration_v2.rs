@@ -24240,7 +24240,7 @@ async fn collection_v2_schema_3_tampered_receipts_reject_before_any_write() {
                 extra["request_url"] = Value::from(url.to_string());
                 collection_page_bounds(
                     &mut extra,
-                    if damage == "gap" { FRESH_END } else { hi - 1 },
+                    if damage == "gap" { hi + 1 } else { hi - 1 },
                     FRESH_END,
                 );
                 pages.push(extra);
@@ -24272,7 +24272,18 @@ async fn collection_v2_schema_3_tampered_receipts_reject_before_any_write() {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("activity"), "{damage}: {error}");
+        // Each case fails its own structural rule, before the read commitment is compared.
+        let expected = match damage {
+            "mixed" => "activity receipt identity mismatch",
+            "repeated_cursor" | "after_terminal" | "missing_terminal" | "empty_continuation" => {
+                "activity page cursor chain is incomplete"
+            }
+            "large_page" => "activity page is outside the frozen read window",
+            "large_window" => "activity window exceeds capacity",
+            "gap" | "overlap" => "activity terminal windows have a gap or overlap",
+            _ => "activity page request does not match its proof",
+        };
+        assert!(error.to_string().contains(expected), "{damage}: {error}");
         assert_eq!(
             before,
             query_values(&side, "SELECT * FROM activity_wallet_coverage_staging_v2"),
