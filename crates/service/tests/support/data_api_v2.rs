@@ -26,6 +26,11 @@ fn amount(value: &Value) -> Decimal {
         .unwrap()
 }
 
+/// The v2 form of one stored v1 activity row, exactly as the fake serves it.
+pub fn activity_row(row: &Value) -> Value {
+    convert(row, false)
+}
+
 fn convert(row: &Value, positions: bool) -> Value {
     let mut converted = serde_json::Map::new();
     for (key, value) in row.as_object().unwrap() {

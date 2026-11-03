@@ -905,7 +905,11 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         .await;
         let local = paper.wallet_scope_drops(&wallet(3), anomaly_epoch).unwrap();
         assert_eq!(local.len(), 1);
-        let raw_row_hash = blake3::hash(&serde_json::to_vec(&unrepresentable).unwrap())
+        // The v2 fake serves the row under v2 field names in a single terminal cursor page.
+        let served_row = data_api_v2::activity_row(&unrepresentable);
+        let served_page = json!({"data": [served_row.clone()],
+            "pagination": {"limit": 1000, "offset": 0, "has_more": false, "next_cursor": null}});
+        let raw_row_hash = blake3::hash(&serde_json::to_vec(&served_row).unwrap())
             .to_hex()
             .to_string();
         let unrepresentable_id = pe_core_types::SourceTradeId(format!(
@@ -920,7 +924,7 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         assert_eq!(
             serde_json::from_str::<Value>(&local[0].proof_json).unwrap(),
             json!({
-                "page_raw_hash": blake3::hash(&serde_json::to_vec(std::slice::from_ref(&unrepresentable)).unwrap()).to_hex().to_string(),
+                "page_raw_hash": blake3::hash(&serde_json::to_vec(&served_page).unwrap()).to_hex().to_string(),
                 "page_row_index": 0,
                 "raw_row_hash": raw_row_hash,
                 "kind": "price_out_of_range"
@@ -1128,10 +1132,12 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
                     let (_, envelope) = frame.unwrap();
                     envelope.source_id.0 == pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID
                         && envelope.schema_version
-                            == pe_service::trade_poller::ACTIVITY_POLL_ANOMALY_PAGE_SCHEMA_VERSION
-                        && serde_json::from_slice::<Vec<Value>>(&envelope.payload)
-                            .unwrap()
-                            .contains(&unrepresentable)
+                            == pe_service::trade_poller::ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION
+                        && serde_json::from_slice::<Value>(&envelope.payload).unwrap()["data"]
+                            .as_array()
+                            .is_some_and(|rows| {
+                                rows.contains(&data_api_v2::activity_row(&unrepresentable))
+                            })
                 })
         );
         let financial = paper.financial_snapshot(now + 1000).unwrap();
