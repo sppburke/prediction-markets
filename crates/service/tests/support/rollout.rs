@@ -85,6 +85,8 @@ struct HttpState {
     rows: Vec<ConfigRow>,
     now: i64,
     ranked_wallets: usize,
+    newcomer: Option<WalletAddress>,
+    activity_requests: Mutex<Vec<HashMap<String, String>>>,
     full_history_requests: Mutex<Vec<String>>,
     cut_full_history_replies: std::sync::atomic::AtomicUsize,
     start: Mutex<Option<pe_event_log::AppendReceipt>>,
@@ -123,6 +125,8 @@ pub async fn boundary_mark() {
         rows: Vec::new(),
         now: 0,
         ranked_wallets: 0,
+        newcomer: None,
+        activity_requests: Mutex::new(Vec::new()),
         full_history_requests: Mutex::new(Vec::new()),
         cut_full_history_replies: AtomicUsize::new(0),
         start: Mutex::new(None),
@@ -184,6 +188,7 @@ async fn serve(
     let path = url.path();
     if matches!(path, "/activity" | "/v2/activity") {
         let w = q.get("user").unwrap();
+        state.activity_requests.lock().unwrap().push(q.clone());
         if q.get("start").is_some_and(|start| start == "1") {
             let reads = {
                 let mut requests = state.full_history_requests.lock().unwrap();
@@ -196,7 +201,11 @@ async fn serve(
                 state.slow.acquire().await.unwrap().forget();
             }
         }
-        if w == &wallet(2).to_string() && !state.release_slow.load(Ordering::SeqCst) {
+        if w == &wallet(2).to_string()
+            && !state.release_slow.load(Ordering::SeqCst)
+            // The admission case holds the refresh baseline, leaving ordinary polls available.
+            && (state.newcomer.is_none() || q.get("start").is_some_and(|start| start == "1"))
+        {
             state.slow_started.notify_one();
             state.slow.acquire().await.unwrap().forget();
         }
@@ -401,7 +410,7 @@ async fn serve(
         "/rest/v1/ranking_neg_risk_group_spans"=>json!(*state.group_spans.lock().unwrap()),
         "/rest/v1/service_config"=>json!(state.rows),
         "/rest/v1/ranking_batches"=>json!([{"batch_id":batch}]),
-        "/rest/v1/ranking_entries"|"/rest/v1/latest_ranking"=>json!((1..=state.ranked_wallets).map(|n|json!({"batch_id":batch,"rank":n,"wallet_hex":wallet(n).to_string(),"ls_tstat":"3","hit_rate":"0.65","n_trades":100,"last_trade_unix":if n == 2 && state.stale_ranked_wallet_2.load(Ordering::SeqCst) { state.now - 300_000 } else { state.now - 20 },"survives":true})).collect::<Vec<_>>()),
+        "/rest/v1/ranking_entries"|"/rest/v1/latest_ranking"=>json!((1..=state.ranked_wallets).filter(|n| batch != 1 || state.newcomer != Some(wallet(*n))).map(|n|json!({"batch_id":batch,"rank":n,"wallet_hex":wallet(n).to_string(),"ls_tstat":"3","hit_rate":"0.65","n_trades":100,"last_trade_unix":if n == 2 && state.stale_ranked_wallet_2.load(Ordering::SeqCst) { state.now - 300_000 } else { state.now - 20 },"survives":true})).collect::<Vec<_>>()),
         "/rest/v1/service_runtime"=>json!([{"updated_at":a.projection_generation.to_string(),"watchlist_size":a.projection.len()}]),
         "/rest/v1/rpc/service_watchlist_replace_v1"=> { assert_eq!(body["expected_token"],a.projection_generation.to_string());a.projection=body["entries"].as_array().unwrap().clone();a.projection_generation+=1;json!([{"new_token":a.projection_generation.to_string(),"count":a.projection.len()}]) },
         "/rest/v1/paper_bankroll"=>json!([{"bankroll_str":a.cash.to_string(),"last_prepared_seq":a.progress}]),
@@ -589,11 +598,11 @@ fn envelope(payload: Vec<u8>, source: &str, at: i64, schema: u32, parser: u32) -
 /// repairs first-entry history, settles once, and restores checkpoint+suffix and exact decisions
 /// from schema-7 v2 cursor pages with schema-3 evidence. FAIL: v1 acquisition or restart drift.
 pub async fn run() {
-    run_case(false, false).await;
+    run_case(false, false, false).await;
 }
 
 pub async fn run_boot_waves() {
-    run_case(true, false).await;
+    run_case(true, false, false).await;
 }
 
 /// PASS: runtime ranking imports and local anomalies exclude only their scopes; revised BUYs
@@ -603,10 +612,17 @@ pub async fn run_boot_waves() {
 /// FAIL: a v1 fetch, missing cursor proof, lost state or inexact sealed replay.
 /// This short run does not meet the qualification duration or closed-copy sample thresholds.
 pub async fn scope_drops() {
-    run_case(false, true).await;
+    run_case(false, true, false).await;
 }
 
-async fn run_case(boot_waves: bool, scope_drops: bool) {
+/// PASS: a newly ranked wallet is admitted and copies before a held routine refresh is released;
+/// the refresh retries, and restart plus sealed CLI replay preserve every decision and membership.
+/// FAIL: the unflagged refresh retains the bracket lock, its retry never anchors, or replay drifts.
+pub async fn newly_ranked_wallet_during_slow_refresh() {
+    run_case(false, false, true).await;
+}
+
+async fn run_case(boot_waves: bool, scope_drops: bool, waiting_admission: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -655,7 +671,15 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         import_reads: Mutex::new(Vec::new()),
         rows: crate::golden::golden_config_rows(&runtime),
         now,
-        ranked_wallets: if boot_waves { 5 } else { 4 },
+        ranked_wallets: if boot_waves {
+            5
+        } else if waiting_admission {
+            3
+        } else {
+            4
+        },
+        newcomer: waiting_admission.then_some(wallet(3)),
+        activity_requests: Mutex::new(Vec::new()),
         full_history_requests: Mutex::new(Vec::new()),
         cut_full_history_replies: std::sync::atomic::AtomicUsize::new(0),
         start: Mutex::new(None),
@@ -679,12 +703,12 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         slow_started: Notify::new(),
         slow: Semaphore::new(0),
         release_slow: AtomicBool::new(boot_waves || scope_drops),
-        gamma_fails: AtomicBool::new(!boot_waves && !scope_drops),
+        gamma_fails: AtomicBool::new(!boot_waves && !scope_drops && !waiting_admission),
         stale_ranked_wallet_2: AtomicBool::new(false),
         gamma_failures: std::sync::atomic::AtomicUsize::new(0),
         resolved: AtomicBool::new(false),
     });
-    if boot_waves || scope_drops {
+    if boot_waves || scope_drops || waiting_admission {
         state.activity.lock().unwrap().clear();
     }
     let server = tokio::spawn(
@@ -721,12 +745,20 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
     drop(side);
     boot.session.unwrap().finish().unwrap();
     let paper = Arc::new(PaperStateDb::open(&cfg.paper_state_db_path).unwrap());
-    let wallets = (1..=state.ranked_wallets).map(wallet).collect::<Vec<_>>();
+    let wallets = (1..=state.ranked_wallets)
+        .map(wallet)
+        .filter(|wallet| Some(*wallet) != state.newcomer)
+        .collect::<Vec<_>>();
     for w in &wallets {
         if scope_drops {
             crate::support::install_verified_empty_anchor(&paper, *w, now - 10);
         } else {
-            crate::support::install_full_history_anchor(&paper, *w, now - 10);
+            let age = if waiting_admission && *w == wallet(2) {
+                i64::try_from(pe_service::trade_poller::ANCHOR_REFRESH_SECS).unwrap() + 1
+            } else {
+                10
+            };
+            crate::support::install_full_history_anchor(&paper, *w, now - age);
         }
         paper
             .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
@@ -778,6 +810,11 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
         )
         .unwrap();
     *state.start.lock().unwrap() = Some(start_receipt);
+    if waiting_admission {
+        run_waiting_admission(&cfg, &paper, &state, &wallets).await;
+        server.abort();
+        return;
+    }
     if boot_waves {
         let c = rusqlite::Connection::open(&cfg.paper_state_db_path).unwrap();
         // Only the fifth wallet has a seed to promote. Every wallet must take a fresh bracket.
@@ -1244,145 +1281,7 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
             assert_eq!(paper.wallet_coverage(w).unwrap(), coverage[i]);
             assert!(!paper.is_wallet_fenced(w).unwrap());
         }
-        let cutoff = last_second_of_day(now) + 1;
-        let mut source = Writer::open(&cfg.source_event_log_path).unwrap();
-        let boundary_receipt = source
-            .append_synced(envelope(
-                serde_json::to_vec(&json!({"kind":"daily_boundary","cutoff_unix":cutoff})).unwrap(),
-                "pe-service.boundary",
-                cutoff,
-                1,
-                1,
-            ))
-            .unwrap();
-        let price = Price::new(dec!(0.50)).unwrap();
-        let prices = financial
-            .positions
-            .iter()
-            .map(|position| {
-                let receipt = source
-                    .append_synced(envelope(
-                        serde_json::to_vec(&json!({"history":[{"t":cutoff,"p":"0.50"}]})).unwrap(),
-                        "pe-service.clob-prices-history",
-                        cutoff,
-                        1,
-                        1,
-                    ))
-                    .unwrap();
-                pe_service::paper_recovery::PaperMarkPrice {
-                    market_id: position.market_id.0.0.clone(),
-                    outcome_id: position.outcome_id.0,
-                    price: Some(price),
-                    sample_unix: Some(cutoff),
-                    receipt: Some(receipt),
-                    closure_receipt: None,
-                    invalid: None,
-                }
-            })
-            .collect();
-        drop(source);
-        let valued = financial
-            .positions
-            .iter()
-            .map(|position| (position.long.checked_sub(position.short).unwrap(), price))
-            .collect::<Vec<_>>();
-        let mark = pe_service::paper_recovery::PortfolioMark {
-            boundary_receipt,
-            cutoff_unix: cutoff,
-            source_tail: TailBinding::from(&Scanner::verify(&cfg.source_event_log_path).unwrap()),
-            financial_prefix_seq: financial.last_prepared_seq,
-            prices,
-            cash: financial.cash,
-            equity: pe_risk_engine::current_equity(&pe_risk_engine::EquityInputs {
-                cash: financial.cash,
-                positions: &valued,
-            })
-            .unwrap(),
-            invalid: None,
-        };
-        Writer::open(&cfg.event_log_path)
-            .unwrap()
-            .append_synced(envelope(
-                serde_json::to_vec(&PaperLogRecord::PortfolioMark(Box::new(mark))).unwrap(),
-                "pe-service.paper",
-                cutoff,
-                2,
-                1,
-            ))
-            .unwrap();
-        let source_prefix =
-            TailBinding::from(&Scanner::verify(&cfg.source_event_log_path).unwrap());
-        let keys = decisions
-            .iter()
-            .map(|row| (row.source_trade_id.clone(), row.semantic_revision.clone()))
-            .collect::<Vec<_>>();
-        let digest = paper
-            .seal_decision_evidence_for_source_prefix(&keys, &keys, source_prefix.last_sequence)
-            .unwrap();
-        let seal = pe_service::paper_recovery::QualificationSealed {
-            start_receipt,
-            source_prefix,
-            financial_prefix: TailBinding::from(&Scanner::verify(&cfg.event_log_path).unwrap()),
-            live_prefix: TailBinding::from(
-                &pe_execution_core::LiveJournal::verified_tail(root.join("live_journal.log"))
-                    .unwrap(),
-            ),
-            decision_evidence_digest: blake3::hash(&digest).to_hex().to_string(),
-            sealed_cutoff_unix: cutoff,
-            reason: pe_service::paper_recovery::SealReason::Complete,
-        };
-        let receipt = Writer::open(&cfg.event_log_path)
-            .unwrap()
-            .append_synced(envelope(
-                serde_json::to_vec(&PaperLogRecord::QualificationSealed(Box::new(seal))).unwrap(),
-                "pe-service.paper",
-                cutoff,
-                2,
-                1,
-            ))
-            .unwrap();
-        let output_path = root.join("qualification.json");
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
-        command
-            .env_clear()
-            .args(["--qualify", "--paper-log"])
-            .arg(&cfg.event_log_path)
-            .arg("--source-log")
-            .arg(&cfg.source_event_log_path)
-            .arg("--live-journal")
-            .arg(root.join("live_journal.log"))
-            .arg("--paper-state")
-            .arg(&cfg.paper_state_db_path)
-            .arg("--seal-hash")
-            .arg(receipt.this_hash.to_hex().as_str())
-            .arg("--output")
-            .arg(&output_path);
-        let output = crate::support::bounded_command_output(command).await;
-        assert!(output.status.success(), "{output:?}");
-        let report: pe_service::qualification::QualificationReport =
-            serde_json::from_slice(&std::fs::read(output_path).unwrap()).unwrap();
-        assert!(report.replay.exact, "{:?}", report.reasons);
-        assert_eq!(report.replay.fills, 5);
-        assert_eq!(report.replay.decisions, 5);
-        assert_eq!(
-            report.verdict,
-            pe_service::qualification::QualificationVerdict::Fail,
-            "{:?}",
-            report.reasons
-        );
-        // Only the short run's thresholds and its intentionally open positions may fail; any other
-        // financial gate failure (drawdown, a measured copy delay over budget) must surface here.
-        let intended = [
-            "complete days ",
-            "closed copies ",
-            "LCB_5pct is not positive",
-            "paper p95 copy delay is absent or above budget",
-            "paper positions remain open at the sealed financial prefix",
-        ];
-        assert_eq!(report.reasons.len(), intended.len(), "{:?}", report.reasons);
-        for (reason, prefix) in report.reasons.iter().zip(intended) {
-            assert!(reason.starts_with(prefix), "{:?}", report.reasons);
-        }
+        seal_and_replay(&cfg, &paper, now, 5).await;
         server.abort();
         return;
     }
@@ -1796,6 +1695,434 @@ async fn run_case(boot_waves: bool, scope_drops: bool) {
     server.abort();
 }
 
+async fn run_waiting_admission(
+    cfg: &ServiceConfig,
+    paper: &PaperStateDb,
+    state: &Arc<HttpState>,
+    initial_wallets: &[WalletAddress],
+) {
+    use std::sync::atomic::Ordering;
+    let root = cfg.event_log_path.parent().unwrap();
+    let newcomer = state.newcomer.unwrap();
+    let refreshing = wallet(2);
+    let original = paper.wallet_coverage(&refreshing).unwrap();
+    assert!(!original.reanchor_required);
+    assert!(pe_service::watchlist_admission::anchor_refresh_due(
+        &original,
+        state.now,
+        pe_service::trade_poller::ANCHOR_REFRESH_SECS,
+    ));
+    assert!(paper.position_anchors(&newcomer).unwrap().is_empty());
+    let config_path = root.join("service.toml");
+    std::fs::write(&config_path, toml::to_string(cfg).unwrap()).unwrap();
+    let child = Child::start(&config_path);
+    tokio::time::timeout(Duration::from_secs(5), state.slow_started.notified())
+        .await
+        .expect("the age-due routine refresh must start immediately after boot");
+    assert_eq!(paper.wallet_coverage(&refreshing).unwrap(), original);
+    assert_eq!(
+        *state.full_history_requests.lock().unwrap(),
+        vec![refreshing.to_string()],
+        "boot reuses its anchors; the held request is the routine refresh baseline"
+    );
+    until(|| state.authority.lock().unwrap().projection.len() == initial_wallets.len()).await;
+    assert!(
+        state
+            .authority
+            .lock()
+            .unwrap()
+            .projection
+            .iter()
+            .all(|row| {
+                initial_wallets
+                    .iter()
+                    .any(|wallet| row["wallet_hex"] == wallet.to_string())
+            })
+    );
+    state.ranking_batch.store(2, Ordering::SeqCst);
+    // This bound is shorter than the held HTTP request's timeout: a failed refresh cannot
+    // release the lock in place of the poller's explicit admission yield.
+    tokio::time::timeout(Duration::from_secs(8), async {
+        until(|| service_logs(root).contains("routine refresh yielded to a waiting admission"))
+            .await;
+        until(|| {
+            state
+                .authority
+                .lock()
+                .unwrap()
+                .projection
+                .iter()
+                .any(|row| row["wallet_hex"] == newcomer.to_string())
+        })
+        .await;
+        assert!(paper.wallet_history_complete(&newcomer).unwrap());
+        assert!(!paper.is_wallet_fenced(&newcomer).unwrap());
+        let anchors = paper.position_anchors(&newcomer).unwrap();
+        assert_eq!(anchors.len(), 1);
+        let proof: Value = serde_json::from_str(&anchors[0].proof_json).unwrap();
+        assert!(pe_service::position_seeder::anchor_proves_full_history(
+            &anchors[0].proof_json
+        ));
+        let end = proof["baseline_walk"]["fixed_end"].as_i64().unwrap();
+        let walks = proof["activity_walks"].as_array().unwrap();
+        assert_eq!(walks.len(), 3);
+        let requests = state
+            .activity_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|query| query["user"] == newcomer.to_string())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(requests.len() >= 4, "{requests:?}");
+        assert_eq!(requests[0]["start"], "1");
+        assert_eq!(requests[0]["end"], end.to_string());
+        for (query, walk) in requests[1..4].iter().zip(walks) {
+            let start = end - pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS;
+            assert_eq!(query["start"], (start + 1).to_string());
+            assert_eq!(
+                query["end"],
+                walk["fixed_end"].as_i64().unwrap().to_string()
+            );
+            assert_eq!(walk["pages"].as_array().unwrap().len(), 1);
+            assert_eq!(walk["pages"][0]["bounds"]["start"], start);
+        }
+        assert_eq!(
+            state
+                .full_history_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|wallet| **wallet == newcomer.to_string())
+                .count(),
+            1
+        );
+        until(|| OffsetDateTime::now_utc().unix_timestamp() > anchors[0].activity_cutoff_unix)
+            .await;
+        let epoch = OffsetDateTime::now_utc().unix_timestamp();
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .insert(newcomer.to_string(), vec![row(newcomer, 3, epoch, 3003)]);
+        until(|| {
+            paper.list_fills().unwrap().len() == 1
+                && state.authority.lock().unwrap().fills.len() == 1
+        })
+        .await;
+    })
+    .await
+    .expect("the newcomer must be admitted and copy while the routine refresh remains held");
+    assert!(!state.release_slow.load(Ordering::SeqCst));
+    assert_eq!(state.slow.available_permits(), 0);
+    assert_eq!(paper.wallet_coverage(&refreshing).unwrap(), original);
+    let fills = paper.list_fills().unwrap();
+    assert_eq!(fills[0].market_id.0.0, condition(3));
+    assert_eq!(fills[0].side, Side::Buy);
+    assert!(fills[0].quantity > ShareAmount::ZERO);
+    assert_eq!(
+        state
+            .authority
+            .lock()
+            .unwrap()
+            .fills
+            .values()
+            .next()
+            .unwrap()["leader_wallet"],
+        newcomer.to_string()
+    );
+    state.release_slow.store(true, Ordering::SeqCst);
+    state.slow.add_permits(16);
+    until(|| paper.wallet_coverage(&refreshing).unwrap().anchor_seq > original.anchor_seq).await;
+    let refreshed = paper.position_anchors(&refreshing).unwrap();
+    assert_eq!(
+        refreshed.len(),
+        2,
+        "only the retried refresh installs an anchor"
+    );
+    assert!(
+        state
+            .full_history_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|wallet| **wallet == refreshing.to_string())
+            .count()
+            >= 2,
+        "the routine refresh retries its cancelled baseline"
+    );
+    let proof: Value = serde_json::from_str(&refreshed[1].proof_json).unwrap();
+    assert!(proof["baseline_walk"]["fixed_end"].as_i64().unwrap() >= state.now);
+    assert_eq!(proof["activity_walks"].as_array().unwrap().len(), 3);
+    assert!(
+        !paper
+            .wallet_coverage(&refreshing)
+            .unwrap()
+            .reanchor_required
+    );
+    until(|| {
+        paper
+            .decision_pending_history()
+            .unwrap()
+            .iter()
+            .all(|row| row.state == pe_paper_state::DecisionPendingState::Terminal)
+    })
+    .await;
+    let logs = child.stop().await;
+    assert!(
+        logs.contains("routine refresh yielded to a waiting admission"),
+        "{logs}"
+    );
+    let census = service_logs(root)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|line| line["message"] == "boot anchor selection census")
+        .unwrap();
+    assert_eq!(census["reused"], initial_wallets.len());
+    assert_eq!(census["walked"], 0);
+    let financial = paper.financial_snapshot(state.now + 1000).unwrap();
+    let fills = paper.list_fills().unwrap();
+    let history = paper.gate_history().unwrap();
+    let decisions = paper.decision_pending_history().unwrap();
+    let positions = paper.leader_positions().unwrap();
+    let projection = state.authority.lock().unwrap().projection.clone();
+    assert_eq!(projection.len(), initial_wallets.len() + 1);
+    let restored_membership = || {
+        let era = paper_era(scan_paper_log(&cfg.event_log_path).unwrap());
+        let entries = crate::golden::BracketFinancialHarness::entries(initial_wallets);
+        replay_membership(
+            &era,
+            pe_trader_index::Watchlist {
+                active_count: entries.len(),
+                incubator_count: 0,
+                entries,
+                snapshot_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            },
+            &cfg.source_event_log_path,
+        )
+        .unwrap()
+        .unwrap()
+        .watchlist
+        .entries
+    };
+    let membership = restored_membership();
+    assert!(membership.iter().any(|entry| entry.wallet == newcomer));
+    assert_eq!(membership.len(), initial_wallets.len() + 1);
+    *state.positions.lock().unwrap() = positions.iter().map(|position| json!({
+        "proxyWallet":position.wallet,"conditionId":position.market_id.0.0,"asset":"107",
+        "outcomeIndex":position.outcome_id.0,"size":position.long_contracts.to_decimal().to_string(),
+        "negativeRisk":false,"redeemable":false,
+    })).collect();
+    std::fs::remove_file(&cfg.status_path).unwrap();
+    let child = Child::start(&config_path);
+    until(|| {
+        std::fs::read(&cfg.status_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|status| {
+                status["watchlist_size"] == membership.len()
+                    && status["uptime_secs"]
+                        .as_u64()
+                        .is_some_and(|uptime| uptime >= 2)
+            })
+    })
+    .await;
+    let logs = child.stop().await;
+    assert!(
+        logs.contains("open decision continuations validated"),
+        "{logs}"
+    );
+    assert_eq!(
+        paper.financial_snapshot(state.now + 1000).unwrap(),
+        financial
+    );
+    assert_eq!(paper.list_fills().unwrap(), fills);
+    assert_eq!(paper.leader_positions().unwrap(), positions);
+    assert_eq!(paper.gate_history().unwrap(), history);
+    assert_eq!(paper.decision_pending_history().unwrap(), decisions);
+    assert_eq!(
+        serde_json::to_value(restored_membership()).unwrap(),
+        serde_json::to_value(&membership).unwrap()
+    );
+    assert_eq!(state.authority.lock().unwrap().projection, projection);
+    assert_eq!(state.authority.lock().unwrap().fills.len(), 1);
+    let report = seal_and_replay(cfg, paper, state.now, 1).await;
+    assert_eq!(report.replay.membership_changes, 1);
+    assert_eq!(report.replay.final_membership_count, membership.len());
+}
+
+fn service_logs(root: &Path) -> String {
+    let mut entries = std::fs::read_dir(root)
+        .unwrap()
+        .flatten()
+        .collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            (name.starts_with("service.") && name.ends_with(".jsonl") && !name.contains("error"))
+                .then(|| std::fs::read_to_string(entry.path()).unwrap_or_default())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn seal_and_replay(
+    cfg: &ServiceConfig,
+    paper: &PaperStateDb,
+    now: i64,
+    expected_fills: usize,
+) -> pe_service::qualification::QualificationReport {
+    let root = cfg.event_log_path.parent().unwrap();
+    let start_receipt = paper_era(scan_paper_log(&cfg.event_log_path).unwrap())
+        .start
+        .unwrap()
+        .0;
+    let financial = paper.financial_snapshot(now + 1000).unwrap();
+    let decisions = paper.decision_pending_history().unwrap();
+    assert_eq!(decisions.len(), expected_fills);
+    let cutoff = last_second_of_day(now) + 1;
+    let mut source = Writer::open(&cfg.source_event_log_path).unwrap();
+    let boundary_receipt = source
+        .append_synced(envelope(
+            serde_json::to_vec(&json!({"kind":"daily_boundary","cutoff_unix":cutoff})).unwrap(),
+            "pe-service.boundary",
+            cutoff,
+            1,
+            1,
+        ))
+        .unwrap();
+    let price = Price::new(dec!(0.50)).unwrap();
+    let prices = financial
+        .positions
+        .iter()
+        .map(|position| {
+            let receipt = source
+                .append_synced(envelope(
+                    serde_json::to_vec(&json!({"history":[{"t":cutoff,"p":"0.50"}]})).unwrap(),
+                    "pe-service.clob-prices-history",
+                    cutoff,
+                    1,
+                    1,
+                ))
+                .unwrap();
+            pe_service::paper_recovery::PaperMarkPrice {
+                market_id: position.market_id.0.0.clone(),
+                outcome_id: position.outcome_id.0,
+                price: Some(price),
+                sample_unix: Some(cutoff),
+                receipt: Some(receipt),
+                closure_receipt: None,
+                invalid: None,
+            }
+        })
+        .collect();
+    drop(source);
+    let valued = financial
+        .positions
+        .iter()
+        .map(|position| (position.long.checked_sub(position.short).unwrap(), price))
+        .collect::<Vec<_>>();
+    let mark = pe_service::paper_recovery::PortfolioMark {
+        boundary_receipt,
+        cutoff_unix: cutoff,
+        source_tail: TailBinding::from(&Scanner::verify(&cfg.source_event_log_path).unwrap()),
+        financial_prefix_seq: financial.last_prepared_seq,
+        prices,
+        cash: financial.cash,
+        equity: pe_risk_engine::current_equity(&pe_risk_engine::EquityInputs {
+            cash: financial.cash,
+            positions: &valued,
+        })
+        .unwrap(),
+        invalid: None,
+    };
+    Writer::open(&cfg.event_log_path)
+        .unwrap()
+        .append_synced(envelope(
+            serde_json::to_vec(&PaperLogRecord::PortfolioMark(Box::new(mark))).unwrap(),
+            "pe-service.paper",
+            cutoff,
+            2,
+            1,
+        ))
+        .unwrap();
+    let source_prefix = TailBinding::from(&Scanner::verify(&cfg.source_event_log_path).unwrap());
+    let keys = decisions
+        .iter()
+        .map(|row| (row.source_trade_id.clone(), row.semantic_revision.clone()))
+        .collect::<Vec<_>>();
+    let digest = paper
+        .seal_decision_evidence_for_source_prefix(&keys, &keys, source_prefix.last_sequence)
+        .unwrap();
+    let seal = pe_service::paper_recovery::QualificationSealed {
+        start_receipt,
+        source_prefix,
+        financial_prefix: TailBinding::from(&Scanner::verify(&cfg.event_log_path).unwrap()),
+        live_prefix: TailBinding::from(
+            &pe_execution_core::LiveJournal::verified_tail(root.join("live_journal.log")).unwrap(),
+        ),
+        decision_evidence_digest: blake3::hash(&digest).to_hex().to_string(),
+        sealed_cutoff_unix: cutoff,
+        reason: pe_service::paper_recovery::SealReason::Complete,
+    };
+    let receipt = Writer::open(&cfg.event_log_path)
+        .unwrap()
+        .append_synced(envelope(
+            serde_json::to_vec(&PaperLogRecord::QualificationSealed(Box::new(seal))).unwrap(),
+            "pe-service.paper",
+            cutoff,
+            2,
+            1,
+        ))
+        .unwrap();
+    let output_path = root.join("qualification.json");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+    command
+        .env_clear()
+        .args(["--qualify", "--paper-log"])
+        .arg(&cfg.event_log_path)
+        .arg("--source-log")
+        .arg(&cfg.source_event_log_path)
+        .arg("--live-journal")
+        .arg(root.join("live_journal.log"))
+        .arg("--paper-state")
+        .arg(&cfg.paper_state_db_path)
+        .arg("--seal-hash")
+        .arg(receipt.this_hash.to_hex().as_str())
+        .arg("--output")
+        .arg(&output_path);
+    let output = crate::support::bounded_command_output(command).await;
+    assert!(output.status.success(), "{output:?}");
+    let report: pe_service::qualification::QualificationReport =
+        serde_json::from_slice(&std::fs::read(output_path).unwrap()).unwrap();
+    assert!(report.replay.exact, "{:?}", report.reasons);
+    assert_eq!(report.replay.fills, expected_fills);
+    assert_eq!(report.replay.decisions, decisions.len());
+    assert_eq!(
+        report.verdict,
+        pe_service::qualification::QualificationVerdict::Fail,
+        "{:?}",
+        report.reasons
+    );
+    // Only the short run's thresholds and its intentionally open positions may fail; any other
+    // financial gate failure (drawdown, a measured copy delay over budget) must surface here.
+    let intended = [
+        "complete days ",
+        "closed copies ",
+        "LCB_5pct is not positive",
+        "paper p95 copy delay is absent or above budget",
+        "paper positions remain open at the sealed financial prefix",
+    ];
+    assert_eq!(report.reasons.len(), intended.len(), "{:?}", report.reasons);
+    for (reason, prefix) in report.reasons.iter().zip(intended) {
+        assert!(reason.starts_with(prefix), "{:?}", report.reasons);
+    }
+    report
+}
+
 fn assert_v2_committed_reads(paper: &PaperStateDb, source_path: &Path) {
     use pe_service::bucket_commit::DecisionContinuationV3;
     use pe_service::trade_poller::{ACTIVITY_POLL_SOURCE_ID, ACTIVITY_POLL_V2_PAGE_SCHEMA_VERSION};
@@ -1921,6 +2248,8 @@ impl CheckpointFixture {
             rows: crate::golden::golden_config_rows(&runtime),
             now,
             ranked_wallets: 1,
+            newcomer: None,
+            activity_requests: Mutex::new(Vec::new()),
             full_history_requests: Mutex::new(Vec::new()),
             cut_full_history_replies: std::sync::atomic::AtomicUsize::new(0),
             start: Mutex::new(None),
@@ -2048,23 +2377,7 @@ impl CheckpointFixture {
         );
     }
     pub fn logs(&self) -> String {
-        let mut entries = std::fs::read_dir(self.dir.path())
-            .unwrap()
-            .flatten()
-            .collect::<Vec<_>>();
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        entries
-            .into_iter()
-            .filter_map(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                (name.starts_with("service.")
-                    && name.ends_with(".jsonl")
-                    && !name.contains("error"))
-                .then(|| std::fs::read_to_string(entry.path()).unwrap_or_default())
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        service_logs(self.dir.path())
     }
 
     pub async fn wait_log(&self, message: &str) {
@@ -2133,6 +2446,8 @@ mod data_api_tests {
             rows: Vec::new(),
             now: 0,
             ranked_wallets: 0,
+            newcomer: None,
+            activity_requests: Mutex::new(Vec::new()),
             full_history_requests: Mutex::new(Vec::new()),
             cut_full_history_replies: AtomicUsize::new(0),
             start: Mutex::new(None),

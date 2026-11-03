@@ -787,9 +787,11 @@ This repair does not create a new financial activation, state generation, table,
 key or migration marker.
 
 Before accepting rollout, verify the running revision and record which old omitted-start anchors
-were revalidated or excluded. Inspect the selected durable `position_anchors` proof for all three
-original page-zero activity requests: exclusive start zero, wire `start=1`, and each walk's fixed
-end. An old complete flag alone cannot justify reuse; failed or deferred boot validation leaves
+were revalidated or excluded. Inspect the selected durable `position_anchors` proof against the
+canonical reuse rule ([glossary](_GLOSSARY.md)): either all three original page-zero activity
+requests (exclusive start zero, wire `start=1`, each walk's fixed end), as direct boot writes, or
+a full `baseline_walk` with that evidence plus three tails, as every runtime bracket writes. An old
+complete flag alone cannot justify reuse; failed or deferred boot validation leaves
 that wallet excluded. Record activity and metadata request counts, actual validation duration,
 total boot duration, and accepted and deferred wallet counts. Every revalidated old anchor performs
 at least seven source requests (three activity walks and two position reads over both partitions)
@@ -2058,16 +2060,35 @@ Audit the invocation's flattened JSON journal lines for `source checkpoint publi
 receipt lag is `published_unix_ms - capture_unix_ms`; last-published age and pending-candidate age
 are separate. Missing receipt/binding evidence or a failed publication leaves AC-A incomplete.
 
-The matrix below documents the historical format-1 rollback gate against `e224e32`. Format 2
-uses the fix-forward policy above; retain this command for format-1 compatibility work:
+Before a rollback, run the matrix against the previous production binary, which already has the source checkpoint
+and its retention fence (today `cfaf643`); the same command runs `previous_binary_reuses_runtime_tail_anchor`:
 
 ```bash
-PE_ROLLBACK_SERVICE_BINARY='<absolute path to the previous production binary built from e224e32>' cargo nextest run -p pe-service --all-features --test scenario_source_log_boot previous_binary_rollback_matrix --nocapture
+PE_ROLLBACK_SERVICE_BINARY='<absolute path to the previous production binary>' cargo nextest run -p pe-service --all-features --test scenario_source_log_boot previous_binary --no-capture
 ```
 
-Record the scenario's printed executable identities and every row's result in the deployment
-artifacts. An unset-variable skip proves nothing. The declared old-reader outcomes are fixed before
-execution:
+Without the variable (CI leaves it unset) the matrix prints SKIP and returns early, and
+`previous_binary_reuses_runtime_tail_anchor` prints SKIP and checks only this build; neither proves rollback
+compatibility. Record the printed executable identities and every row's result in the deployment artifacts. Each row runs in both directions, the
+previous binary and then this build, from the row's own record, with the wallet marked `reanchor_required` so boot
+walks it before listening:
+
+| Invalidation record | Outcome for both binaries |
+|---|---|
+| Absent | Checkpoint-assisted, prefix verified after listening; record left at generation 0, fenced |
+| Inactive | Checkpoint-assisted, prefix verified after listening; record keeps its generation, fenced |
+| Active | Full verified walk; the next checkpoint clears it; fenced |
+| Unreadable | Status 78 before listening, record kept; `--recover-source-checkpoint` installs generation 1; that boot full-walks and publishes; the next boot is checkpoint-assisted |
+
+Every row requires, from the previous binary, refusal of a corrupt frame after the checkpoint and an idempotent exact
+covered retry; from both, boot admission before listening, graceful drain, unchanged balances, history and decisions,
+no fence on the wallet, complete history and effective live membership. An unexpected observation fails its row and
+removes authorization to roll back that state. Stop and drain before reversal, preserve retained evidence and all
+financial state, never undo clearance or restore stale state. The unit drop-in that stops restarts on status 78 serves
+both binaries.
+
+Historical: the format-1 rollback gate ran this test against `e224e32`, a binary older than the checkpoint, with these
+declared outcomes; its command does not apply to the current tree:
 
 | Invalidation record | Previous `e224e32` outcome | Following new-reader outcome |
 |---|---|---|
@@ -2075,13 +2096,6 @@ execution:
 | Inactive | Allowed: raw-prefix verifies before serving; preserves record | Checkpoint-assisted |
 | Active with checkpoint present | Allowed: raw-prefix verifies before serving; preserves record | Full verified walk, publication, active clearance |
 | Unreadable | Allowed: raw-prefix verifies before serving; preserves record | Repeated full verified walks; quiesced recovery, full walk/publication, then checkpoint-assisted |
-
-Every row requires refusal of a corrupt frame after the checkpoint, idempotent exact covered retry,
-graceful drain, unchanged balances/history/decisions, no re-fence, and effective live membership
-after stale-anchor admission. An unexpected observation fails its row and removes authorization to
-roll back that state. Record the exact run's printed identities and results in deployment artifacts.
-Stop and drain before reversal, preserve retained evidence and all financial state, never undo clearance or restore stale state.
-The unit drop-in is harmless to the previous binary, which never selects checkpoint status 78.
 
 
 For AC-A, set `invocation`, `restart_utc`, and `window_end_utc` from the retained invocation and

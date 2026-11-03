@@ -38,7 +38,7 @@ use pe_trader_index::WatchlistTier;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinSet};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::activity_ingest::{
     ACTIVITY_WS_SOURCE_ID, ReconciliationTrigger, SourceLogHandle, SourceLogHandleError,
@@ -1413,13 +1413,25 @@ impl TradePoller {
                 );
                 let now = (self.now)();
                 // A pending daily boundary waits on every pre-cutoff obligation and paper risk
-                // needs its mark, so then every refresh yields.
-                if let Some((wallet, handoff, handle)) = &refresh_visit
-                    && (refresh_yields || self.obligations.pending_boundary().is_some())
-                    && self.obligations.by_wallet.contains_key(wallet)
-                    && handoff.cancel_before_handoff()
-                {
-                    handle.abort();
+                // needs its mark, so then every refresh yields. An unflagged refresh also yields to
+                // a waiting admission, so a newly ranked wallet never waits behind it.
+                if let Some((wallet, handoff, handle)) = &refresh_visit {
+                    let admission_waiting = refresh_yields
+                        && self
+                            .admission_preparer
+                            .as_ref()
+                            .is_some_and(AdmissionPreparer::admission_waiting);
+                    let already_cancelled = handoff.is_cancelled();
+                    if ((refresh_yields || self.obligations.pending_boundary().is_some())
+                        && self.obligations.by_wallet.contains_key(wallet)
+                        || admission_waiting)
+                        && handoff.cancel_before_handoff()
+                    {
+                        if admission_waiting && !already_cancelled {
+                            info!(wallet = %wallet, "routine refresh yielded to a waiting admission");
+                        }
+                        handle.abort();
+                    }
                 }
                 if let Some((wallet, cancel)) = &backstop_visit
                     && self.has_new_obligation(*wallet, &attempts)
@@ -1700,6 +1712,15 @@ impl TradePoller {
                 (true, false) => Some(cadence),
                 (false, true) => Some(retry_ready),
                 (false, false) => None,
+            };
+            // A waiting admission raises no event, so an unflagged refresh is rechecked every poll
+            // interval even while backstop work is busy.
+            let wake = if refresh_busy && refresh_yields {
+                let recheck = tokio::time::Instant::now()
+                    + Duration::from_secs(self.config.poll_interval_secs);
+                Some(wake.map_or(recheck, |wake| wake.min(recheck)))
+            } else {
+                wake
             };
             #[cfg(feature = "scenario")]
             if let Some(observer) = &self.wait_observer {

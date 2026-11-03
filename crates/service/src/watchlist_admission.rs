@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
@@ -250,6 +250,68 @@ mod admission_tests {
         assert!(rx.try_recv().is_err());
         assert!(state.cursor(&wallet(1)).unwrap().is_none());
         drop(held);
+    }
+
+    /// The poller yields a routine refresh only while an admission with wallets waits for the
+    /// lock: an empty preparation returns at once, and every way a wait ends clears its count.
+    #[tokio::test(start_paused = true)]
+    async fn only_admissions_with_wallets_count_as_waiting_until_their_wait_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let (tx, _rx) = mpsc::channel(1);
+        let preparer = AdmissionPreparer::new(tx, state);
+        let held = preparer.inner.attempt.lock().await;
+        let empty = preparer.prepare(&[]).await.unwrap();
+        assert!(empty.started.is_empty() && empty.unstarted.is_empty());
+        assert!(empty.admitted.is_empty() && empty.deferred.is_empty());
+        assert!(!preparer.admission_waiting());
+        // Two overlapping waits: one ends at its deadline, the other is dropped.
+        let timed = tokio::spawn({
+            let preparer = preparer.clone();
+            async move {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                preparer
+                    .prepare_with_cursors(
+                        &[wallet(1)],
+                        None,
+                        Some(deadline),
+                        AdmissionContext::Other,
+                    )
+                    .await
+                    .map(|outcome| outcome.unstarted)
+            }
+        });
+        let dropped = tokio::spawn({
+            let preparer = preparer.clone();
+            async move { preparer.prepare(&[wallet(2)]).await.is_ok() }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(preparer.inner.admissions_waiting.load(Ordering::Acquire), 2);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(timed.await.unwrap().unwrap(), vec![wallet(1)]);
+        assert!(
+            preparer.admission_waiting(),
+            "the dropped wait still counts until dropped"
+        );
+        dropped.abort();
+        assert!(dropped.await.unwrap_err().is_cancelled());
+        assert!(!preparer.admission_waiting());
+        // A wait that acquires the lock stops counting before it prepares anything.
+        let acquired = tokio::spawn({
+            let preparer = preparer.clone();
+            async move {
+                preparer
+                    .prepare(&[wallet(3)])
+                    .await
+                    .map(|outcome| outcome.deferred)
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(preparer.admission_waiting());
+        drop(held);
+        let deferred = acquired.await.unwrap().unwrap();
+        assert!(!preparer.admission_waiting());
+        assert_eq!(deferred[0].kind, "history.missing");
     }
 
     /// A wallet retention removed but did not drain: a group and a gate result left, with their trade rows.
@@ -613,7 +675,18 @@ struct Preparer {
     control_tx: mpsc::Sender<OrchestratorControl>,
     paper_state: Arc<PaperStateDb>,
     attempt: Mutex<AdmissionQueue>,
+    /// Admissions with wallets waiting for `attempt`; the poller yields a routine refresh to them.
+    admissions_waiting: AtomicUsize,
     validator: Option<CausalPositionValidator>,
+}
+
+/// Counts one admission as waiting for `attempt` until it holds the lock or gives up.
+struct WaitingAdmission<'a>(&'a AtomicUsize);
+
+impl Drop for WaitingAdmission<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Default)]
@@ -660,6 +733,15 @@ struct AdmissionLaunchLog {
     context: AdmissionContext,
     eligible: Vec<String>,
     started_previous_keys: Vec<(String, u64)>,
+    /// The wait for the bracket lock, logged as `lock_wait_started_unix_ms` and `lock_wait_ms`.
+    lock_wait: Option<LockWait>,
+}
+
+/// A wait still pending when the preparation is dropped runs to the drop.
+struct LockWait {
+    started_unix_ms: i64,
+    started: Instant,
+    acquired: Option<Instant>,
 }
 
 impl AdmissionLaunchLog {
@@ -683,8 +765,20 @@ impl Drop for AdmissionLaunchLog {
             AdmissionContext::Capacity => ("capacity", None),
             AdmissionContext::Other => ("other", None),
         };
+        let (lock_wait_started_unix_ms, lock_wait_ms) = self
+            .lock_wait
+            .as_ref()
+            .map(|wait| {
+                let waited = wait.acquired.unwrap_or_else(Instant::now) - wait.started;
+                (
+                    wait.started_unix_ms,
+                    u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                )
+            })
+            .unzip();
         info!(path, first, eligible = %serde_json::json!(self.eligible), started = self.started_previous_keys.len(),
-            started_previous_keys = %serde_json::json!(self.started_previous_keys), "admission launch order");
+            started_previous_keys = %serde_json::json!(self.started_previous_keys), lock_wait_started_unix_ms,
+            lock_wait_ms, "admission launch order");
     }
 }
 
@@ -705,6 +799,7 @@ impl AdmissionPreparer {
                 control_tx,
                 paper_state,
                 attempt: Mutex::new(AdmissionQueue::default()),
+                admissions_waiting: AtomicUsize::new(0),
                 validator: None,
             }),
             source_log: None,
@@ -713,6 +808,11 @@ impl AdmissionPreparer {
 
     pub(crate) fn paper_state(&self) -> &PaperStateDb {
         &self.inner.paper_state
+    }
+
+    /// Whether an admission with wallets is waiting for the bracket lock.
+    pub(crate) fn admission_waiting(&self) -> bool {
+        self.inner.admissions_waiting.load(Ordering::Acquire) > 0
     }
 
     /// Production constructor with the five-step causal positions bracket.
@@ -726,6 +826,7 @@ impl AdmissionPreparer {
                 control_tx,
                 paper_state,
                 attempt: Mutex::new(AdmissionQueue::default()),
+                admissions_waiting: AtomicUsize::new(0),
                 validator: Some(validator),
             }),
             source_log: None,
@@ -859,7 +960,27 @@ impl AdmissionPreparer {
             context,
             eligible: Vec::new(),
             started_previous_keys: Vec::new(),
+            lock_wait: None,
         };
+        // Nothing to admit needs no lock, so it never waits behind a refresh.
+        if additions.is_empty() {
+            return Ok(AdmissionOutcome {
+                started,
+                unstarted,
+                admitted: Vec::new(),
+                deferred: Vec::new(),
+            });
+        }
+        preparer.admissions_waiting.fetch_add(1, Ordering::AcqRel);
+        let waiting = WaitingAdmission(&preparer.admissions_waiting);
+        launch.lock_wait = Some(LockWait {
+            started_unix_ms: i64::try_from(
+                time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
+            )
+            .unwrap_or(i64::MAX),
+            started: Instant::now(),
+            acquired: None,
+        });
         let mut attempt = if let Some(end) = deadline {
             match tokio::time::timeout_at(end, preparer.attempt.lock()).await {
                 Ok(guard) => guard,
@@ -875,6 +996,10 @@ impl AdmissionPreparer {
         } else {
             preparer.attempt.lock().await
         };
+        drop(waiting);
+        if let Some(wait) = &mut launch.lock_wait {
+            wait.acquired = Some(Instant::now());
+        }
         let mut admitted = Vec::new();
         let mut deferred = Vec::new();
         let mut eligible = Vec::new();
@@ -960,11 +1085,7 @@ impl AdmissionPreparer {
                     &eligible,
                     &preparer.control_tx,
                     &preparer.paper_state,
-                    if matches!(context, AdmissionContext::Reentry { .. }) {
-                        ValidationPurpose::Reentry
-                    } else {
-                        ValidationPurpose::CatchUp
-                    },
+                    ValidationPurpose::CatchUp,
                     deadline,
                 )
                 .await;
@@ -1356,9 +1477,6 @@ impl AdmissionPreparer {
             {
                 ValidationPurpose::RoutineRefresh { cutoff }
             }
-            // A wallet that must re-anchor reads its full history once and then short tails, as
-            // re-entry does: a busy wallet's three full reads would never agree.
-            _ if coverage.reanchor_required => ValidationPurpose::Reentry,
             _ => ValidationPurpose::CatchUp,
         };
         let outcomes = validator

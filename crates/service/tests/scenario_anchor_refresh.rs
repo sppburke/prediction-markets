@@ -198,10 +198,7 @@ fn stable_bracket_responses(wallets: &[WalletAddress]) -> HashMap<String, Vec<Ve
             "negativeRisk": false
         })])
         .unwrap();
-        responses.insert(
-            activity_url(*wallet),
-            vec![activity.clone(), activity.clone(), activity],
-        );
+        responses.insert(activity_url(*wallet), vec![activity; 4]);
         responses.insert(
             position_url(*wallet, PositionPartition::NotRedeemable),
             vec![positions.clone(), positions],
@@ -811,7 +808,7 @@ async fn deferred_refresh_continues_the_poller() {
     let mut responses = stable_bracket_responses(&[wallet]);
     let ordinary_page = responses[&activity_url(wallet)][0].clone();
     // The first bracket sees an unseen post-anchor entry. Its preflight defers before writes;
-    // the remaining three reads belong to the retry after urgent ordinary reconciliation.
+    // the remaining baseline and three tails belong to the retry after urgent ordinary reconciliation.
     responses
         .get_mut(&activity_url(wallet))
         .unwrap()

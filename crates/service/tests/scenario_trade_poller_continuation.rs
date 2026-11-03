@@ -1193,6 +1193,7 @@ struct RunningPoll {
     poller: tokio::task::JoinHandle<Result<(), pe_service::trade_poller::TradePollerOwnerError>>,
     coordinator_gate: Arc<Mutex<(bool, Option<std::task::Waker>)>>,
     ingest: tokio::task::JoinHandle<()>,
+    preparer: Option<pe_service::watchlist_admission::AdmissionPreparer>,
     control: tokio::task::JoinHandle<Vec<RecordedBucket>>,
     now: Arc<std::sync::atomic::AtomicI64>,
     active: std::collections::HashSet<WalletAddress>,
@@ -1295,6 +1296,7 @@ impl RunningPoll {
         self.poller.await.unwrap().unwrap();
         drop(self.source);
         drop(self.triggers);
+        drop(self.preparer);
         self.ingest.await.unwrap();
         self.control.await.unwrap()
     }
@@ -1685,7 +1687,7 @@ fn start_recorded_poller_with_membership(
             &pe_service::config::ServiceConfig::default(),
         )),
         obligations,
-        preparer,
+        preparer.clone(),
     )
     .with_crash_boundary(crash_boundary.clone())
     .with_source_receipt_index(receipts.clone())
@@ -1763,6 +1765,7 @@ fn start_recorded_poller_with_membership(
             poller,
             coordinator_gate,
             ingest,
+            preparer,
             control,
             now,
             active: Default::default(),
@@ -2029,6 +2032,9 @@ async fn refresh_cooldown_clears_queued_wallet_so_other_wallet_refreshes() {
     assert!(activity.url.contains(&wallet().to_string()));
     assert!(activity.url.contains("&start=1&"));
     activity.respond.send(b"[]".to_vec()).unwrap();
+    let tail = running.requests.recv().await.unwrap();
+    assert!(tail.url.contains("/activity?") && !tail.url.contains("&start=1&"));
+    tail.respond.send(b"[]".to_vec()).unwrap();
     let positions = running.requests.recv().await.unwrap();
     assert!(positions.url.contains("/positions?"));
 
@@ -2340,12 +2346,10 @@ async fn refresh_cooldown_uses_terminal_time_and_gates_normal_queued_and_retry_p
         let activity = running.requests.recv().await.unwrap();
         assert!(activity.url.contains("&start=1&"));
         activity.respond.send(b"[]".to_vec()).unwrap();
-        if !routine {
-            // A re-anchoring refresh reads its first tail after the full baseline.
-            let tail = running.requests.recv().await.unwrap();
-            assert!(tail.url.contains("/activity?") && !tail.url.contains("&start=1&"));
-            tail.respond.send(b"[]".to_vec()).unwrap();
-        }
+        // Every refresh reads its first tail after the full baseline.
+        let tail = running.requests.recv().await.unwrap();
+        assert!(tail.url.contains("/activity?") && !tail.url.contains("&start=1&"));
+        tail.respond.send(b"[]".to_vec()).unwrap();
         let positions = running.requests.recv().await.unwrap();
         assert!(positions.url.contains("/positions?"));
 
@@ -2524,8 +2528,7 @@ async fn refresh_cooldown_resets_on_restart() {
 }
 
 async fn fail_refresh_positions(running: &mut RunningPoll, wallet: WalletAddress) {
-    // A routine refresh reads activity once before positions; a re-anchoring one reads its
-    // baseline and first tail.
+    // Every refresh reads its full baseline and first tail before positions.
     loop {
         let request = running.requests.recv().await.unwrap();
         assert!(request.url.contains(&wallet.to_string()));
@@ -2608,6 +2611,527 @@ async fn last_wallet_refresh_defers_unvisited_health_and_yields_to_same_wallet_t
         "cancelled and unstarted refreshes create no cooldown"
     );
     running.finish().await;
+}
+
+/// PASS: an admission waiting for the bracket lock makes the poller cancel a routine refresh
+/// before its install handoff within one poll interval, so the newcomer's bracket starts at once
+/// even with a busy backstop and no triggers, and the retried refresh anchors afterwards; an
+/// admission with no wallets never preempts, and a flagged wallet's refresh keeps the lock. A
+/// sent install completes before a waiting admission proceeds.
+/// FAIL: a newly ranked wallet waits behind validation, or an admission cancels a sent install.
+#[tokio::test(start_paused = true)]
+async fn routine_refresh_yields_to_a_waiting_admission() {
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    let newcomer = WalletAddress::from_hex("0x00000000000000000000000000000000000000ad").unwrap();
+    let other = WalletAddress([0xbb; 20]);
+    for (flagged, additions, preempts, busy_backstop) in [
+        (false, vec![newcomer], true, false),
+        (false, Vec::new(), false, false),
+        (true, vec![newcomer], false, false),
+        (false, vec![newcomer], true, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let wallets = if busy_backstop {
+            vec![wallet(), other]
+        } else {
+            vec![wallet()]
+        };
+        let (mut running, paper) =
+            start_recorded_poller_with_anchors(&dir, &wallets, false, true, Some(EPOCH));
+        paper.set_cursor(&newcomer, EPOCH - 10).unwrap();
+        if busy_backstop {
+            rusqlite::Connection::open(dir.path().join("paper.db"))
+                .unwrap()
+                .execute(
+                    "UPDATE position_anchors SET anchored_at_unix = ?1 WHERE wallet_hex = ?2",
+                    rusqlite::params![EPOCH, other.to_string()],
+                )
+                .unwrap();
+        }
+        if flagged {
+            rusqlite::Connection::open(dir.path().join("paper.db"))
+                .unwrap()
+                .execute(
+                    "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+                    [wallet().to_string()],
+                )
+                .unwrap();
+        }
+        for expected in wallets {
+            let backstop = running.requests.recv().await.unwrap();
+            assert!(backstop.url.contains(&expected.to_string()));
+            backstop.respond.send(b"[]".to_vec()).unwrap();
+            running.completed(expected).await;
+        }
+        running.round_completed().await;
+        let validation = running.requests.recv().await.unwrap();
+        assert!(validation.url.contains("&start=1&"), "{}", validation.url);
+        let held_backstop = if busy_backstop {
+            running.now.store(EPOCH + 30, Ordering::SeqCst);
+            tokio::time::advance(Duration::from_secs(30)).await;
+            let backstop = running.requests.recv().await.unwrap();
+            assert!(
+                backstop.url.contains(&other.to_string()),
+                "{}",
+                backstop.url
+            );
+            // Park every task before admission, leaving only the bounded refresh wake.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert!(running.requests.try_recv().is_err());
+            Some(backstop)
+        } else {
+            None
+        };
+        let no_wallets = additions.is_empty();
+        let preparer = running.preparer.clone().unwrap();
+        let mut admission = tokio::spawn(async move { preparer.prepare(&additions).await });
+        tokio::task::yield_now().await;
+        let waiting_since = Instant::now();
+        running.now.fetch_add(30, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        if !busy_backstop {
+            running.round_completed().await;
+        }
+        if !preempts {
+            assert!(
+                running.requests.try_recv().is_err(),
+                "no admission read starts"
+            );
+            if no_wallets {
+                assert!(
+                    admission.is_finished(),
+                    "an empty admission never waits for the lock"
+                );
+                let outcome = admission.await.unwrap().unwrap();
+                assert!(outcome.started.is_empty() && outcome.unstarted.is_empty());
+                assert!(outcome.admitted.is_empty() && outcome.deferred.is_empty());
+            } else {
+                assert!(
+                    !admission.is_finished(),
+                    "the flagged refresh keeps the lock"
+                );
+                admission.abort();
+                let _ = admission.await;
+            }
+            assert!(
+                validation.respond.send(b"[]".to_vec()).is_ok(),
+                "flagged={flagged}: the refresh keeps the lock"
+            );
+            running.finish().await;
+            continue;
+        }
+        let started = tokio::time::timeout(Duration::from_secs(1), running.requests.recv())
+            .await
+            .expect("admission must start within one poll interval, even with a busy backstop")
+            .unwrap();
+        assert!(Instant::now().duration_since(waiting_since) <= Duration::from_secs(30));
+        assert!(
+            started.url.contains(&newcomer.to_string()),
+            "{}",
+            started.url
+        );
+        assert!(
+            validation.respond.send(b"[]".to_vec()).is_err(),
+            "the refresh was cancelled before its handoff"
+        );
+        started.respond.send(b"[]".to_vec()).unwrap();
+        loop {
+            tokio::select! {
+                result = &mut admission => {
+                    assert_eq!(result.unwrap().unwrap().admitted, vec![newcomer]);
+                    break;
+                }
+                request = running.requests.recv() => {
+                    let request = request.unwrap();
+                    assert!(request.url.contains(&newcomer.to_string()), "{}", request.url);
+                    request.respond.send(b"[]".to_vec()).unwrap();
+                }
+            }
+        }
+        assert_eq!(paper.position_anchors(&wallet()).unwrap().len(), 1);
+        if let Some(backstop) = held_backstop {
+            backstop.respond.send(b"[]".to_vec()).unwrap();
+            running.completed(other).await;
+        } else {
+            running.now.fetch_add(30, Ordering::SeqCst);
+            tokio::time::advance(Duration::from_secs(30)).await;
+        }
+        let retry = loop {
+            tokio::select! {
+                progress = running.progress.recv() => running.track(&progress.unwrap()),
+                request = running.requests.recv() => {
+                    let request = request.unwrap();
+                    if request.url.contains("&start=1&") {
+                        break request;
+                    }
+                    assert!(request.url.contains("/activity?"), "{}", request.url);
+                    request.respond.send(b"[]".to_vec()).unwrap();
+                }
+            }
+        };
+        assert!(
+            retry.url.contains(&wallet().to_string()) && retry.url.contains("&start=1&"),
+            "the cancelled refresh was retried: {}",
+            retry.url
+        );
+        retry.respond.send(b"[]".to_vec()).unwrap();
+        loop {
+            tokio::select! {
+                biased;
+                event = running.controls.recv() => if matches!(event, Some(ControlCompletion::Anchored(w)) if w == wallet()) { break },
+                request = running.requests.recv() => {
+                    let request = request.unwrap();
+                    assert!(request.url.contains(&wallet().to_string()), "{}", request.url);
+                    request.respond.send(b"[]".to_vec()).unwrap();
+                }
+            }
+        }
+        assert_eq!(paper.position_anchors(&wallet()).unwrap().len(), 2);
+        assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+        running.finish().await;
+    }
+
+    // Once the install is sent, the admission must wait for its acknowledgement.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, true, Some(EPOCH));
+    paper.set_cursor(&newcomer, EPOCH - 10).unwrap();
+    let held = running
+        .anchor_ack_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    drive_refresh_to_sent_install(&mut running).await;
+    let preparer = running.preparer.clone().unwrap();
+    let mut admission = tokio::spawn(async move { preparer.prepare(&[newcomer]).await });
+    tokio::task::yield_now().await;
+    running.now.store(EPOCH + 30, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    running.round_completed().await;
+    assert!(
+        !admission.is_finished(),
+        "admission waits for the sent install"
+    );
+    assert!(running.requests.try_recv().is_err());
+    assert_eq!(paper.position_anchors(&wallet()).unwrap().len(), 2);
+    drop(held);
+    let started = running.requests.recv().await.unwrap();
+    assert!(
+        started.url.contains(&newcomer.to_string()),
+        "{}",
+        started.url
+    );
+    started.respond.send(b"[]".to_vec()).unwrap();
+    loop {
+        tokio::select! {
+            result = &mut admission => {
+                assert_eq!(result.unwrap().unwrap().admitted, vec![newcomer]);
+                break;
+            }
+            request = running.requests.recv() => {
+                let request = request.unwrap();
+                assert!(request.url.contains(&newcomer.to_string()), "{}", request.url);
+                request.respond.send(b"[]".to_vec()).unwrap();
+            }
+        }
+    }
+    assert_eq!(paper.position_anchors(&wallet()).unwrap().len(), 2);
+    assert_eq!(paper.position_anchors(&newcomer).unwrap().len(), 1);
+    running.finish().await;
+}
+
+/// PASS: an admission cancels a routine refresh with its real-owner baseline acknowledgement
+/// held or its first tail pending, preserving the committed groups and first-entry history;
+/// admission completes, the retried refresh anchors once without duplicates, and restart agrees.
+/// FAIL: cancellation installs an anchor, loses committed history, or retry/restart duplicates it.
+#[tokio::test(start_paused = true)]
+async fn admission_cancels_refresh_after_baseline_commit_and_retry_converges() {
+    use pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS;
+    use std::time::Duration;
+
+    let newcomer = WalletAddress::from_hex("0x00000000000000000000000000000000000000ad").unwrap();
+    for hold_ack in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut running, paper) =
+            start_recorded_poller_with_anchors(&dir, &[wallet()], true, true, Some(EPOCH));
+        paper.set_cursor(&newcomer, EPOCH - 10).unwrap();
+        let anchor_count = paper.position_anchors(&wallet()).unwrap().len();
+        assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+        assert!(
+            paper
+                .activity_groups_after(&wallet(), 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(paper.gate_history().unwrap()[&wallet()].is_empty());
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(b"[]".to_vec())
+            .unwrap();
+        running.completed(wallet()).await;
+        running.round_completed().await;
+
+        // These covered BUYs are outside every tail, so only the baseline can repair history.
+        let epoch = EPOCH - 2 * REENTRY_HISTORY_OVERLAP_SECS;
+        let rows = [
+            activity_row(
+                "TRADE",
+                "baseline-a",
+                MARKET_A,
+                "BUY",
+                "1",
+                "asset-a",
+                epoch,
+            ),
+            stream_row(wallet(), "baseline-b", epoch),
+        ];
+        let payload = serde_json::to_vec(&rows).unwrap();
+        let baseline = running.requests.recv().await.unwrap();
+        assert!(baseline.url.contains(&wallet().to_string()));
+        assert!(baseline.url.contains("&start=1&"), "{}", baseline.url);
+        let mut held_ack = Some(
+            running
+                .bucket_ack_gate
+                .clone()
+                .acquire_owned()
+                .await
+                .unwrap(),
+        );
+        baseline.respond.send(payload.clone()).unwrap();
+        assert!(matches!(
+            running.controls.recv().await,
+            Some(ControlCompletion::BucketCommitted)
+        ));
+        let groups = paper.activity_groups_after(&wallet(), 0).unwrap();
+        assert_eq!(groups.len(), rows.len());
+        for row in &rows {
+            let target = aggregate(row.clone());
+            assert!(groups.iter().any(|group| {
+                &group.source_trade_id == target.group_id.key()
+                    && group.semantic_revision == target.semantic_revision.as_str()
+                    && group.source_epoch == epoch
+            }));
+            let history = paper
+                .market_history_record(&wallet(), &market(row["conditionId"].as_str().unwrap()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(history.first_epoch, epoch);
+            assert_eq!(&history.source_trade_id, target.group_id.key());
+        }
+        let history = paper.gate_history().unwrap()[&wallet()].clone();
+        assert_eq!(history.len(), rows.len());
+        let history_records = [MARKET_A, MARKET_B].map(|id| {
+            paper
+                .market_history_record(&wallet(), &market(id))
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(
+            paper.position_anchors(&wallet()).unwrap().len(),
+            anchor_count
+        );
+        let tail_start = format!("&start={}&", EPOCH - REENTRY_HISTORY_OVERLAP_SECS + 1);
+        let held_tail = if hold_ack {
+            assert_eq!(running.bucket_ack_gate.available_permits(), 0);
+            assert!(running.requests.try_recv().is_err());
+            None
+        } else {
+            drop(held_ack.take());
+            let tail = running.requests.recv().await.unwrap();
+            assert!(tail.url.contains(&tail_start), "{}", tail.url);
+            Some(tail)
+        };
+
+        let preparer = running.preparer.clone().unwrap();
+        let mut admission = tokio::spawn(async move { preparer.prepare(&[newcomer]).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !admission.is_finished(),
+            "admission waits for the bracket lock"
+        );
+        running.now.store(EPOCH + 30, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        running.round_completed().await;
+        let started = tokio::time::timeout(Duration::from_secs(1), running.requests.recv())
+            .await
+            .expect("admission must acquire the lock after cancelling the refresh")
+            .unwrap();
+        assert!(
+            started.url.contains(&newcomer.to_string()),
+            "{}",
+            started.url
+        );
+        assert!(started.url.contains("&start=1&"));
+        if let Some(tail) = held_tail {
+            assert!(
+                tail.respond.send(b"[]".to_vec()).is_err(),
+                "the refresh was cancelled while waiting for its first tail"
+            );
+        } else {
+            assert_eq!(running.bucket_ack_gate.available_permits(), 0);
+        }
+        assert_eq!(
+            paper.position_anchors(&wallet()).unwrap().len(),
+            anchor_count
+        );
+        assert_eq!(paper.activity_groups_after(&wallet(), 0).unwrap(), groups);
+        assert_eq!(paper.gate_history().unwrap()[&wallet()], history);
+        for record in &history_records {
+            assert_eq!(
+                paper
+                    .market_history_record(&wallet(), &record.market_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(record)
+            );
+        }
+        drop(held_ack);
+        started.respond.send(b"[]".to_vec()).unwrap();
+        loop {
+            tokio::select! {
+                result = &mut admission => {
+                    let outcome = result.unwrap().unwrap();
+                    assert_eq!(outcome.admitted, vec![newcomer]);
+                    assert!(outcome.deferred.is_empty());
+                    break;
+                }
+                request = running.requests.recv() => {
+                    let request = request.unwrap();
+                    assert!(request.url.contains(&newcomer.to_string()), "{}", request.url);
+                    request.respond.send(b"[]".to_vec()).unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            paper.position_anchors(&wallet()).unwrap().len(),
+            anchor_count
+        );
+        assert_eq!(paper.position_anchors(&newcomer).unwrap().len(), 1);
+
+        running.now.store(EPOCH + 60, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let retry = loop {
+            tokio::select! {
+                progress = running.progress.recv() => running.track(&progress.unwrap()),
+                request = running.requests.recv() => {
+                    let request = request.unwrap();
+                    assert!(request.url.contains(&wallet().to_string()), "{}", request.url);
+                    if request.url.contains("&start=1&") {
+                        break request;
+                    }
+                    assert!(request.url.contains("/activity?"), "{}", request.url);
+                    request.respond.send(b"[]".to_vec()).unwrap();
+                }
+            }
+        };
+        retry.respond.send(payload).unwrap();
+        let mut tails = 0;
+        loop {
+            tokio::select! {
+                biased;
+                event = running.controls.recv() => {
+                    if matches!(event, Some(ControlCompletion::Anchored(w)) if w == wallet()) {
+                        break;
+                    }
+                }
+                request = running.requests.recv() => {
+                    let request = request.unwrap();
+                    assert!(request.url.contains(&wallet().to_string()), "{}", request.url);
+                    if request.url.contains("/activity?") {
+                        assert!(request.url.contains(&tail_start), "{}", request.url);
+                        tails += 1;
+                    } else {
+                        assert!(request.url.contains("/positions?"), "{}", request.url);
+                    }
+                    request.respond.send(b"[]".to_vec()).unwrap();
+                }
+            }
+        }
+        assert_eq!(tails, 3);
+        assert_eq!(
+            paper.position_anchors(&wallet()).unwrap().len(),
+            anchor_count + 1
+        );
+        assert_eq!(paper.activity_groups_after(&wallet(), 0).unwrap(), groups);
+        assert_eq!(paper.gate_history().unwrap()[&wallet()], history);
+        for record in &history_records {
+            assert_eq!(
+                paper
+                    .market_history_record(&wallet(), &record.market_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(record)
+            );
+        }
+        assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+        assert!(paper.decision_pending_history().unwrap().is_empty());
+        assert_eq!(paper.fills_count().unwrap(), 0);
+        let anchors = paper.position_anchors(&wallet()).unwrap();
+        let newcomer_anchors = paper.position_anchors(&newcomer).unwrap();
+        let positions = paper.leader_positions().unwrap();
+        let history = paper.gate_history().unwrap();
+        let commits = running.finish().await;
+        let baseline_commits = commits
+            .iter()
+            .filter(|(groups, context, _)| context.bracket_commit && groups.len() == rows.len())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            baseline_commits.len(),
+            2,
+            "the cancelled baseline and its retry"
+        );
+        assert!(!baseline_commits[0].2.already_committed);
+        assert!(baseline_commits[1].2.already_committed);
+        let financial_log = std::fs::read(dir.path().join("paper.log")).unwrap();
+        drop(paper);
+
+        let (mut restarted, reopened) =
+            start_recorded_poller_with_anchors(&dir, &[wallet()], true, true, Some(EPOCH));
+        restarted
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(b"[]".to_vec())
+            .unwrap();
+        restarted.completed(wallet()).await;
+        restarted.round_completed().await;
+        restarted.finish().await;
+        assert_eq!(reopened.position_anchors(&wallet()).unwrap(), anchors);
+        assert_eq!(
+            reopened.position_anchors(&newcomer).unwrap(),
+            newcomer_anchors
+        );
+        assert_eq!(
+            reopened.activity_groups_after(&wallet(), 0).unwrap(),
+            groups
+        );
+        assert_eq!(reopened.gate_history().unwrap(), history);
+        for record in &history_records {
+            assert_eq!(
+                reopened
+                    .market_history_record(&wallet(), &record.market_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(record)
+            );
+        }
+        assert_eq!(reopened.leader_positions().unwrap(), positions);
+        assert!(reopened.decision_pending_history().unwrap().is_empty());
+        assert_eq!(reopened.fills_count().unwrap(), 0);
+        assert_eq!(
+            std::fs::read(dir.path().join("paper.log")).unwrap(),
+            financial_log
+        );
+    }
 }
 
 /// PASS: a busy wallet that must re-anchor refreshes as re-entry does. Its own observation
@@ -2976,6 +3500,7 @@ async fn uncertain_anchor_install_stops_before_releasing_wallet_to_urgent() {
     assert!(running.requests.try_recv().is_err());
     drop(running.source);
     drop(running.triggers);
+    drop(running.preparer);
     running.ingest.await.unwrap();
     running.control.await.unwrap();
 }
@@ -7813,7 +8338,12 @@ async fn routine_refresh_with_each_anomaly_keeps_the_poller_copying() {
                 request = running.requests.recv() => {
                     let request = request.unwrap();
                     let body = if request.url.contains("/activity?") {
-                        assert!(request.url.contains("&start=1&"), "{}", request.url);
+                        let start = if activity_reads == 0 {
+                            1
+                        } else {
+                            EPOCH - pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS + 1
+                        };
+                        assert!(request.url.contains(&format!("&start={start}&")), "{}", request.url);
                         activity_reads += 1;
                         payload.clone()
                     } else {
@@ -7824,7 +8354,10 @@ async fn routine_refresh_with_each_anomaly_keeps_the_poller_copying() {
                 }
             }
         }
-        assert_eq!(activity_reads, 3, "{kind}: routine bracket converges");
+        assert_eq!(
+            activity_reads, 4,
+            "{kind}: baseline and three tails converge"
+        );
         assert_eq!(paper.position_anchors(&wallet()).unwrap().len(), 2);
         assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
         assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
@@ -7861,7 +8394,7 @@ async fn routine_refresh_with_each_anomaly_keeps_the_poller_copying() {
             .iter()
             .filter(|(_, context, _)| context.bracket_commit)
             .collect::<Vec<_>>();
-        assert_eq!(bracket.len(), 3, "{kind}");
+        assert_eq!(bracket.len(), 4, "{kind}");
         assert!(!bracket[0].2.already_committed);
         assert!(bracket[1..].iter().all(|commit| commit.2.already_committed));
         assert!(

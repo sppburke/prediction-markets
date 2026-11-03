@@ -316,9 +316,9 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 > re-verify by 2026-11-15.** Implementation-time review of the
 > [official activity reference](https://docs.polymarket.com/api-reference/core/get-user-activity)
 > reconfirmed the positive-start requirement for full history on descending `/activity` reads.
-> The service bracket now requests exclusive `Some(0)`, translated by the existing reader to
-> wire `start=1`, on all three walks except runtime re-entry: one full baseline read precedes
-> three stability reads from the baseline's fixed end minus `REENTRY_HISTORY_OVERLAP_SECS`,
+> The service's direct boot bracket requests exclusive `Some(0)`, translated by the existing reader
+> to wire `start=1`, on all three walks; every runtime bracket makes one such full baseline read,
+> then three stability reads from the baseline's fixed end minus `REENTRY_HISTORY_OVERLAP_SECS`,
 > as defined by the [Copy-entry gate](_GLOSSARY.md#copy-entry-gate-first-ever-buy-entry-issues-290-339).
 > Each walk retains its sampled end and the existing split pagination.
 > Omitted/zero wire start selects the documented recent default window. This is

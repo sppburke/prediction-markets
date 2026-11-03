@@ -42,6 +42,15 @@ async fn deployed_flow_replays_exactly_and_qualifies() {
 mod rollout;
 mod support;
 
+/// PASS: an unflagged, age-due refresh yields while its activity read is held, so a newly ranked
+/// wallet completes one full baseline and three tails, is published and copies a fresh BUY before
+/// release. The refresh retries and anchors; restart preserves state and sealed CLI replay is exact.
+/// FAIL: admission or copying waits for release, bracket requests differ, or restart/replay drifts.
+#[tokio::test]
+async fn paper_service_newly_ranked_wallet_is_admitted_and_copies_while_a_refresh_is_slow() {
+    rollout::newly_ranked_wallet_during_slow_refresh().await;
+}
+
 /// PASS: the real process admits an unrepresentable activity row with a local drop and copies
 /// that wallet's later healthy-market BUY. Imports, local anomalies and retained revisions survive
 /// restart with identical state; sealed CLI replay reproduces the run exactly.
