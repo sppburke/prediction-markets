@@ -737,11 +737,15 @@ for e in source.values("polymarket-activity-ws", "polymarket-public.activity-rec
     rows = payload(e)["data"] if v2 else [payload(e)] if is_frame else payload(e)
     for r in rows:
         if r.get("type", r.get("activity_type", "TRADE" if is_frame else "")).strip().upper() != "TRADE": continue
-        # A v2 page no longer marks anomaly rows by schema: refuse a countable trade that could be one.
+        # A v2 page no longer marks anomaly rows by schema: refuse a countable trade that could be one
+        # (exponent or over-28-digit decimals, a price outside [0, 1], an unlabeled 999 or non-u16 outcome).
         if v2 and not r.get("is_combo", r.get("isCombo", False)) and Decimal(str(r.get("size", 0))) > 0:
-            numbers = [r.get(k) for k in ("price", "size", "usdc_size", "usdcSize") if r.get(k) is not None]
-            if (any("e" in str(v).lower() for v in numbers) or not 0 <= Decimal(str(r.get("price", 0))) <= 1
-                    or (str(r.get("outcome_index", r.get("outcomeIndex", ""))) == "999" and not (r.get("outcome") or "").strip())):
+            numbers = [Decimal(str(r[k])) for k in ("price", "size", "usdc_size", "usdcSize") if r.get(k) is not None]
+            o = str(r.get("outcome_index", r.get("outcomeIndex", "0"))).strip()
+            if (any("e" in str(r.get(k)).lower() for k in ("price", "size", "usdc_size", "usdcSize") if r.get(k) is not None)
+                    or any(len(d.as_tuple().digits) > 28 or d.as_tuple().exponent < -28 for d in numbers)
+                    or not 0 <= Decimal(str(r.get("price", 0))) <= 1
+                    or not (o.isdigit() and int(o) <= 65535) or (o == "999" and not (r.get("outcome") or "").strip())):
                 raise ValueError(f"possible anomaly row in v2 page {e['seq']}: outside this census (#822)")
         wallet = r.get("proxyWallet", r.get("proxy_wallet", "")).strip().lower()
         tx = r.get("transactionHash", r.get("transaction_hash", "")).strip().lower()
