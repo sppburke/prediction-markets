@@ -21912,12 +21912,18 @@ async fn chunked_finalize_reports_a_later_wallets_failure_for_every_classifier_c
             .unwrap_err();
             assert!(error.to_string().contains(reported), "{shape}: {error}");
             if reported == decoding {
-                // Today's exact wallet-specific prefix, followed by the original cause.
-                let message = error.to_string();
-                let cause = message.strip_prefix(&format!("invalid: {decoding}: "));
-                assert!(
-                    cause.is_some_and(|cause| !cause.is_empty()),
-                    "{shape}: {error}"
+                // Today's exact wallet-specific prefix, followed by the original cause: the stored
+                // components' own decoding error.
+                let cause = pe_bootstrap::error::BootstrapError::from(
+                    serde_json::from_str::<
+                        pe_source_polymarket_public::SourceActivityGroupComponents,
+                    >("{}")
+                    .unwrap_err(),
+                );
+                assert_eq!(
+                    error.to_string(),
+                    format!("invalid: {decoding}: {cause}"),
+                    "{shape}"
                 );
             }
             assert_chunked_finalize_rolled_back_after_rows(&path, &original);
