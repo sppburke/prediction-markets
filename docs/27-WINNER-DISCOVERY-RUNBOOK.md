@@ -67,13 +67,61 @@ The [one-time classifier-6 catch-up](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.
 records an activation batch of zero. Before the first ordinary cycle, the owner selects the
 ordinary batch size; a recorded cycle keeps that value through retries.
 
-There is no separate eval/export stage or candidates JSON: `winner-discovery` fetches
+There is no separate eval/export stage or candidates selection JSON: `winner-discovery` fetches
 the leaderboard, datadash and market participant slices and upserts new wallets (recording the
 source bit) straight into the cache. In standalone mode it activates eligible
 ones immediately. `rank_and_push.sh` instead admits only the controlled batch, then
 backfills their trade history and ranks them alongside the rest of the universe — the
 ranker's own eligibility filters decide which discovered wallets make the published
 cohort.
+
+## Collection beside staging (C9)
+
+Plain discovery still collects and applies leaderboard → datadash → participants on one cache,
+committing each source before the next. In the schema-two wrapper lane, an attempt whose candidate
+and prior are both absent starts collection immediately before `cache-stage`:
+
+```bash
+pe-bootstrap winner-discovery --defer-activation --collect-to "$SPOOL" \
+  --coverage-from "$FIXED_DB" --not-before "$((RANK_WINDOW_END_UNIX + FILL_WINDOW_SECS))" \
+  --end-date-min "$FLOOR" --recurrences "$RECURRENCES" [bootstrap.toml]
+PE_BOOTSTRAP_CACHE_PATH="$SIDE" pe-bootstrap winner-discovery --defer-activation \
+  --apply-from "$SPOOL" --end-date-min "$FLOOR" --recurrences "$RECURRENCES" [bootstrap.toml]
+```
+
+Collector flags are required together; apply forbids them. Both modes require
+`--defer-activation`, and no other subcommand accepts these flags. Collection uses the same
+fetchers, limits, retries and evidence lines. It writes only its attempt's spool and atomic-write
+temporary file; it takes no cache lock or writable opener. It refuses an existing spool, any
+spool/temp alias of the fixed cache, sidecars or lock, and a fixed schema other than two before
+requests. Only the reached, enabled participant arm waits for `--not-before`, samples its clock
+and reads raw coverage immutably (ignoring WAL). Decode/validation failures are recorded source
+outcomes; local read errors exit nonzero without a spool. Exit zero means a complete spool was written.
+
+Apply validates the version, settings, source prefix, coverage flag and wallet/count/coverage
+records and roles before taking the candidate lock. Under that lock it compares raw coverage
+through a read-only connection, closes it, then opens writably. Refusal before the writable opener
+exits [77](_GLOSSARY.md#discovery-spool). Binding success replays the ordinary
+commits and completion/warning lines; an earlier cache error wins over a later recorded source
+failure. Participant upserts still commit before coverage. Tombstones are evaluated at apply time,
+and `discovered_at_unix` is the insert time at apply.
+
+After staging/migration, the activation-batch probe still decides whether discovery runs. A recorded
+batch stops/reaps the collector and skips discovery. Otherwise the wrapper joins it and applies its
+spool. Collector nonzero or apply 77 runs ordinary discovery; every other apply status uses ordinary
+stage status mapping (including participant 75). A staging failure stops/reaps collection and keeps
+staging's status. Existing candidates, prior-backed attempts and bulk-root resumes retain their
+ordinary flow. Each eligible attempt chooses a new spool; completed spools and abandoned temporary
+files remain evidence and are never used by another attempt.
+
+Evidence includes `[winner-discovery] collecting beside cache-stage: <command>`, the stage start/end,
+`[winner-discovery] joining the collector started beside cache-stage`,
+`[winner-discovery] collector exited <status>`, and the ordinary apply/fallback start/end lines.
+Collector and apply log `winner-discovery: spool` with path and SHA-256. Participant summary, chunk
+and page evidence remains in collection; datadash soft failure and source completion lines occur
+at apply. On the first installed eligible cycle, measure overlap, join wait and critical-path saving
+from these journal lines; this rollout measurement is not a test claim. Earlier collection can
+advance coverage less far than serial discovery; the next cycle's canonical overlap prevents a gap.
 
 ## Leaderboard slices
 
@@ -261,7 +309,7 @@ cycle can skip discovery, so one invocation's log is insufficient.
 - **Exit codes** follow the shared `pe-bootstrap` vocabulary (each command emits
   a subset): 0 = success, 1 = permanent failure, 2 = partial failure,
   75 = temporary failure (loop-supervised retry; includes failed or incomplete enabled participant
-  discovery, `events` and `resolutions`).
+  discovery, `events` and `resolutions`); 77 = discovery spool refused before a writable open.
 
 ## Related docs
 

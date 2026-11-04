@@ -5088,6 +5088,40 @@ fn open_immutable(path: &Path) -> Result<Connection, BootstrapError> {
     Ok(connection)
 }
 
+/// These immutable inspections deliberately ignore WAL frames and never create sidecars.
+pub(crate) fn discovery_immutable_version(path: &Path) -> Result<i64, BootstrapError> {
+    verified_user_version(path)
+}
+
+pub(crate) fn discovery_immutable_coverage(path: &Path) -> Result<Option<String>, BootstrapError> {
+    let connection = open_immutable(path)?;
+    let raw = crate::cache::raw_participant_discovery_coverage(&connection)?;
+    connection.close().map_err(|(_, error)| error)?;
+    Ok(raw)
+}
+
+/// Refuse every spool/cache alias before a collector request or candidate lock.
+pub(crate) fn require_discovery_spool_roles(
+    cache: &Path,
+    spool: &Path,
+) -> Result<(), BootstrapError> {
+    let temp = atomic_write_temp_path(spool);
+    let lock = lock_target_path(cache)?;
+    let sidecars = ["-wal", "-shm", "-journal"].map(|suffix| sidecar_path(cache, suffix));
+    let mut roles = vec![
+        ("discovery cache", cache),
+        ("discovery spool", spool),
+        ("discovery spool temporary file", temp.as_path()),
+        ("cache mutation lock", lock.as_path()),
+    ];
+    roles.extend(
+        sidecars
+            .iter()
+            .map(|path| ("cache sidecar", path.as_path())),
+    );
+    require_distinct_files(&roles)
+}
+
 /// The immutable prior's `user_version`, read without touching the file.
 fn verified_user_version(path: &Path) -> Result<i64, BootstrapError> {
     let connection = open_immutable(path)?;
@@ -7513,8 +7547,9 @@ mod distinct_wallet_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod relock_tests {
-    use super::relock_unchanged;
+    use super::{open_immutable, relock_unchanged, stage_cache_cycle_v2};
     use rusqlite::{Connection, TransactionBehavior};
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn another_connections_commit_is_refused_and_the_own_commit_is_not() {
@@ -7539,6 +7574,33 @@ mod relock_tests {
             let relocked = relock_unchanged(&mut own, baseline);
             assert_eq!(relocked.is_err(), interleaved);
         }
+    }
+    #[test]
+    fn discovery_spool_immutable_read_does_not_block_staging_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixed = dir.path().join("fixed.db");
+        let cache = crate::cache::WalletCache::open(&fixed).unwrap();
+        cache.raw_conn_for_test().execute_batch("INSERT INTO meta VALUES ('participant_discovery_coverage','main file'); PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint=0; UPDATE meta SET value='WAL frame' WHERE key='participant_discovery_coverage';").unwrap();
+        let immutable = open_immutable(&fixed).unwrap();
+        let mut read = immutable.prepare("SELECT value FROM meta").unwrap();
+        let mut rows = read.query([]).unwrap();
+        assert_eq!(
+            rows.next().unwrap().unwrap().get::<_, String>(0).unwrap(),
+            "main file"
+        );
+        let report = stage_cache_cycle_v2(
+            &fixed,
+            &dir.path().join("prior.db"),
+            &dir.path().join("side.db"),
+            Some(&dir.path().join("build.json")),
+            None,
+        )
+        .unwrap();
+        let bytes = std::fs::read(&fixed).unwrap();
+        assert_eq!(
+            report.prior_sha256,
+            Some(format!("{:x}", Sha256::digest(bytes)))
+        );
     }
 }
 

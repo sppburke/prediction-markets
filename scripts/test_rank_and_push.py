@@ -2255,6 +2255,13 @@ class RankAndPushScenario(unittest.TestCase):
             "now = int(time.time())\n"
             "sub, db = a[0], opt('--db')\n"
             "if sub == 'winner-discovery':\n"
+            "    if opt('--collect-to'):\n"
+            "        Path(opt('--collect-to')).write_text(json.dumps({'collector': os.getpid()}))\n"
+            "        raise SystemExit(int(os.environ.get('STUB_DISCOVERY_COLLECT_EXIT', '0')))\n"
+            "    if opt('--apply-from'):\n"
+            "        assert Path(opt('--apply-from')).is_file(), 'missing attempt spool'\n"
+            "        code = int(os.environ.get('STUB_DISCOVERY_APPLY_EXIT', '0'))\n"
+            "        if code: raise SystemExit(code)\n"
             "    from rank_cycle_manifest import _participant_scope\n"
             "    scope = _participant_scope(opt('--recurrences').split(','), [dict(id='7', slug='seven')])\n"
             "    # Through the end of today's UTC day: any same-day cycle's print tail is covered whatever the clock reads.\n"
@@ -2480,11 +2487,12 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(list(fixed.parent.glob("*.side.db")), [])
 
     def _bootstrap_ops(self):
-        return [line.split()[0] for line in (self._log("pe_bootstrap.log") or "").splitlines()]
+        return [line.split()[0] for line in (self._log("pe_bootstrap.log") or "").splitlines()
+                if "--collect-to" not in shlex.split(line)]
 
     def _bootstrap_lines(self, op):
         return [line for line in (self._log("pe_bootstrap.log") or "").splitlines()
-                if line.startswith(op + " ")]
+                if line.startswith(op + " ") and "--collect-to" not in shlex.split(line)]
 
     def _foreground_ops(self, start=0):
         """Bootstrap operations from `start` without the fresh lane's scope sweep, which runs
@@ -2679,6 +2687,201 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
         pid = int((self.root / "capture_started").read_text())
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
+
+
+    def _discovery_calls(self):
+        return [shlex.split(line) for line in (self._log("pe_bootstrap.log") or "").splitlines()
+                if line.startswith("winner-discovery ")]
+
+    def _install_discovery_probe(self):
+        os.mkfifo(self.root / "discovery-overlap.pipe")
+        stub = self.root / "target/release/pe-bootstrap"
+        body = stub.read_text()
+        marker = 'case "$1" in cache-stage-v2'
+        assert marker in body
+        body = body.replace('sub="$1"\n', 'sub="$1"\n' + r'''
+if [[ "$1" == winner-discovery && " $* " == *" --collect-to "* ]]; then
+  exec python3 scripts/_discovery_probe.py "$@"
+fi
+if [[ "$1" == cache-stage-v2 && ! -e discovery-handshake ]]; then
+  printf staging > discovery-overlap.pipe
+  : > discovery-handshake
+fi
+if [[ "$1" == activate-next ]]; then
+  [[ -f discovery_applied || -f discovery_stopped || "${STUB_DISCOVERY_COLLECT_EXIT:-0}" != 0 ]] || exit 99
+fi
+if [[ "$1" == winner-discovery && " $* " == *" --apply-from "* ]]; then
+  : > discovery_applied
+fi
+''', 1)
+        _write_exec(stub, body)
+        _write_exec(self.root / "scripts/_discovery_probe.py", """#!/usr/bin/env python3
+import json, os, signal, sys, time
+from pathlib import Path
+a = sys.argv[1:]
+out = Path(a[a.index('--collect-to') + 1])
+mode = os.environ.get('STUB_DISCOVERY_MODE', 'overlap')
+def stopped(_signal, _frame):
+    time.sleep(1)
+    Path('discovery_stopped').write_text('yes')
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stopped)
+Path('discovery_started').write_text(str(os.getpid()))
+Path('discovery_fds').write_text('\\n'.join(os.path.realpath('/proc/self/fd/' + fd) for fd in os.listdir('/proc/self/fd')))
+if not Path('discovery-handshake').exists():
+    with open('discovery-overlap.pipe') as pipe:
+        pipe.read()
+if mode == 'block':
+    while True: signal.pause()
+if mode == 'orphan':
+    with open('discovery-release.pipe') as pipe: pipe.read()
+code = int(os.environ.get('STUB_DISCOVERY_COLLECT_EXIT', '0'))
+if not code: out.write_text(json.dumps({'collector': os.getpid()}))
+Path('discovery_finished').write_text(str(os.getpid()))
+raise SystemExit(code)
+""")
+
+    def test_discovery_spool_overlaps_staging_and_applies_after_probe_before_activation(self):
+        self._prepare_incremental_fixture(two_file=True)
+        self._install_discovery_probe()
+        helper = self.root / "scripts/rank_cycle_manifest.py"
+        helper.write_text(helper.read_text().replace('    if args.command == "activation-batch":',
+                          '    if args.command == "activation-batch":\n        Path("discovery_probe_checked").touch()'))
+        stub = self.root / "scripts/_stub_cache_ops.py"
+        stub.write_text(stub.read_text().replace("    if opt('--apply-from'):",
+                        "    if opt('--apply-from'):\n        assert Path('discovery_probe_checked').exists()"))
+        result = self._run(fd9=self.root / "loop.lock")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertTrue((self.root / "discovery-handshake").exists())
+        lines = result.stdout.splitlines()
+        def at(text): return next(i for i, line in enumerate(lines) if text in line)
+        self.assertLess(at("collecting beside cache-stage"), at("[cache-stage] running:"))
+        self.assertLess(at("[cache-stage] ok"), at("joining the collector"))
+        self.assertLess(at("collector exited 0"), at("--apply-from"))
+        self.assertLess(at("--apply-from"), at("[activate-next] running:"))
+        calls = self._discovery_calls()
+        self.assertEqual(len(calls), 2)
+        spool = calls[0][calls[0].index("--collect-to") + 1]
+        self.assertEqual(calls[1][calls[1].index("--apply-from") + 1], spool)
+        for lock in ("loop.lock", "data/eval-results/.rank_and_push.lock"):
+            self.assertNotIn(str((self.root / lock).resolve()), (self.root / "discovery_fds").read_text().splitlines())
+
+    def test_discovery_spool_fallback_and_fatal_status_mapping(self):
+        for collect_code, apply_code, expected, ordinary in [(0,77,2,True),(1,0,2,True),(75,0,2,True),(0,75,75,False),(0,1,1,False)]:
+            with self.subTest(collector=collect_code, apply=apply_code):
+                self.tearDown(); self.setUp()
+                self._prepare_incremental_fixture(two_file=True)
+                result = self._run(exit_env={"STUB_DISCOVERY_COLLECT_EXIT":str(collect_code),"STUB_DISCOVERY_APPLY_EXIT":str(apply_code)})
+                self.assertEqual(result.returncode,expected,result.stdout + result.stderr)
+                calls=self._discovery_calls()
+                self.assertEqual(sum("--collect-to" not in call and "--apply-from" not in call for call in calls),int(ordinary))
+                self.assertIn(f"collector exited {collect_code}",result.stdout)
+                if apply_code==77 and not collect_code: self.assertIn("apply exited 77",result.stdout)
+                if expected in (75,1): self.assertNotIn("activate-next",self._bootstrap_ops())
+
+    def test_discovery_spool_staging_failure_and_recorded_batch_reap_collector(self):
+        for stage_failure in (True,False):
+            with self.subTest(stage_failure=stage_failure):
+                self.tearDown();self.setUp()
+                self._prepare_incremental_fixture(two_file=True)
+                self._install_discovery_probe()
+                if not stage_failure:
+                    helper=self.root / "scripts/rank_cycle_manifest.py"
+                    helper.write_text(helper.read_text().replace('    if args.command == "activation-batch":',
+                                      '    if args.command == "activation-batch":\n        print("1"); return'))
+                result=self._run(exit_env={"STUB_DISCOVERY_MODE":"block",**({"STUB_EXIT_cache_stage_v2":"75"} if stage_failure else {})})
+                self.assertEqual(result.returncode,75 if stage_failure else 2,result.stdout+result.stderr)
+                self.assertTrue((self.root / "discovery_stopped").exists())
+                pid=int((self.root / "discovery_started").read_text())
+                with self.assertRaises(ProcessLookupError):os.kill(pid,0)
+                self.assertFalse(any("--apply-from" in call for call in self._discovery_calls()))
+                if stage_failure:self.assertIn("[cache-stage] TEMPFAIL",result.stderr)
+                else:self.assertIn("[winner-discovery] skipped",result.stdout)
+
+
+    def test_discovery_spool_checkpoint_repaired_main_coverage_falls_back(self):
+        fixed=self._install_candidate_layout(schema=2)
+        self._install_candidate_stub(two_file=True)
+        with (self.root / ".env").open("a") as handle:
+            handle.write("PE_RANK_SCHEMA_TWO_CUTOVER=prepare\n")
+        with sqlite3.connect(fixed) as c:
+            c.execute("UPDATE meta SET value='malformed' WHERE key='participant_discovery_coverage'")
+        stub=self.root / "scripts/_stub_cache_ops.py"
+        body=stub.read_text()
+        body=body.replace("Path(opt('--collect-to')).write_text(json.dumps({'collector': os.getpid()}))",
+                          "with sqlite3.connect('file:' + opt('--coverage-from') + '?immutable=1', uri=True) as c:\n"
+                          "            raw = c.execute(\"SELECT value FROM meta WHERE key='participant_discovery_coverage'\").fetchone()[0]\n"
+                          "        assert raw == 'malformed'\n"
+                          "        Path(opt('--collect-to')).write_text(json.dumps({'raw': raw}))")
+        body=body.replace("    if opt('--apply-from'):",
+                          "    if opt('--apply-from'):\n"
+                          "        with sqlite3.connect(os.environ['PE_BOOTSTRAP_CACHE_PATH']) as c:\n"
+                          "            candidate = c.execute(\"SELECT value FROM meta WHERE key='participant_discovery_coverage'\").fetchone()[0]\n"
+                          "        assert candidate != json.loads(Path(opt('--apply-from')).read_text())['raw']\n"
+                          "        raise SystemExit(77)")
+        body=body.replace("    if not resumed:\n        for p in Path(db).parent.iterdir():",
+                          "    if not resumed:\n"
+                          "        while not list(Path('data/eval-results').glob('cron-*/discovery_spool.*.json')): time.sleep(0.01)\n"
+                          "        # Emulate staging's checkpoint exposing a valid WAL-only value.\n"
+                          "        with sqlite3.connect(db) as c:\n"
+                          "            repaired = dict(version=1, scope=dict(recurrences=['15m'], series=[dict(id='7',slug='seven')]), market_floor_unix=0, covered_from_unix=0, covered_through_unix=253402300799)\n"
+                          "            c.execute(\"UPDATE meta SET value=? WHERE key='participant_discovery_coverage'\", (json.dumps(repaired),))\n"
+                          "        evidence['source_sha256'] = sha(db)\n"
+                          "        evidence_path.write_text(json.dumps(evidence))\n"
+                          "        for p in Path(db).parent.iterdir():")
+        stub.write_text(body)
+        result=self._run()
+        self.assertEqual(result.returncode,2,result.stdout+result.stderr)
+        calls=self._discovery_calls()
+        self.assertEqual(len(calls),3)
+        self.assertIn('--collect-to',calls[0]);self.assertIn('--apply-from',calls[1])
+        self.assertNotIn('--collect-to',calls[2]);self.assertNotIn('--apply-from',calls[2])
+        self.assertIn('apply exited 77',result.stdout)
+
+    def test_discovery_spool_retry_existing_candidate_is_serial(self):
+        self._prepare_incremental_fixture(two_file=True)
+        stopped=self._run(exit_env={"STUB_EXIT_cache_populate_activity_v2":"75"})
+        self.assertEqual(stopped.returncode,75,stopped.stdout+stopped.stderr)
+        before=len(self._discovery_calls())
+        resumed=self._run()
+        self.assertEqual(resumed.returncode,2,resumed.stdout+resumed.stderr)
+        calls=self._discovery_calls()[before:]
+        self.assertEqual(len(calls),1)
+        self.assertNotIn("--collect-to",calls[0]);self.assertNotIn("--apply-from",calls[0])
+
+    def test_discovery_spool_orphan_finishing_last_cannot_supply_new_attempt(self):
+        import fcntl
+        self._prepare_incremental_fixture(two_file=True)
+        self._install_discovery_probe()
+        os.mkfifo(self.root / "discovery-release.pipe")
+        stdout=self.root / "wrapper.stdout"
+        loop_lock=self.root / "loop.lock"
+        with stdout.open("w") as out:
+            process=subprocess.Popen(RankAndPushScenario._wrapper_command(self,[],loop_lock),cwd=self.root,
+                env=RankAndPushScenario._run_env(self,{"STUB_DISCOVERY_MODE":"orphan"}),stdout=out,stderr=subprocess.DEVNULL,start_new_session=True)
+        self.addCleanup(RankAndPushScenario._end_run_group,process.pid,str(self.root))
+        deadline=time.time()+30
+        while "joining the collector" not in stdout.read_text():
+            self.assertLess(time.time(),deadline,stdout.read_text());self.assertIsNone(process.poll());time.sleep(0.05)
+        old=self._discovery_calls()[0];old_spool=self.root / old[old.index("--collect-to")+1]
+        orphan=int((self.root / "discovery_started").read_text())
+        os.kill(process.pid,signal.SIGKILL);process.wait(timeout=10);os.kill(orphan,0)
+        for lock in (loop_lock,self.root / "data/eval-results/.rank_and_push.lock"):
+            with lock.open("a") as handle:fcntl.flock(handle,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        # A retained attempt with an incomplete copy is eligible again.
+        for side in (self.root / "phys").glob("*.side.db"):side.unlink()
+        # The fixture's handshake only gates the first process.
+        result=self._run(exit_env={"STUB_DISCOVERY_MODE":"overlap"})
+        self.assertEqual(result.returncode,2,result.stdout+result.stderr)
+        calls=self._discovery_calls();new_collect=[call for call in calls[1:] if "--collect-to" in call][0]
+        new_spool=self.root / new_collect[new_collect.index("--collect-to")+1]
+        self.assertNotEqual(old_spool,new_spool)
+        saved=new_spool.read_bytes()
+        with open(self.root / "discovery-release.pipe","w") as pipe:pipe.write("release")
+        deadline=time.time()+10
+        while not old_spool.exists():self.assertLess(time.time(),deadline);time.sleep(0.05)
+        self.assertEqual(new_spool.read_bytes(),saved)
+        self.assertTrue(all(call[call.index("--apply-from")+1] != str(old_spool.relative_to(self.root)) for call in calls if "--apply-from" in call))
 
     def _install_scope_probe(self, *, release=False):
         """Replace the fresh lane's scope sweep with a probe. Unless STUB_SCOPE_MODE=plain, it reads

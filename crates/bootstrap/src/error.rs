@@ -50,16 +50,23 @@ pub enum BootstrapError {
     /// and from `Config` (which wraps figment's loader errors).
     #[error("invalid: {message}")]
     Invalid { message: String },
+    #[error("discovery spool refused: {message}")]
+    DiscoverySpoolRefused { message: String },
+    #[error("{message}")]
+    DiscoveryRecorded { exit_code: i32, message: String },
     #[error("internal error")]
     Internal,
 }
 
 impl BootstrapError {
     pub const TEMPFAIL_EXIT_CODE: i32 = 75;
+    pub const DISCOVERY_SPOOL_REFUSED_EXIT_CODE: i32 = 77;
 
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::TransientSource { .. } => Self::TEMPFAIL_EXIT_CODE,
+            Self::DiscoverySpoolRefused { .. } => Self::DISCOVERY_SPOOL_REFUSED_EXIT_CODE,
+            Self::DiscoveryRecorded { exit_code, .. } => *exit_code,
             _ => 1,
         }
     }

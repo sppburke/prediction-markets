@@ -21,11 +21,11 @@ use time::OffsetDateTime;
 use crate::cache::WalletCache;
 use crate::config::BootstrapConfig;
 use crate::datadash_discovery::{
-    DatadashDiscoveryReport, ReqwestCohortFetcher, run_datadash_discovery_with_policy,
+    CollectedDatadash, ReqwestCohortFetcher, apply_datadash, collect_datadash,
 };
 use crate::error::BootstrapError;
 use crate::leaderboard_discovery::{
-    LeaderboardDiscoveryReport, LeaderboardFetcher, run_leaderboard_discovery_with_policy,
+    CollectedLeaderboard, LeaderboardFetcher, apply_leaderboard, collect_leaderboard,
 };
 use crate::market_scope::{
     MarketScope, ScopeFetcher, ScopePage, ScopeSeries, canonical_recurrences, list_market_series,
@@ -201,7 +201,8 @@ fn upsert_participants(
 }
 
 /// The supported wallet-discovery sources for `winner-discovery`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WalletDiscoverySource {
     Leaderboard,
     Datadash,
@@ -235,10 +236,47 @@ pub async fn run_source_discovery_with_policy(
     activation_policy: ActivationPolicy,
     market_floor: Option<i64>,
 ) -> Result<SourceDiscoveryResult, BootstrapError> {
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let collected = collect_source_discovery(source, config, market_floor, now, || {
+        pe_event_log::run_blocking(|| cache.participant_discovery_coverage())
+    })
+    .await?;
+    let disabled = source == WalletDiscoverySource::MarketParticipants
+        && matches!(collected, CollectedSource::Disabled);
+    let mut result =
+        pe_event_log::run_blocking(|| apply_source_discovery(cache, activation_policy, collected))?;
+    if disabled {
+        result.status = "disabled";
+    }
+    Ok(result)
+}
+
+/// Collected data has no cache handle; application owns every durable change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "source",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub(crate) enum CollectedSource {
+    Leaderboard(CollectedLeaderboard),
+    Datadash(CollectedDatadash),
+    MarketParticipants(CollectedParticipants),
+    Disabled,
+}
+
+pub(crate) async fn collect_source_discovery(
+    source: WalletDiscoverySource,
+    config: &BootstrapConfig,
+    market_floor: Option<i64>,
+    now: i64,
+    prior: impl FnOnce() -> Result<Option<ParticipantDiscoveryCoverage>, BootstrapError>,
+) -> Result<CollectedSource, BootstrapError> {
     match source {
         WalletDiscoverySource::Leaderboard => {
             if config.leaderboard_top_n == 0 {
-                return Ok(SourceDiscoveryResult::default());
+                return Ok(CollectedSource::Disabled);
             }
             let base_url = config
                 .leaderboard_base_url
@@ -254,25 +292,19 @@ pub async fn run_source_discovery_with_policy(
                 ReqwestFetcher::new(client)
                     .with_min_interval_ms(config.leaderboard_request_interval_ms),
             );
-            let r: LeaderboardDiscoveryReport = run_leaderboard_discovery_with_policy(
+            let collected = collect_leaderboard(
                 &fetcher,
                 &config.leaderboard_categories,
                 config.leaderboard_top_n,
-                cache,
-                activation_policy,
             )
             .await?;
-            Ok(SourceDiscoveryResult {
-                unique_wallets: r.unique_wallets,
-                activated: r.activated,
-                ..SourceDiscoveryResult::default()
-            })
+            Ok(CollectedSource::Leaderboard(collected))
         }
         WalletDiscoverySource::Datadash => {
             // Datadash is on by default; an empty/unset URL disables it.
             let Some(base_url) = config.datadash_api_url.as_deref() else {
                 tracing::debug!("wallet_discovery: Datadash skipped — datadash_api_url not set");
-                return Ok(SourceDiscoveryResult::default());
+                return Ok(CollectedSource::Disabled);
             };
             // Network-facing failures in this arm map to
             // `BootstrapError::Datadash` (client build, lock acquire, and every
@@ -292,27 +324,19 @@ pub async fn run_source_discovery_with_policy(
                 client,
                 config.datadash_request_interval_ms,
             );
-            let r: DatadashDiscoveryReport = run_datadash_discovery_with_policy(
+            let collected = collect_datadash(
                 &fetcher,
                 &config.datadash_exclude_ids,
                 &config.datadash_exclude_titles,
                 config.datadash_max_cohort_wallets,
-                cache,
-                activation_policy,
             )
             .await?;
-            Ok(SourceDiscoveryResult {
-                unique_wallets: r.unique_wallets,
-                activated: r.activated,
-                ..SourceDiscoveryResult::default()
-            })
+            Ok(CollectedSource::Datadash(collected))
         }
         WalletDiscoverySource::MarketParticipants => {
-            let now = OffsetDateTime::now_utc().unix_timestamp();
-            run_participant_discovery(
+            collect_participants(
                 config,
-                cache,
-                activation_policy,
+                prior,
                 now,
                 participant_fetcher,
                 || list_market_series(config, &config.market_recurrences),
@@ -331,6 +355,51 @@ pub async fn run_source_discovery_with_policy(
     }
 }
 
+pub(crate) fn apply_source_discovery(
+    cache: &mut WalletCache,
+    policy: ActivationPolicy,
+    collected: CollectedSource,
+) -> Result<SourceDiscoveryResult, BootstrapError> {
+    match collected {
+        CollectedSource::Leaderboard(data) => {
+            let r = apply_leaderboard(cache, policy, data)?;
+            Ok(SourceDiscoveryResult {
+                unique_wallets: r.unique_wallets,
+                activated: r.activated,
+                ..SourceDiscoveryResult::default()
+            })
+        }
+        CollectedSource::Datadash(data) => {
+            let r = apply_datadash(cache, policy, data)?;
+            Ok(SourceDiscoveryResult {
+                unique_wallets: r.unique_wallets,
+                activated: r.activated,
+                ..SourceDiscoveryResult::default()
+            })
+        }
+        CollectedSource::MarketParticipants(data) => {
+            let count = data.wallets.len();
+            upsert_participants(cache, data.wallets)?;
+            cache.set_participant_discovery_coverage(&data.coverage)?;
+            let activated = pile::apply_activation_policy(cache, policy)?;
+            Ok(SourceDiscoveryResult {
+                unique_wallets: count,
+                activated,
+                status: "ok",
+            })
+        }
+        CollectedSource::Disabled => Ok(SourceDiscoveryResult::default()),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CollectedParticipants {
+    pub wallets: Vec<String>,
+    pub now: i64,
+    pub coverage: ParticipantDiscoveryCoverage,
+}
+
 struct ParticipantRecord {
     source_id: &'static str,
     schema_version: u32,
@@ -344,6 +413,7 @@ struct ParticipantRecord {
     status: &'static str,
 }
 
+#[cfg(test)]
 async fn run_participant_discovery<F, L, S, Listed, Swept>(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
@@ -351,8 +421,40 @@ async fn run_participant_discovery<F, L, S, Listed, Swept>(
     now: i64,
     make_fetcher: impl FnOnce() -> Result<F, BootstrapError>,
     list: L,
-    mut sweep: S,
+    sweep: S,
 ) -> Result<SourceDiscoveryResult, BootstrapError>
+where
+    F: ScopeFetcher + Sync,
+    L: FnOnce() -> Listed,
+    Listed: Future<Output = Result<(Vec<ScopeSeries>, Vec<ScopePage>), BootstrapError>>,
+    S: FnMut(i64, Vec<ScopeSeries>) -> Swept,
+    Swept: Future<Output = Result<MarketScope, BootstrapError>>,
+{
+    let collected = collect_participants(
+        config,
+        || cache.participant_discovery_coverage(),
+        now,
+        make_fetcher,
+        list,
+        sweep,
+    )
+    .await?;
+    let disabled = matches!(collected, CollectedSource::Disabled);
+    let mut result = apply_source_discovery(cache, policy, collected)?;
+    if disabled {
+        result.status = "disabled";
+    }
+    Ok(result)
+}
+
+pub(crate) async fn collect_participants<F, L, S, Listed, Swept>(
+    config: &BootstrapConfig,
+    read_prior: impl FnOnce() -> Result<Option<ParticipantDiscoveryCoverage>, BootstrapError>,
+    now: i64,
+    make_fetcher: impl FnOnce() -> Result<F, BootstrapError>,
+    list: L,
+    mut sweep: S,
+) -> Result<CollectedSource, BootstrapError>
 where
     F: ScopeFetcher + Sync,
     L: FnOnce() -> Listed,
@@ -364,7 +466,7 @@ where
     let prior = if config.participant_lookback_secs == 0 {
         None
     } else {
-        cache.participant_discovery_coverage()?
+        read_prior()?
     };
     let matching = prior
         .as_ref()
@@ -525,10 +627,7 @@ where
         tracing::info!(page = %serde_json::to_string(page)?, "winner_discovery: participant page");
     }
     if record.status == "disabled" {
-        return Ok(SourceDiscoveryResult {
-            status: record.status,
-            ..SourceDiscoveryResult::default()
-        });
+        return Ok(CollectedSource::Disabled);
     }
     if record.status != "ok" {
         return Err(BootstrapError::TransientSource {
@@ -555,14 +654,11 @@ where
         coverage.market_floor_unix = coverage.market_floor_unix.max(prior.market_floor_unix);
     }
     coverage.validate()?;
-    upsert_participants(cache, wallets)?;
-    cache.set_participant_discovery_coverage(&coverage)?;
-    let activated = pile::apply_activation_policy(cache, policy)?;
-    Ok(SourceDiscoveryResult {
-        unique_wallets: record.wallet_count,
-        activated,
-        status: record.status,
-    })
+    Ok(CollectedSource::MarketParticipants(CollectedParticipants {
+        wallets,
+        now,
+        coverage,
+    }))
 }
 
 fn participant_fetcher() -> Result<ReqwestFetcher, BootstrapError> {
@@ -582,7 +678,7 @@ fn participant_failure(reason: &'static str, error: &impl std::fmt::Display) -> 
     reason
 }
 
-fn valid_participant_window(lo: i64, now: i64) -> bool {
+pub(crate) fn valid_participant_window(lo: i64, now: i64) -> bool {
     lo >= 0 && lo < now && lo >= now.saturating_sub(PARTICIPANT_WINDOW_SECS)
 }
 

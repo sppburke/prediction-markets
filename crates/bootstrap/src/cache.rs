@@ -3790,21 +3790,13 @@ impl WalletCache {
     pub fn participant_discovery_coverage(
         &self,
     ) -> Result<Option<crate::wallet_discovery::ParticipantDiscoveryCoverage>, BootstrapError> {
-        let row: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'participant_discovery_coverage'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        row.map(|json| {
-            let coverage: crate::wallet_discovery::ParticipantDiscoveryCoverage =
-                serde_json::from_str(&json)?;
-            coverage.validate()?;
-            Ok(coverage)
-        })
-        .transpose()
+        decode_participant_discovery_coverage(self.raw_participant_discovery_coverage()?)
+    }
+
+    pub(crate) fn raw_participant_discovery_coverage(
+        &self,
+    ) -> Result<Option<String>, BootstrapError> {
+        raw_participant_discovery_coverage(&self.conn)
     }
 
     /// Commit coverage after its participant upsert, with the cache mutation lock held.
@@ -4846,6 +4838,31 @@ fn add_column_if_missing(
         conn.execute_batch(&sql)?;
     }
     Ok(())
+}
+
+/// The raw text is the collector/apply binding, including malformed JSON.
+pub(crate) fn raw_participant_discovery_coverage(
+    conn: &Connection,
+) -> Result<Option<String>, BootstrapError> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'participant_discovery_coverage'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+pub(crate) fn decode_participant_discovery_coverage(
+    raw: Option<String>,
+) -> Result<Option<crate::wallet_discovery::ParticipantDiscoveryCoverage>, BootstrapError> {
+    raw.map(|json| {
+        let coverage: crate::wallet_discovery::ParticipantDiscoveryCoverage =
+            serde_json::from_str(&json)?;
+        coverage.validate()?;
+        Ok(coverage)
+    })
+    .transpose()
 }
 
 /// The payout walk's own additive columns, applied by every opener that can

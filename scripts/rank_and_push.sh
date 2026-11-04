@@ -13,7 +13,8 @@
 #
 # What `bash scripts/rank_and_push.sh` does (no args), in order:
 #   Step 0  refresh data (always-on; --skip-discovery / --skip-backfill to bypass):
-#     discover     pe-bootstrap winner-discovery --defer-activation  ingest without bulk activation
+#     discover     fresh two-file candidates collect beside cache-stage, then apply the bound spool
+#                  pe-bootstrap winner-discovery --defer-activation (ordinary discovery on refusal)
 #     activate     pe-bootstrap activate-next     at most the next audited batch of non-infra wallets (glossary default)
 #     backfill     pe-bootstrap backfill --defer-activation  trade history for every active wallet
 #     events       pe-bootstrap events            condition→event + fee maps (eligibility gate)
@@ -402,12 +403,14 @@ CURRENT_CYCLE_TMP=""
 CAPTURE_PID=""
 SAMPLER_PID=""
 SCOPE_PID=""
+DISCOVERY_PID=""
+DISCOVERY_SPOOL=""
 cleanup_rank_and_push() {
   local status=$?
   local pid running
   # Signal only a child bash still lists as running, read right before signaling it: an exited
   # child may already be reaped (its status kept for `wait`) and its PID reused.
-  for pid in "$CAPTURE_PID" "$SAMPLER_PID" "$SCOPE_PID"; do
+  for pid in "$CAPTURE_PID" "$SAMPLER_PID" "$SCOPE_PID" "$DISCOVERY_PID"; do
     [[ -n "$pid" ]] || continue
     running=" $(jobs -rp | tr '\n' ' ') "
     [[ "$running" != *" $pid "* ]] || kill "$pid" 2>/dev/null || true
@@ -863,6 +866,30 @@ start_market_scope() {
   SCOPE_PID=$!
 }
 
+start_winner_discovery() {
+  DISCOVERY_SPOOL="$OUT_DIR/discovery_spool.$$.$(date -u +%Y%m%dT%H%M%S%NZ).json"
+  local -a command=("$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation
+    --collect-to "$DISCOVERY_SPOOL" --coverage-from "$FIXED_DB"
+    --not-before "$((RANK_WINDOW_END_UNIX + FILL_WINDOW_SECS))"
+    "${DISCOVERY_SCOPE_ARGS[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}")
+  echo "   [winner-discovery] collecting beside cache-stage: ${command[*]}"
+  "${command[@]}" 8>&- 9>&- &
+  DISCOVERY_PID=$!
+}
+
+join_winner_discovery() {
+  local stop="${1:-0}" running
+  DISCOVERY_STATUS=0
+  if [[ "$stop" == "1" ]]; then
+    running=" $(jobs -rp | tr '\n' ' ') "
+    [[ "$running" != *" $DISCOVERY_PID "* ]] || kill "$DISCOVERY_PID" 2>/dev/null || true
+  fi
+  echo "   [winner-discovery] joining the collector started beside cache-stage"
+  wait "$DISCOVERY_PID" || DISCOVERY_STATUS=$?
+  DISCOVERY_PID=""
+  echo "   [winner-discovery] collector exited $DISCOVERY_STATUS"
+}
+
 # 76 is emitted only for schema-one empty ranking/publication or globally stale
 # trades, before a publication request exists. All other exits retain their meaning.
 # Read CURRENT state: the frozen manifest precedes backfill and survives retries.
@@ -1009,6 +1036,9 @@ with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
     }
     echo "   [bulk-root] resuming the frozen candidate; setup already completed"
   else
+    if [[ ! -e "$side" && ! -L "$side" && ! -e "$prior" && ! -L "$prior" ]]; then
+      start_winner_discovery
+    fi
     run_refresh_stage "cache-stage" stage_candidate_cache "$prior" "$side" "$build_manifest" "$stage_json"
     side_schema="$("$PYTHON_BIN" -c 'import json, sys
 print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$stage_json")"
@@ -1030,10 +1060,29 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
       echo "FATAL: could not read activation batch $ACTIVATION_BATCH_ID from the candidate" >&2; exit 2;
     }
     if [[ "$batch_recorded" == "1" ]]; then
+      [[ -z "$DISCOVERY_PID" ]] || join_winner_discovery 1
       echo "   [winner-discovery] skipped: activation batch $ACTIVATION_BATCH_ID already recorded"
     elif [[ "$batch_recorded" == "0" ]]; then
-      run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation \
-        "${DISCOVERY_SCOPE_ARGS[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+      local ordinary_discovery=1 apply_rc=0
+      if [[ -n "$DISCOVERY_PID" ]]; then
+        join_winner_discovery
+        if [[ "$DISCOVERY_STATUS" == "0" ]]; then
+          local -a apply_command=("$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation
+            --apply-from "$DISCOVERY_SPOOL" "${DISCOVERY_SCOPE_ARGS[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}")
+          echo "   [winner-discovery] running: ${apply_command[*]}"
+          "${apply_command[@]}" || apply_rc=$?
+          if [[ "$apply_rc" == "77" ]]; then
+            echo "   [winner-discovery] apply exited 77 (discovery spool refused); running ordinary discovery"
+          else
+            refresh_stage_status "winner-discovery" "$apply_rc"
+            ordinary_discovery=0
+          fi
+        fi
+      fi
+      if [[ "$ordinary_discovery" == "1" ]]; then
+        run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation \
+          "${DISCOVERY_SCOPE_ARGS[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+      fi
     else
       echo "FATAL: unexpected activation batch probe output: $batch_recorded" >&2; exit 2
     fi
