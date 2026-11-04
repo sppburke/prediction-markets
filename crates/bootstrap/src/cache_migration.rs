@@ -4538,7 +4538,10 @@ fn verify_reusable_ranker_projection(
 }
 
 #[cfg(feature = "scenario")]
-pub use projection_v3::finalize_cache_v2_with_projection_chunk_for_test;
+pub use projection_v3::{
+    finalize_cache_v2_with_projection_chunk_for_test,
+    finalize_cache_v2_with_projection_shape_for_test,
+};
 
 /// Finalize a complete v2 side cache and optionally emit a hash-bound stage record.
 /// Format three verifies available histories once and commits their projection spool.

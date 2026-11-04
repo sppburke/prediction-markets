@@ -21550,6 +21550,18 @@ async fn collection_747_window_retry_keeps_bounds_and_finishes_internal_backoff_
 // #747 chunked finalize (AC7)
 
 async fn chunked_finalize_candidate(dir: &TempDir) -> std::path::PathBuf {
+    chunked_finalize_candidate_with(dir, &[], Vec::new(), false).await
+}
+
+/// The chunked candidate plus `wallets`, admitted after its first generation so the second
+/// reads them in full, and their `rows`; with `six`, both generations collect under frozen
+/// identity 4, so finalize runs classifier 6.
+async fn chunked_finalize_candidate_with(
+    dir: &TempDir,
+    wallets: &[&str],
+    extra: Vec<Value>,
+    six: bool,
+) -> std::path::PathBuf {
     let side = dataset_candidate(dir, "unfinalized.db", &[WALLET_B]);
     let mut conversion = projection_v3_row("0xe", "retained-conversion", FRESH_END - 5);
     conversion["type"] = "CONVERSION".into();
@@ -21557,11 +21569,17 @@ async fn chunked_finalize_candidate(dir: &TempDir) -> std::path::PathBuf {
         rows: vec![conversion],
         ..Default::default()
     };
+    if six {
+        collection_admit_v1(&side, 1, FRESH_END, &[]).await;
+    }
     history_v3_collect(&side, &source, 1, FRESH_END, &[])
         .await
         .unwrap();
     projection_v3_payouts(&side);
     finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+    for wallet in wallets {
+        admit_dataset_wallet(&side, wallet);
+    }
     let mut rows = vec![
         projection_v3_row("0xa", "before-retained-drop", FRESH_END - 6),
         projection_v3_row("0xf", "certified-problem-second", FRESH_END - 5),
@@ -21599,6 +21617,7 @@ async fn chunked_finalize_candidate(dir: &TempDir) -> std::path::PathBuf {
     let mut other_wallet = projection_v3_row("0xd", "other-wallet", FRESH_END + 1);
     other_wallet["proxyWallet"] = WALLET_B.into();
     rows.push(other_wallet);
+    rows.extend(extra);
     let markets = ["0xa", "0xb", "0xd", "0xf", "0x10", "0x12", "0x13", "0x14"]
         .into_iter()
         .map(|market| serde_json::json!({
@@ -21613,6 +21632,9 @@ async fn chunked_finalize_candidate(dir: &TempDir) -> std::path::PathBuf {
         rows,
         ..Default::default()
     };
+    if six {
+        collection_admit_v1(&side, 2, FRESH_END + 1, &[WALLET.to_owned()]).await;
+    }
     history_v3_collect(&side, &source, 2, FRESH_END + 1, &[WALLET.to_owned()])
         .await
         .unwrap();
@@ -21682,6 +21704,586 @@ async fn chunked_finalize_targets_one_and_three_match_one_chunk_and_scoped_oracl
         } else {
             baseline = Some(observed);
         }
+    }
+}
+
+/// FAIL: a classifier count or chunk target changes the spool, the projection state, a certificate,
+/// the certificate digest or the report, for classifier 7 or frozen classifier 6, or the rows differ
+/// from the scoped oracle; or the hook accepts no classifier.
+#[tokio::test]
+async fn chunked_finalize_matches_for_every_classifier_count_and_target() {
+    use pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_shape_for_test;
+    let wallet_row = |wallet: &str, market: &str, id: &str, epoch: i64| {
+        let mut row = projection_v3_row(market, id, epoch);
+        row["proxyWallet"] = wallet.into();
+        row
+    };
+    // WALLET_C buys eight times across two markets and sells once, so target 3 cuts it into
+    // several chunks that carry its positions between them; WALLET_D is admitted with no rows;
+    // WALLET_E buys three times.
+    let mut extra = (0..8)
+        .map(|index| {
+            wallet_row(
+                WALLET_C,
+                if index % 2 == 0 { "0xa" } else { "0xb" },
+                &format!("c-buy-{index}"),
+                FRESH_END - 8 + index,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut sell = wallet_row(WALLET_C, "0xa", "c-sell", FRESH_END);
+    sell["side"] = "SELL".into();
+    extra.push(sell);
+    extra.extend((0..3).map(|index| {
+        wallet_row(
+            WALLET_E,
+            "0xd",
+            &format!("e-buy-{index}"),
+            FRESH_END - 3 + index,
+        )
+    }));
+    for six in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let candidate = chunked_finalize_candidate_with(
+            &dir,
+            &[WALLET_C, WALLET_D, WALLET_E],
+            extra.clone(),
+            six,
+        )
+        .await;
+        // The oracle is classifier 6's rule and stamps classifier 7; on this history without
+        // anomalies the two classifiers select the same rows.
+        let mut expected = reference_scoped_rows(&candidate);
+        if six {
+            for row in &mut expected {
+                row["classifier_version"] = 6.into();
+            }
+        }
+        for wallet in [WALLET, WALLET_B, WALLET_C, WALLET_E] {
+            assert!(
+                expected.iter().any(|row| row["wallet_hex"] == wallet),
+                "{wallet} has projection rows"
+            );
+        }
+        assert!(!expected.iter().any(|row| row["wallet_hex"] == WALLET_D));
+        let certificate_sql = "SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex";
+        let mut baseline = None;
+        for classifiers in [1, 2, 3] {
+            for chunk in [usize::MAX, 1, 3] {
+                let copy_dir = dir.path().join(format!("shape-{classifiers}-{chunk}"));
+                std::fs::create_dir(&copy_dir).unwrap();
+                let path = copy_dir.join("candidate.db");
+                std::fs::copy(&candidate, &path).unwrap();
+                let report = finalize_cache_v2_with_projection_shape_for_test(
+                    &path,
+                    FRESH_END + 3,
+                    chunk,
+                    classifiers,
+                )
+                .unwrap()
+                .unwrap();
+                let shape = format!("six {six}, {classifiers} classifiers, target {chunk}");
+                assert_eq!(projection_v3_rows(&path), expected, "{shape}");
+                let state = query_values(
+                    &path,
+                    "SELECT ranker_projection_count, ranker_projection_digest, ranker_projection_inputs_json, ranker_classifier_version FROM cache_v2_migration_state",
+                );
+                assert_eq!(
+                    state[0][1],
+                    rusqlite::types::Value::Text(whole_json_digest(&expected)),
+                    "{shape}"
+                );
+                assert_eq!(
+                    state[0][3],
+                    rusqlite::types::Value::Integer(if six { 6 } else { 7 }),
+                    "{shape}"
+                );
+                let certificates = query_values(&path, certificate_sql);
+                assert_eq!(certificates.len(), 5, "{shape}");
+                let observed = (
+                    std::fs::read(format!("{}.projection-v3.jsonl", path.display())).unwrap(),
+                    state,
+                    certificates,
+                    digests::certificate_digest(&Connection::open(&path).unwrap()).unwrap(),
+                    serde_json::to_vec(&report).unwrap(),
+                );
+                if let Some(baseline) = &baseline {
+                    assert_eq!(&observed, baseline, "{shape}");
+                } else {
+                    baseline = Some(observed);
+                }
+            }
+        }
+        // A finalized cache reuses its spool without starting a classifier, so the hook refuses
+        // zero before either path.
+        let finalized = dir.path().join("shape-3-3").join("candidate.db");
+        for (cache, path) in [("unfinalized", &candidate), ("finalized", &finalized)] {
+            let error = finalize_cache_v2_with_projection_shape_for_test(path, FRESH_END + 3, 3, 0)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("at least one classifier"),
+                "{cache}: {error}"
+            );
+        }
+    }
+}
+
+/// FAIL: with earlier wallets' chunks pending, a later wallet's decoding, serialization or
+/// history-check failure is reported with another context than today's, does not roll the pass
+/// back, or leaves a different finalize after repair, for any classifier count.
+#[tokio::test]
+async fn chunked_finalize_reports_a_later_wallets_failure_for_every_classifier_count() {
+    use pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_shape_for_test;
+    let dir = TempDir::new().unwrap();
+    let wallet_row = |wallet: &str, market: &str, id: &str, epoch: i64| {
+        let mut row = projection_v3_row(market, id, epoch);
+        row["proxyWallet"] = wallet.into();
+        row
+    };
+    let extra = (0..6)
+        .flat_map(|index| {
+            let market = if index % 2 == 0 { "0xa" } else { "0xb" };
+            [
+                wallet_row(
+                    WALLET_C,
+                    market,
+                    &format!("c-{index}"),
+                    FRESH_END - 6 + index,
+                ),
+                wallet_row(
+                    WALLET_E,
+                    market,
+                    &format!("e-{index}"),
+                    FRESH_END - 6 + index,
+                ),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let candidate =
+        chunked_finalize_candidate_with(&dir, &[WALLET_C, WALLET_D, WALLET_E], extra, false).await;
+    let expected = reference_scoped_rows(&candidate);
+    let original = query_values(
+        &candidate,
+        "SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex",
+    );
+    let decoding = format!("activity history decoding failed for {WALLET_E}");
+    let damages = [
+        ("components_json", "'{}'", decoding.as_str()),
+        ("source_time_unix", "-62167219201", "year"),
+        (
+            "share_amount_str",
+            "'2.250001'",
+            "activity history chain mismatch",
+        ),
+    ];
+    for (column, value, reported) in damages {
+        for classifiers in [1, 2, 3] {
+            let copy_dir = dir.path().join(format!("{column}-{classifiers}"));
+            std::fs::create_dir(&copy_dir).unwrap();
+            let path = copy_dir.join("candidate.db");
+            std::fs::copy(&candidate, &path).unwrap();
+            let connection = history_v3_damage_connection(&path);
+            let (id, before): (String, rusqlite::types::Value) = connection
+                .query_row(
+                    &format!(
+                        "SELECT source_trade_id, {column} FROM activity_groups_v2 WHERE wallet_hex = ?1
+                         ORDER BY source_time_unix, source_trade_id LIMIT 1 OFFSET 1"
+                    ),
+                    [WALLET_E],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            connection
+                .execute(
+                    &format!(
+                        "UPDATE activity_groups_v2 SET {column} = {value} WHERE source_trade_id = ?1"
+                    ),
+                    [&id],
+                )
+                .unwrap();
+            drop(connection);
+            let shape = format!("{column}, {classifiers} classifiers");
+            let error = finalize_cache_v2_with_projection_shape_for_test(
+                &path,
+                FRESH_END + 3,
+                3,
+                classifiers,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(reported), "{shape}: {error}");
+            if reported == decoding {
+                // Today's exact wallet-specific prefix, followed by the original cause.
+                let message = error.to_string();
+                let cause = message.strip_prefix(&format!("invalid: {decoding}: "));
+                assert!(
+                    cause.is_some_and(|cause| !cause.is_empty()),
+                    "{shape}: {error}"
+                );
+            }
+            assert_chunked_finalize_rolled_back_after_rows(&path, &original);
+            history_v3_damage_connection(&path)
+                .execute(
+                    &format!(
+                        "UPDATE activity_groups_v2 SET {column} = ?2 WHERE source_trade_id = ?1"
+                    ),
+                    params![id, before],
+                )
+                .unwrap();
+            finalize_cache_v2_with_projection_shape_for_test(&path, FRESH_END + 3, 3, classifiers)
+                .unwrap();
+            assert_eq!(projection_v3_rows(&path), expected, "{shape}");
+        }
+    }
+}
+
+/// FAIL: a classifier count or chunk target changes the spool, the projection state, a
+/// certificate, the certificate digest with its carried seed drops, the report, the order of its
+/// unresolved anomalies, or which carried seed drops remain; or a visited wallet keeps its carried
+/// drops, or an unvisited one loses them.
+#[tokio::test]
+async fn chunked_finalize_matches_for_every_classifier_count_with_seeds_and_anomalies() {
+    use pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_shape_for_test;
+    let dir = TempDir::new().unwrap();
+    // WALLET and WALLET_B earn certified drops in an old cache; a fresh cache seeded with WALLET
+    // carries both wallets' drops, and WALLET_B is never admitted, so its drops stay unvisited.
+    let old = dataset_candidate(&dir, "old.db", &[WALLET_B]);
+    let history = |wallet: &str, conversion: bool| {
+        let row = |market: &str, id: &str, epoch: i64| {
+            let mut row = dataset_row(wallet, market, &format!("{wallet}-{id}"), "BUY", epoch);
+            row["asset"] = Value::from(if market == "0xb" { "200" } else { "100" });
+            row
+        };
+        let mut rows = vec![
+            row("0xa", "before-drop", FRESH_END - 3),
+            row("0xb", "beside-drop", FRESH_END - 2),
+        ];
+        if conversion {
+            let mut conversion = row("\\xe", "conversion", FRESH_END - 2);
+            conversion["type"] = Value::from("CONVERSION");
+            rows.push(conversion);
+        }
+        rows
+    };
+    history_v3_collect(
+        &old,
+        &DatasetFetcher {
+            rows: [history(WALLET, true), history(WALLET_B, true)].concat(),
+            ..Default::default()
+        },
+        1,
+        FRESH_END,
+        &[],
+    )
+    .await
+    .unwrap();
+    projection_v3_payouts(&old);
+    finalize_cache_v2_unbound(&old, None, FRESH_END + 1).unwrap();
+    let seeded = certificate_row(&old, WALLET).pop().unwrap();
+    let seeds = dir.path().join("seeds.txt");
+    std::fs::write(&seeds, format!("{WALLET}\n")).unwrap();
+    let fresh = dir.path().join("fresh.db");
+    pe_bootstrap::cache_migration::SeedPlan::read(&seeds, &old)
+        .and_then(|plan| {
+            plan.init(&BootstrapConfig {
+                cache_path: fresh.clone(),
+                ..Default::default()
+            })
+        })
+        .unwrap();
+    migrate_cache_v2(&fresh, &write_build_manifest(&dir, &fresh)).unwrap();
+    admit_dataset_wallet(&fresh, WALLET_C);
+    admit_dataset_wallet(&fresh, WALLET_E);
+    let carried = "SELECT wallet_hex FROM activity_seed_drops_v3 ORDER BY wallet_hex";
+    assert_eq!(
+        query_values(&fresh, carried),
+        vec![
+            vec![rusqlite::types::Value::Text(WALLET.to_owned())],
+            vec![rusqlite::types::Value::Text(WALLET_B.to_owned())],
+        ]
+    );
+    let row = |wallet: &str, market: &str, id: &str, epoch: i64| {
+        let mut row = projection_v3_row(market, id, epoch);
+        row["proxyWallet"] = wallet.into();
+        row
+    };
+    // Unresolved anomalies (no payout evidence for market 0x99) in two wallets: before WALLET_C's
+    // first aggregate, between its chunks, after its last aggregate (drained by its final chunk),
+    // and alone in a second of WALLET_E's.
+    let unresolved = |wallet: &str, epoch: i64| {
+        let mut row = forge_822_anomaly(2, epoch);
+        row["proxyWallet"] = wallet.into();
+        row["transactionHash"] = format!("{wallet}-anomaly-{epoch}").into();
+        row["conditionId"] = Value::from("0x99");
+        row["asset"] = Value::from("99999");
+        row
+    };
+    let mut rows = history(WALLET, false);
+    rows.extend([
+        unresolved(WALLET_C, FRESH_END - 9),
+        row(WALLET_C, "0xa", "c-1", FRESH_END - 8),
+        row(WALLET_C, "0xb", "c-2", FRESH_END - 7),
+        unresolved(WALLET_C, FRESH_END - 6),
+        row(WALLET_C, "0xa", "c-3", FRESH_END - 5),
+        row(WALLET_C, "0xb", "c-4", FRESH_END - 4),
+        row(WALLET_C, "0xa", "c-5", FRESH_END - 3),
+        unresolved(WALLET_C, FRESH_END - 1),
+        row(WALLET_E, "0xa", "e-1", FRESH_END - 6),
+        unresolved(WALLET_E, FRESH_END - 5),
+        row(WALLET_E, "0xb", "e-2", FRESH_END - 4),
+    ]);
+    history_v3_collect(
+        &fresh,
+        &DatasetFetcher {
+            rows,
+            ..Default::default()
+        },
+        1,
+        FRESH_END,
+        &[],
+    )
+    .await
+    .unwrap();
+    projection_v3_payouts(&fresh);
+    let certificate_sql = "SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex";
+    let carried_sql = "SELECT * FROM activity_seed_drops_v3 ORDER BY wallet_hex";
+    let mut baseline = None;
+    for classifiers in [1, 2, 3] {
+        for chunk in [usize::MAX, 1, 3] {
+            let copy_dir = dir.path().join(format!("seeded-{classifiers}-{chunk}"));
+            std::fs::create_dir(&copy_dir).unwrap();
+            let path = copy_dir.join("candidate.db");
+            std::fs::copy(&fresh, &path).unwrap();
+            let report = finalize_cache_v2_with_projection_shape_for_test(
+                &path,
+                FRESH_END + 1,
+                chunk,
+                classifiers,
+            )
+            .unwrap()
+            .unwrap();
+            let shape = format!("{classifiers} classifiers, target {chunk}");
+            let wire = serde_json::to_value(&report).unwrap();
+            let anomalies = wire["unresolved_anomalies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|anomaly| {
+                    (
+                        anomaly["wallet_hex"].as_str().unwrap().to_owned(),
+                        anomaly["source_time_unix"].as_i64().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                anomalies,
+                vec![
+                    (WALLET_C.to_owned(), FRESH_END - 9),
+                    (WALLET_C.to_owned(), FRESH_END - 6),
+                    (WALLET_C.to_owned(), FRESH_END - 1),
+                    (WALLET_E.to_owned(), FRESH_END - 5),
+                ],
+                "{shape}"
+            );
+            // WALLET's first certificate took over its carried drops; WALLET_B's stay carried.
+            assert_eq!(
+                certificate_row(&path, WALLET).pop().unwrap(),
+                seeded,
+                "{shape}"
+            );
+            assert_eq!(
+                query_values(&path, carried),
+                vec![vec![rusqlite::types::Value::Text(WALLET_B.to_owned())]],
+                "{shape}"
+            );
+            let observed = (
+                std::fs::read(format!("{}.projection-v3.jsonl", path.display())).unwrap(),
+                query_values(
+                    &path,
+                    "SELECT ranker_projection_count, ranker_projection_digest, ranker_projection_inputs_json FROM cache_v2_migration_state",
+                ),
+                query_values(&path, certificate_sql),
+                query_values(&path, carried_sql),
+                digests::certificate_digest(&Connection::open(&path).unwrap()).unwrap(),
+                serde_json::to_vec(&report).unwrap(),
+            );
+            if let Some(baseline) = &baseline {
+                assert_eq!(&observed, baseline, "{shape}");
+            } else {
+                baseline = Some(observed);
+            }
+        }
+    }
+}
+
+/// Finalizes the benchmark candidate with `classifiers`, or with the production count when
+/// `None`. The only line that differs from the copy of this benchmark run on `main`.
+fn finalize_classifier_benchmark_run(
+    path: &std::path::Path,
+    classifiers: Option<usize>,
+) -> Option<pe_bootstrap::cache_migration::ClassificationReport> {
+    match classifiers {
+        Some(classifiers) => {
+            pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_shape_for_test(
+                path,
+                FRESH_END + 1,
+                100_000,
+                classifiers,
+            )
+        }
+        None => pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_chunk_for_test(
+            path,
+            FRESH_END + 1,
+            100_000,
+        ),
+    }
+    .unwrap()
+}
+
+/// C6 benchmark. With `PE_C6_BENCH_DIR` unset it builds a candidate and finalizes copies with
+/// 1, 2, 1, 2 classifiers in this process. With it set, the first run builds
+/// `$PE_C6_BENCH_DIR/candidate.db` once; every run then finalizes one fresh copy with
+/// `PE_C6_BENCH_CLASSIFIERS` (unset: the production count) and prints its time, peak memory
+/// and spool hash, so a driver can alternate binaries and counts in separate processes.
+#[tokio::test]
+#[ignore = "benchmark (C6 AC5): see finalize_classifier_benchmark_run and the driver in the PR"]
+async fn finalize_classifier_benchmark() {
+    fn knob<T: std::str::FromStr>(name: &str, default: T) -> T {
+        std::env::var(name).map_or(default, |value| value.parse().ok().unwrap())
+    }
+    let small: usize = knob("PE_C6_BENCH_WALLETS", 4_000);
+    let small_rows: i64 = knob("PE_C6_BENCH_ROWS", 300);
+    let giants: usize = knob("PE_C6_BENCH_GIANTS", 2);
+    let giant_rows: i64 = knob("PE_C6_BENCH_GIANT_ROWS", 150_000);
+    let markets: usize = knob("PE_C6_BENCH_MARKETS", 2_000);
+    let underflow_every: i64 = knob("PE_C6_BENCH_UNDERFLOW_EVERY", 8);
+    // A wallet past the shared held-row limit stays partial and resumes in the next generation.
+    let generations: u64 = knob("PE_C6_BENCH_GENERATIONS", 1);
+    let bench = std::env::var_os("PE_C6_BENCH_DIR").map(std::path::PathBuf::from);
+    let candidate = bench.as_ref().map(|bench| bench.join("candidate.db"));
+    let work = TempDir::new().unwrap();
+    if candidate
+        .as_ref()
+        .is_none_or(|candidate| !candidate.exists())
+    {
+        let wallets = (0..small + giants)
+            .map(|index| format!("0x{index:040x}"))
+            .collect::<Vec<_>>();
+        let refs = wallets.iter().map(String::as_str).collect::<Vec<_>>();
+        let side = dataset_candidate(&work, "benchmark.db", &refs);
+        // Each wallet walks its own run of markets: two buys and a partial sell of a market,
+        // then a third buy, or every `underflow_every` steps (0: never) a merge in a market it
+        // never held, which certifies an underflow drop that every later second carries.
+        let mut rows = Vec::new();
+        for (index, wallet) in wallets.iter().enumerate() {
+            let count = if index >= small {
+                giant_rows
+            } else {
+                small_rows
+            };
+            for step in 0..count {
+                let walked = (index * 7 + usize::try_from(step / 4).unwrap()) % markets;
+                let (market, side, kind) = match step % 4 {
+                    0 | 1 => (walked, "BUY", "TRADE"),
+                    2 => (walked, "SELL", "TRADE"),
+                    _ if underflow_every > 0 && step % underflow_every == 3 => {
+                        ((walked + markets / 2) % markets, "BUY", "MERGE")
+                    }
+                    _ => (walked, "BUY", "TRADE"),
+                };
+                let mut row = dataset_row(
+                    wallet,
+                    &format!("0x{market:x}"),
+                    &format!("{index}-{step}"),
+                    side,
+                    FRESH_END - count + step,
+                );
+                row["asset"] = format!("1{market:05}").into();
+                row["type"] = kind.into();
+                rows.push(row);
+            }
+        }
+        let total = rows.len();
+        let built = std::time::Instant::now();
+        let source = DatasetFetcher {
+            rows,
+            ..Default::default()
+        };
+        for generation in 1..=generations {
+            let end = FRESH_END + i64::try_from(generation).unwrap() - 1;
+            history_v3_collect(&side, &source, generation, end, &[])
+                .await
+                .unwrap();
+        }
+        let payouts = (0..markets)
+            .map(|market| serde_json::json!({
+                "condition_id": format!("0x{market:x}"), "closed": true, "neg_risk": false,
+                "is_50_50_outcome": false, "end_date_iso": "2027-01-16T00:00:00Z",
+                "tokens": [{"token_id": format!("1{market:05}"), "outcome": "Yes", "price": "1", "winner": true},
+                           {"token_id": format!("2{market:05}"), "outcome": "No", "price": "0", "winner": false}]}))
+            .collect::<Vec<_>>();
+        publication_payouts(&side, &payouts, FRESH_END);
+        Connection::open(&side)
+            .unwrap()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        eprintln!(
+            "benchmark candidate: {small} wallets x {small_rows} rows, {giants} x {giant_rows}, {markets} markets, underflow every {underflow_every}, {generations} generations; {total} rows, {} aggregates, {} excluded receipts, built in {:.1} s",
+            count(&side, "SELECT COUNT(*) FROM activity_groups_v2"),
+            count(
+                &side,
+                &format!(
+                    "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = {generations}
+                     AND (exclusion_reason IS NOT NULL OR json_extract(acquisition_json, '$.disposition') = 'excluded')"
+                )
+            ),
+            built.elapsed().as_secs_f64()
+        );
+        match &candidate {
+            Some(candidate) => {
+                std::fs::copy(&side, candidate).unwrap();
+            }
+            None => std::fs::copy(&side, work.path().join("candidate.db"))
+                .map(drop)
+                .unwrap(),
+        }
+    }
+    let source = candidate.unwrap_or_else(|| work.path().join("candidate.db"));
+    let runs: Vec<Option<usize>> = if bench.is_some() {
+        vec![
+            std::env::var("PE_C6_BENCH_CLASSIFIERS")
+                .ok()
+                .map(|value| value.parse().unwrap()),
+        ]
+    } else {
+        vec![Some(1), Some(2), Some(1), Some(2)]
+    };
+    for (run, classifiers) in runs.into_iter().enumerate() {
+        let path = work.path().join(format!("run-{run}.db"));
+        std::fs::copy(&source, &path).unwrap();
+        // The copy's write-back would otherwise overlap the timed finalize.
+        std::fs::File::open(&path).unwrap().sync_all().unwrap();
+        let started = std::time::Instant::now();
+        let report = finalize_classifier_benchmark_run(&path, classifiers).unwrap();
+        let elapsed = started.elapsed().as_secs_f64();
+        let peak = || {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find(|line| line.starts_with("VmHWM:"))
+                .map(|line| line.split_whitespace().nth(1).unwrap().to_owned())
+                .unwrap()
+        };
+        // Finalize's own peak, before reading the whole spool adds to it.
+        let finalize_peak = peak();
+        let spool = std::fs::read(format!("{}.projection-v3.jsonl", path.display())).unwrap();
+        eprintln!(
+            "benchmark run {run}: classifiers {classifiers:?}, finalize {elapsed:.2} s, peak {finalize_peak} kB, process peak {} kB, spool {} bytes sha256 {:x}, drops {:?}",
+            peak(),
+            spool.len(),
+            Sha256::digest(&spool),
+            report.drops_by_cause
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 }
 
