@@ -1296,7 +1296,8 @@ class DuckParityTest(unittest.TestCase):
                     fast.append(rendered(con, path))
                     return fast[-1]
                 with mock.patch.object(exp, "_parquet_projection_digest", side_effect=tamper), \
-                     mock.patch.object(exp, "_compact_projection_rows", wraps=exp._compact_projection_rows) as rows_read:
+                     mock.patch.object(exp, "_compact_projection_rows", wraps=exp._compact_projection_rows) as rows_read, \
+                     mock.patch.object(exp, "log", wraps=exp.log) as logged:
                     if mutation == "integer":
                         export(db, pq)
                     else:
@@ -1305,6 +1306,9 @@ class DuckParityTest(unittest.TestCase):
                         if mutation in values:
                             self.assertIn("Parquet projection count/digest mismatch", str(refused.exception))
                 self.assertEqual(rows_read.call_count, 1)
+                reason = "column types differ" if mutation in types else "DuckDB-rendered digest differs"
+                self.assertEqual([call.args[0] for call in logged.call_args_list].count(
+                    f"projection: {reason}; rechecking with per-row JSON"), 1)
                 if mutation in types:
                     self.assertIsNone(fast[0])
                 else:
@@ -1340,12 +1344,15 @@ class DuckParityTest(unittest.TestCase):
                 fast.append(original(con, path))
                 return fast[-1]
             with mock.patch.object(exp, "_parquet_projection_digest", side_effect=rendered), \
-                 mock.patch.object(exp, "_compact_projection_rows", wraps=exp._compact_projection_rows) as rows_read:
+                 mock.patch.object(exp, "_compact_projection_rows", wraps=exp._compact_projection_rows) as rows_read, \
+                 mock.patch.object(exp, "log", wraps=exp.log) as logged:
                 export(db, pq)
             # DuckDB writes \u001F where json.dumps writes \u001f: the digests differ, and the per-row path accepts.
             self.assertEqual(fast[0][0], len(rows))
             self.assertNotEqual(fast[0], finalized)
             self.assertEqual(rows_read.call_count, 1)
+            messages = [call.args[0] for call in logged.call_args_list]
+            self.assertEqual(messages.count("projection: DuckDB-rendered digest differs; rechecking with per-row JSON"), 1)
             manifest = json.loads((Path(pq) / exp.V2_EXPORT_MANIFEST).read_text())
             self.assertEqual((manifest["projection"]["count"], manifest["projection"]["digest"]), finalized)
             engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, schema_version=2)
@@ -1364,6 +1371,33 @@ class DuckParityTest(unittest.TestCase):
             return [integers[(index + offset) % len(integers)] if exp.PROJECTION_TYPES[name] == "BIGINT"
                     else texts[(index + offset) % len(texts)] for offset, name in enumerate(names)]
         batch = 4
+        fetched = []
+
+        class BoundedCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def fetchmany(self, size):
+                if size != batch:
+                    raise AssertionError(f"unbounded batch: {size}")
+                rows = self.cursor.fetchmany(size)
+                fetched.append(len(rows))
+                return rows
+
+            def fetchall(self):
+                raise AssertionError("rendered rows must never fetchall")
+
+        class BoundedConnection:
+            def __init__(self, con):
+                self.con = con
+
+            def execute(self, query):
+                cursor = self.con.execute(query)
+                # Column metadata is bounded; only the rendered rows must stream through fetchmany.
+                if query.startswith("DESCRIBE "):
+                    return cursor
+                return BoundedCursor(cursor)
+
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(exp, "RENDERED_BATCH_SIZE", batch):
             # DuckDB cuts row groups at 2048-row vectors: 5000 rows make three.
             for count in (0, 1, batch - 1, batch, batch + 1, 2 * batch + 1, 5000):
@@ -1382,7 +1416,10 @@ class DuckParityTest(unittest.TestCase):
                         con.execute(f"SET threads = {threads}")
                         expected = exp._projection_digest(exp._compact_projection_rows(con, path))
                         self.assertEqual(expected[0], count)
-                        self.assertEqual(exp._parquet_projection_digest(con, path), expected)
+                        fetched.clear()
+                        self.assertEqual(exp._parquet_projection_digest(BoundedConnection(con), path), expected)
+                        self.assertEqual(fetched, [batch] * (count // batch)
+                                         + ([count % batch] if count % batch else []) + [0])
                 con.close()
 
     def test_v2_repaired_payouts_do_not_change_v1_ranking_or_survivors(self) -> None:
