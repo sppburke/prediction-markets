@@ -592,6 +592,17 @@ market still missing a terminal row. The subcommand runs the full
 decay anchor: production cycles use their directory's UTC creation day across retries and pauses;
 parameterized runs use today's date, and explicit overrides win
 ([`ranker_window_days`](_GLOSSARY.md#live-wallet-source-supabase-ranking-handoff-issue-339), #821).
+
+For an eligible schema-two attempt (both candidate and prior absent), winner collection starts
+beside cache staging, then joins after staging/migration and the activation-batch probe. Apply
+binds raw participant coverage under the candidate lock before its writable opener and retains
+ordinary source commit order. A collector failure or apply exit 77 falls back to ordinary discovery;
+other apply exits retain ordinary status mapping. Existing candidates, prior-backed attempts,
+bulk-root resumes and publication recovery retain their established paths. The collector's
+`--not-before` is the frozen window end plus fill window, so coverage reaches the print tail even
+when a run crosses UTC midnight. Spools and abandoned temporary files remain with each attempt's
+cycle evidence; later attempts choose new names. See [discovery modes and journal evidence](27-WINNER-DISCOVERY-RUNBOOK.md#collection-beside-staging-c9).
+
 Each ranking run, resumes included, runs `pe-bootstrap market-scope`: Gamma's
 15-minute series and their events ending at or after the window start minus one day, about 1,350 requests at ≤ 2/s (14 min on the dev box), written to
 `market_scope.json` in the run directory ([`ranker_market_scope`](_GLOSSARY.md#ranker-market-scope),

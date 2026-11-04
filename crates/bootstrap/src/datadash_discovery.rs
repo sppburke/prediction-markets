@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 #[cfg(any(test, feature = "scenario"))]
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cache::{WalletCache, WalletUpsertRow};
 use crate::error::BootstrapError;
@@ -240,8 +240,17 @@ impl CohortFetcher for ReqwestCohortFetcher {
     }
 }
 
+/// Collected wallets and completion counts, before any cache writes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CollectedDatadash {
+    pub wallets: Vec<String>,
+    pub report: DatadashDiscoveryReport,
+}
+
 /// Per-run discovery counts.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DatadashDiscoveryReport {
     /// Cohorts returned by `ListCohorts`.
     pub cohorts_listed: usize,
@@ -313,6 +322,17 @@ pub async fn run_datadash_discovery_with_policy<F: CohortFetcher + Send + Sync>(
     cache: &mut WalletCache,
     activation_policy: pile::ActivationPolicy,
 ) -> Result<DatadashDiscoveryReport, BootstrapError> {
+    let collected =
+        collect_datadash(fetcher, exclude_ids, exclude_titles, max_cohort_wallets).await?;
+    apply_datadash(cache, activation_policy, collected)
+}
+
+pub(crate) async fn collect_datadash<F: CohortFetcher + Send + Sync>(
+    fetcher: &F,
+    exclude_ids: &[String],
+    exclude_titles: &[String],
+    max_cohort_wallets: u64,
+) -> Result<CollectedDatadash, BootstrapError> {
     let cohorts = fetcher.list_cohorts().await?;
     let cohorts_listed = cohorts.len();
 
@@ -386,7 +406,32 @@ pub async fn run_datadash_discovery_with_policy<F: CohortFetcher + Send + Sync>(
     all.dedup();
     let unique_wallets = all.len();
 
-    let upserts: Vec<WalletUpsertRow> = all
+    Ok(CollectedDatadash {
+        wallets: all,
+        report: DatadashDiscoveryReport {
+            cohorts_listed,
+            cohorts_kept,
+            raw_addresses,
+            unique_wallets,
+            activated: 0,
+        },
+    })
+}
+
+pub(crate) fn apply_datadash(
+    cache: &mut WalletCache,
+    activation_policy: pile::ActivationPolicy,
+    collected: CollectedDatadash,
+) -> Result<DatadashDiscoveryReport, BootstrapError> {
+    let DatadashDiscoveryReport {
+        cohorts_listed,
+        cohorts_kept,
+        raw_addresses,
+        unique_wallets,
+        ..
+    } = collected.report;
+    let upserts: Vec<WalletUpsertRow> = collected
+        .wallets
         .into_iter()
         .map(|hex| (hex, SRC_DATADASH, false, None, None, None, 0))
         .collect();

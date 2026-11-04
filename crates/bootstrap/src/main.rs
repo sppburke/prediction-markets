@@ -39,6 +39,13 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let first_arg = args.get(1).map(|s| s.as_str());
+    let discovery_mode = match parse_discovery_mode(&args) {
+        Ok(mode) => mode,
+        Err(error) => {
+            tracing::error!(error = %error, "winner-discovery: invalid mode");
+            std::process::exit(1);
+        }
+    };
     // Infra marks are permanent (#826). The removed command must not fall through to the
     // positional-config default below, which would run `all` on the configured cache.
     if first_arg == Some("clear-infra-exclusion") {
@@ -58,6 +65,7 @@ async fn main() {
     //        exhausted its in-process retries; the production loop supervisor
     //        retries the cycle. Emitted by `events`, `resolutions`, and
     //        `cache-populate-activity-v2` (transient or rate-limited reads).
+    //   77 = discovery spool refused before any writable cache open.
 
     // ── Subcommands that take [--strict] [<toml-path>] ──────────────────────
     let known_sub = matches!(
@@ -170,6 +178,17 @@ async fn main() {
                 reset_clob_cursor = true;
             } else if a == "--dry-run" {
                 dry_run = true;
+            } else if [
+                "--collect-to",
+                "--coverage-from",
+                "--not-before",
+                "--apply-from",
+            ]
+            .contains(&a)
+                && i + 1 < rest.len()
+            {
+                i += 1; // Mode grammar was validated before any dispatch.
+                flag_values.insert(rest[i]);
             } else if a == "--defer-activation" {
                 defer_activation = true;
             } else if a == "--held-loop-lock-fd" && i + 1 < rest.len() {
@@ -905,6 +924,58 @@ async fn main() {
             None
         };
 
+        match discovery_mode {
+            DiscoveryMode::Collect {
+                spool,
+                coverage_from,
+                not_before,
+            } => {
+                let result = winner_discovery::collect_winner_discovery(
+                    &bootstrap_config,
+                    &spool,
+                    &coverage_from,
+                    not_before,
+                    end_date_min_arg,
+                )
+                .await;
+                let exit = match result {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        tracing::error!(error = %error, "winner-discovery: collector failed");
+                        error.exit_code()
+                    }
+                };
+                std::process::exit(exit);
+            }
+            DiscoveryMode::Apply { spool } => {
+                let result = (|| {
+                    let spool = winner_discovery::read_discovery_spool(
+                        &bootstrap_config,
+                        &spool,
+                        end_date_min_arg,
+                    )?;
+                    pe_event_log::run_blocking(|| {
+                        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
+                            &bootstrap_config.cache_path,
+                        )
+                        .map_err(|error| {
+                            BootstrapError::DiscoverySpoolRefused {
+                                message: error.to_string(),
+                            }
+                        })?;
+                        winner_discovery::bind_discovery_spool(
+                            &spool,
+                            &bootstrap_config.cache_path,
+                        )?;
+                        let mut cache = open_cli_cache(&bootstrap_config, false)?;
+                        winner_discovery::apply_discovery_spool(spool, &mut cache)
+                    })
+                })();
+                std::process::exit(winner_discovery_exit(result));
+            }
+            DiscoveryMode::Plain => {}
+        }
+
         // Every named command below opens WalletCache read-write (including
         // `all`), so the one central guard must precede that open (#544).
         // Genuine readers return above through `open_read_only`.
@@ -1152,8 +1223,8 @@ async fn main() {
                 }
             }
 
-            "winner-discovery" => {
-                match winner_discovery::run_winner_discovery_with_policy(
+            "winner-discovery" => winner_discovery_exit(
+                winner_discovery::run_winner_discovery_with_policy(
                     &bootstrap_config,
                     &mut cache,
                     if defer_activation {
@@ -1163,27 +1234,8 @@ async fn main() {
                     },
                     end_date_min_arg,
                 )
-                .await
-                {
-                    Ok(r) => {
-                        tracing::info!(
-                            leaderboard_unique = r.leaderboard_unique,
-                            leaderboard_activated = r.leaderboard_activated,
-                            datadash_unique = r.datadash_unique,
-                            datadash_activated = r.datadash_activated,
-                            participants_unique = r.participants_unique,
-                            participants_activated = r.participants_activated,
-                            participants_status = r.participants_status,
-                            "winner-discovery: complete"
-                        );
-                        0
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "winner-discovery: fatal");
-                        e.exit_code()
-                    }
-                }
-            }
+                .await,
+            ),
 
             "participants-import" => {
                 let result = (|| {
@@ -1672,6 +1724,118 @@ fn activity_json_report(
 
 fn json_report<T: serde::Serialize>(report: T) -> Result<serde_json::Value, BootstrapError> {
     serde_json::to_value(report).map_err(BootstrapError::from)
+}
+
+#[derive(Debug)]
+enum DiscoveryMode {
+    Plain,
+    Collect {
+        spool: std::path::PathBuf,
+        coverage_from: std::path::PathBuf,
+        not_before: i64,
+    },
+    Apply {
+        spool: std::path::PathBuf,
+    },
+}
+
+fn parse_discovery_mode(args: &[String]) -> Result<DiscoveryMode, BootstrapError> {
+    let names = [
+        "--collect-to",
+        "--coverage-from",
+        "--not-before",
+        "--apply-from",
+    ];
+    let mut values = std::collections::HashMap::new();
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        let (name, inline) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+        if names.contains(&name) {
+            if args.get(1).map(String::as_str) != Some("winner-discovery") {
+                return Err(BootstrapError::Invalid {
+                    message: format!("{name} is only supported by winner-discovery"),
+                });
+            }
+            let value = match inline {
+                Some(value) => value,
+                None => {
+                    i += 1;
+                    args.get(i).map(String::as_str).unwrap_or_default()
+                }
+            };
+            if value.is_empty() || value.starts_with("--") || values.insert(name, value).is_some() {
+                return Err(BootstrapError::Invalid {
+                    message: format!("{name} requires one value"),
+                });
+            }
+        }
+        i += 1;
+    }
+    if values.is_empty() {
+        return Ok(DiscoveryMode::Plain);
+    }
+    if !args.iter().any(|a| a == "--defer-activation") {
+        return Err(BootstrapError::Invalid {
+            message: "discovery spool modes require --defer-activation".to_owned(),
+        });
+    }
+    if let Some(spool) = values.get("--apply-from") {
+        if values.len() != 1 {
+            return Err(BootstrapError::Invalid {
+                message: "--apply-from conflicts with collector flags".to_owned(),
+            });
+        }
+        return Ok(DiscoveryMode::Apply {
+            spool: spool.into(),
+        });
+    }
+    let (Some(spool), Some(coverage_from), Some(not_before)) = (
+        values.get("--collect-to"),
+        values.get("--coverage-from"),
+        values.get("--not-before"),
+    ) else {
+        return Err(BootstrapError::Invalid {
+            message: "collector requires --collect-to, --coverage-from and --not-before together"
+                .to_owned(),
+        });
+    };
+    let not_before = not_before
+        .parse::<i64>()
+        .map_err(|_| BootstrapError::Invalid {
+            message: "--not-before requires an integer".to_owned(),
+        })?;
+    Ok(DiscoveryMode::Collect {
+        spool: spool.into(),
+        coverage_from: coverage_from.into(),
+        not_before,
+    })
+}
+
+fn winner_discovery_exit(
+    result: Result<winner_discovery::WinnerDiscoveryReport, BootstrapError>,
+) -> i32 {
+    match result {
+        Ok(r) => {
+            tracing::info!(
+                leaderboard_unique = r.leaderboard_unique,
+                leaderboard_activated = r.leaderboard_activated,
+                datadash_unique = r.datadash_unique,
+                datadash_activated = r.datadash_activated,
+                participants_unique = r.participants_unique,
+                participants_activated = r.participants_activated,
+                participants_status = r.participants_status,
+                "winner-discovery: complete"
+            );
+            0
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "winner-discovery: fatal");
+            e.exit_code()
+        }
+    }
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use pe_source_polymarket_public::endpoint::{
     LeaderboardCategory, LeaderboardSort, LeaderboardWindow, PolymarketEndpoint,
 };
 use pe_source_polymarket_public::fetcher::PageFetcher;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cache::{WalletCache, WalletUpsertRow};
 use crate::error::BootstrapError;
@@ -30,8 +30,16 @@ pub const SORT_WINDOW_SLICES: [(LeaderboardSort, LeaderboardWindow); 8] = [
     (LeaderboardSort::Volume, LeaderboardWindow::AllTime),
 ];
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CollectedLeaderboard {
+    pub wallets: Vec<String>,
+    pub report: LeaderboardDiscoveryReport,
+}
+
 /// Per-run discovery counts.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LeaderboardDiscoveryReport {
     pub slices_attempted: usize,
     pub slices_fetched: usize,
@@ -118,6 +126,15 @@ pub async fn run_leaderboard_discovery_with_policy<F: PageFetcher + Send + Sync>
     cache: &mut WalletCache,
     activation_policy: pile::ActivationPolicy,
 ) -> Result<LeaderboardDiscoveryReport, BootstrapError> {
+    let collected = collect_leaderboard(fetcher, categories, top_n).await?;
+    apply_leaderboard(cache, activation_policy, collected)
+}
+
+pub(crate) async fn collect_leaderboard<F: PageFetcher + Send + Sync>(
+    fetcher: &LeaderboardFetcher<F>,
+    categories: &[LeaderboardCategory],
+    top_n: u32,
+) -> Result<CollectedLeaderboard, BootstrapError> {
     let mut all: Vec<String> = Vec::new();
     let mut slices_attempted = 0usize;
     let mut slices_fetched = 0usize;
@@ -171,7 +188,32 @@ pub async fn run_leaderboard_discovery_with_policy<F: PageFetcher + Send + Sync>
     all.dedup();
     let unique_wallets = all.len();
 
-    let upserts: Vec<WalletUpsertRow> = all
+    Ok(CollectedLeaderboard {
+        wallets: all,
+        report: LeaderboardDiscoveryReport {
+            slices_attempted,
+            slices_fetched,
+            raw_entries,
+            unique_wallets,
+            activated: 0,
+        },
+    })
+}
+
+pub(crate) fn apply_leaderboard(
+    cache: &mut WalletCache,
+    activation_policy: pile::ActivationPolicy,
+    collected: CollectedLeaderboard,
+) -> Result<LeaderboardDiscoveryReport, BootstrapError> {
+    let LeaderboardDiscoveryReport {
+        slices_attempted,
+        slices_fetched,
+        raw_entries,
+        unique_wallets,
+        ..
+    } = collected.report;
+    let upserts: Vec<WalletUpsertRow> = collected
+        .wallets
         .into_iter()
         .map(|hex| (hex, SRC_LEADERBOARD, false, None, None, None, 0))
         .collect();
