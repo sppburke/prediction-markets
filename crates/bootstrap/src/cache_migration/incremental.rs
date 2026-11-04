@@ -190,6 +190,15 @@ impl HistoryChain {
         !self.parts.is_empty()
     }
 
+    /// A chain with no receipt parts, for unit tests that only feed its check.
+    #[cfg(test)]
+    pub(super) fn without_parts_for_test(wallet: &str) -> Self {
+        Self {
+            wallet: wallet.to_owned(),
+            parts: Vec::new(),
+        }
+    }
+
     pub(super) fn check(&self) -> HistoryCheck<'_> {
         HistoryCheck {
             chain: self,
