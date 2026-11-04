@@ -239,6 +239,8 @@ pub struct ServiceConfig {
 
     /// A live wallet idle (no observed trade) for at least this many seconds is evicted,
     /// unless it is a proven winner (then spared up to `inactivity_hard_cap_secs`).
+    /// Applies only under `watchlist_membership_mode = knockout`; under `full_rerank` the
+    /// knockout removes only underperformers.
     /// Inactivity uses the activity clock (#511), falling back to the delivery cursor. Ranking
     /// timestamps seed the activity clock without an admission grace period. Default: 259_200
     /// (72 h). See
@@ -248,7 +250,8 @@ pub struct ServiceConfig {
 
     /// Hard ceiling on sparing a proven winner from inactivity eviction: past this idle
     /// span the wallet is evicted unconditionally (a winner silent for a week is more
-    /// likely abandoned than patient). Default: 604_800 (7 d). See `docs/_GLOSSARY.md`:
+    /// likely abandoned than patient). Applies only under `watchlist_membership_mode =
+    /// knockout`. Default: 604_800 (7 d). See `docs/_GLOSSARY.md`:
     /// `inactivity_hard_cap_secs`.
     #[serde(default = "default_inactivity_hard_cap_secs")]
     pub inactivity_hard_cap_secs: u64,
