@@ -321,18 +321,44 @@ impl DiscoverySpool {
                                 .ok_or_else(|| refused("invalid participant lookback"))?;
                             let addition_lo =
                                 matching.map_or(lo, |prior| lo.min(prior.covered_from_unix));
+                            let covered = matching
+                                .and_then(|prior| prior.scope.series.as_deref())
+                                .unwrap_or_default();
+                            let has_additions = c
+                                .coverage
+                                .scope
+                                .series
+                                .as_deref()
+                                .unwrap_or_default()
+                                .iter()
+                                .any(|series| !covered.iter().any(|old| old.id == series.id));
+                            // collect_participants fails with failed:window outside these bounds.
+                            if !crate::wallet_discovery::valid_participant_window(lo, c.now)
+                                || (has_additions
+                                    && !crate::wallet_discovery::valid_participant_window(
+                                        addition_lo,
+                                        c.now,
+                                    ))
+                            {
+                                return Err(refused("participant window is not admissible"));
+                            }
                             let through = matching
                                 .map_or(c.now, |prior| c.now.max(prior.covered_through_unix));
-                            let floor = |start: i64| {
-                                matching.map_or(start, |prior| start.max(prior.market_floor_unix))
-                            };
-                            let (min_floor, max_floor) = match market_floor {
-                                Some(value) => (floor(value), floor(value)),
-                                None => (floor(addition_lo), floor(lo)),
-                            };
+                            // The combined scope floor is the largest floor of the sweeps that ran.
+                            let sweep_floor = [
+                                (!covered.is_empty()).then(|| market_floor.unwrap_or(lo)),
+                                has_additions.then(|| market_floor.unwrap_or(addition_lo)),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .max()
+                            .ok_or_else(|| refused("participant collection swept no series"))?;
+                            let expected_floor = matching.map_or(sweep_floor, |prior| {
+                                sweep_floor.max(prior.market_floor_unix)
+                            });
                             if c.coverage.covered_from_unix != addition_lo
                                 || c.coverage.covered_through_unix != through
-                                || !(min_floor..=max_floor).contains(&c.coverage.market_floor_unix)
+                                || c.coverage.market_floor_unix != expected_floor
                                 || matching
                                     .and_then(|prior| prior.scope.series.as_ref())
                                     .is_some_and(|series| {
@@ -1341,12 +1367,16 @@ mod tests {
     #[tokio::test]
     async fn discovery_spool_collected_coverage_refuses_impossible_certificates() {
         for prior_kind in ["absent", "matching", "legacy", "other_recurrences"] {
-            for market_floor in [None, Some(0), Some(NOW - 100)] {
+            // A prior floor below the sweep floor exposes any slack in the derived floor.
+            for (market_floor, prior_floor) in [None, Some(0), Some(NOW - 100)]
+                .into_iter()
+                .flat_map(|floor| [(floor, NOW - 125), (floor, 0)])
+            {
                 let dir = tempfile::tempdir().unwrap();
                 let candidate = dir.path().join("candidate.db");
                 let mut cache = WalletCache::open(&candidate).unwrap();
                 let mut prior = coverage();
-                prior.market_floor_unix = NOW - 125;
+                prior.market_floor_unix = prior_floor;
                 prior.scope.series.as_mut().unwrap().push(ScopeSeries {
                     id: "8".into(),
                     slug: Some("eight".into()),
@@ -1457,6 +1487,68 @@ mod tests {
                     assert_eq!(std::fs::read(&candidate).unwrap(), before);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn discovery_spool_collected_coverage_refuses_inadmissible_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("candidate.db");
+        let window: i64 = 1_065 * 86_400;
+        let mut future = coverage();
+        future.covered_through_unix = NOW + 1_000;
+        // (lookback, prior, claimed coverage): plain collection stops with failed:window for each.
+        let cases = [
+            (u64::try_from(window + 1).unwrap(), None, NOW - window - 1),
+            (100_u64, Some(future.clone()), NOW + 900),
+        ];
+        for (lookback, prior, covered_from) in cases {
+            let config = BootstrapConfig {
+                leaderboard_top_n: 0,
+                datadash_api_url: None,
+                participant_lookback_secs: lookback,
+                ..fixture_config(&candidate)
+            };
+            let prior_raw = prior.map(|p| serde_json::to_string(&p).unwrap());
+            let mut claimed = coverage();
+            claimed.covered_from_unix = covered_from;
+            claimed.covered_through_unix = NOW.max(covered_from + 1);
+            if prior_raw.is_some() {
+                claimed.covered_through_unix = NOW + 1_000;
+                claimed.covered_from_unix = NOW - 200;
+            }
+            claimed.validate().unwrap();
+            let spool = DiscoverySpool {
+                version: 1,
+                settings: discovery_settings(&config, Some(0)),
+                coverage_read: true,
+                prior_coverage_raw: prior_raw,
+                outcomes: vec![
+                    SourceOutcome {
+                        source: WalletDiscoverySource::Leaderboard,
+                        result: DiscoveryOutcome::Disabled,
+                    },
+                    SourceOutcome {
+                        source: WalletDiscoverySource::Datadash,
+                        result: DiscoveryOutcome::Disabled,
+                    },
+                    SourceOutcome {
+                        source: WalletDiscoverySource::MarketParticipants,
+                        result: DiscoveryOutcome::Collected {
+                            data: CollectedSource::MarketParticipants(
+                                crate::wallet_discovery::CollectedParticipants {
+                                    wallets: vec![format!("0x{}", "a".repeat(40))],
+                                    now: NOW,
+                                    coverage: claimed,
+                                },
+                            ),
+                        },
+                    },
+                ],
+            };
+            let error = spool.validate(&config, Some(0)).unwrap_err();
+            assert_eq!(error.exit_code(), 77, "lookback {lookback}");
+            assert!(error.to_string().contains("not admissible"), "{error}");
         }
     }
 

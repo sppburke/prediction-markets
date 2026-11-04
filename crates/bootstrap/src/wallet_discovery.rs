@@ -678,7 +678,7 @@ fn participant_failure(reason: &'static str, error: &impl std::fmt::Display) -> 
     reason
 }
 
-fn valid_participant_window(lo: i64, now: i64) -> bool {
+pub(crate) fn valid_participant_window(lo: i64, now: i64) -> bool {
     lo >= 0 && lo < now && lo >= now.saturating_sub(PARTICIPANT_WINDOW_SECS)
 }
 
