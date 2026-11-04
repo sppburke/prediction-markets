@@ -1262,23 +1262,31 @@ pub(super) fn open_finalize(cache_path: &Path) -> Result<(Connection, i64, i64),
     Ok((connection, sealed_generation, payout_generation))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "finalization carries explicit artifact roles and the scenario boundary hook"
+)]
 pub(super) fn finalize(
     connection: Connection,
     cache_path: &Path,
     stage_record_path: Option<&Path>,
     export_manifest: Option<&Path>,
+    ready_file: Option<&Path>,
     finalized_at_unix: i64,
     sealed_generation: i64,
     payout_generation: i64,
+    ready_hook: Option<&mut dyn FnMut()>,
 ) -> Result<Option<CacheFinalStageRecord>, BootstrapError> {
     finalize_with_shape(
         connection,
         cache_path,
         stage_record_path,
         export_manifest,
+        ready_file,
         finalized_at_unix,
         (sealed_generation, payout_generation),
         (PROJECTION_CHUNK_AGGREGATES, projection_classifiers()),
+        ready_hook,
     )
     .map(|(record, _)| record)
 }
@@ -1318,22 +1326,30 @@ pub fn finalize_cache_v2_with_projection_shape_for_test(
         cache_path,
         None,
         None,
+        None,
         finalized_at_unix,
         (sealed_generation, payout_generation),
         (chunk, classifiers),
+        None,
     )
     .map(|(_, report)| report)
 }
 
 /// `shape` is the projection chunk target and the classifier count.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "finalization carries explicit artifact roles, projection shape and the scenario boundary hook"
+)]
 fn finalize_with_shape(
     mut connection: Connection,
     cache_path: &Path,
     stage_record_path: Option<&Path>,
     export_manifest: Option<&Path>,
+    ready_file: Option<&Path>,
     finalized_at_unix: i64,
     generations: (i64, i64),
     shape: (usize, usize),
+    ready_hook: Option<&mut dyn FnMut()>,
 ) -> Result<(Option<CacheFinalStageRecord>, Option<ClassificationReport>), BootstrapError> {
     let started = Instant::now();
     let (sealed_generation, payout_generation) = generations;
@@ -1441,6 +1457,12 @@ fn finalize_with_shape(
     let (export_sha256, export_projection) = export.ok_or(BootstrapError::Internal)?;
     let started = Instant::now();
     let canonical_cache_path = std::fs::canonicalize(cache_path)?;
+    write_ready_file(
+        ready_file,
+        &canonical_cache_path,
+        stage_record_path,
+        ready_hook,
+    )?;
     let cache_sha256 = sha256_file(cache_path)?;
     phase_completed("cache_hash", started);
     let started = Instant::now();

@@ -77,6 +77,9 @@ cohort.
 
 ## Collection beside staging (C9)
 
+After export, Stage 2 hashes beside pass one using the readiness-marker protocol in
+[the refresh runbook](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md#fresh-private-candidate-cycles-and-the-scheduled-schema-two-lane-588-648).
+
 Plain discovery still collects and applies leaderboard → datadash → participants on one cache,
 committing each source before the next. In the schema-two wrapper lane, an attempt whose candidate
 and prior are both absent starts collection immediately before `cache-stage`:

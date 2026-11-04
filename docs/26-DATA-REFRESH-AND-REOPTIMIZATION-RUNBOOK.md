@@ -611,8 +611,10 @@ right after the candidate targets, and joins it before the cutover checks and ex
 exit handling, so its Gamma snapshot is taken when collection starts, still after the window end. **Stage 1** ranks the full trade universe (`--universe-from-trades` — have-data ⇒
 in-universe), scoring only first entries in the scope's markets. Schema two exports every
 certified first-entry position in the ranking window without a leader-price, horizon or
-statistical pre-gate. **Stage 2** waits for candidate capture, then runs export-bound
-`cache-finalize-v2 --stage-record` before pass two. Pass two prices the first eligible
+statistical pre-gate. **Stage 2** joins candidate capture after export, then runs export-bound
+`cache-finalize-v2 --stage-record --ready-file` in the background. Pass one starts after its
+post-close readiness marker and runs beside the whole-cache hash; pass two waits for both.
+Pass two prices the first eligible
 fee-paying first-entry print second on each market/outcome, using the highest price in that
 second, the canonical cushion and the 15-minute taker fee. Horizon uses the scheduled marker's next UTC
 midnight; band, horizon and survival limits are the [glossary contracts](_GLOSSARY.md#ranking-copy-price).
@@ -801,7 +803,8 @@ each, merged into one file, and certifies the exported projection against the fi
 digest; it does not re-read SQLite's projection or assert that SQLite stays unchanged afterwards. An
 export failure stops a schema-two cutover run. The fresh lane's first finalization certifies,
 checkpoints and syncs without hashing the file or writing a stage record. It re-finalizes with
-`--stage-record` after export and before pass two/request preparation, so the stage hash covers
+`--stage-record --ready-file` after export and the capture join, with pass one beside its
+post-close hash and a join before pass two/request preparation, so the stage hash covers
 the installed bytes and certified export; a pending request's replay relies on activation's
 bound-artifact checks.
 Refinalization reuses the projection only when the finalized database's saved activity generation,
@@ -1186,10 +1189,50 @@ the installed cache is schema two, and for the one-time initial cutover when `.e
 opt-in changes and an outstanding legacy cycle completes under its original contract. In
 the lane, Step 0 is the sequence above (legacy `backfill`, `events` and `resolutions` read
 retired `trades`/`source_cursor` and do not run), followed by the existing cutover path:
-candidate capture into `candidate_cycle_manifest.json` alongside Parquet export, pass one,
-then export-bound second finalization with `--stage-record` and `--export-manifest` before
-pass two. This binds the installed bytes and manifest-3 export summary. Pass two binds that
-capture. An initial schema-one cutover keeps its full initial `cycle_manifest.json` capture and
+candidate capture into `candidate_cycle_manifest.json` alongside Parquet export, capture join,
+then export-bound second finalization with `--stage-record`, `--export-manifest` and `--ready-file`.
+Pass one starts at readiness beside the finalization hash; both join before pass two. This binds
+the installed bytes and manifest-3 export summary. Pass two binds that
+capture. The transient marker protocol is authoritative here: each attempt chooses
+`stage2_ready.<wrapper-pid>.<UTC-nanosecond-stamp>.json` under its run directory. The binary
+refuses an occupied marker (including a dangling symlink) or any path/inode alias among the
+cache, sidecars, mutation lock, projection spool, record, marker, their atomic-write temp files
+and optional export manifest, before locking or opening the cache. `--ready-file` requires
+`cache-finalize-v2 --stage-record`. After commit, checkpoint, close, sidecar checks and sync,
+the binary canonicalizes the cache, atomically writes `{ "version": 1, "pid": <child-pid>,
+"cache_path": <canonical-cache>, "stage_record": <path-as-given> }`, then hashes the cache
+and atomically writes the unchanged stage record while retaining the mutation lock.
+
+The wrapper probes the regular, non-symlink marker's version, PID, canonical cache path and
+record path before checking child liveness through `jobs -rp`, polling once per second. If the
+child is gone it checks the marker once more before pass one. It logs
+`[stage-2] running: <command>`, exactly one `[stage-2] ready pid=<pid> marker=<path>` before
+pass one when readiness is observed, and `[stage-2] exited <status>` after the authoritative
+`wait` and final marker validation. A child gone without readiness logs
+`[stage-2] exited before readiness`. Invalid markers fail the protocol; exit zero without a
+valid owned marker is status 1, including an old binary that ignores the flag. Pass one always
+runs, even if capture or Stage 2 failed. Its mapped failure wins, followed by capture, then
+Stage 2; pass two runs only if all succeeded. A failed pass one TERMs Stage 2 if still listed
+as running, then reaps it. The EXIT trap also TERMs and reaps owned running children.
+Cleanup removes only a still-valid owned marker; foreign, malformed, pre-existing and symlink
+paths remain. A cleanup warning never changes saved statuses.
+
+Stage 2 can install a record before pass one finishes. After interruption an old or newly
+renamed record, atomic-write temp, or abandoned marker may remain. Resume repeats normal
+finalization and both passes with a new attempt marker; a record alone never selects recovery.
+Publication recovery remains bound to the pending request. No cache phase event, record format,
+whole-cache hash, quick_check or gate changes. Release the binary and wrapper together; mixed
+versions are unsupported. Roll back the paired release at a cycle boundary.
+
+Scheduling moves pass one later (after the pre-hash phases), pass two earlier and request
+preparation earlier. Existing export-age, cache-freshness and activity-window gates read those
+earlier/later clocks with unchanged rules; forced DuckDB keeps its export-age bypass. Wallets
+near the activity-window boundary can therefore have different admission outcomes. Each install
+report states this timing effect. Byte identity requires identical complete inputs and clocks.
+The expected 13–15 minute saving is a rollout hypothesis, measured from these log lines,
+finalization phase lines and pass-one timestamps in the first installed cycle.
+
+An initial schema-one cutover keeps its full initial `cycle_manifest.json` capture and
 same-day gate; recurring cycles started on installed schema two write a two-field lane record
 (`version`, `configuration`) instead. The new-cycle `pipeline-versions` output remains available
 to candidate capture and the publisher. Then come
@@ -1426,8 +1469,9 @@ to the owner. Record each completed step and resume it, rather than starting ano
    has no separate fetch stage. Never change configuration during the cycle.
 5. **Owner consent to the catch-up**, then run one detached `bash scripts/rank_and_push.sh` while
    the loop unit stays inactive; record its PID/process group and log. It runs staging → transition
-   → collection → payout → finalize → export → pass one → export-bound re-finalize → pass two →
-   prepare. Acceptance is `RANK_AND_PUSH_PREPARED_ONLY=<request>` and exit 2 with request/pending
+   → collection → payout → finalize → export → capture join → export-bound re-finalize →
+   readiness → pass one beside its hash → join → pass two → prepare. Acceptance is
+   `RANK_AND_PUSH_PREPARED_ONLY=<request>` and exit 2 with request/pending
    pointer retained and installed bytes unchanged; other exit-2 failures are not acceptance.
    Before launching, cross-build from the tested tree with the bootstrap release recipe:
    `cargo build --release -p pe-bootstrap --features scenario --example classifier_v6_sample`,

@@ -82,8 +82,9 @@
 # initial schema-one candidate once (cache-migrate-v2) → discover → activate →
 # collect complete activity for the union of current acquisition candidates and
 # retained histories (cache-populate-activity-v2 --fresh-generation) → payout →
-# cache-finalize-v2 → the existing cutover path (rank, export-bound re-finalize,
-# prepare-only publication, cache-activate, exact resume). Legacy backfill/events/
+# cache-finalize-v2 → export → capture join → export-bound re-finalize (pass one
+# beside its hash after readiness) → pass two → prepare-only publication →
+# cache-activate → exact resume. Legacy backfill/events/
 # resolutions read retired tables and do not run in this lane. The lane is frozen
 # in the cycle configuration, so a resumed cycle keeps its lane.
 
@@ -401,6 +402,7 @@ PIPELINE_VERSIONS_TMP=""
 CYCLE_CONFIG_TMP=""
 CURRENT_CYCLE_TMP=""
 CAPTURE_PID=""
+STAGE2_PID=""
 SAMPLER_PID=""
 SCOPE_PID=""
 DISCOVERY_PID=""
@@ -410,7 +412,7 @@ cleanup_rank_and_push() {
   local pid running
   # Signal only a child bash still lists as running, read right before signaling it: an exited
   # child may already be reaped (its status kept for `wait`) and its PID reused.
-  for pid in "$CAPTURE_PID" "$SAMPLER_PID" "$SCOPE_PID" "$DISCOVERY_PID"; do
+  for pid in "$CAPTURE_PID" "$STAGE2_PID" "$SAMPLER_PID" "$SCOPE_PID" "$DISCOVERY_PID"; do
     [[ -n "$pid" ]] || continue
     running=" $(jobs -rp | tr '\n' ' ') "
     [[ "$running" != *" $pid "* ]] || kill "$pid" 2>/dev/null || true
@@ -890,6 +892,28 @@ join_winner_discovery() {
   echo "   [winner-discovery] collector exited $DISCOVERY_STATUS"
 }
 
+# 0: this child's marker; 2: absent; 1: occupied but invalid. Never follow a symlink.
+validate_stage2_ready() {
+  "$PYTHON_BIN" -c 'import json, os, stat, sys
+try:
+    mode = os.lstat(sys.argv[1]).st_mode
+except FileNotFoundError:
+    sys.exit(2)
+try:
+    if not stat.S_ISREG(mode):
+        sys.exit(1)
+    with open(sys.argv[1], encoding="utf-8") as source:
+        marker = json.load(source)
+    valid = (type(marker["version"]) is int and marker["version"] == 1
+             and type(marker["pid"]) is int and marker["pid"] == int(sys.argv[2])
+             and marker["cache_path"] == os.path.realpath(sys.argv[3])
+             and marker["stage_record"] == sys.argv[4])
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+sys.exit(0 if valid else 1)
+' "$STAGE2_READY" "$STAGE2_CHILD_PID" "$DB" "$CACHE_STAGE_RECORD"
+}
+
 # 76 is emitted only for schema-one empty ranking/publication or globally stale
 # trades, before a publication request exists. All other exits retain their meaning.
 # Read CURRENT state: the frozen manifest precedes backfill and survives retries.
@@ -1223,6 +1247,66 @@ if [[ "$SKIP_RANK" == "0" ]]; then
       --cache-stage-record "$CACHE_STAGE_RECORD"
     )
   fi
+  CAPTURE_STATUS=0
+  STAGE2_STATUS=0
+  STAGE2_CHILD_PID=""
+  STAGE2_READY_OBSERVED=0
+  STAGE2_PROTOCOL_STATUS=0
+  if [[ "$CUTOVER_MODE" == "1" ]]; then
+    if [[ -n "$CAPTURE_PID" ]]; then
+      echo "   [candidate-capture] joining the capture started beside export"
+      wait "$CAPTURE_PID" || CAPTURE_STATUS=$?
+      CAPTURE_PID=""
+      echo "   [candidate-capture] exited $CAPTURE_STATUS"
+    fi
+    if [[ "$CAPTURE_STATUS" -eq 0 ]]; then
+      # Bind publication and activation to the exact certified export and cache bytes.
+      EXPORT_MANIFEST_ARGS=()
+      EXPORT_MANIFEST="$PARQUET_DIR/schema_v2_export_manifest.json"
+      if [[ "$("$PYTHON_BIN" -c 'import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' "$EXPORT_MANIFEST")" == "3" ]]; then
+        EXPORT_MANIFEST_ARGS=(--export-manifest "$EXPORT_MANIFEST")
+      fi
+      STAGE2_READY="$OUT_DIR/stage2_ready.$$.$(date -u +%Y%m%dT%H%M%S%NZ).json"
+      STAGE2_CMD=("$PE_BOOTSTRAP_BIN" cache-finalize-v2 --db "$DB"
+        "${EXPORT_MANIFEST_ARGS[@]}" --stage-record "$CACHE_STAGE_RECORD"
+        --ready-file "$STAGE2_READY" "${BOOTSTRAP_CONFIG_ARGS[@]}")
+      echo "── Stage 2/3: bind the certified export (hash beside pass one) ──"
+      echo "   [stage-2] running: ${STAGE2_CMD[*]}"
+      "${STAGE2_CMD[@]}" 8>&- 9>&- &
+      STAGE2_PID=$!
+      STAGE2_CHILD_PID="$STAGE2_PID"
+      while true; do
+        ready_status=0
+        validate_stage2_ready || ready_status=$?
+        if [[ "$ready_status" -eq 2 ]]; then
+          running=" $(jobs -rp | tr '\n' ' ') "
+          if [[ "$running" == *" $STAGE2_PID "* ]]; then
+            sleep 1
+            continue
+          fi
+          # The child may have installed the marker between the probe and jobs.
+          ready_status=0
+          validate_stage2_ready || ready_status=$?
+        fi
+        if [[ "$ready_status" -eq 0 ]]; then
+          STAGE2_READY_OBSERVED=1
+          echo "   [stage-2] ready pid=$STAGE2_CHILD_PID marker=$STAGE2_READY"
+        elif [[ "$ready_status" -eq 1 ]]; then
+          echo "   [stage-2] invalid readiness marker: $STAGE2_READY" >&2
+          STAGE2_PROTOCOL_STATUS=1
+          running=" $(jobs -rp | tr '\n' ' ') "
+          [[ "$running" != *" $STAGE2_PID "* ]] || kill "$STAGE2_PID" 2>/dev/null || true
+          wait "$STAGE2_PID" || STAGE2_STATUS=$?
+          STAGE2_PID=""
+        else
+          echo "   [stage-2] exited before readiness"
+        fi
+        break
+      done
+    fi
+  fi
+  PASS1_STATUS=0
   echo "── Stage 1/3: pass-1 edge-floor ranking ──────────────────────────────────────"
   run_ranking_stage "pass-1" "$PYTHON_BIN" scripts/rank_72hr_buyandhold.py \
     --db "$DB" "${UNIVERSE_ARGS[@]}" --out-dir "$OUT_DIR" \
@@ -1231,25 +1315,35 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --target-n "$TARGET_N" --price-min "$PRICE_MIN" --price-max "$PRICE_MAX" \
     --min-trl "$MIN_TRL" --min-avg-per-month "$MIN_AVG_PER_MONTH" \
     --min-active-months "$MIN_ACTIVE_MONTHS" \
-    --floor-tstat "$FLOOR_TSTAT" --scheduled-only
+    --floor-tstat "$FLOOR_TSTAT" --scheduled-only || PASS1_STATUS=$?
 
-  echo "── Stage 2/3: bind the certified export and price first-entry prints ────────"
-  if [[ -n "$CAPTURE_PID" ]]; then
-    capture_status=0
-    wait "$CAPTURE_PID" || capture_status=$?
-    CAPTURE_PID=""
-    [[ "$capture_status" -eq 0 ]] || exit "$capture_status"
-  fi
-  if [[ "$CUTOVER_MODE" == "1" ]]; then
-    # Bind publication and activation to the exact certified export and cache bytes.
-    EXPORT_MANIFEST_ARGS=()
-    EXPORT_MANIFEST="$PARQUET_DIR/schema_v2_export_manifest.json"
-    if [[ "$("$PYTHON_BIN" -c 'import json, sys
-print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' "$EXPORT_MANIFEST")" == "3" ]]; then
-      EXPORT_MANIFEST_ARGS=(--export-manifest "$EXPORT_MANIFEST")
+  if [[ -n "$STAGE2_CHILD_PID" ]]; then
+    if [[ -n "$STAGE2_PID" ]]; then
+      if [[ "$PASS1_STATUS" -ne 0 ]]; then
+        running=" $(jobs -rp | tr '\n' ' ') "
+        [[ "$running" != *" $STAGE2_PID "* ]] || kill "$STAGE2_PID" 2>/dev/null || true
+      fi
+      wait "$STAGE2_PID" || STAGE2_STATUS=$?
+      STAGE2_PID=""
     fi
-    "$PE_BOOTSTRAP_BIN" cache-finalize-v2 --db "$DB" \
-      "${EXPORT_MANIFEST_ARGS[@]}" --stage-record "$CACHE_STAGE_RECORD" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    ready_status=0
+    validate_stage2_ready || ready_status=$?
+    if [[ "$ready_status" -eq 1 || ( "$STAGE2_STATUS" -eq 0 && "$ready_status" -ne 0 && "$STAGE2_READY_OBSERVED" -eq 0 ) ]]; then
+      STAGE2_PROTOCOL_STATUS=1
+    fi
+    if [[ "$STAGE2_PROTOCOL_STATUS" -ne 0 ]]; then
+      STAGE2_STATUS=1
+    fi
+    if [[ "$ready_status" -eq 0 ]]; then
+      rm -- "$STAGE2_READY" || { echo "WARN: could not remove owned Stage 2 marker: $STAGE2_READY" >&2; true; }
+    fi
+    echo "   [stage-2] exited $STAGE2_STATUS"
+  fi
+  [[ "$PASS1_STATUS" -eq 0 ]] || exit "$PASS1_STATUS"
+  [[ "$CAPTURE_STATUS" -eq 0 ]] || exit "$CAPTURE_STATUS"
+  [[ "$STAGE2_STATUS" -eq 0 ]] || exit "$STAGE2_STATUS"
+  if [[ "$CUTOVER_MODE" != "1" ]]; then
+    echo "── Stage 2/3: bind the certified export and price first-entry prints ────────"
   fi
 
   echo "── Pass 2: first-entry taker-print rerank ───────────────────────────────────"
