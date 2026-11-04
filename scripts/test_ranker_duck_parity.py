@@ -204,6 +204,79 @@ def run_pass1(db: str, out_dir: str, engine: str, parquet_dir: str, max_age_hour
         return rk.main()
 
 
+def _extract_positions_v2_at_6c1c78e(con, wallets, win_start, win_end):
+    """`ranker_duck.duck_extract_positions_v2` exactly as at 6c1c78e: SQL, staging and streaming."""
+    import pandas as pd
+
+    traded_outcome = "list_position(json_extract_string(p.tokens_json, '$[*].token_id'), g.asset) - 1"
+
+    def _q(s):
+        return s.replace("'", "''")
+
+    con.register(
+        "universe",
+        pd.DataFrame({"wallet_hex": pd.Series(list(wallets), dtype=object)}),
+    )
+    staged = os.path.join(
+        con.execute("SELECT current_setting('temp_directory')").fetchone()[0],
+        "positions_v2.parquet",
+    )
+    compact = con.execute("SELECT COUNT(*) FROM duckdb_views() WHERE view_name = 'projection'").fetchone()[0] > 0
+    marker = "g" if compact else "r"
+    source = (
+        "FROM projection g " if compact else
+        "FROM ranker_entries_v2 r LEFT JOIN activity_groups_v2 g "
+        "ON g.source_trade_id = r.source_trade_id AND g.coverage_generation = r.activity_generation "
+    ) + "LEFT JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id "
+    payout = "g" if compact else "p"
+    payout_mismatch = (
+        " OR g.payout_vector_json IS DISTINCT FROM p.payout_vector_json "
+        "OR g.end_date_unix IS DISTINCT FROM p.end_date_unix" if compact else ""
+    )
+    try:
+        bad = con.execute(
+            f"SELECT COUNT(*) {source} "
+            f"WHERE NOT regexp_full_match({marker}.source_trade_id, 'g2:[0-9a-f]{{64}}') "
+            "OR g.source_trade_id IS NULL OR p.market_id IS NULL OR g.condition_id IS NULL "
+            "OR g.asset IS NULL OR g.outcome_id IS NULL OR g.side != 'buy' "
+            f"OR {traded_outcome} IS NULL "
+            "OR TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) IS NULL "
+            "OR TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) <= 0 "
+            "OR TRY_CAST(g.price_weighted_share_amount_str AS DECIMAL(38,12)) IS NULL "
+            "OR p.end_date_unix IS NULL OR p.payout_status != 'resolved' "
+            "OR p.payout_vector_json NOT IN ('[\"1\",\"0\"]','[\"0\",\"1\"]',"
+            "'[\"0.5\",\"0.5\"]')" + payout_mismatch
+        ).fetchone()[0]
+        if bad:
+            raise RuntimeError(
+                f"schema-two projection contains {bad} structurally invalid row(s)"
+            )
+        con.execute(
+            "COPY (SELECT g.wallet_hex AS wallet, g.condition_id AS market_id, "
+            f"{traded_outcome} AS outcome_id, g.source_time_unix AS entry_ts, "
+            f"CAST({payout}.end_date_unix - g.source_time_unix AS BIGINT) AS ttr_secs, "
+            "CAST(TRY_CAST(g.price_weighted_share_amount_str AS DECIMAL(38,12)) / "
+            "TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) AS DOUBLE) AS price, "
+            "g.share_amount_str AS contracts, "
+            f"CAST(json_extract_string({payout}.payout_vector_json, "
+            f"'$[' || CAST({traded_outcome} AS VARCHAR) || ']') AS DOUBLE) AS payoff, "
+            f"{payout}.end_date_unix AS resolved_at, {marker}.source_trade_id "
+            f"{source} JOIN universe u ON u.wallet_hex = g.wallet_hex "
+            f"WHERE g.source_time_unix >= {int(win_start)} AND g.source_time_unix < {int(win_end)}) "
+            f"TO '{_q(staged)}' (FORMAT PARQUET)"
+        )
+        result = con.execute(
+            f"SELECT * EXCLUDE (source_trade_id) FROM read_parquet('{_q(staged)}') "
+            "ORDER BY wallet, entry_ts, source_trade_id"
+        )
+        while not (chunk := result.fetch_df_chunk(64)).empty:
+            yield chunk
+    finally:
+        con.unregister("universe")
+        if os.path.exists(staged):
+            os.remove(staged)
+
+
 def _pass_one_before_scope_sql(engine, wallets, prm):
     """Frozen schema-two loop and artifact tail from 6c1c78e, before SQL scope filtering."""
     import pandas as pd
@@ -226,7 +299,7 @@ def _pass_one_before_scope_sql(engine, wallets, prm):
         writer.writerow(["wallet", "market_id", "outcome_id", "entry_ts", "ttr_secs", "price",
                          "contracts", "payoff", "gross", "net", "resolved_at"])
         total_qualified = 0
-        for w, rows in rk.wallet_groups(ranker_duck.duck_extract_positions_v2(
+        for w, rows in rk.wallet_groups(_extract_positions_v2_at_6c1c78e(
                 engine, wallets, prm.win_start, prm.win_end)):
             diag["qualified"] += len(rows)
             total_qualified += rk.process_wallet_positions(
