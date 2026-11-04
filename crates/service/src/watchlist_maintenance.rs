@@ -9,10 +9,15 @@
 //!      trailing-window realized P&L < 0 (`demotion_pnl_window_secs`) AND
 //!      ≥ `demotion_min_trades` settled fills.
 //!
+//! Inactivity applies only under [`MembershipMode::Knockout`]. Under
+//! [`MembershipMode::FullRerank`] the ranker owns idleness, so only underperformance removes a
+//! ranked wallet between batches (owner 2026-11-04; see [`decide_evictions`]).
+//!
 //! The idle clock is the wallet's activity clock (#511), falling back to its delivery cursor:
 //! `ranking_entries.last_trade_unix` seeds it at admission and the [`crate::trade_poller`]
-//! advances it, so `idle = now − last observed trade`. There is no admission grace: a wallet whose
-//! last trade is already > `inactivity_threshold_secs` ago is eviction-eligible on the next tick.
+//! advances it, so `idle = now − last observed trade`. There is no admission grace: under
+//! `Knockout`, a wallet whose last trade is already > `inactivity_threshold_secs` ago is
+//! eviction-eligible on the next tick.
 //! A wallet with neither clock (not yet polled and no seed value) is treated as idle 0: it
 //! self-heals to "now" rather than being read as inactive-forever.
 //!
@@ -35,9 +40,10 @@
 //!   the knockout-only policy was the worst tested; full re-rank the most robust). Memoryless
 //!   by design: the ranker's verdict overrides live demotion memory at each batch (the evicted
 //!   set clears), while the knockout above still runs BETWEEN batches as the intra-cycle
-//!   safety rail — a readmitted bleeder is re-demotable on the next tick. A failed fetch,
-//!   admission preparation, or structural apply leaves the batch marker unadvanced so the swap
-//!   retries next tick.
+//!   safety rail — a readmitted bleeder is re-demotable on the next tick. In this mode it
+//!   removes underperformers only; an idle survivor stays live until a batch drops it. A
+//!   failed fetch, admission preparation, or structural apply leaves the batch marker
+//!   unadvanced so the swap retries next tick.
 //!
 //! ## Admission preparation (#542)
 //!
@@ -105,9 +111,11 @@ impl MembershipMode {
 pub struct MaintenanceConfig {
     /// Seconds between ticks. `0` disables the loop entirely (handled by the caller).
     pub interval_secs: u64,
-    /// Idle threshold (seconds) past which a non-proven-winner wallet is evicted.
+    /// Idle threshold (seconds) past which a non-proven-winner wallet is evicted under
+    /// [`MembershipMode::Knockout`].
     pub inactivity_threshold_secs: u64,
-    /// Hard ceiling (seconds) past which even a proven winner is evicted for inactivity.
+    /// Hard ceiling (seconds) past which even a proven winner is evicted for inactivity under
+    /// [`MembershipMode::Knockout`].
     pub inactivity_hard_cap_secs: u64,
     /// Minimum settled fills for the demotion and proven-winner predicates.
     pub demotion_min_trades: usize,
@@ -744,6 +752,11 @@ pub fn knockout_decision(
 
 /// Decide all evictions for the current live set. Pure: no I/O.
 ///
+/// Under [`MembershipMode::FullRerank`] the ranker owns membership, so only underperformance
+/// removes a ranked wallet between batches; inactivity removes wallets only under
+/// [`MembershipMode::Knockout`] (owner 2026-11-04). [`knockout_decision`] itself stays
+/// mode-independent because replay re-derives recorded evictions with it.
+///
 /// `cursors` maps each live wallet to its inactivity clock (activity clock, delivery-cursor
 /// fallback; `None` = not yet polled). `stats` is keyed
 /// by leader hex (`WalletAddress::to_string`, canonical lowercase `0x…`) per [`wallet_edge_stats`].
@@ -761,13 +774,18 @@ pub fn decide_evictions(
             let wallet = e.wallet;
             let s = stats.get(&wallet.to_string());
             let last_ts = cursors.get(&wallet).copied().flatten();
-            knockout_decision(last_ts, s, cfg, now_unix).map(|reason| Eviction {
-                wallet,
-                reason,
-                live_pnl: s.map(|st| st.realized_pnl),
-                trades_observed: s.map_or(0, |st| st.settled_count),
-                last_trade_unix: last_ts,
-            })
+            knockout_decision(last_ts, s, cfg, now_unix)
+                .filter(|reason| {
+                    cfg.membership_mode == MembershipMode::Knockout
+                        || *reason == KnockoutReason::Underperformance
+                })
+                .map(|reason| Eviction {
+                    wallet,
+                    reason,
+                    live_pnl: s.map(|st| st.realized_pnl),
+                    trades_observed: s.map_or(0, |st| st.settled_count),
+                    last_trade_unix: last_ts,
+                })
         })
         .collect()
 }
@@ -1441,9 +1459,9 @@ enum Reentry {
 }
 
 /// Re-entry eligibility of a live-absent structural member. The pinned batch's
-/// `last_trade_unix` admits it regardless of age. Inactivity belongs to the existing knockout
-/// after admission. A missing or future batch value parks: neither changes within a batch,
-/// and admission seeding would raise the activity clock to a future value.
+/// `last_trade_unix` admits it regardless of age. Under `Knockout`, inactivity belongs to the
+/// existing knockout after admission. A missing or future batch value parks: neither changes
+/// within a batch, and admission seeding would raise the activity clock to a future value.
 fn reentry(ranked: Option<i64>, now_unix: i64) -> Reentry {
     if ranked.is_some_and(|at| at <= now_unix) {
         return Reentry::Admit;
@@ -5166,12 +5184,42 @@ mod tests {
         #[tokio::test]
         async fn shared_full_rerank_failure_still_applies_due_demotion() {
             for failure in ["structural"] {
-                let (idle, candidate) = (wallet(21), wallet(22));
+                // An active proven loser: under `FullRerank` only underperformance is due.
+                let (loser, candidate) = (wallet(21), wallet(22));
                 let mut fake = Fake::new(Some(2));
                 fake.ranking_entries = vec![row(2, 1, candidate)];
                 fake.failure = Some(failure);
-                let h = harness(fake, &[idle]).await;
-                h.paper_state.set_cursor(&idle, NOW - 300_000).unwrap();
+                let h = harness(fake, &[loser]).await;
+                h.paper_state.set_cursor(&loser, NOW - 10).unwrap();
+                let losing = settled_edge_artifact(loser, false, Some(NOW - 10));
+                for fill in &losing.fills {
+                    h.paper_state
+                        .reconcile_fill(
+                            &pe_paper_state::FillRecord {
+                                idempotency_key: fill.idempotency_key.clone(),
+                                market_id: fill.market_id.clone(),
+                                outcome_id: fill.outcome_id,
+                                side: fill.side,
+                                quantity: fill.quantity,
+                                fill_price: fill.fill_price,
+                                principal: fill.principal,
+                                fee: fill.fee,
+                            },
+                            fill.event_seq,
+                        )
+                        .unwrap();
+                }
+                for settlement in &losing.settlements {
+                    let row = settlement.to_row().unwrap();
+                    h.paper_state
+                        .record_settled_market(
+                            &row.market_id,
+                            &row.outcome_prices_json,
+                            row.credit_applied,
+                            row.settled_at_unix,
+                        )
+                        .unwrap();
+                }
                 let remembered = wallet(23);
                 let (mut evicted, mut marker) = (set(&[remembered]), Some(1));
                 h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
@@ -5181,13 +5229,96 @@ mod tests {
                     "{failure}: independently due demotion was skipped"
                 );
                 assert_eq!(marker, Some(1), "{failure}: unapplied marker advanced");
-                assert!(evicted.contains(&idle));
+                assert!(evicted.contains(&loser));
                 assert!(
                     evicted.contains(&remembered),
                     "{failure}: eviction memory was cleared"
                 );
                 assert!(!evicted.contains(&candidate));
             }
+        }
+
+        /// Owner 2026-11-04: under `FullRerank` only underperformance removes a ranked wallet
+        /// between batches, while `Knockout` keeps both inactivity reasons. The idle loser
+        /// proves underperformance precedence.
+        #[test]
+        fn full_rerank_selects_only_underperformance_evictions() {
+            let (idle, winner, loser) = (wallet(32), wallet(33), wallet(34));
+            let snapshot = live(&[idle, winner, loser]).snapshot();
+            let edge = HashMap::from([
+                (
+                    winner.to_string(),
+                    stats(40, dec!(120), Some(dec!(0.05)), Some(dec!(0.30))),
+                ),
+                (
+                    loser.to_string(),
+                    stats(20, dec!(-50), Some(dec!(-0.30)), Some(dec!(-0.05))),
+                ),
+            ]);
+            let cursors = HashMap::from([
+                (idle, Some(NOW - 300_000)),
+                (winner, Some(NOW - 604_800)),
+                (loser, Some(NOW - 300_000)),
+            ]);
+            let decided = |membership_mode| {
+                let config = MaintenanceConfig {
+                    membership_mode,
+                    ..cfg()
+                };
+                decide_evictions(&snapshot, &edge, &cursors, &config, NOW)
+                    .into_iter()
+                    .map(|eviction| (eviction.wallet, eviction.reason))
+                    .collect::<HashMap<_, _>>()
+            };
+            assert_eq!(
+                decided(MembershipMode::Knockout),
+                HashMap::from([
+                    (idle, KnockoutReason::Inactivity),
+                    (winner, KnockoutReason::InactivityHardCap),
+                    (loser, KnockoutReason::Underperformance),
+                ])
+            );
+            assert_eq!(
+                decided(MembershipMode::FullRerank),
+                HashMap::from([(loser, KnockoutReason::Underperformance)])
+            );
+        }
+
+        /// PASS: unchanged-batch `FullRerank` ticks reach the knockout pass in both alternation
+        /// orders and keep an idle ranked survivor live and structural, with no eviction memory
+        /// or knockout causal frame. FAIL: the knockout removes it for inactivity.
+        #[tokio::test]
+        async fn full_rerank_unchanged_batch_keeps_an_idle_ranked_wallet() {
+            let idle = wallet(31);
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![row(1, 1, idle)];
+            let h = harness(fake, &[idle]).await;
+            let stale = NOW - 300_000;
+            h.paper_state.set_cursor(&idle, stale).unwrap();
+            h.paper_state.set_activity(&idle, stale).unwrap();
+            assert_eq!(h.paper_state.cursor(&idle).unwrap(), Some(stale));
+            assert_eq!(h.paper_state.activity(&idle).unwrap(), Some(stale));
+            let mut sync = admission_sync(1);
+            sync.capacity_generation = h.applied.load().generation;
+            let mut evicted = HashSet::new();
+            for _ in 0..2 {
+                h.tick_synced(MembershipMode::FullRerank, &mut evicted, &mut sync)
+                    .await;
+            }
+            assert_eq!(
+                sync.marker,
+                Some(1),
+                "an unchanged batch must not transition"
+            );
+            assert_eq!(members(&h.live), set(&[idle]));
+            assert_eq!(h.live.structural_membership(), set(&[idle]));
+            assert!(evicted.is_empty());
+            let knockout_frames = pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|(_, frame)| frame.source_id.0 == KNOCKOUT_CAUSAL_SOURCE_ID)
+                .count();
+            assert_eq!(knockout_frames, 0);
         }
 
         #[tokio::test]
