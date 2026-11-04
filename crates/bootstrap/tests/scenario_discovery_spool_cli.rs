@@ -135,6 +135,56 @@ fn discovery_spool_cli_grammar_refuses_before_lock_open_or_requests() {
         vec!["winner-discovery", "--apply-from", "s"],
         vec![
             "winner-discovery",
+            "--out",
+            "--defer-activation",
+            "--apply-from=spool.json",
+        ],
+        vec![
+            "winner-discovery",
+            "--audit-csv",
+            "--defer-activation",
+            "--apply-from=spool.json",
+        ],
+        vec![
+            "winner-discovery",
+            "--out",
+            "--defer-activation",
+            "--collect-to=s",
+            "--coverage-from=fixed",
+            "--not-before=0",
+        ],
+        vec![
+            "winner-discovery",
+            "--out",
+            "--apply-from=spool.json",
+            "--audit-csv",
+            "--defer-activation",
+        ],
+        vec![
+            "winner-discovery",
+            "--out",
+            "--collect-to=s",
+            "--coverage-from=fixed",
+            "--not-before=0",
+            "--audit-csv",
+            "--defer-activation",
+        ],
+        vec![
+            "winner-discovery",
+            "--out",
+            "--apply-from=spool.json",
+            "--defer-activation",
+        ],
+        vec![
+            "winner-discovery",
+            "--out",
+            "--collect-to=s",
+            "--coverage-from=fixed",
+            "--not-before=0",
+            "--defer-activation",
+        ],
+        vec![
+            "winner-discovery",
             "--collect-to",
             "s",
             "--coverage-from",
@@ -160,6 +210,7 @@ fn discovery_spool_cli_grammar_refuses_before_lock_open_or_requests() {
         vec!["pipeline-versions", "--apply-from=s"],
         vec!["bootstrap.toml", "--coverage-from=fixed"],
     ];
+    let absent = dir.path().join("absent.db");
     for args in cases {
         let out = run(dir.path(), &db, &args, true);
         assert_eq!(out.status.code(), Some(1), "{args:?}: {}", logs(&out));
@@ -167,8 +218,12 @@ fn discovery_spool_cli_grammar_refuses_before_lock_open_or_requests() {
         assert!(!logs(&out).contains("cache mutation lock failed"));
         assert_eq!(state(&db), before);
         assert_eq!(std::fs::read(&db).unwrap(), bytes);
+        let out = run(dir.path(), &absent, &args, true);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", logs(&out));
+        assert!(logs(&out).contains("invalid mode"));
+        assert!(!absent.exists());
+        assert!(!pe_bootstrap::lock::lock_path_for(&absent).exists());
     }
-    let absent = dir.path().join("absent.db");
     let out = run(dir.path(), &absent, &["events", "--apply-from=s"], true);
     assert_eq!(out.status.code(), Some(1));
     assert!(!absent.exists());
@@ -229,12 +284,16 @@ fn discovery_spool_cli_refusals_precede_old_schema_two_migration() {
     invalid.push(version);
     for (key, value) in original["settings"].as_object().unwrap() {
         let mut v = original.clone();
-        v["settings"][key] = match value {
-            Value::Number(n) => json!(n.as_u64().unwrap() + 1),
-            Value::Array(_) => json!(["different"]),
-            Value::String(s) => json!(format!("{s}different")),
-            Value::Null => json!("different"),
-            _ => unreachable!(),
+        v["settings"][key] = if key == "market_floor" {
+            json!(1)
+        } else {
+            match value {
+                Value::Number(n) => json!(n.as_u64().unwrap() + 1),
+                Value::Array(_) => json!(["different"]),
+                Value::String(s) => json!(format!("{s}different")),
+                Value::Null => json!("different"),
+                _ => unreachable!(),
+            }
         };
         invalid.push(v);
     }

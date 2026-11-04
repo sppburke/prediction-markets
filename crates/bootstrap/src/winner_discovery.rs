@@ -19,8 +19,8 @@ use crate::config::BootstrapConfig;
 use crate::error::BootstrapError;
 use crate::pile::ActivationPolicy;
 use crate::wallet_discovery::{
-    CollectedSource, SourceDiscoveryResult, WalletDiscoverySource, apply_source_discovery,
-    collect_source_discovery, run_source_discovery_with_policy,
+    CollectedSource, ParticipantDiscoveryCoverage, SourceDiscoveryResult, WalletDiscoverySource,
+    apply_source_discovery, collect_source_discovery,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -54,39 +54,53 @@ pub async fn run_winner_discovery_with_policy(
     activation_policy: ActivationPolicy,
     market_floor: Option<i64>,
 ) -> Result<WinnerDiscoveryReport, BootstrapError> {
-    let lb = run_source_discovery_with_policy(
-        WalletDiscoverySource::Leaderboard,
-        config,
+    run_winner_discovery_with_collector(
         cache,
         activation_policy,
-        market_floor,
+        async |source, now, prior| {
+            collect_source_discovery(source, config, market_floor, now, prior).await
+        },
+        || time::OffsetDateTime::now_utc().unix_timestamp(),
     )
-    .await?;
+    .await
+}
+
+async fn run_winner_discovery_with_collector(
+    cache: &mut WalletCache,
+    activation_policy: ActivationPolicy,
+    mut collect: impl AsyncFnMut(
+        WalletDiscoverySource,
+        i64,
+        &mut dyn FnMut() -> Result<Option<ParticipantDiscoveryCoverage>, BootstrapError>,
+    ) -> Result<CollectedSource, BootstrapError>,
+    mut now: impl FnMut() -> i64,
+) -> Result<WinnerDiscoveryReport, BootstrapError> {
+    let mut run_source = async |source| {
+        let collected = collect(source, now(), &mut || {
+            pe_event_log::run_blocking(|| cache.participant_discovery_coverage())
+        })
+        .await?;
+        let disabled = source == WalletDiscoverySource::MarketParticipants
+            && matches!(collected, CollectedSource::Disabled);
+        let mut result = pe_event_log::run_blocking(|| {
+            apply_source_discovery(cache, activation_policy, collected)
+        })?;
+        if disabled {
+            result.status = "disabled";
+        }
+        Ok(result)
+    };
+    let lb = run_source(WalletDiscoverySource::Leaderboard).await?;
     // Datadash soft-fails: a third-party outage must not break `pe-bootstrap all`.
     // Only `BootstrapError::Datadash` is swallowed; any other variant (e.g. a
     // shared-cache failure) still propagates as fatal.
-    let dd = match run_source_discovery_with_policy(
-        WalletDiscoverySource::Datadash,
-        config,
-        cache,
-        activation_policy,
-        market_floor,
-    )
-    .await
-    {
+    let dd = match run_source(WalletDiscoverySource::Datadash).await {
         Ok(r) => r,
         Err(BootstrapError::Datadash { message }) => datadash_soft_failure(&message),
         Err(e) => return Err(e),
     };
 
-    let participants = run_source_discovery_with_policy(
-        WalletDiscoverySource::MarketParticipants,
-        config,
-        cache,
-        activation_policy,
-        market_floor,
-    )
-    .await?;
+    let participants = run_source(WalletDiscoverySource::MarketParticipants).await?;
 
     Ok(complete_report(lb, dd, participants))
 }
@@ -280,10 +294,61 @@ impl DiscoverySpool {
                             CollectedSource::MarketParticipants(c),
                         ) => {
                             c.coverage.validate().map_err(refused)?;
+                            if !self.coverage_read {
+                                return Err(refused(
+                                    "collected participants require prior coverage read",
+                                ));
+                            }
+                            let prior = crate::cache::decode_participant_discovery_coverage(
+                                self.prior_coverage_raw.clone(),
+                            )
+                            .map_err(refused)?;
                             let recurrences = crate::market_scope::canonical_recurrences(
                                 &config.market_recurrences,
                             )
                             .map_err(refused)?;
+                            let matching = prior.as_ref().filter(|prior| {
+                                prior.scope.recurrences == recurrences
+                                    && prior.scope.series.is_some()
+                            });
+                            let lo = i64::try_from(config.participant_lookback_secs)
+                                .ok()
+                                .and_then(|lookback| {
+                                    matching
+                                        .map_or(c.now, |prior| prior.covered_through_unix)
+                                        .checked_sub(lookback)
+                                })
+                                .ok_or_else(|| refused("invalid participant lookback"))?;
+                            let addition_lo =
+                                matching.map_or(lo, |prior| lo.min(prior.covered_from_unix));
+                            let through = matching
+                                .map_or(c.now, |prior| c.now.max(prior.covered_through_unix));
+                            let floor = |start: i64| {
+                                matching.map_or(start, |prior| start.max(prior.market_floor_unix))
+                            };
+                            let (min_floor, max_floor) = match market_floor {
+                                Some(value) => (floor(value), floor(value)),
+                                None => (floor(addition_lo), floor(lo)),
+                            };
+                            if c.coverage.covered_from_unix != addition_lo
+                                || c.coverage.covered_through_unix != through
+                                || !(min_floor..=max_floor).contains(&c.coverage.market_floor_unix)
+                                || matching
+                                    .and_then(|prior| prior.scope.series.as_ref())
+                                    .is_some_and(|series| {
+                                        series.iter().any(|old| {
+                                            !c.coverage
+                                                .scope
+                                                .series
+                                                .as_ref()
+                                                .is_some_and(|new| new.contains(old))
+                                        })
+                                    })
+                            {
+                                return Err(refused(
+                                    "participant coverage differs from collection window, floor or prior series",
+                                ));
+                            }
                             if c.coverage.scope.recurrences != recurrences
                                 || c.coverage.scope.series.is_none()
                                 || c.wallets.iter().any(|wallet| {
@@ -366,6 +431,36 @@ pub async fn collect_winner_discovery(
     not_before: i64,
     market_floor: Option<i64>,
 ) -> Result<(), BootstrapError> {
+    collect_winner_discovery_with_collector(
+        config,
+        spool_path,
+        coverage_from,
+        not_before,
+        market_floor,
+        async |source, now, prior| {
+            collect_source_discovery(source, config, market_floor, now, prior).await
+        },
+        || time::OffsetDateTime::now_utc().unix_timestamp(),
+        async |duration| tokio::time::sleep(duration).await,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_winner_discovery_with_collector(
+    config: &BootstrapConfig,
+    spool_path: &Path,
+    coverage_from: &Path,
+    not_before: i64,
+    market_floor: Option<i64>,
+    mut collect: impl AsyncFnMut(
+        WalletDiscoverySource,
+        i64,
+        &mut dyn FnMut() -> Result<Option<ParticipantDiscoveryCoverage>, BootstrapError>,
+    ) -> Result<CollectedSource, BootstrapError>,
+    mut now: impl FnMut() -> i64,
+    mut sleep: impl AsyncFnMut(std::time::Duration),
+) -> Result<(), BootstrapError> {
     pe_event_log::run_blocking(|| {
         crate::cache_migration::require_discovery_spool_roles(coverage_from, spool_path)?;
         if spool_path.try_exists()? || std::fs::symlink_metadata(spool_path).is_ok() {
@@ -387,17 +482,12 @@ pub async fn collect_winner_discovery(
         let now = if source == WalletDiscoverySource::MarketParticipants
             && config.participant_lookback_secs > 0
         {
-            wait_not_before(
-                not_before,
-                || time::OffsetDateTime::now_utc().unix_timestamp(),
-                async |duration| tokio::time::sleep(duration).await,
-            )
-            .await
+            wait_not_before(not_before, &mut now, &mut sleep).await
         } else {
-            time::OffsetDateTime::now_utc().unix_timestamp()
+            now()
         };
         let mut local_error = None;
-        let result = collect_source_discovery(source, config, market_floor, now, || {
+        let result = collect(source, now, &mut || {
             let raw = pe_event_log::run_blocking(|| {
                 crate::cache_migration::discovery_immutable_coverage(coverage_from)
             });
@@ -597,10 +687,11 @@ mod tests {
     async fn fixture_collect(
         source: WalletDiscoverySource,
         config: &BootstrapConfig,
-        raw: Option<String>,
+        read_prior: impl FnOnce() -> Result<Option<ParticipantDiscoveryCoverage>, BootstrapError>,
         case: &str,
         calls: &mut Vec<WalletDiscoverySource>,
         now: i64,
+        market_floor: Option<i64>,
     ) -> Result<CollectedSource, BootstrapError> {
         calls.push(source);
         match source {
@@ -664,7 +755,7 @@ mod tests {
             WalletDiscoverySource::MarketParticipants => {
                 collect_participants(
                     config,
-                    || crate::cache::decode_participant_discovery_coverage(raw),
+                    read_prior,
                     now,
                     || Ok(TradesFixture),
                     || async {
@@ -675,14 +766,14 @@ mod tests {
                         }
                         Ok((coverage().scope.series.unwrap(), Vec::new()))
                     },
-                    |_, series| async move {
+                    |lo, series| async move {
                         Ok(MarketScope {
                             version: 1,
                             source_id: "fixture",
                             schema_version: 1,
                             parser_version: 1,
                             recurrence: "15m".into(),
-                            end_date_min_unix: 0,
+                            end_date_min_unix: market_floor.unwrap_or(lo),
                             started_at_unix: NOW,
                             completed_at_unix: NOW,
                             series,
@@ -698,17 +789,6 @@ mod tests {
         }
     }
 
-    fn outcome(result: Result<CollectedSource, BootstrapError>) -> DiscoveryOutcome {
-        match result {
-            Ok(CollectedSource::Disabled) => DiscoveryOutcome::Disabled,
-            Ok(data) => DiscoveryOutcome::Collected { data },
-            Err(BootstrapError::Datadash { message }) => DiscoveryOutcome::SoftFailed { message },
-            Err(error) => DiscoveryOutcome::Terminal {
-                exit_code: error.exit_code(),
-                message: error.to_string(),
-            },
-        }
-    }
     fn snapshot(cache: &WalletCache) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
         ["wallets", "purged_wallets", "meta"]
             .iter()
@@ -736,6 +816,10 @@ mod tests {
         let paths = [dir.path().join("plain.db"), dir.path().join("split.db")];
         for path in &paths {
             let mut cache = WalletCache::open(path).unwrap();
+            cache
+                .raw_conn_for_test()
+                .execute_batch("PRAGMA user_version=2")
+                .unwrap();
             cache
                 .set_participant_discovery_coverage(&coverage())
                 .unwrap();
@@ -781,76 +865,81 @@ mod tests {
         let mut plain = WalletCache::open(&paths[0]).unwrap();
         let mut plain_calls = Vec::new();
         let plain_start = time::OffsetDateTime::now_utc().unix_timestamp();
-        let mut code = 0;
-        for source in SOURCES {
-            let raw = if source == WalletDiscoverySource::MarketParticipants
-                && config.participant_lookback_secs > 0
-            {
-                plain.raw_participant_discovery_coverage().unwrap()
-            } else {
-                None
-            };
-            match fixture_collect(source, &config, raw, case, &mut plain_calls, NOW).await {
-                Ok(data) => {
-                    if let Err(error) =
-                        apply_source_discovery(&mut plain, ActivationPolicy::Deferred, data)
-                    {
-                        code = error.exit_code();
-                        break;
-                    }
-                }
-                Err(BootstrapError::Datadash { .. }) => {}
-                Err(error) => {
-                    code = error.exit_code();
-                    break;
-                }
-            }
-        }
-        assert_eq!(code, expected_code, "plain {case}");
+        let plain_result = run_winner_discovery_with_collector(
+            &mut plain,
+            ActivationPolicy::Deferred,
+            async |source, now, prior| {
+                fixture_collect(source, &config, prior, case, &mut plain_calls, now, Some(0)).await
+            },
+            || NOW,
+        )
+        .await;
+        assert_eq!(
+            plain_result.as_ref().err().map_or(0, |e| e.exit_code()),
+            expected_code,
+            "plain {case}"
+        );
         let plain_end = time::OffsetDateTime::now_utc().unix_timestamp();
         config.cache_path = paths[1].clone();
-        let mut split = WalletCache::open(&paths[1]).unwrap();
-        let mut spool = DiscoverySpool {
-            version: 1,
-            settings: discovery_settings(&config, Some(0)),
-            coverage_read: false,
-            prior_coverage_raw: None,
-            outcomes: vec![],
-        };
         let mut split_calls = Vec::new();
-        for source in SOURCES {
-            let raw = if source == WalletDiscoverySource::MarketParticipants
-                && config.participant_lookback_secs > 0
-            {
-                spool.coverage_read = true;
-                spool.prior_coverage_raw = split.raw_participant_discovery_coverage().unwrap();
-                spool.prior_coverage_raw.clone()
-            } else {
-                None
-            };
-            let result =
-                outcome(fixture_collect(source, &config, raw, case, &mut split_calls, NOW).await);
-            let terminal = matches!(result, DiscoveryOutcome::Terminal { .. });
-            spool.outcomes.push(SourceOutcome { source, result });
-            if terminal {
-                break;
-            }
-        }
-        spool.validate(&config, Some(0)).unwrap();
         let file = dir.path().join("spool.json");
-        crate::cache_migration::atomic_write_json(&file, &spool).unwrap();
+        collect_winner_discovery_with_collector(
+            &config,
+            &file,
+            &paths[1],
+            NOW,
+            Some(0),
+            async |source, now, prior| {
+                fixture_collect(source, &config, prior, case, &mut split_calls, now, Some(0)).await
+            },
+            || NOW,
+            async |_| panic!("fixed clock must not sleep"),
+        )
+        .await
+        .unwrap();
         let spool = read_discovery_spool(&config, &file, Some(0)).unwrap();
         let _lock = crate::lock::CacheMutationLock::acquire(&paths[1]).unwrap();
         bind_discovery_spool(&spool, &paths[1]).unwrap();
+        let mut split = WalletCache::open(&paths[1]).unwrap();
         let split_start = time::OffsetDateTime::now_utc().unix_timestamp();
         let result = apply_discovery_spool(spool, &mut split);
         assert_eq!(
-            result.err().map_or(0, |e| e.exit_code()),
+            result.as_ref().err().map_or(0, |e| e.exit_code()),
             expected_code,
             "split {case}"
         );
         let split_end = time::OffsetDateTime::now_utc().unix_timestamp();
+        let counts = |r: &WinnerDiscoveryReport| {
+            (
+                r.leaderboard_unique,
+                r.leaderboard_activated,
+                r.datadash_unique,
+                r.datadash_activated,
+                r.participants_unique,
+                r.participants_activated,
+                r.participants_status,
+            )
+        };
+        assert_eq!(
+            plain_result.as_ref().ok().map(counts),
+            result.as_ref().ok().map(counts),
+            "reports {case}"
+        );
         assert_eq!(snapshot(&plain), snapshot(&split), "{case}");
+        let plain_prefix = match case {
+            "leaderboard_empty" | "terminal_existing" | "leaderboard_upsert" | "earlier_upsert" => {
+                &SOURCES[..1]
+            }
+            "datadash_upsert" => &SOURCES[..2],
+            _ => &SOURCES[..],
+        };
+        let split_prefix = if matches!(case, "leaderboard_empty" | "terminal_existing") {
+            &SOURCES[..1]
+        } else {
+            &SOURCES[..]
+        };
+        assert_eq!(plain_calls, plain_prefix, "plain source order {case}");
+        assert_eq!(split_calls, split_prefix, "collector source order {case}");
         for (cache, lo, hi) in [
             (&plain, plain_start, plain_end),
             (&split, split_start, split_end),
@@ -1192,12 +1281,16 @@ mod tests {
         invalid.push(flag);
         for (key, old) in value["settings"].as_object().unwrap() {
             let mut changed = value.clone();
-            changed["settings"][key] = match old {
-                serde_json::Value::String(s) => json!(format!("{s}changed")),
-                serde_json::Value::Number(_) => json!(old.as_u64().unwrap() + 1),
-                serde_json::Value::Array(_) => json!(["changed"]),
-                serde_json::Value::Null => json!("changed"),
-                _ => panic!("unexpected setting"),
+            changed["settings"][key] = if key == "market_floor" {
+                json!(1)
+            } else {
+                match old {
+                    serde_json::Value::String(s) => json!(format!("{s}changed")),
+                    serde_json::Value::Number(_) => json!(old.as_u64().unwrap() + 1),
+                    serde_json::Value::Array(_) => json!(["changed"]),
+                    serde_json::Value::Null => json!("changed"),
+                    _ => panic!("unexpected setting"),
+                }
             };
             invalid.push(changed);
         }
@@ -1246,35 +1339,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovery_spool_collected_coverage_refuses_impossible_certificates() {
+        for prior_kind in ["absent", "matching", "legacy", "other_recurrences"] {
+            for market_floor in [None, Some(0), Some(NOW - 100)] {
+                let dir = tempfile::tempdir().unwrap();
+                let candidate = dir.path().join("candidate.db");
+                let mut cache = WalletCache::open(&candidate).unwrap();
+                let mut prior = coverage();
+                prior.market_floor_unix = NOW - 125;
+                prior.scope.series.as_mut().unwrap().push(ScopeSeries {
+                    id: "8".into(),
+                    slug: Some("eight".into()),
+                });
+                match prior_kind {
+                    "legacy" => prior.scope.series = None,
+                    "other_recurrences" => prior.scope.recurrences = vec!["5m".into()],
+                    _ => {}
+                }
+                if prior_kind != "absent" {
+                    cache.set_participant_discovery_coverage(&prior).unwrap();
+                }
+                cache.raw_conn_for_test().execute_batch(
+                    "PRAGMA user_version=2; ALTER TABLE clob_payout_evidence_v2 DROP COLUMN neg_risk;"
+                ).unwrap();
+                drop(cache);
+                let config = fixture_config(&candidate);
+                let path = dir.path().join("spool.json");
+                let before = std::fs::read(&candidate).unwrap();
+                let mut calls = Vec::new();
+                collect_winner_discovery_with_collector(
+                    &config,
+                    &path,
+                    &candidate,
+                    NOW,
+                    market_floor,
+                    async |source, now, read_prior| {
+                        fixture_collect(
+                            source,
+                            &config,
+                            read_prior,
+                            "success",
+                            &mut calls,
+                            now,
+                            market_floor,
+                        )
+                        .await
+                    },
+                    || NOW,
+                    async |_| panic!("fixed clock must not sleep"),
+                )
+                .await
+                .unwrap();
+                let spool = read_discovery_spool(&config, &path, market_floor).unwrap();
+                let DiscoveryOutcome::Collected {
+                    data: CollectedSource::MarketParticipants(data),
+                } = &spool.outcomes[2].result
+                else {
+                    panic!("missing collected participants");
+                };
+                let mut invalid = Vec::new();
+                let mut interval = data.coverage.clone();
+                interval.covered_from_unix = 0;
+                interval.covered_through_unix = NOW + 86_400;
+                invalid.push(interval);
+                let mut shifted = data.coverage.clone();
+                shifted.covered_from_unix += 1;
+                invalid.push(shifted);
+                let mut through = data.coverage.clone();
+                through.covered_through_unix += 1;
+                invalid.push(through);
+                let mut lowered_floor = data.coverage.clone();
+                lowered_floor.market_floor_unix -= 1;
+                invalid.push(lowered_floor);
+                let mut raised_floor = data.coverage.clone();
+                raised_floor.market_floor_unix += 1;
+                invalid.push(raised_floor);
+                if prior_kind == "matching" {
+                    let mut shrunk = data.coverage.clone();
+                    shrunk.scope.series.as_mut().unwrap().pop();
+                    invalid.push(shrunk);
+                    let mut renamed = data.coverage.clone();
+                    renamed.scope.series.as_mut().unwrap()[0].slug = Some("renamed".into());
+                    invalid.push(renamed);
+                }
+                for coverage in invalid {
+                    // Every counterexample decodes and passes the coverage type's own validation.
+                    coverage.validate().unwrap();
+                    let mut changed = spool.clone();
+                    changed.outcomes[2].result = DiscoveryOutcome::Collected {
+                        data: CollectedSource::MarketParticipants(
+                            crate::wallet_discovery::CollectedParticipants {
+                                coverage,
+                                ..data.clone()
+                            },
+                        ),
+                    };
+                    std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+                    assert_eq!(
+                        read_discovery_spool(&config, &path, market_floor)
+                            .unwrap_err()
+                            .exit_code(),
+                        77,
+                        "{prior_kind} {market_floor:?}: {changed:?}"
+                    );
+                    assert_eq!(std::fs::read(&candidate).unwrap(), before);
+                }
+                for raw in [Some("malformed".into()), Some("{}".into())] {
+                    let mut changed = spool.clone();
+                    changed.prior_coverage_raw = raw;
+                    std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+                    assert_eq!(
+                        read_discovery_spool(&config, &path, market_floor)
+                            .unwrap_err()
+                            .exit_code(),
+                        77
+                    );
+                    assert_eq!(std::fs::read(&candidate).unwrap(), before);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn discovery_spool_not_before_crosses_midnight_with_fixed_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixed = dir.path().join("fixed.db");
+        let mut cache = WalletCache::open(&fixed).unwrap();
+        cache
+            .raw_conn_for_test()
+            .execute_batch("PRAGMA user_version=2")
+            .unwrap();
+        cache
+            .set_participant_discovery_coverage(&coverage())
+            .unwrap();
+        drop(cache);
+        let config = fixture_config(&fixed);
+        let file = dir.path().join("spool.json");
         let clock = std::cell::Cell::new(NOW - 1);
         let waits = std::cell::Cell::new(0);
-        wait_not_before(
+        let mut calls = Vec::new();
+        collect_winner_discovery_with_collector(
+            &config,
+            &file,
+            &fixed,
             NOW + 120,
+            None,
+            async |source, now, prior| {
+                fixture_collect(source, &config, prior, "success", &mut calls, now, None).await
+            },
             || clock.get(),
             async |duration| {
                 waits.set(waits.get() + 1);
                 clock.set(clock.get() + i64::try_from(duration.as_secs()).unwrap());
             },
         )
-        .await;
-        assert_eq!(clock.get(), NOW + 120);
-        assert_eq!(waits.get(), 1);
-        let mut calls = Vec::new();
-        let config = fixture_config(Path::new("unused"));
-        let data = fixture_collect(
-            SOURCES[2],
-            &config,
-            None,
-            "success",
-            &mut calls,
-            clock.get(),
-        )
         .await
         .unwrap();
-        if let CollectedSource::MarketParticipants(data) = data {
+        assert_eq!(clock.get(), NOW + 120);
+        assert_eq!(waits.get(), 1);
+        assert_eq!(calls, SOURCES);
+        let spool = read_discovery_spool(&config, &file, None).unwrap();
+        assert!(spool.coverage_read);
+        assert_eq!(
+            spool.prior_coverage_raw,
+            Some(serde_json::to_string(&coverage()).unwrap())
+        );
+        if let DiscoveryOutcome::Collected {
+            data: CollectedSource::MarketParticipants(data),
+        } = &spool.outcomes[2].result
+        {
             assert!(data.now >= NOW + 120);
+            assert_eq!(data.coverage.covered_from_unix, NOW - 200);
             assert_eq!(data.coverage.covered_through_unix, clock.get());
+            assert_eq!(data.coverage.market_floor_unix, NOW - 150);
+            assert_eq!(data.coverage.scope, coverage().scope);
             // Exercise the exact hold owner used by candidate-targets, using this
             // collected coverage at the midnight print-tail boundary.
             let script = r#"import json, sqlite3, sys
@@ -1284,6 +1522,8 @@ coverage = json.loads(sys.argv[1])
 window_end = int(sys.argv[2])
 with sqlite3.connect(':memory:') as c:
     c.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)')
+    c.execute('INSERT INTO meta VALUES (?, ?)', ('participant_discovery_coverage', json.dumps(coverage)))
+    assert not _participant_coverage_hold(c, coverage['scope'], coverage['covered_from_unix'], window_end, coverage['market_floor_unix'], 120)
     for tail in (119, 120, 121):
         coverage['covered_through_unix'] = window_end + tail
         c.execute('INSERT OR REPLACE INTO meta VALUES (?, ?)', ('participant_discovery_coverage', json.dumps(coverage)))

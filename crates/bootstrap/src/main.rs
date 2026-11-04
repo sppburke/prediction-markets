@@ -419,6 +419,21 @@ async fn main() {
             i += 1;
         }
 
+        let consumed_discovery_mode = flag_values.iter().any(|value| {
+            matches!(
+                value.split('=').next(),
+                Some("--collect-to" | "--coverage-from" | "--not-before" | "--apply-from")
+            )
+        });
+        if !matches!(discovery_mode, DiscoveryMode::Plain)
+            && (!defer_activation || consumed_discovery_mode)
+        {
+            tracing::error!(
+                "winner-discovery: invalid mode: spool mode flags and --defer-activation must be parsed as flags"
+            );
+            std::process::exit(1);
+        }
+
         if create_cache && sub != "all" {
             tracing::error!("bootstrap: --create-cache is only supported by all");
             std::process::exit(1);
