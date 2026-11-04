@@ -691,9 +691,42 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
 TRADED_OUTCOME = "list_position(json_extract_string(p.tokens_json, '$[*].token_id'), g.asset) - 1"
 
 
-def duck_extract_positions_v2(con, wallets, win_start, win_end):
-    """Yield every structurally valid Rust-classified schema-two first buy.
+def _positions_v2_sql(con, win_start, win_end):
+    """Shared projection source, payout join and unscoped universe/window SQL."""
+    compact = con.execute("SELECT COUNT(*) FROM duckdb_views() WHERE view_name = 'projection'").fetchone()[0] > 0
+    source = (
+        "FROM projection g " if compact else
+        "FROM ranker_entries_v2 r LEFT JOIN activity_groups_v2 g "
+        "ON g.source_trade_id = r.source_trade_id AND g.coverage_generation = r.activity_generation "
+    ) + "LEFT JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id "
+    window_source = (
+        f"{source} JOIN universe u ON u.wallet_hex = g.wallet_hex "
+        f"WHERE g.source_time_unix >= {int(win_start)} AND g.source_time_unix < {int(win_end)}"
+    )
+    return compact, source, window_source
 
+
+def count_window_positions_v2(con, wallets, win_start, win_end):
+    """Count projected buys in the universe/window before market-scope filtering."""
+    import pandas as pd
+
+    con.register(
+        "universe",
+        pd.DataFrame({"wallet_hex": pd.Series(list(wallets), dtype=object)}),
+    )
+    try:
+        _, _, window_source = _positions_v2_sql(con, win_start, win_end)
+        return int(con.execute(f"SELECT COUNT(*) {window_source}").fetchone()[0])
+    finally:
+        con.unregister("universe")
+
+
+def duck_extract_positions_v2(con, wallets, win_start, win_end, market_scope=None):
+    """Yield structurally valid Rust-classified schema-two first buys, optionally in scope.
+
+    The full projection is structurally validated even with a market scope.
+    Scope filtering happens before staging, sorting and Python conversion: raw
+    scorer inputs shrink, while its post-filter inputs stay identical.
     No leader-price, scheduled-horizon, price-band, or statistical filter is
     applied here. Those eligibility decisions belong to pass two after the
     copy print price is selected. Rows arrive in (wallet, time,
@@ -712,19 +745,21 @@ def duck_extract_positions_v2(con, wallets, win_start, win_end):
         con.execute("SELECT current_setting('temp_directory')").fetchone()[0],
         "positions_v2.parquet",
     )
-    compact = con.execute("SELECT COUNT(*) FROM duckdb_views() WHERE view_name = 'projection'").fetchone()[0] > 0
+    compact, source, window_source = _positions_v2_sql(con, win_start, win_end)
     marker = "g" if compact else "r"
-    source = (
-        "FROM projection g " if compact else
-        "FROM ranker_entries_v2 r LEFT JOIN activity_groups_v2 g "
-        "ON g.source_trade_id = r.source_trade_id AND g.coverage_generation = r.activity_generation "
-    ) + "LEFT JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id "
     payout = "g" if compact else "p"
     payout_mismatch = (
         " OR g.payout_vector_json IS DISTINCT FROM p.payout_vector_json "
         "OR g.end_date_unix IS DISTINCT FROM p.end_date_unix" if compact else ""
     )
     try:
+        scope_filter = ""
+        if market_scope is not None:
+            con.register(
+                "scope",
+                pd.DataFrame({"condition_id": pd.Series(list(market_scope), dtype=object)}),
+            )
+            scope_filter = " AND g.condition_id IN (SELECT condition_id FROM scope)"
         bad = con.execute(
             f"SELECT COUNT(*) {source} "
             f"WHERE NOT regexp_full_match({marker}.source_trade_id, 'g2:[0-9a-f]{{64}}') "
@@ -752,8 +787,7 @@ def duck_extract_positions_v2(con, wallets, win_start, win_end):
             f"CAST(json_extract_string({payout}.payout_vector_json, "
             f"'$[' || CAST({TRADED_OUTCOME} AS VARCHAR) || ']') AS DOUBLE) AS payoff, "
             f"{payout}.end_date_unix AS resolved_at, {marker}.source_trade_id "
-            f"{source} JOIN universe u ON u.wallet_hex = g.wallet_hex "
-            f"WHERE g.source_time_unix >= {int(win_start)} AND g.source_time_unix < {int(win_end)}) "
+            f"{window_source}{scope_filter}) "
             f"TO '{_q(staged)}' (FORMAT PARQUET)"
         )
         result = con.execute(
@@ -764,6 +798,8 @@ def duck_extract_positions_v2(con, wallets, win_start, win_end):
             yield chunk
     finally:
         con.unregister("universe")
+        if market_scope is not None:
+            con.unregister("scope")
         if os.path.exists(staged):
             os.remove(staged)
 
