@@ -573,14 +573,16 @@ def main() -> int:
 
         diag["wallets_seen"] = len(wallets)
         if schema_version >= 2:
-            # Rust has already proved the first-entry semantics. Pass every
-            # structurally valid projected buy to the reference-price pass;
-            # leader price, horizon, band, and pass-one statistics are not gates.
+            # Rust has already proved the first-entry semantics. Validate the
+            # full projection, but filter market scope in SQL before staging:
+            # raw scorer inputs shrink; its post-filter inputs stay identical.
+            # Leader price, horizon, band, and pass-one statistics are not gates.
             # The query streams in (wallet, time, trade id) order, so one wallet
             # is resident at a time and no sort is needed.
+            diag["qualified"] = ranker_duck.count_window_positions_v2(
+                engine, wallets, prm.win_start, prm.win_end)
             for w, rows in wallet_groups(ranker_duck.duck_extract_positions_v2(
-                    engine, wallets, prm.win_start, prm.win_end)):
-                diag["qualified"] += len(rows)
+                    engine, wallets, prm.win_start, prm.win_end, market_scope=prm.market_scope)):
                 total_qualified += process_wallet_positions(
                     w, [position(row) for row in rows], prm, writer, summaries, floor_pos)
         else:
