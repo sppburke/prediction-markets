@@ -355,7 +355,7 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
     return rows, entry, marker
 
 
-def build_format_three_cache(db: str, *, identity_version=4, classifier_version=6):
+def build_format_three_cache(db: str, *, identity_version=4, classifier_version=6, asset_suffix=""):
     """Python-built C2-C5 fixture; activity mirrors deliberately disagree."""
     import rank_cycle_manifest as cycle
 
@@ -364,7 +364,7 @@ def build_format_three_cache(db: str, *, identity_version=4, classifier_version=
     rows.sort(key=lambda row: (row["wallet_hex"], row["source_time_unix"], row["source_trade_id"]))
     for index, row in enumerate(rows):
         row["condition_id"] = f"0x{index + 1:064x}"
-        row["asset"] = "tökén雪" if row["wallet_hex"] == W("a") else f"{ESCAPED_ASSET}-{index}"
+        row["asset"] = ("tökén雪" if row["wallet_hex"] == W("a") else f"{ESCAPED_ASSET}-{index}") + asset_suffix
         row["price_weighted_share_amount_str"] = f"{Decimal('0.35') + Decimal(index) * Decimal('0.04'):.12f}"
     drops = [{"cause": "conversion", "dropped_at_unix": entry - 60,
               "scope_id": "0xa", "scope_kind": "event"},
@@ -1244,10 +1244,15 @@ class DuckParityTest(unittest.TestCase):
 
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_format_three_spool_commitment_and_parquet_tampering_refused(self):
-        for mutation in ("missing", "size", "sha256", "dropped", "foreign", "duplicate", "altered"):
+        values = {"dropped", "foreign", "duplicate", "altered", "reordered"}
+        types = {"blob": "encode(condition_id) AS condition_id",
+                 "decimal": "CAST(outcome_id AS DECIMAL(18, 0)) AS outcome_id",
+                 "integer": "CAST(outcome_id AS INTEGER) AS outcome_id"}
+        for mutation in ("missing", "size", "sha256", *sorted(values), *types):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
                 db = str(Path(tmp) / "candidate.db")
                 rows, _, _ = build_format_three_cache(db)
+                finalized = (len(rows), whole_projection_digest(rows))
                 pq = str(Path(tmp) / "export")
                 spool = Path(db + ".projection-v3.jsonl")
                 if mutation == "missing":
@@ -1259,25 +1264,163 @@ class DuckParityTest(unittest.TestCase):
                 if mutation in ("missing", "size", "sha256"):
                     with self.assertRaises((ValueError, FileNotFoundError)):
                         export(db, pq)
-                else:
-                    original = exp._compact_projection_rows
-                    def tamper(con, path):
-                        relation = f"read_parquet('{exp._q(path)}')"
-                        if mutation == "dropped":
-                            query = f"SELECT * FROM {relation} WHERE source_trade_id != '{rows[-1]['source_trade_id']}'"
-                        elif mutation == "foreign":
-                            query = f"SELECT * REPLACE ('{W('f')}' AS wallet_hex) FROM {relation}"
-                        elif mutation == "duplicate":
-                            query = f"SELECT * FROM {relation} UNION ALL SELECT * FROM {relation} LIMIT {len(rows) + 1}"
-                        else:
-                            query = f"SELECT * REPLACE ('1.250001' AS share_amount_str) FROM {relation}"
-                        con.execute(f"COPY ({query}) TO '{exp._q(path)}.changed' (FORMAT PARQUET)")
-                        os.replace(path + ".changed", path)
-                        yield from original(con, path)
-                    with mock.patch.object(exp, "_compact_projection_rows", side_effect=tamper):
-                        with self.assertRaisesRegex(ValueError, "Parquet projection count/digest mismatch"):
+                    self.assertFalse((Path(pq) / exp.V2_EXPORT_MANIFEST).exists())
+                    continue
+                rendered = exp._parquet_projection_digest
+                fast = []
+                def tamper(con, path):
+                    relation = f"read_parquet('{exp._q(path)}')"
+                    if mutation == "dropped":
+                        query = f"SELECT * FROM {relation} WHERE source_trade_id != '{rows[-1]['source_trade_id']}'"
+                    elif mutation == "foreign":
+                        query = f"SELECT * REPLACE ('{W('f')}' AS wallet_hex) FROM {relation}"
+                    elif mutation == "duplicate":
+                        query = f"SELECT * FROM {relation} UNION ALL SELECT * FROM {relation} LIMIT {len(rows) + 1}"
+                    elif mutation == "altered":
+                        query = f"SELECT * REPLACE ('1.250001' AS share_amount_str) FROM {relation}"
+                    elif mutation == "reordered":
+                        query = (f"SELECT * FROM {relation} "
+                                 "ORDER BY wallet_hex DESC, source_time_unix DESC, source_trade_id DESC")
+                    else:
+                        query = f"SELECT * REPLACE ({types[mutation]}) FROM {relation}"
+                    con.execute(f"COPY ({query}) TO '{exp._q(path)}.changed' (FORMAT PARQUET)")
+                    os.replace(path + ".changed", path)
+                    if mutation in types:
+                        # Unguarded, DuckDB renders these values exactly like the finalized rows.
+                        names = sorted(exp.PROJECTION_TYPES)
+                        struct = "{" + ", ".join(f"'{name}': {name}" for name in names) + "}"
+                        lines = [row[0] for row in con.execute(
+                            f"SELECT encode(to_json({struct})) FROM {relation}").fetchall()]
+                        self.assertEqual((len(lines), hashlib.sha256(b"[" + b",".join(lines) + b"]").hexdigest()),
+                                         finalized)
+                    fast.append(rendered(con, path))
+                    return fast[-1]
+                with mock.patch.object(exp, "_parquet_projection_digest", side_effect=tamper), \
+                     mock.patch.object(exp, "_compact_projection_rows", wraps=exp._compact_projection_rows) as rows_read, \
+                     mock.patch.object(exp, "log", wraps=exp.log) as logged:
+                    if mutation == "integer":
+                        export(db, pq)
+                    else:
+                        with self.assertRaises(ValueError if mutation in values else TypeError) as refused:
                             export(db, pq)
-                self.assertFalse((Path(pq) / exp.V2_EXPORT_MANIFEST).exists())
+                        if mutation in values:
+                            self.assertIn("Parquet projection count/digest mismatch", str(refused.exception))
+                self.assertEqual(rows_read.call_count, 1)
+                reason = "column types differ" if mutation in types else "DuckDB-rendered digest differs"
+                self.assertEqual([call.args[0] for call in logged.call_args_list].count(
+                    f"projection: {reason}; rechecking with per-row JSON"), 1)
+                if mutation in types:
+                    self.assertIsNone(fast[0])
+                else:
+                    self.assertNotEqual(fast[0], finalized)
+                published = (Path(pq) / exp.V2_EXPORT_MANIFEST).exists()
+                self.assertEqual(published, mutation == "integer")
+                self.assertEqual((Path(pq) / "projection.parquet").exists(), mutation == "integer")
+                if published:
+                    manifest = json.loads((Path(pq) / exp.V2_EXPORT_MANIFEST).read_text())
+                    self.assertEqual((manifest["projection"]["count"], manifest["projection"]["digest"]), finalized)
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_format_three_ordinary_export_uses_only_the_rendered_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "candidate.db"), str(Path(tmp) / "export")
+            rows, _, _ = build_format_three_cache(db)
+            with mock.patch.object(exp, "_parquet_projection_digest", wraps=exp._parquet_projection_digest) as fast, \
+                 mock.patch.object(exp, "_compact_projection_rows", side_effect=AssertionError("per-row recheck")):
+                export(db, pq)
+            self.assertEqual(fast.call_count, 1)
+            manifest = json.loads((Path(pq) / exp.V2_EXPORT_MANIFEST).read_text())
+            self.assertEqual((manifest["projection"]["count"], manifest["projection"]["digest"]),
+                             (len(rows), whole_projection_digest(rows)))
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_format_three_escape_case_difference_is_rechecked_row_by_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "candidate.db"), str(Path(tmp) / "export")
+            rows, _, _ = build_format_three_cache(db, asset_suffix="\x1f")
+            finalized = (len(rows), whole_projection_digest(rows))
+            fast = []
+            def rendered(con, path, original=exp._parquet_projection_digest):
+                fast.append(original(con, path))
+                return fast[-1]
+            with mock.patch.object(exp, "_parquet_projection_digest", side_effect=rendered), \
+                 mock.patch.object(exp, "_compact_projection_rows", wraps=exp._compact_projection_rows) as rows_read, \
+                 mock.patch.object(exp, "log", wraps=exp.log) as logged:
+                export(db, pq)
+            # DuckDB writes \u001F where json.dumps writes \u001f: the digests differ, and the per-row path accepts.
+            self.assertEqual(fast[0][0], len(rows))
+            self.assertNotEqual(fast[0], finalized)
+            self.assertEqual(rows_read.call_count, 1)
+            messages = [call.args[0] for call in logged.call_args_list]
+            self.assertEqual(messages.count("projection: DuckDB-rendered digest differs; rechecking with per-row JSON"), 1)
+            manifest = json.loads((Path(pq) / exp.V2_EXPORT_MANIFEST).read_text())
+            self.assertEqual((manifest["projection"]["count"], manifest["projection"]["digest"]), finalized)
+            engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, schema_version=2)
+            try:
+                self.assertEqual(list(exp._compact_projection_rows(engine, str(Path(pq) / "projection.parquet"))), rows)
+            finally:
+                engine.close()
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_rendered_projection_digest_matches_the_per_row_digest(self):
+        names = list(exp.PROJECTION_TYPES)
+        texts = ['plain', 'q"uote', 'back\\slash', 'line\nfeed', 'tab\tstop', '\x01', 'é雪', ' ', '', None,
+                 '["1","0"]', '</script>', 'a/b']
+        integers = [0, -1, 2**63 - 1, -2**63, None, 1793664000]
+        def row(index):
+            return [integers[(index + offset) % len(integers)] if exp.PROJECTION_TYPES[name] == "BIGINT"
+                    else texts[(index + offset) % len(texts)] for offset, name in enumerate(names)]
+        batch = 4
+        fetched = []
+
+        class BoundedCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def fetchmany(self, size):
+                if size != batch:
+                    raise AssertionError(f"unbounded batch: {size}")
+                rows = self.cursor.fetchmany(size)
+                fetched.append(len(rows))
+                return rows
+
+            def fetchall(self):
+                raise AssertionError("rendered rows must never fetchall")
+
+        class BoundedConnection:
+            def __init__(self, con):
+                self.con = con
+
+            def execute(self, query):
+                cursor = self.con.execute(query)
+                # Column metadata is bounded; only the rendered rows must stream through fetchmany.
+                if query.startswith("DESCRIBE "):
+                    return cursor
+                return BoundedCursor(cursor)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(exp, "RENDERED_BATCH_SIZE", batch):
+            # DuckDB cuts row groups at 2048-row vectors: 5000 rows make three.
+            for count in (0, 1, batch - 1, batch, batch + 1, 2 * batch + 1, 5000):
+                path = str(Path(tmp) / f"projection-{count}.parquet")
+                con = duckdb.connect()
+                con.execute("CREATE TABLE p (" + ", ".join(f"{name} {kind}" for name, kind in exp.PROJECTION_TYPES.items()) + ")")
+                if count:
+                    con.executemany(f"INSERT INTO p VALUES ({', '.join('?' * len(names))})",
+                                    [row(index) for index in range(count)])
+                con.execute(f"COPY p TO '{exp._q(path)}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)")
+                if count == 5000:
+                    self.assertGreater(con.execute(
+                        "SELECT count(DISTINCT row_group_id) FROM parquet_metadata(?)", [path]).fetchone()[0], 1)
+                for threads in (1, 4):
+                    with self.subTest(count=count, threads=threads):
+                        con.execute(f"SET threads = {threads}")
+                        expected = exp._projection_digest(exp._compact_projection_rows(con, path))
+                        self.assertEqual(expected[0], count)
+                        fetched.clear()
+                        self.assertEqual(exp._parquet_projection_digest(BoundedConnection(con), path), expected)
+                        self.assertEqual(fetched, [batch] * (count // batch)
+                                         + ([count % batch] if count % batch else []) + [0])
+                con.close()
 
     def test_v2_repaired_payouts_do_not_change_v1_ranking_or_survivors(self) -> None:
         """#544 boundary: stored repaired payouts are replay evidence only.
