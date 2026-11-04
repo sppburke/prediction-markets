@@ -35,8 +35,8 @@ use time::format_description::well_known::Rfc3339;
 const LS_TSTAT_BPS_SCALE: i64 = 1_000;
 
 /// Strict-canary ranked-trade freshness window in hours. Ordinary bench admission and
-/// re-entry trust ranked survivors regardless of age; inactivity belongs to the knockout.
-/// See `docs/_GLOSSARY.md`.
+/// re-entry trust ranked survivors regardless of age; inactivity belongs to the knockout
+/// (`knockout` membership mode only). See `docs/_GLOSSARY.md`.
 pub const ACTIVE_WINDOW_HOURS: i64 = 72;
 pub const CANARY_RANKING_MAX_AGE_SECS: i64 = 21_600;
 
@@ -107,7 +107,7 @@ struct RankingRow {
     /// Wallet's real last on-chain trade time (unix seconds), stamped by the ranker (#357).
     /// Absent column or JSON `null` → `None`, excluded from bench reads. Present values seed the
     /// poll cursor / inactivity clock (#357 PR-3) regardless of age; inactivity belongs to the
-    /// knockout. This value never affects the row→entry map.
+    /// knockout (`knockout` membership mode only). This value never affects the row→entry map.
     #[serde(default)]
     last_trade_unix: Option<i64>,
     /// Exact text projection of `hit_rate` ([`RANKING_EXACT_SELECT`], #514). Preferred
@@ -779,10 +779,11 @@ fn candidates_query(exclude: &[WalletAddress], batch_id: i64) -> String {
 /// the live and evicted sets by byte-equality, so a casing miss cannot re-admit a wallet.
 ///
 /// Ranked survivors are prepared regardless of the ranked value's age; missing values stay
-/// excluded. Inactivity is decided by the existing knockout from the activity clock, kept
-/// current by bracket commits and accepted bracket installation. An inactive survivor stays
-/// live until the next successful knockout publication that includes it. Returns the
-/// [`Watchlist`] plus the last-trade side-map for admission cursor seeding.
+/// excluded. Under `knockout` membership mode, inactivity is decided by the existing knockout
+/// from the activity clock, kept current by bracket commits and accepted bracket installation,
+/// and an inactive survivor stays live until the next successful knockout publication that
+/// includes it. Under `full_rerank` an idle survivor stays live until a batch drops it.
+/// Returns the [`Watchlist`] plus the last-trade side-map for admission cursor seeding.
 pub async fn fetch_candidates(
     client: &reqwest::Client,
     base_url: &str,
