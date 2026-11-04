@@ -16,7 +16,8 @@ scope so older readers refuse it.
 
 Format three exports the committed projection spool and payout evidence only.
 Its manifest is written after the Parquet projection reproduces the finalized
-count and UTF-8 digest; normalized activity stays in SQLite.
+count and UTF-8 digest; normalized activity stays in SQLite. DuckDB renders the
+rows for that digest; any type or digest difference is rechecked row by row.
 
 SQLite stays the system-of-record; this is a read-only snapshot. sqlite_scanner
 preserves the declared column types (INTEGER->BIGINT, TEXT->VARCHAR), so the DuckDB
@@ -73,6 +74,7 @@ PROJECTION_TYPES = {
     "source_trade_id": "VARCHAR", "source_usdc_amount_str": "VARCHAR", "wallet_hex": "VARCHAR",
 }
 PROJECTION_BATCH_SIZE = 1024
+RENDERED_BATCH_SIZE = 65_536
 CERTIFIED_ACTIVITY_SQL = (
     "SELECT g.* FROM ranker_entries_v2 AS r "
     "CROSS JOIN activity_groups_v2 AS g "
@@ -352,6 +354,35 @@ def _compact_projection_rows(con, path: str) -> Iterator[dict]:
             yield dict(zip(names, row, strict=True))
 
 
+def _parquet_projection_digest(con, path: str) -> tuple[int, str] | None:
+    """`_projection_digest` of the Parquet rows, with DuckDB rendering each row's JSON.
+
+    `to_json` of the sorted columns writes compact JSON with Python's escapes except
+    the hex case of `\\u00XX` control escapes, so a digest difference is rechecked by
+    the per-row path. Other column types can render a different row identically, so
+    a file whose types differ from PROJECTION_TYPES returns None.
+    """
+    import hashlib
+
+    names = sorted(PROJECTION_TYPES)
+    relation = f"read_parquet('{_q(path)}')"
+    types = [(name, kind) for name, kind, *_ in con.execute(
+        f"DESCRIBE SELECT {', '.join(names)} FROM {relation}").fetchall()]
+    if types != [(name, PROJECTION_TYPES[name]) for name in names]:
+        return None
+    struct = "{" + ", ".join(f"'{name}': {name}" for name in names) + "}"
+    cursor = con.execute(f"SELECT encode(to_json({struct})) FROM {relation}")
+    digest = hashlib.sha256(b"[")
+    count = 0
+    while batch := cursor.fetchmany(RENDERED_BATCH_SIZE):
+        if count:
+            digest.update(b",")
+        digest.update(b",".join(row[0] for row in batch))
+        count += len(batch)
+    digest.update(b"]")
+    return count, digest.hexdigest()
+
+
 def _export_v3_projection(con, db_path: str, out_dir: str, row_group_size: int) -> dict:
     import json
     from rank_cycle_manifest import _fresh_identity
@@ -385,7 +416,12 @@ def _export_v3_projection(con, db_path: str, out_dir: str, row_group_size: int) 
         f"COPY (SELECT * FROM read_json('{_q(spool)}', format='newline_delimited', "
         f"columns={{{columns}}})) TO '{_q(temporary)}' "
         f"(FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {int(row_group_size)})")
-    actual_count, actual_digest = _projection_digest(_compact_projection_rows(con, temporary))
+    exported = _parquet_projection_digest(con, temporary)
+    if exported != (count, digest):
+        reason = "column types differ" if exported is None else "DuckDB-rendered digest differs"
+        log(f"projection: {reason}; rechecking with per-row JSON")
+        exported = _projection_digest(_compact_projection_rows(con, temporary))
+    actual_count, actual_digest = exported
     if actual_count != count or actual_digest != digest:
         raise ValueError("format-three Parquet projection count/digest mismatch")
     os.replace(temporary, final)
