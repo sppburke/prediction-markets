@@ -34,6 +34,7 @@ Run: `python3 scripts/test_rank_and_push.py`
   or: `pytest scripts/test_rank_and_push.py -v`
 """
 import os
+import hashlib
 import json
 import shutil
 import shlex
@@ -194,7 +195,8 @@ if mode in ('block', 'fail-after', 'interrupt'):
     with open('stage2-release.pipe') as release: release.read()
 if mode == 'fail-after': raise SystemExit(44)
 if Path('scripts/_stub_cache_ops.py').exists():
-    record.write_text(json.dumps(dict(cache_path=str(db.resolve()), cache_sha256=hashlib.sha256(db.read_bytes()).hexdigest())))
+    record.write_text(json.dumps(dict(cache_path=str(db.resolve()), cache_sha256=hashlib.sha256(db.read_bytes()).hexdigest(),
+                                      attempt=str(ready))))
 if mode == 'renamed-fail': raise SystemExit(45)
 Path('stage2_done').write_text('yes')
 """)
@@ -2610,6 +2612,7 @@ Path('stage2_done').write_text('yes')
         out = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
         stage = out / "cache_stage_record.json"
         self.assertEqual(stage.exists(), record_present)
+        previous = stage.read_text() if record_present else None
         self.assertFalse((out / "ranking_publish_request.json").exists())
         before = len(self._bootstrap_ops())
         resumed = self._run()
@@ -2625,7 +2628,12 @@ Path('stage2_done').write_text('yes')
         self.assertNotEqual(finalizes[1][finalizes[1].index("--ready-file") + 1],
                             finalizes[3][finalizes[3].index("--ready-file") + 1])
         self.assertEqual(len(self._log("rank.log").splitlines()), 2)
+        # The resumed attempt rewrote the record, for the resumed cache's bytes.
+        self.assertNotEqual(stage.read_text(), previous)
         record = json.loads(stage.read_text())
+        self.assertEqual(record["attempt"], finalizes[3][finalizes[3].index("--ready-file") + 1])
+        self.assertEqual(record["cache_sha256"],
+                         hashlib.sha256(Path(record["cache_path"]).read_bytes()).hexdigest())
         request = json.loads((out / "ranking_publish_request.json").read_text())
         self.assertEqual(request["cache_activation"]["expected_sha256"], record["cache_sha256"])
         self.assertEqual(request["cache_activation"]["side_path"], record["cache_path"])

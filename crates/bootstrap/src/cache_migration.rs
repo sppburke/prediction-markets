@@ -5193,7 +5193,19 @@ pub fn require_ready_file_roles(
     let stage_temp = atomic_write_temp_path(stage_record);
     let lock = lock_target_path(cache)?;
     let spool = sidecar_path(cache, ".projection-v3.jsonl");
-    let sidecars = ["-wal", "-shm", "-journal"].map(|suffix| sidecar_path(cache, suffix));
+    // SQLite opens the canonical cache, so its sidecars sit beside the physical
+    // file; finalization also clears those beside the spelled path.
+    let physical = std::fs::canonicalize(cache)?;
+    let mut sidecars: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for base in [cache, physical.as_path()] {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let path = sidecar_path(base, suffix);
+            let intended = canonical_intended_path(&path)?;
+            if sidecars.iter().all(|(seen, _)| *seen != intended) {
+                sidecars.push((intended, path));
+            }
+        }
+    }
     let mut roles = vec![
         ("cache", cache),
         ("cache mutation lock", lock.as_path()),
@@ -5206,7 +5218,7 @@ pub fn require_ready_file_roles(
     roles.extend(
         sidecars
             .iter()
-            .map(|path| ("cache sidecar", path.as_path())),
+            .map(|(_, path)| ("cache sidecar", path.as_path())),
     );
     if let Some(manifest) = export_manifest {
         roles.push(("export manifest", manifest));

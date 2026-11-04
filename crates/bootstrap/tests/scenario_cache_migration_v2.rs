@@ -25714,6 +25714,32 @@ fn stage2_ready_role_refusals_touch_nothing() {
         );
         assert_eq!(original(), before);
     }
+    // Through a linked cache, SQLite's sidecars sit beside the physical file.
+    let alias = dir.path().join("alias.db");
+    std::os::unix::fs::symlink(&cache, &alias).unwrap();
+    for base in [&cache, &alias] {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let marker = std::path::PathBuf::from(format!("{}{suffix}", base.display()));
+            let before = original();
+            assert!(
+                require_ready_file_roles(&alias, &marker, &stage, Some(&export)).is_err(),
+                "{}",
+                marker.display()
+            );
+            assert!(
+                finalize_cache_v2_with_export_manifest(
+                    &alias,
+                    Some(&stage),
+                    Some(&export),
+                    Some(&marker),
+                    1800000000
+                )
+                .is_err()
+            );
+            assert_eq!(original(), before);
+        }
+    }
+    std::fs::remove_file(&alias).unwrap();
     let ready_temp = dir
         .path()
         .join(format!(".ready.json.{}.tmp", std::process::id()));
@@ -26012,13 +26038,24 @@ fn stage2_ready_compare_retained_cycle(
         .unwrap(),
     )
     .unwrap();
+    let artifacts = [
+        "cache_stage_record.json",
+        "qualifying_positions_72hr.csv",
+        "ranked_72hr_buyandhold.csv",
+        "ranked_72hr_buyandhold.txt",
+        "latency_shift_ranked.csv",
+        "oracle_outcomes.csv",
+        "oracle_manifest.json",
+        "ranking_publish_request.json",
+    ];
+    // Outputs are never restored: each order must write every artifact itself.
     let mut inputs = BTreeMap::new();
     for entry in std::fs::read_dir(out)
         .unwrap()
         .chain(std::fs::read_dir(&parquet).unwrap())
     {
         let path = entry.unwrap().path();
-        if path.is_file() {
+        if path.is_file() && !artifacts.iter().any(|name| path == out.join(name)) {
             inputs.insert(
                 path.clone(),
                 (
@@ -26056,16 +26093,6 @@ fn stage2_ready_compare_retained_cycle(
             );
         }
     }
-    let artifacts = [
-        "cache_stage_record.json",
-        "qualifying_positions_72hr.csv",
-        "ranked_72hr_buyandhold.csv",
-        "ranked_72hr_buyandhold.txt",
-        "latency_shift_ranked.csv",
-        "oracle_outcomes.csv",
-        "oracle_manifest.json",
-        "ranking_publish_request.json",
-    ];
     let mut reference = BTreeMap::new();
     for overlapped in [false, true] {
         for suffix in ["-wal", "-shm"] {
@@ -26090,9 +26117,17 @@ fn stage2_ready_compare_retained_cycle(
                 .unwrap();
             assert_eq!(std::fs::read(path).unwrap(), *bytes);
         }
-        let bridge = Command::new("python3").current_dir(root).env_remove("PYTHONPATH")
+        for name in artifacts {
+            assert!(
+                !out.join(name).exists(),
+                "{name} exists before overlap={overlapped}"
+            );
+        }
+        // Stage 2 inherits the wrapper's environment, which loads `.env` this way.
+        let bridge = Command::new("bash").current_dir(root).env_remove("PYTHONPATH")
             .env("PE_RANKER_ENGINE", "duck").env("PE_RANKER_PARQUET_DIR", &parquet)
-            .args(["-B", "-c", "import json, sys; sys.path.insert(0, 'scripts'); from test_ranker_duck_parity import retained_cycle_publication; a=json.load(open(sys.argv[1])); retained_cycle_publication(**a, overlapped=sys.argv[2]=='true')"])
+            .args(["-c", "set -a; source ./.env; set +a; exec python3 -B -c \"$0\" \"$@\"",
+                "import json, sys; sys.path.insert(0, 'scripts'); from test_ranker_duck_parity import retained_cycle_publication; a=json.load(open(sys.argv[1])); retained_cycle_publication(**a, overlapped=sys.argv[2]=='true')"])
             .arg(&spec).arg(overlapped.to_string()).output().unwrap();
         assert!(
             bridge.status.success(),
