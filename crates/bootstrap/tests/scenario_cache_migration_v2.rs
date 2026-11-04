@@ -99,7 +99,7 @@ fn finalize_cache_v2(
                 "activity_generation": inputs["activity_generation"], "spool_sha256": inputs["projection_spool"]["sha256"]}
         }))?,
     )?;
-    finalize_cache_v2_with_export_manifest(path, stage, Some(&manifest), now)
+    finalize_cache_v2_with_export_manifest(path, stage, Some(&manifest), None, now)
 }
 
 // Decision 6: format-three scenarios supply the already hash-bound final-stage record.
@@ -3534,6 +3534,7 @@ async fn refinalization_resumes_after_commit_before_stage_receipt() {
                 .with_extension("fixture-parquet")
                 .join("cache-export-v2.json"),
         ),
+        None,
         CLASSIFIER_FIXED_END + 3,
     )
     .unwrap()
@@ -18063,6 +18064,7 @@ async fn projection_v3_refinalize_refuses_certificate_receipt_spool_and_export_d
                     .with_extension("fixture-parquet")
                     .join("cache-export-v2.json"),
             ),
+            None,
             FRESH_END + 2,
         )
         .unwrap_err();
@@ -22946,7 +22948,7 @@ async fn seeded_cache_publishes_exact_entries() {
 /// the explicit participant coverage set.
 #[tokio::test]
 async fn real_wrapper_seeded_loop_prepares_and_publishes() {
-    real_wrapper_seeded_publication(false).await;
+    real_wrapper_seeded_publication(false, false).await;
 }
 
 // PASS: supersession preserves the incomplete prepared root, batch 0, archived
@@ -22957,11 +22959,11 @@ async fn real_wrapper_seeded_loop_prepares_and_publishes() {
 #[tokio::test]
 async fn real_wrapper_superseded_incomplete_root_completes_and_publishes_replacement() {
     let began = std::time::Instant::now();
-    real_wrapper_seeded_publication(true).await;
+    real_wrapper_seeded_publication(true, false).await;
     eprintln!("end-to-end supersession runtime: {:?}", began.elapsed());
 }
 
-async fn real_wrapper_seeded_publication(supersession: bool) {
+async fn real_wrapper_seeded_publication(supersession: bool, stage2_comparison: bool) {
     const DAY: i64 = 86_400;
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let quiet = format!(
@@ -23605,6 +23607,11 @@ async fn real_wrapper_seeded_publication(supersession: bool) {
     assert!(venue.batches.lock().unwrap().is_empty());
     let first = run_dir(&stdout);
     assert!(first.join("ranking_publish_request.json").is_file());
+    if stage2_comparison {
+        stage2_ready_compare_retained_cycle(dir.path(), &first, now, cycle_end);
+        venue.stop();
+        return;
+    }
     assert!(data.join("eval-results/rank_and_push.pending").exists());
     assert!(linked(&first));
     assert_wrapper_scope(&first, &fixed);
@@ -25483,4 +25490,720 @@ async fn collection_v2_terminal_window_proofs_reject_gaps_overlaps_and_outside_p
             "{damage}: {error}"
         );
     }
+}
+
+// AC1: readers begin only after the durable close, before the hash, in both formats.
+#[tokio::test]
+async fn stage2_ready_boundary_preserves_record_bytes_and_reader_sidecar_release() {
+    use pe_bootstrap::cache_migration::finalize_cache_v2_with_ready_hook_for_test;
+    for classifier in [3, 7] {
+        for existing_record in [false, true] {
+            let dir = TempDir::new().unwrap();
+            std::fs::create_dir(dir.path().join("eval-results")).unwrap();
+            let side = dir.path().join("side.db");
+            retained_classifier_activity_at_version(&dir, &side, classifier).await;
+            let stage = dir.path().join("ready-stage.json");
+            finalize_cache_v2(&side, Some(&stage), CLASSIFIER_FIXED_END + 3).unwrap();
+            let reference = std::fs::read(&stage).unwrap();
+            if existing_record {
+                std::fs::write(&stage, b"previous stage record").unwrap();
+            } else {
+                std::fs::remove_file(&stage).unwrap();
+            }
+            let before = sha256_file(&side).unwrap();
+            let ready = dir.path().join("ready.json");
+            let export = side
+                .with_extension("fixture-parquet")
+                .join("cache-export-v2.json");
+            let log = CheckLog::default();
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let mut reader = None;
+            let mut called = false;
+            let record = finalize_cache_v2_with_ready_hook_for_test(
+                &side,
+                &stage,
+                (classifier == 7).then_some(export.as_path()),
+                &ready,
+                CLASSIFIER_FIXED_END + 3,
+                &mut || {
+                    called = true;
+                    if classifier == 7 {
+                        assert_finalize_phases(
+                            &log,
+                            &[
+                                "open_checks",
+                                "history_preflight",
+                                "input_binding",
+                                "spool_verification",
+                                "export_verification",
+                                "commit_checkpoint_sync",
+                            ],
+                        );
+                    } else {
+                        // open_checks is emitted by the shared opener even for format two;
+                        // format two has no commit/hash/record phase events of its own.
+                        assert_finalize_phases(&log, &["open_checks"]);
+                    }
+                    for suffix in ["-wal", "-shm"] {
+                        assert!(
+                            !std::path::PathBuf::from(format!("{}{suffix}", side.display()))
+                                .exists()
+                        );
+                    }
+                    if existing_record {
+                        assert_eq!(std::fs::read(&stage).unwrap(), b"previous stage record");
+                    } else {
+                        assert!(!stage.exists());
+                    }
+                    let marker: Value =
+                        serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
+                    assert_eq!(
+                        marker,
+                        serde_json::json!({"version":1, "pid":std::process::id(),
+                        "cache_path":side.canonicalize().unwrap(), "stage_record":stage})
+                    );
+                    assert_eq!(sha256_file(&side).unwrap(), before);
+                    let connection = Connection::open_with_flags(
+                        format!("file:{}?mode=ro", side.display()),
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                    )
+                    .unwrap();
+                    connection
+                        .execute_batch("BEGIN; SELECT COUNT(*) FROM ranker_entries_v2;")
+                        .unwrap();
+                    reader = Some(connection);
+                },
+            )
+            .unwrap()
+            .unwrap();
+            assert!(called);
+            if classifier == 7 {
+                assert_finalize_phases(&log, &["cache_hash", "stage_record"]);
+            } else {
+                assert_finalize_phases(&log, &[]);
+            }
+            assert_eq!(record.cache_sha256, before);
+            assert_eq!(sha256_file(&side).unwrap(), before);
+            assert_eq!(std::fs::read(&stage).unwrap(), reference);
+            drop(reader);
+            let fixed = dir.path().join("fixed.db");
+            finalize_historical_empty_side(&dir, &fixed, CLASSIFIER_FIXED_END).await;
+            // Format two is a retained historical classifier, so it cannot be
+            // promoted as a current candidate. Its sidecar release still runs
+            // before the final-stage proof gate; stop there after observing it.
+            let activation = activate_cache_v2_with_handoff(
+                &CacheActivationRequest {
+                    fixed_path: fixed.clone(),
+                    side_path: side.clone(),
+                    prior_cache_backup_path: dir.path().join("prior.db"),
+                    expected_side_sha256: if classifier == 3 {
+                        "0".repeat(64)
+                    } else {
+                        record.cache_sha256
+                    },
+                    stage_evidence_sha256: None,
+                },
+                None,
+                Some(&stage),
+                None,
+            );
+            if classifier == 3 {
+                assert!(
+                    activation
+                        .unwrap_err()
+                        .to_string()
+                        .contains("does not describe the activation candidate")
+                );
+                assert_eq!(sha256_file(&side).unwrap(), before);
+            } else {
+                activation.unwrap();
+            }
+            for path in [&side, &fixed] {
+                for suffix in ["-wal", "-shm"] {
+                    assert!(
+                        !std::path::PathBuf::from(format!("{}{suffix}", path.display())).exists()
+                    );
+                }
+            }
+        }
+    }
+}
+
+// AC2: refusal cannot reach SQLite or change the persistent lock inode/content.
+#[test]
+fn stage2_ready_role_refusals_touch_nothing() {
+    use pe_bootstrap::cache_migration::{
+        finalize_cache_v2_with_export_manifest, require_ready_file_roles,
+    };
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = TempDir::new().unwrap();
+    let cache = dir.path().join("cache.db");
+    let stage = dir.path().join("stage.json");
+    let export = dir.path().join("export.json");
+    let ready = dir.path().join("ready.json");
+    let lock = pe_bootstrap::lock::lock_path_for(&cache);
+    for path in [&cache, &stage, &export, &lock] {
+        std::fs::write(path, path.as_os_str().as_encoded_bytes()).unwrap();
+    }
+    let original = || {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let metadata = std::fs::symlink_metadata(&path).unwrap();
+                let bytes = if metadata.file_type().is_symlink() {
+                    std::fs::read_link(&path)
+                        .unwrap()
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .to_vec()
+                } else {
+                    std::fs::read(&path).unwrap()
+                };
+                (
+                    path,
+                    (
+                        bytes,
+                        metadata.ino(),
+                        metadata.len(),
+                        metadata.mtime(),
+                        metadata.mtime_nsec(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let stage_temp = dir
+        .path()
+        .join(format!(".stage.json.{}.tmp", std::process::id()));
+    let mut aliases = vec![
+        cache.clone(),
+        stage.clone(),
+        stage_temp,
+        lock.clone(),
+        export.clone(),
+        std::path::PathBuf::from(format!("{}.projection-v3.jsonl", cache.display())),
+    ];
+    aliases.extend(
+        ["-wal", "-shm", "-journal"]
+            .map(|suffix| std::path::PathBuf::from(format!("{}{suffix}", cache.display()))),
+    );
+    for marker in aliases {
+        let before = original();
+        assert!(
+            require_ready_file_roles(&cache, &marker, &stage, Some(&export)).is_err(),
+            "{}",
+            marker.display()
+        );
+        assert!(
+            finalize_cache_v2_with_export_manifest(
+                &cache,
+                Some(&stage),
+                Some(&export),
+                Some(&marker),
+                1800000000
+            )
+            .is_err()
+        );
+        assert_eq!(original(), before);
+    }
+    // Through a linked cache, SQLite's sidecars sit beside the physical file.
+    let alias = dir.path().join("alias.db");
+    std::os::unix::fs::symlink(&cache, &alias).unwrap();
+    for base in [&cache, &alias] {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let marker = std::path::PathBuf::from(format!("{}{suffix}", base.display()));
+            let before = original();
+            assert!(
+                require_ready_file_roles(&alias, &marker, &stage, Some(&export)).is_err(),
+                "{}",
+                marker.display()
+            );
+            assert!(
+                finalize_cache_v2_with_export_manifest(
+                    &alias,
+                    Some(&stage),
+                    Some(&export),
+                    Some(&marker),
+                    1800000000
+                )
+                .is_err()
+            );
+            assert_eq!(original(), before);
+        }
+    }
+    std::fs::remove_file(&alias).unwrap();
+    let ready_temp = dir
+        .path()
+        .join(format!(".ready.json.{}.tmp", std::process::id()));
+    let before = original();
+    assert!(require_ready_file_roles(&cache, &ready, &ready_temp, Some(&export)).is_err());
+    assert_eq!(original(), before);
+    for target in [&cache, &stage] {
+        std::fs::hard_link(target, &ready).unwrap();
+        let before = original();
+        assert!(require_ready_file_roles(&cache, &ready, &stage, Some(&export)).is_err());
+        assert_eq!(original(), before);
+        std::fs::remove_file(&ready).unwrap();
+    }
+    for dangling in [false, true] {
+        if dangling {
+            std::os::unix::fs::symlink("absent", &ready).unwrap();
+        } else {
+            std::fs::write(&ready, b"occupied").unwrap();
+        }
+        let before = original();
+        assert!(
+            finalize_cache_v2_with_export_manifest(
+                &cache,
+                Some(&stage),
+                Some(&export),
+                Some(&ready),
+                1800000000
+            )
+            .is_err()
+        );
+        assert_eq!(original(), before);
+        std::fs::remove_file(&ready).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn stage2_ready_cli_grammar_refusals_and_pre_readiness_failure() {
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("side.db");
+    retained_classifier_activity(&dir, &side).await;
+    let stage = dir.path().join("stage.json");
+    let ready = dir.path().join("ready.json");
+    let lock = pe_bootstrap::lock::lock_path_for(&side);
+    std::fs::write(&lock, b"untouched PID").unwrap();
+    let config = dir.path().join("fixture.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "output_path = \"watchlist.json\"\ncache_path = {:?}\n",
+            side.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let cli = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"))
+            .env_clear()
+            .env("RUST_LOG", "error")
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let before = sha256_file(&side).unwrap();
+    for args in [
+        vec!["cache-finalize-v2", "--ready-file", ready.to_str().unwrap()],
+        vec!["cache-init", "--ready-file", ready.to_str().unwrap()],
+        vec!["pipeline-versions", "--ready-file=ready.json"],
+        vec![
+            "cache-finalize-v2",
+            "--stage-record",
+            stage.to_str().unwrap(),
+            "--ready-file",
+            side.to_str().unwrap(),
+            config.to_str().unwrap(),
+        ],
+        vec![
+            "cache-finalize-v2",
+            "--stage-record",
+            stage.to_str().unwrap(),
+            "--ready-file",
+        ],
+    ] {
+        let result = cli(&args);
+        assert!(!result.status.success(), "{args:?}: {result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("ready"),
+            "{args:?}: {result:?}"
+        );
+        assert_eq!(sha256_file(&side).unwrap(), before);
+        assert_eq!(std::fs::read(&lock).unwrap(), b"untouched PID");
+        assert!(!ready.exists());
+        assert!(!stage.exists());
+    }
+    // Unknown flags retain their legacy interaction with the positional config.
+    let unknown = cli(&["cache-finalize-v2", "--unknown-flag", "not-a-config"]);
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("config error"));
+    let export = side
+        .with_extension("fixture-parquet")
+        .join("cache-export-v2.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&export).unwrap()).unwrap();
+    manifest["projection"]["digest"] = Value::from("mismatch");
+    let bad = dir.path().join("bad-export.json");
+    std::fs::write(&bad, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let refused = cli(&[
+        "cache-finalize-v2",
+        "--stage-record",
+        stage.to_str().unwrap(),
+        "--ready-file",
+        ready.to_str().unwrap(),
+        "--export-manifest",
+        bad.to_str().unwrap(),
+        config.to_str().unwrap(),
+    ]);
+    assert!(!refused.status.success());
+    assert!(!ready.exists());
+    assert!(!stage.exists());
+    for equals in [false, true] {
+        let mut args = vec![
+            "cache-finalize-v2".to_owned(),
+            "--stage-record".to_owned(),
+            stage.to_str().unwrap().to_owned(),
+            "--export-manifest".to_owned(),
+            export.to_str().unwrap().to_owned(),
+        ];
+        if equals {
+            args.push(format!("--ready-file={}", ready.display()));
+        } else {
+            args.extend([
+                "--ready-file".to_owned(),
+                ready.to_str().unwrap().to_owned(),
+            ]);
+        }
+        args.push(config.to_str().unwrap().to_owned());
+        let result = cli(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(result.status.success(), "{result:?}");
+        let marker: Value = serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
+        assert_eq!(marker["stage_record"], stage.to_str().unwrap());
+        assert_eq!(
+            marker["cache_path"],
+            side.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(marker["version"], 1);
+        assert!(marker["pid"].as_u64().unwrap() > 0);
+        std::fs::remove_file(&ready).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn stage2_ready_retained_cycle_serial_and_overlap_are_byte_identical() {
+    real_wrapper_seeded_publication(false, true).await;
+}
+
+fn stage2_ready_compare_retained_cycle(
+    root: &std::path::Path,
+    out: &std::path::Path,
+    process_now: i64,
+    cycle_end: i64,
+) {
+    let request: Value =
+        serde_json::from_slice(&std::fs::read(out.join("ranking_publish_request.json")).unwrap())
+            .unwrap();
+    let oracle: Value =
+        serde_json::from_slice(&std::fs::read(out.join("oracle_manifest.json")).unwrap()).unwrap();
+    let activation = &request["cache_activation"];
+    let cache = std::path::PathBuf::from(activation["side_path"].as_str().unwrap());
+    let stage = out.join("cache_stage_record.json");
+    let parquet = root.join("data/parquet");
+    let day = time::OffsetDateTime::from_unix_timestamp(cycle_end)
+        .unwrap()
+        .date()
+        .to_string();
+    let path = |name: &str| out.join(name).to_str().unwrap().to_owned();
+    let cache_arg = cache.to_str().unwrap().to_owned();
+    let out_arg = out.to_str().unwrap().to_owned();
+    let pass_one = vec![
+        "--db".to_owned(),
+        cache_arg.clone(),
+        "--out-dir".to_owned(),
+        out_arg.clone(),
+        "--universe-from-trades".to_owned(),
+        "--win-end".to_owned(),
+        day.clone(),
+        "--as-of".to_owned(),
+        day.clone(),
+        "--scheduled-only".to_owned(),
+        "--market-scope".to_owned(),
+        path("market_scope.json"),
+        "--ttr-hours".to_owned(),
+        "24".to_owned(),
+        "--half-life-days".to_owned(),
+        "30".to_owned(),
+        "--target-n".to_owned(),
+        "25".to_owned(),
+        "--price-min".to_owned(),
+        "0.15".to_owned(),
+        "--price-max".to_owned(),
+        "0.65".to_owned(),
+        "--min-trl".to_owned(),
+        "20".to_owned(),
+        "--min-avg-per-month".to_owned(),
+        "0".to_owned(),
+        "--min-active-months".to_owned(),
+        "0".to_owned(),
+        "--floor-tstat".to_owned(),
+        "3.0".to_owned(),
+    ];
+    let pass_two = vec![
+        "--db".to_owned(),
+        cache_arg.clone(),
+        "--out-dir".to_owned(),
+        out_arg,
+        "--ranked-csv".to_owned(),
+        path("ranked_72hr_buyandhold.csv"),
+        "--positions-csv".to_owned(),
+        path("qualifying_positions_72hr.csv"),
+        "--latency-shift-secs".to_owned(),
+        "2".to_owned(),
+        "--fill-window-secs".to_owned(),
+        "120".to_owned(),
+        "--half-life-days".to_owned(),
+        "30".to_owned(),
+        "--as-of".to_owned(),
+        day,
+        "--min-trl".to_owned(),
+        "20".to_owned(),
+        "--min-ttr-secs".to_owned(),
+        "60".to_owned(),
+        "--ttr-max-secs".to_owned(),
+        "86400".to_owned(),
+        "--price-min".to_owned(),
+        "0.15".to_owned(),
+        "--price-max".to_owned(),
+        "0.65".to_owned(),
+        "--floor-tstat".to_owned(),
+        "3.0".to_owned(),
+        "--git-sha".to_owned(),
+        oracle["git_sha"].as_str().unwrap().to_owned(),
+        "--before-ranking-json".to_owned(),
+        path("before_ranking.json"),
+        "--cycle-manifest-file".to_owned(),
+        path("candidate_cycle_manifest.json"),
+        "--cache-stage-record".to_owned(),
+        path("cache_stage_record.json"),
+        "--pipeline-versions-file".to_owned(),
+        path("pipeline_versions.json"),
+        "--market-scope".to_owned(),
+        path("market_scope.json"),
+    ];
+    let publish = vec![
+        "--db".to_owned(),
+        cache_arg.clone(),
+        "--ranked-csv".to_owned(),
+        path("latency_shift_ranked.csv"),
+        "--manifest-file".to_owned(),
+        path("oracle_manifest.json"),
+        "--cache-stage-record".to_owned(),
+        path("cache_stage_record.json"),
+        "--cache-side-db".to_owned(),
+        cache_arg.clone(),
+        "--cache-fixed-db".to_owned(),
+        activation["fixed_path"].as_str().unwrap().to_owned(),
+        "--prior-cache-backup".to_owned(),
+        activation["prior_cache_backup_path"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+        "--git-sha".to_owned(),
+        request["batch"]["git_sha"].as_str().unwrap().to_owned(),
+        "--notes".to_owned(),
+        request["batch"]["notes"].as_str().unwrap().to_owned(),
+        "--request-file".to_owned(),
+        path("ranking_publish_request.json"),
+    ];
+    let finalize = vec![
+        env!("CARGO_BIN_EXE_pe-bootstrap").to_owned(),
+        "cache-finalize-v2".to_owned(),
+        "--db".to_owned(),
+        cache_arg,
+        "--export-manifest".to_owned(),
+        parquet
+            .join("schema_v2_export_manifest.json")
+            .to_str()
+            .unwrap()
+            .to_owned(),
+        "--stage-record".to_owned(),
+        stage.to_str().unwrap().to_owned(),
+    ];
+    let spec = root.join("retained-cycle-args.json");
+    std::fs::write(
+        &spec,
+        serde_json::to_vec(&serde_json::json!({
+            "pass_one":pass_one, "pass_two":pass_two, "publish":publish, "finalize":finalize,
+            "process_now":process_now,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let artifacts = [
+        "cache_stage_record.json",
+        "qualifying_positions_72hr.csv",
+        "ranked_72hr_buyandhold.csv",
+        "ranked_72hr_buyandhold.txt",
+        "latency_shift_ranked.csv",
+        "oracle_outcomes.csv",
+        "oracle_manifest.json",
+        "ranking_publish_request.json",
+    ];
+    // Outputs are never restored: each order must write every artifact itself.
+    let mut inputs = BTreeMap::new();
+    for entry in std::fs::read_dir(out)
+        .unwrap()
+        .chain(std::fs::read_dir(&parquet).unwrap())
+    {
+        let path = entry.unwrap().path();
+        if path.is_file() && !artifacts.iter().any(|name| path == out.join(name)) {
+            inputs.insert(
+                path.clone(),
+                (
+                    std::fs::read(&path).unwrap(),
+                    std::fs::metadata(&path).unwrap().modified().unwrap(),
+                ),
+            );
+        }
+    }
+    for path in [
+        cache.clone(),
+        std::path::PathBuf::from(format!("{}.projection-v3.jsonl", cache.display())),
+    ] {
+        inputs.insert(
+            path.clone(),
+            (
+                std::fs::read(&path).unwrap(),
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+            ),
+        );
+    }
+    // Request preparation reads the staging evidence; pass one also consumes
+    // the committed infra supplement. Retain both alongside the cycle inputs.
+    for path in [
+        cache.with_extension("stage.json"),
+        root.join("deploy/forge/ever-infra-wallets.txt"),
+    ] {
+        if path.exists() {
+            inputs.insert(
+                path.clone(),
+                (
+                    std::fs::read(&path).unwrap(),
+                    std::fs::metadata(&path).unwrap().modified().unwrap(),
+                ),
+            );
+        }
+    }
+    let mut reference = BTreeMap::new();
+    for overlapped in [false, true] {
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = std::path::PathBuf::from(format!("{}{suffix}", cache.display()));
+            if sidecar.exists() {
+                std::fs::remove_file(sidecar).unwrap();
+            }
+        }
+        for name in artifacts {
+            let file = out.join(name);
+            if file.exists() {
+                std::fs::remove_file(file).unwrap();
+            }
+        }
+        for (path, (bytes, modified)) in &inputs {
+            std::fs::write(path, bytes).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(*modified))
+                .unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), *bytes);
+        }
+        for name in artifacts {
+            assert!(
+                !out.join(name).exists(),
+                "{name} exists before overlap={overlapped}"
+            );
+        }
+        // Stage 2 inherits the wrapper's environment, which loads `.env` this way.
+        let bridge = Command::new("bash").current_dir(root).env_remove("PYTHONPATH")
+            .env("PE_RANKER_ENGINE", "duck").env("PE_RANKER_PARQUET_DIR", &parquet)
+            .args(["-c", "set -a; source ./.env; set +a; exec python3 -B -c \"$0\" \"$@\"",
+                "import json, sys; sys.path.insert(0, 'scripts'); from test_ranker_duck_parity import retained_cycle_publication; a=json.load(open(sys.argv[1])); retained_cycle_publication(**a, overlapped=sys.argv[2]=='true')"])
+            .arg(&spec).arg(overlapped.to_string()).output().unwrap();
+        assert!(
+            bridge.status.success(),
+            "retained comparison overlap={overlapped}:\n{}\n{}",
+            String::from_utf8_lossy(&bridge.stdout),
+            String::from_utf8_lossy(&bridge.stderr)
+        );
+        let record: CacheFinalStageRecord =
+            serde_json::from_slice(&std::fs::read(&stage).unwrap()).unwrap();
+        assert_eq!(record.cache_sha256, sha256_file(&cache).unwrap());
+        for name in artifacts {
+            let bytes = std::fs::read(out.join(name)).unwrap();
+            if overlapped {
+                assert_eq!(bytes, reference[name], "artifact differs: {name}");
+            } else {
+                reference.insert(name, bytes);
+            }
+        }
+    }
+    // A nonempty request including its publish key was compared using the production serializer.
+    let request: Value =
+        serde_json::from_slice(&reference["ranking_publish_request.json"]).unwrap();
+    assert!(!request["entries"].as_array().unwrap().is_empty());
+    assert!(request["publish_key"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn stage2_ready_marker_write_failure_stops_before_hash() {
+    use pe_bootstrap::cache_migration::finalize_cache_v2_with_ready_hook_for_test;
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("side.db");
+    retained_classifier_activity(&dir, &side).await;
+    let ready = dir.path().join("ready.json");
+    let temp = dir
+        .path()
+        .join(format!(".ready.json.{}.tmp", std::process::id()));
+    std::fs::write(&temp, b"retained temp").unwrap();
+    let stage = dir.path().join("stage.json");
+    std::fs::write(&stage, b"previous record").unwrap();
+    let log = CheckLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let mut called = false;
+    assert!(
+        finalize_cache_v2_with_ready_hook_for_test(
+            &side,
+            &stage,
+            Some(
+                &side
+                    .with_extension("fixture-parquet")
+                    .join("cache-export-v2.json")
+            ),
+            &ready,
+            CLASSIFIER_FIXED_END + 3,
+            &mut || called = true
+        )
+        .is_err()
+    );
+    assert!(!called);
+    assert!(!ready.exists());
+    assert_eq!(std::fs::read(&stage).unwrap(), b"previous record");
+    assert_eq!(std::fs::read(&temp).unwrap(), b"retained temp");
+    assert_finalize_phases(
+        &log,
+        &[
+            "open_checks",
+            "history_preflight",
+            "input_binding",
+            "spool_verification",
+            "export_verification",
+            "commit_checkpoint_sync",
+        ],
+    );
 }

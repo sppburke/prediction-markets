@@ -39,6 +39,15 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let first_arg = args.get(1).map(|s| s.as_str());
+    if first_arg != Some("cache-finalize-v2")
+        && args
+            .iter()
+            .skip(1)
+            .any(|arg| arg == "--ready-file" || arg.starts_with("--ready-file="))
+    {
+        tracing::error!("bootstrap: --ready-file is only supported by cache-finalize-v2");
+        std::process::exit(1);
+    }
     let discovery_mode = match parse_discovery_mode(&args) {
         Ok(mode) => mode,
         Err(error) => {
@@ -137,6 +146,7 @@ async fn main() {
         let mut manifest_arg: Option<std::path::PathBuf> = None;
         let mut frozen_payload_arg: Option<std::path::PathBuf> = None;
         let mut export_manifest_arg: Option<std::path::PathBuf> = None;
+        let mut ready_file_arg: Option<std::path::PathBuf> = None;
         let mut stage_record_arg: Option<std::path::PathBuf> = None;
         let mut fixed_db_arg: Option<std::path::PathBuf> = None;
         let mut backup_arg: Option<std::path::PathBuf> = None;
@@ -257,6 +267,16 @@ async fn main() {
                 export_manifest_arg = Some(std::path::PathBuf::from(rest[i]));
             } else if let Some(v) = a.strip_prefix("--export-manifest=") {
                 export_manifest_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--ready-file" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                ready_file_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if a == "--ready-file" {
+                tracing::error!("bootstrap: --ready-file requires a path");
+                std::process::exit(1);
+            } else if let Some(v) = a.strip_prefix("--ready-file=") {
+                flag_values.insert(v);
+                ready_file_arg = Some(std::path::PathBuf::from(v));
             } else if a == "--stage-record" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -436,6 +456,13 @@ async fn main() {
 
         if create_cache && sub != "all" {
             tracing::error!("bootstrap: --create-cache is only supported by all");
+            std::process::exit(1);
+        }
+
+        if ready_file_arg.is_some() && (sub != "cache-finalize-v2" || stage_record_arg.is_none()) {
+            tracing::error!(
+                "bootstrap: --ready-file requires cache-finalize-v2 with --stage-record"
+            );
             std::process::exit(1);
         }
 
@@ -665,17 +692,32 @@ async fn main() {
                     }
                     .await
                 }
-                "cache-finalize-v2" => pe_bootstrap::lock::CacheMutationLock::acquire(
-                    &bootstrap_config.cache_path,
-                )
+                "cache-finalize-v2" => ready_file_arg
+                    .as_deref()
+                    .map_or(Ok(()), |ready| {
+                        let stage_record =
+                            stage_record_arg.as_deref().ok_or_else(|| BootstrapError::Invalid {
+                                message: "--ready-file requires --stage-record".to_owned(),
+                            })?;
+                        pe_bootstrap::cache_migration::require_ready_file_roles(
+                            &bootstrap_config.cache_path,
+                            ready,
+                            stage_record,
+                            export_manifest_arg.as_deref(),
+                        )
+                    })
+                    .and_then(|()| {
+                        pe_bootstrap::lock::CacheMutationLock::acquire(&bootstrap_config.cache_path)
+                    })
                     .and_then(|_lock| {
                         finalize_cache_v2_with_export_manifest(
                             &bootstrap_config.cache_path,
                             stage_record_arg.as_deref(),
                             export_manifest_arg.as_deref(),
+                            ready_file_arg.as_deref(),
                             now,
                         )
-                            .and_then(json_report)
+                        .and_then(json_report)
                     }),
                 "cache-activate" => fixed_db_arg
                     .zip(backup_arg)

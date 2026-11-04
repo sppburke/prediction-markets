@@ -34,6 +34,7 @@ Run: `python3 scripts/test_rank_and_push.py`
   or: `pytest scripts/test_rank_and_push.py -v`
 """
 import os
+import hashlib
 import json
 import shutil
 import shlex
@@ -154,8 +155,51 @@ class RankAndPushScenario(unittest.TestCase):
             'sub="$1"\n'
             'key="STUB_EXIT_${sub//-/_}"\n'
             'code="${!key:-0}"\n'
+            'if [[ "$sub" == cache-finalize-v2 && " $* " == *" --ready-file "* && "$code" == 0 ]]; then\n'
+            f'  exec {shlex.quote(sys.executable)} scripts/_stub_stage2_ready.py "$@"\n'
+            'fi\n'
             'exit "$code"\n',
         )
+
+        _write_exec(self.root / "scripts/_stub_stage2_ready.py", """#!/usr/bin/env python3
+import hashlib, json, os, signal, sys
+from pathlib import Path
+a = sys.argv[1:]
+def opt(name): return a[a.index(name) + 1]
+ready, db, record = (Path(opt(name)) for name in ('--ready-file', '--db', '--stage-record'))
+assert (ready.parent / 'candidate_cycle_manifest.json').is_file()
+if Path('capture_started').exists():
+    assert Path('capture_done').is_file()
+    try: os.kill(int(Path('capture_started').read_text()), 0)
+    except ProcessLookupError: pass
+    else: raise AssertionError('capture was not joined')
+Path('stage2_started').write_text(str(os.getpid()))
+Path('stage2_marker_path').write_text(str(ready))
+mode = os.environ.get('STUB_STAGE2_MODE', 'normal')
+def stopped(_signal, _frame):
+    Path('stage2_reaped').write_text('yes')
+    raise SystemExit(143)
+signal.signal(signal.SIGTERM, stopped)
+if mode == 'fail-before': raise SystemExit(43)
+if mode == 'no-marker': raise SystemExit(0)
+if mode == 'temp-fail':
+    record.with_name(f'.{record.name}.{os.getpid()}.tmp').write_text('unfinished')
+    raise SystemExit(46)
+if ready.exists() or ready.is_symlink(): raise SystemExit(1)
+marker = dict(version=1, pid=os.getpid(), cache_path=str(db.resolve()), stage_record=str(record))
+if mode in ('foreign', 'invalid'): marker['pid'] += 1
+if mode == 'malformed': ready.write_text('{')
+elif mode == 'symlink': ready.symlink_to('missing')
+else: ready.write_text(json.dumps(marker))
+if mode in ('block', 'fail-after', 'interrupt'):
+    with open('stage2-release.pipe') as release: release.read()
+if mode == 'fail-after': raise SystemExit(44)
+if Path('scripts/_stub_cache_ops.py').exists():
+    record.write_text(json.dumps(dict(cache_path=str(db.resolve()), cache_sha256=hashlib.sha256(db.read_bytes()).hexdigest(),
+                                      attempt=str(ready))))
+if mode == 'renamed-fail': raise SystemExit(45)
+Path('stage2_done').write_text('yes')
+""")
 
         # Fake pass-1 ranker: log argv, emit the two CSVs the wrapper expects in --out-dir.
         _write_exec(
@@ -2383,7 +2427,7 @@ class RankAndPushScenario(unittest.TestCase):
             "        certs = [dict(zip(columns,row)) for row in c.execute('SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex')]\n"
             "        inputs = dict(activity_generation=generation, oracle_version=6, certificate_digest=hashlib.sha256(json.dumps(certs,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest())\n"
             "        c.execute('UPDATE cache_v2_migration_state SET phase=?, ranker_projection_count = 1, ranker_projection_digest = ?, ranker_classifier_version = ?, ranker_projection_inputs_json=?', ('finalized',f'digest-{generation}',7 if identity['version'] == 5 else 6,json.dumps(inputs)))\n"
-            "    if opt('--stage-record'): json.dump({'cache_path': os.path.abspath(db), 'cache_sha256': sha(db)}, open(opt('--stage-record'), 'w'))\n"
+            "    if opt('--stage-record') and not opt('--ready-file'): json.dump({'cache_path': os.path.abspath(db), 'cache_sha256': sha(db)}, open(opt('--stage-record'), 'w'))\n"
             "elif sub == 'activate-next':\n"
             "    # Opt-in: commit the batch row as activate-next does (#788).\n"
             "    if os.environ.get('STUB_RECORD_ACTIVATION') == '1':\n"
@@ -2563,18 +2607,13 @@ class RankAndPushScenario(unittest.TestCase):
                                  prefix + ["winner-discovery", "activate-next"])
                 self.assertNotIn("clear-infra-exclusion", self._bootstrap_ops())
 
-    def test_fresh_finalize_without_record_resumes_to_record_before_pass_two(self):
-        self._prepare_incremental_fixture(two_file=True)
-        stopped = self._run(exit_env={"STUB_EXIT_rank": "75"})
+    def _assert_stage2_resume(self, stopped, record_present):
         self.assertEqual(stopped.returncode, 75, stopped.stderr + stopped.stdout)
         out = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
         stage = out / "cache_stage_record.json"
-        first = self._bootstrap_lines("cache-finalize-v2")
-        self.assertEqual(len(first), 1)
-        self.assertNotIn("--stage-record", shlex.split(first[0]))
-        self.assertFalse(stage.exists())
+        self.assertEqual(stage.exists(), record_present)
+        previous = stage.read_text() if record_present else None
         self.assertFalse((out / "ranking_publish_request.json").exists())
-
         before = len(self._bootstrap_ops())
         resumed = self._run()
         self.assertEqual(resumed.returncode, 2, resumed.stderr + resumed.stdout)
@@ -2582,21 +2621,282 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(self._foreground_ops(before),
                          ["cache-stage-v2", "winner-discovery", "activate-next",
                           "cache-finalize-v2", "cache-finalize-v2"])
-        self.assertEqual(self._bootstrap_ops()[before:].count("market-scope"), 1)
         finalizes = [shlex.split(line) for line in self._bootstrap_lines("cache-finalize-v2")]
-        self.assertEqual(len(finalizes), 3)
-        self.assertTrue(all("--stage-record" not in args for args in finalizes[:2]))
-        self.assertEqual(finalizes[-1][finalizes[-1].index("--stage-record") + 1],
-                         str(stage.relative_to(self.root)))
-        self.assertTrue(stage.is_file())
+        self.assertEqual(len(finalizes), 4)
+        self.assertTrue(all("--stage-record" not in finalizes[i] for i in (0, 2)))
+        self.assertTrue(all("--ready-file" in finalizes[i] for i in (1, 3)))
+        self.assertNotEqual(finalizes[1][finalizes[1].index("--ready-file") + 1],
+                            finalizes[3][finalizes[3].index("--ready-file") + 1])
+        self.assertEqual(len(self._log("rank.log").splitlines()), 2)
+        # The resumed attempt rewrote the record, for the resumed cache's bytes.
+        self.assertNotEqual(stage.read_text(), previous)
         record = json.loads(stage.read_text())
+        self.assertEqual(record["attempt"], finalizes[3][finalizes[3].index("--ready-file") + 1])
+        self.assertEqual(record["cache_sha256"],
+                         hashlib.sha256(Path(record["cache_path"]).read_bytes()).hexdigest())
         request = json.loads((out / "ranking_publish_request.json").read_text())
         self.assertEqual(request["cache_activation"]["expected_sha256"], record["cache_sha256"])
         self.assertEqual(request["cache_activation"]["side_path"], record["cache_path"])
 
+    def test_stage2_ready_resume_pass_one_failed_during_hash(self):
+        self._prepare_incremental_fixture(two_file=True)
+        os.mkfifo(self.root / "stage2-release.pipe")
+        stopped = self._run(exit_env={"STUB_EXIT_rank": "75", "STUB_STAGE2_MODE": "block"})
+        self.assertTrue((self.root / "stage2_reaped").is_file())
+        self._assert_stage2_resume(stopped, False)
+
+    def test_stage2_ready_resume_pass_one_failed_after_record(self):
+        self._prepare_incremental_fixture(two_file=True)
+        # Reap before pass one deterministically, including on a very slow host.
+        body = self.wrapper.read_text().replace('      while true; do', '      wait "$STAGE2_PID"\n      while true; do', 1)
+        self.wrapper.write_text(body)
+        stopped = self._run(exit_env={"STUB_EXIT_rank": "75"})
+        self._assert_stage2_resume(stopped, True)
+
+    def _install_stage2_overlap_probe(self, *, release=True):
+        os.mkfifo(self.root / "stage2-release.pipe")
+        first = self.root / "scripts/rank_72hr_buyandhold.py"
+        probe = """import json
+from pathlib import Path
+print('pass-one-start', flush=True)
+ready = Path(Path('stage2_marker_path').read_text())
+assert json.loads(ready.read_text())['pid'] == int(Path('stage2_started').read_text())
+"""
+        if release:
+            probe += "with open('stage2-release.pipe', 'w') as release: release.write('pass one started')\n"
+        first.write_text(first.read_text().replace("a = sys.argv[1:]", probe + "a = sys.argv[1:]", 1))
+        rerank = self.root / "scripts/latency_shift_rerank.py"
+        rerank.write_text(rerank.read_text().replace("def main():\n", "def main():\n    assert os.path.isfile('stage2_done')\n", 1))
+
+    def _assert_stage2_logs(self, result):
+        lines = result.stdout.splitlines()
+        ready = [i for i, line in enumerate(lines) if '[stage-2] ready pid=' in line]
+        self.assertEqual(len(ready), 1, result.stdout)
+        self.assertLess(next(i for i, line in enumerate(lines) if '[stage-2] running:' in line), ready[0])
+        if 'pass-one-start' in lines:
+            self.assertLess(ready[0], lines.index('pass-one-start'))
+        self.assertLess(ready[0], next(i for i, line in enumerate(lines) if '[stage-2] exited ' in line))
+
+    def test_stage2_ready_hash_overlaps_pass_one_and_join_precedes_pass_two(self):
+        self._prepare_incremental_fixture(two_file=True)
+        self._install_candidate_capture_probe()
+        self._install_stage2_overlap_probe()
+        result = self._run(exit_env={"STUB_STAGE2_MODE": "block"})
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        self._assert_stage2_logs(result)
+        self.assertIn('[stage-2] exited 0', result.stdout)
+        ready = self.root / (self.root / 'stage2_marker_path').read_text()
+        self.assertFalse(ready.exists())
+        self.assertTrue(self._log('rerank.log'))
+        # The stub refuses Stage 2 if the joined capture's output is absent.
+        self.assertTrue((ready.parent / 'candidate_cycle_manifest.json').is_file())
+
+    def test_stage2_ready_failure_precedence_and_protocol(self):
+        cases = [('fail-before', 0, 43), ('fail-before', 76, 1),
+                 ('no-marker', 0, 1), ('invalid', 0, 1), ('invalid', 75, 75)]
+        for mode, pass_one, expected in cases:
+            with self.subTest(mode=mode, pass_one=pass_one):
+                self.tearDown(); self.setUp()
+                self._prepare_incremental_fixture(two_file=True)
+                result = self._run(exit_env={'STUB_STAGE2_MODE': mode, 'STUB_EXIT_rank': str(pass_one)})
+                self.assertEqual(result.returncode, expected, result.stderr + result.stdout)
+                self.assertTrue(self._log('rank.log'))
+                self.assertIsNone(self._log('rerank.log'))
+                if pass_one == 76:
+                    self.assertIn('exit 76 → 1', result.stderr)
+
+    def test_stage2_ready_failure_after_readiness(self):
+        self._prepare_incremental_fixture(two_file=True)
+        self._install_stage2_overlap_probe()
+        result = self._run(exit_env={'STUB_STAGE2_MODE': 'fail-after'})
+        self.assertEqual(result.returncode, 44, result.stderr + result.stdout)
+        self._assert_stage2_logs(result)
+        self.assertIn('[stage-2] exited 44', result.stdout)
+        self.assertIsNone(self._log('rerank.log'))
+        self.assertFalse((self.root / (self.root / 'stage2_marker_path').read_text()).exists())
+
+    def test_stage2_ready_pass_one_failure_terms_and_reaps_hash(self):
+        self._prepare_incremental_fixture(two_file=True)
+        self._install_stage2_overlap_probe(release=False)
+        result = self._run(exit_env={'STUB_STAGE2_MODE': 'block', 'STUB_EXIT_rank': '76'})
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertTrue((self.root / 'stage2_reaped').exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int((self.root / 'stage2_started').read_text()), 0)
+        self.assertIsNone(self._log('rerank.log'))
+        self.assertFalse((self.root / (self.root / 'stage2_marker_path').read_text()).exists())
+
+    def test_stage2_ready_completed_before_poll_and_between_probe_and_jobs(self):
+        for when in ('before-poll', 'before-jobs'):
+            with self.subTest(when=when):
+                self.tearDown(); self.setUp()
+                self._prepare_incremental_fixture(two_file=True)
+                body = self.wrapper.read_text()
+                if when == 'before-poll':
+                    body = body.replace('      while true; do', '      wait "$STAGE2_PID"\n      while true; do', 1)
+                else:
+                    # Force the first probe to see no marker, then let the real child
+                    # finish before jobs runs. The final step-3 probe must observe it.
+                    os.mkfifo(self.root / 'stage2-start.pipe')
+                    stub = self.root / 'scripts/_stub_stage2_ready.py'
+                    stub.write_text(stub.read_text().replace("if ready.exists()", "with open('stage2-start.pipe') as start: start.read()\nif ready.exists()", 1))
+                    body = body.replace('        if [[ "$ready_status" -eq 2 ]]; then',
+                        '        if [[ "$ready_status" -eq 2 ]]; then\n'
+                        '          printf start > stage2-start.pipe\n'
+                        '          wait "$STAGE2_PID"', 1)
+                self.wrapper.write_text(body)
+                first = self.root / 'scripts/rank_72hr_buyandhold.py'
+                first.write_text(first.read_text().replace('a = sys.argv[1:]', "print('pass-one-start', flush=True)\na = sys.argv[1:]", 1))
+                result = self._run()
+                self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+                self._assert_stage2_logs(result)
+                self.assertTrue(self._log('rerank.log'))
+
+    def test_stage2_ready_preserves_unowned_markers(self):
+        for mode in ('foreign', 'malformed', 'symlink', 'occupied'):
+            with self.subTest(mode=mode):
+                self.tearDown(); self.setUp()
+                self._prepare_incremental_fixture(two_file=True)
+                if mode == 'occupied':
+                    body = self.wrapper.read_text().replace('      STAGE2_CMD=(', '      printf occupied > "$STAGE2_READY"\n      STAGE2_CMD=(', 1)
+                    self.wrapper.write_text(body)
+                result = self._run(exit_env={'STUB_STAGE2_MODE': mode})
+                self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+                command = shlex.split(next(line.split('[stage-2] running: ', 1)[1] for line in result.stdout.splitlines() if '[stage-2] running: ' in line))
+                marker = self.root / command[command.index('--ready-file') + 1]
+                if mode == 'symlink': self.assertEqual(os.readlink(marker), 'missing')
+                elif mode == 'malformed': self.assertEqual(marker.read_text(), '{')
+                elif mode == 'occupied': self.assertEqual(marker.read_text(), 'occupied')
+                else: self.assertNotEqual(json.loads(marker.read_text())['pid'], int((self.root / 'stage2_started').read_text()))
+                self.assertTrue(self._log('rank.log'))
+                self.assertIsNone(self._log('rerank.log'))
+
+    def test_stage2_ready_cleanup_warning_preserves_status(self):
+        for pass_one, expected in ((0, 2), (75, 75)):
+            with self.subTest(pass_one=pass_one):
+                self.tearDown(); self.setUp()
+                self._prepare_incremental_fixture(two_file=True)
+                clock = self.root / 'clock'; clock.mkdir(exist_ok=True)
+                _write_exec(clock / 'rm', '#!/bin/bash\nif [[ "$*" == *stage2_ready.* ]]; then exit 42; fi\nexec /bin/rm "$@"\n')
+                result = self._run(exit_env={'STUB_EXIT_rank': str(pass_one)})
+                self.assertEqual(result.returncode, expected, result.stderr + result.stdout)
+                self.assertIn('WARN: could not remove owned Stage 2 marker', result.stderr)
+                self.assertTrue((self.root / (self.root / 'stage2_marker_path').read_text()).exists())
+
+    def test_stage2_ready_capture_failure_keeps_pass_one_precedence(self):
+        for pass_one, expected in ((0, 47), (75, 75), (76, 1)):
+            with self.subTest(pass_one=pass_one):
+                self.tearDown(); self.setUp()
+                self._prepare_incremental_fixture(two_file=True)
+                self._install_candidate_capture_probe()
+                result = self._run(exit_env={'STUB_CAPTURE_MODE': 'fail', 'STUB_EXIT_rank': str(pass_one)})
+                self.assertEqual(result.returncode, expected, result.stderr + result.stdout)
+                self.assertTrue(self._log('rank.log'))
+                self.assertFalse((self.root / 'stage2_started').exists())
+                self.assertIsNone(self._log('rerank.log'))
+
+    def test_stage2_ready_orphan_late_marker_cannot_supply_new_attempt(self):
+        self._prepare_incremental_fixture(two_file=True)
+        stopped = self._run(exit_env={'STUB_EXIT_rank': '75'})
+        self.assertEqual(stopped.returncode, 75, stopped.stderr + stopped.stdout)
+        old = self.root / (self.root / 'stage2_marker_path').read_text()
+        call = shlex.split(self._bootstrap_lines('cache-finalize-v2')[-1])
+        cache = call[call.index('--db') + 1]
+        record = call[call.index('--stage-record') + 1]
+        # A valid marker from the stopped attempt is present before the retry.
+        old.write_text(json.dumps(dict(version=1, pid=int((self.root / 'stage2_started').read_text()),
+                                       cache_path=str(Path(cache).resolve()), stage_record=record)))
+        os.mkfifo(self.root / 'orphan-release.pipe')
+        os.mkfifo(self.root / 'orphan-done.pipe')
+        orphan_code = """import json, os, sys
+from pathlib import Path
+with open('orphan-release.pipe') as release: release.read()
+Path(sys.argv[1]).write_text(json.dumps(dict(version=1, pid=os.getpid(), cache_path=sys.argv[2], stage_record=sys.argv[3])))
+with open('orphan-done.pipe', 'w') as done: done.write('late marker installed')
+"""
+        orphan = subprocess.Popen([sys.executable, '-c', orphan_code, str(old), str(Path(cache).resolve()), record], cwd=self.root)
+        self.addCleanup(lambda: (orphan.kill(), orphan.wait()) if orphan.poll() is None else None)
+        stub = self.root / 'scripts/_stub_stage2_ready.py'
+        stub.write_text(stub.read_text().replace("if mode == 'no-marker': raise SystemExit(0)",
+            "if mode == 'no-marker':\n"
+            "    with open('orphan-release.pipe', 'w') as release: release.write('new attempt started')\n"
+            "    with open('orphan-done.pipe') as done: done.read()\n"
+            "    raise SystemExit(0)", 1))
+        result = self._run(exit_env={'STUB_STAGE2_MODE': 'no-marker'})
+        orphan.wait(timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertNotEqual(old, self.root / (self.root / 'stage2_marker_path').read_text())
+        self.assertEqual(json.loads(old.read_text())['pid'], orphan.pid)
+        self.assertNotIn('[stage-2] ready pid=', result.stdout)
+        self.assertIsNone(self._log('rerank.log'))
+
+    def test_stage2_ready_interrupt_reaps_child_and_resumes(self):
+        self._prepare_incremental_fixture(two_file=True)
+        self._install_candidate_capture_probe()
+        os.mkfifo(self.root / 'stage2-release.pipe')
+        os.mkfifo(self.root / 'pass-one-release.pipe')
+        # Bash receives TERM while waiting for this foreground child. Release it
+        # after TERM so EXIT can reap Stage 2, without relying on sleep for order.
+        first = self.root / 'scripts/rank_72hr_buyandhold.py'
+        first.write_text(first.read_text().replace('a = sys.argv[1:]',
+            "from pathlib import Path\nPath('pass-one-started').write_text('yes')\nwith open('pass-one-release.pipe') as release: release.read()\na = sys.argv[1:]", 1))
+        output = self.root / 'interrupt.stdout'
+        with output.open('w') as out:
+            process = subprocess.Popen(self._wrapper_command([]), cwd=self.root,
+                env=self._run_env({'STUB_STAGE2_MODE': 'block'}), stdout=out, stderr=out, start_new_session=True)
+        self.addCleanup(self._end_run_group, process.pid, str(self.root))
+        self._wait_file('pass-one-started')
+        process.send_signal(signal.SIGTERM)
+        with (self.root / 'pass-one-release.pipe').open('w') as release: release.write('release')
+        process.wait(timeout=10)
+        self.assertEqual(process.returncode, -signal.SIGTERM)
+        with self.assertRaises(ProcessLookupError): os.kill(int((self.root / 'capture_started').read_text()), 0)
+        self.assertTrue((self.root / 'stage2_reaped').exists())
+        with self.assertRaises(ProcessLookupError): os.kill(int((self.root / 'stage2_started').read_text()), 0)
+        first.write_text(first.read_text().replace("with open('pass-one-release.pipe') as release: release.read()\n", ''))
+        manifest = self.root / 'scripts/rank_cycle_manifest.py'
+        shutil.copy(self.root / 'scripts/_rank_cycle_manifest_real.py', manifest)
+        export = self.root / 'scripts/export_trades_parquet.py'
+        export.write_text(export.read_text().replace("with open('capture-started.pipe') as ready:\n    ready.read()\n", '').replace("if os.environ.get('STUB_CAPTURE_MODE', 'normal') == 'normal':\n    with open('export-complete.pipe', 'w') as complete: complete.write('exported')\n", ''))
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 2, resumed.stderr + resumed.stdout)
+        self.assertIn('RANK_AND_PUSH_PREPARED_ONLY=', resumed.stdout)
+
+    def _wait_file(self, name):
+        deadline = time.monotonic() + 30
+        while not (self.root / name).exists():
+            self.assertLess(time.monotonic(), deadline, name)
+            time.sleep(0.01)
+
+    def test_stage2_ready_resume_recovery_states(self):
+        for state in ('commit-before-checkpoint', 'renamed-record', 'record-temp', 'old-record'):
+            with self.subTest(state=state):
+                self.tearDown(); self.setUp()
+                self._prepare_incremental_fixture(two_file=True)
+                mode = {'renamed-record': 'renamed-fail', 'record-temp': 'temp-fail',
+                        'old-record': 'fail-before'}.get(state, 'normal')
+                original = self.wrapper.read_text()
+                if state == 'old-record':
+                    self.wrapper.write_text(original.replace('      STAGE2_CMD=(',
+                        '      printf \'{"previous":true}\' > "$CACHE_STAGE_RECORD"\n      STAGE2_CMD=(', 1))
+                stopped = self._run(exit_env={'STUB_EXIT_rank': '75', 'STUB_STAGE2_MODE': mode})
+                self.wrapper.write_text(original)
+                self.assertEqual(stopped.returncode, 75, stopped.stderr + stopped.stdout)
+                out = self.root / (self.root / 'data/eval-results/rank_and_push.cycle').read_text().strip()
+                stage = out / 'cache_stage_record.json'
+                if state == 'commit-before-checkpoint':
+                    side = json.loads(stage.read_text())['cache_path']
+                    code = "import os, sqlite3, sys; c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA journal_mode=WAL'); c.execute('PRAGMA application_id=77'); c.commit(); os._exit(0)"
+                    subprocess.run([sys.executable, '-c', code, side], check=True)
+                    self.assertGreater(Path(side + '-wal').stat().st_size, 0)
+                elif state == 'record-temp': self.assertTrue(list(out.glob('.cache_stage_record.json.*.tmp')))
+                elif state == 'old-record': self.assertEqual(stage.read_text(), '{"previous":true}')
+                elif state == 'renamed-record': self.assertIn('[stage-2] exited 45', stopped.stdout)
+                self._assert_stage2_resume(stopped, state != 'record-temp')
+
     def _install_candidate_capture_probe(self):
         os.mkfifo(self.root / "capture-started.pipe")
-        os.mkfifo(self.root / "rank-complete.pipe")
+        os.mkfifo(self.root / "export-complete.pipe")
         manifest = self.root / "scripts/rank_cycle_manifest.py"
         manifest.rename(self.root / "scripts/_rank_cycle_manifest_real.py")
         _write_exec(manifest, """#!/usr/bin/env python3
@@ -2621,7 +2921,7 @@ if a and a[0] == 'capture' and '--output' in a and 'candidate_cycle_manifest' in
         raise SystemExit(47)
     if mode == 'block':
         while True: signal.pause()
-    with open('rank-complete.pipe') as complete:
+    with open('export-complete.pipe') as complete:
         complete.read()
     result = subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_real.py', *a])
     if result.returncode == 0: Path('capture_done').write_text('yes')
@@ -2638,11 +2938,11 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
             1,
         )
         _write_exec(export, body)
-        first = self.root / "scripts/rank_72hr_buyandhold.py"
-        _write_exec(first, first.read_text() +
-                    "if os.environ.get('STUB_CAPTURE_MODE', 'normal') == 'normal':\n"
-                    "    with open('rank-complete.pipe', 'w') as complete:\n"
-                    "        complete.write('ranked')\n")
+        _write_exec(export, export.read_text().replace(
+            "raise SystemExit(int(os.environ.get(\"STUB_EXIT_export\", \"0\")))",
+            "if os.environ.get('STUB_CAPTURE_MODE', 'normal') == 'normal':\n"
+            "    with open('export-complete.pipe', 'w') as complete: complete.write('exported')\n"
+            "raise SystemExit(int(os.environ.get(\"STUB_EXIT_export\", \"0\")))"))
         rerank = self.root / "scripts/latency_shift_rerank.py"
         body = rerank.read_text().replace("def main():\n", "def main():\n    assert os.path.isfile('capture_done')\n", 1)
         _write_exec(rerank, body)
@@ -2656,8 +2956,9 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
         self.assertEqual(len(calls), 1)
         manifest = calls[0][calls[0].index("--export-manifest") + 1]
         self.assertEqual(manifest, "data/custom-parquet/schema_v2_export_manifest.json")
+        self.assertIn("--ready-file", calls[0])
 
-    def test_candidate_capture_overlaps_export_and_rank_then_finishes_before_pass_two(self):
+    def test_candidate_capture_overlaps_export_then_finishes_before_stage2(self):
         self._prepare_incremental_fixture(two_file=True)
         self._install_candidate_capture_probe()
         result = self._run()

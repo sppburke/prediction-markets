@@ -39,6 +39,7 @@ from decimal import Decimal
 import math
 import os
 import sqlite3
+import subprocess
 import shutil
 import sys
 import tempfile
@@ -713,6 +714,62 @@ def _certified_publication(db: str, record: str, root: Path, index: int, process
     assert request["batch"]["config_hash"] == hashlib.sha256(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return request, out
+
+
+def retained_cycle_publication(pass_one: list[str], pass_two: list[str], publish: list[str],
+                               finalize: list[str], process_now: int, overlapped: bool) -> None:
+    """Consume an authentic retained cycle at its original paths, without rebuilding any input.
+
+    The caller restores input bytes and supplies identical argv and clocks for each order.
+    Stage 2 is the real CLI; all ranking and request serialization use production owners.
+    """
+    import stat
+    import time
+    import latency_shift_rerank as latency
+    import push_ranking_to_supabase as publisher
+    import ranker_duck
+
+    record = Path(finalize[finalize.index('--stage-record') + 1])
+    db = Path(finalize[finalize.index('--db') + 1])
+    ready = record.parent / 'retained-stage2-ready.json'
+    child = None
+    try:
+        if overlapped:
+            assert not ready.exists() and not ready.is_symlink()
+            child = subprocess.Popen([*finalize, '--ready-file', str(ready)])
+            deadline = time.monotonic() + 60
+            while not ready.exists():
+                if child.poll() is not None:
+                    assert ready.exists(), 'Stage 2 exited without readiness'
+                    break
+                assert time.monotonic() < deadline, 'Stage 2 readiness timed out'
+                time.sleep(0.01)
+            assert stat.S_ISREG(ready.lstat().st_mode)
+            marker = json.loads(ready.read_bytes())
+            assert marker == dict(version=1, pid=child.pid, cache_path=str(db.resolve()),
+                                  stage_record=str(record))
+        with mock.patch.object(sys, 'argv', ['rank', *pass_one]), \
+                mock.patch.object(ranker_duck.time, 'time', return_value=process_now):
+            assert rk.main() == 0
+        if child is None:
+            subprocess.run(finalize, check=True)
+        else:
+            assert child.wait(timeout=60) == 0
+        with mock.patch.object(sys, 'argv', ['latency', *pass_two]), \
+                mock.patch.object(ranker_duck.time, 'time', return_value=process_now):
+            assert latency.main() == 0
+        args = publisher.build_parser().parse_args(publish)
+        with mock.patch.object(publisher, '_request_once') as network:
+            request = publisher.prepare_publish_request(args, process_now)
+        network.assert_not_called()
+        publisher.save_publish_request(args.request_file, request)
+    finally:
+        if child is not None:
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=60)
+            if ready.exists():
+                ready.unlink()
 
 
 def assert_certified_seeded_publication_equivalence(

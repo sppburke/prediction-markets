@@ -4552,7 +4552,13 @@ pub fn finalize_cache_v2(
     stage_record_path: Option<&Path>,
     finalized_at_unix: i64,
 ) -> Result<Option<CacheFinalStageRecord>, BootstrapError> {
-    finalize_cache_v2_with_export_manifest(cache_path, stage_record_path, None, finalized_at_unix)
+    finalize_cache_v2_with_export_manifest(
+        cache_path,
+        stage_record_path,
+        None,
+        None,
+        finalized_at_unix,
+    )
 }
 
 /// Bind a format-three re-finalization to its validated exported projection.
@@ -4560,8 +4566,53 @@ pub fn finalize_cache_v2_with_export_manifest(
     cache_path: &Path,
     stage_record_path: Option<&Path>,
     export_manifest: Option<&Path>,
+    ready_file: Option<&Path>,
     finalized_at_unix: i64,
 ) -> Result<Option<CacheFinalStageRecord>, BootstrapError> {
+    finalize_cache_v2_with_ready_hook(
+        cache_path,
+        stage_record_path,
+        export_manifest,
+        ready_file,
+        finalized_at_unix,
+        None,
+    )
+}
+
+/// Observe the durable, closed-cache boundary before the final whole-file hash.
+#[cfg(feature = "scenario")]
+pub fn finalize_cache_v2_with_ready_hook_for_test(
+    cache_path: &Path,
+    stage_record_path: &Path,
+    export_manifest: Option<&Path>,
+    ready_file: &Path,
+    finalized_at_unix: i64,
+    hook: &mut dyn FnMut(),
+) -> Result<Option<CacheFinalStageRecord>, BootstrapError> {
+    finalize_cache_v2_with_ready_hook(
+        cache_path,
+        Some(stage_record_path),
+        export_manifest,
+        Some(ready_file),
+        finalized_at_unix,
+        Some(hook),
+    )
+}
+
+fn finalize_cache_v2_with_ready_hook(
+    cache_path: &Path,
+    stage_record_path: Option<&Path>,
+    export_manifest: Option<&Path>,
+    ready_file: Option<&Path>,
+    finalized_at_unix: i64,
+    ready_hook: Option<&mut dyn FnMut()>,
+) -> Result<Option<CacheFinalStageRecord>, BootstrapError> {
+    if let Some(ready) = ready_file {
+        let stage = stage_record_path.ok_or_else(|| BootstrapError::Invalid {
+            message: "--ready-file requires --stage-record".to_owned(),
+        })?;
+        require_ready_file_roles(cache_path, ready, stage, export_manifest)?;
+    }
     let (mut connection, sealed_generation, payout_generation) =
         projection_v3::open_finalize(cache_path)?;
     if fresh_collection_record(&connection)?.is_some_and(|identity| identity.history_format_three())
@@ -4571,9 +4622,11 @@ pub fn finalize_cache_v2_with_export_manifest(
             cache_path,
             stage_record_path,
             export_manifest,
+            ready_file,
             finalized_at_unix,
             sealed_generation,
             payout_generation,
+            ready_hook,
         );
     }
     // The write lock is held from the start: re-finalization verifies the
@@ -4622,9 +4675,16 @@ pub fn finalize_cache_v2_with_export_manifest(
     let Some(stage_record_path) = stage_record_path else {
         return Ok(None);
     };
+    let canonical_cache_path = std::fs::canonicalize(cache_path)?;
+    write_ready_file(
+        ready_file,
+        &canonical_cache_path,
+        stage_record_path,
+        ready_hook,
+    )?;
     let record = CacheFinalStageRecord {
         version: FINAL_STAGE_RECORD_VERSION,
-        cache_path: std::fs::canonicalize(cache_path)?,
+        cache_path: canonical_cache_path,
         cache_sha256: sha256_file(cache_path)?,
         schema_version: CACHE_SCHEMA_VERSION_V2,
         sealed_generation: to_u64(sealed_generation, "sealed generation")?,
@@ -5120,6 +5180,81 @@ pub(crate) fn require_discovery_spool_roles(
             .map(|path| ("cache sidecar", path.as_path())),
     );
     require_distinct_files(&roles)
+}
+
+/// Refuse marker aliases and occupied paths before the cache mutation lock or open.
+pub fn require_ready_file_roles(
+    cache: &Path,
+    ready: &Path,
+    stage_record: &Path,
+    export_manifest: Option<&Path>,
+) -> Result<(), BootstrapError> {
+    let ready_temp = atomic_write_temp_path(ready);
+    let stage_temp = atomic_write_temp_path(stage_record);
+    let lock = lock_target_path(cache)?;
+    let spool = sidecar_path(cache, ".projection-v3.jsonl");
+    // SQLite opens the canonical cache, so its sidecars sit beside the physical
+    // file; finalization also clears those beside the spelled path.
+    let physical = std::fs::canonicalize(cache)?;
+    let mut sidecars: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for base in [cache, physical.as_path()] {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let path = sidecar_path(base, suffix);
+            let intended = canonical_intended_path(&path)?;
+            if sidecars.iter().all(|(seen, _)| *seen != intended) {
+                sidecars.push((intended, path));
+            }
+        }
+    }
+    let mut roles = vec![
+        ("cache", cache),
+        ("cache mutation lock", lock.as_path()),
+        ("projection spool", spool.as_path()),
+        ("stage record", stage_record),
+        ("stage record temporary file", stage_temp.as_path()),
+        ("ready file", ready),
+        ("ready temporary file", ready_temp.as_path()),
+    ];
+    roles.extend(
+        sidecars
+            .iter()
+            .map(|(_, path)| ("cache sidecar", path.as_path())),
+    );
+    if let Some(manifest) = export_manifest {
+        roles.push(("export manifest", manifest));
+    }
+    require_distinct_files(&roles)?;
+    match std::fs::symlink_metadata(ready) {
+        Ok(_) => invalid(format!(
+            "ready file {} is already occupied",
+            ready.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_ready_file(
+    ready_file: Option<&Path>,
+    canonical_cache_path: &Path,
+    stage_record: &Path,
+    ready_hook: Option<&mut dyn FnMut()>,
+) -> Result<(), BootstrapError> {
+    if let Some(ready) = ready_file {
+        atomic_write_json(
+            ready,
+            &serde_json::json!({
+                "version": 1,
+                "pid": std::process::id(),
+                "cache_path": canonical_cache_path,
+                "stage_record": stage_record,
+            }),
+        )?;
+        if let Some(hook) = ready_hook {
+            hook();
+        }
+    }
+    Ok(())
 }
 
 /// The immutable prior's `user_version`, read without touching the file.
