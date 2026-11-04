@@ -205,6 +205,127 @@ def run_pass1(db: str, out_dir: str, engine: str, parquet_dir: str, max_age_hour
         return rk.main()
 
 
+def _extract_positions_v2_at_6c1c78e(con, wallets, win_start, win_end):
+    """`ranker_duck.duck_extract_positions_v2` exactly as at 6c1c78e: SQL, staging and streaming."""
+    import pandas as pd
+
+    traded_outcome = "list_position(json_extract_string(p.tokens_json, '$[*].token_id'), g.asset) - 1"
+
+    def _q(s):
+        return s.replace("'", "''")
+
+    con.register(
+        "universe",
+        pd.DataFrame({"wallet_hex": pd.Series(list(wallets), dtype=object)}),
+    )
+    staged = os.path.join(
+        con.execute("SELECT current_setting('temp_directory')").fetchone()[0],
+        "positions_v2.parquet",
+    )
+    compact = con.execute("SELECT COUNT(*) FROM duckdb_views() WHERE view_name = 'projection'").fetchone()[0] > 0
+    marker = "g" if compact else "r"
+    source = (
+        "FROM projection g " if compact else
+        "FROM ranker_entries_v2 r LEFT JOIN activity_groups_v2 g "
+        "ON g.source_trade_id = r.source_trade_id AND g.coverage_generation = r.activity_generation "
+    ) + "LEFT JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id "
+    payout = "g" if compact else "p"
+    payout_mismatch = (
+        " OR g.payout_vector_json IS DISTINCT FROM p.payout_vector_json "
+        "OR g.end_date_unix IS DISTINCT FROM p.end_date_unix" if compact else ""
+    )
+    try:
+        bad = con.execute(
+            f"SELECT COUNT(*) {source} "
+            f"WHERE NOT regexp_full_match({marker}.source_trade_id, 'g2:[0-9a-f]{{64}}') "
+            "OR g.source_trade_id IS NULL OR p.market_id IS NULL OR g.condition_id IS NULL "
+            "OR g.asset IS NULL OR g.outcome_id IS NULL OR g.side != 'buy' "
+            f"OR {traded_outcome} IS NULL "
+            "OR TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) IS NULL "
+            "OR TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) <= 0 "
+            "OR TRY_CAST(g.price_weighted_share_amount_str AS DECIMAL(38,12)) IS NULL "
+            "OR p.end_date_unix IS NULL OR p.payout_status != 'resolved' "
+            "OR p.payout_vector_json NOT IN ('[\"1\",\"0\"]','[\"0\",\"1\"]',"
+            "'[\"0.5\",\"0.5\"]')" + payout_mismatch
+        ).fetchone()[0]
+        if bad:
+            raise RuntimeError(
+                f"schema-two projection contains {bad} structurally invalid row(s)"
+            )
+        con.execute(
+            "COPY (SELECT g.wallet_hex AS wallet, g.condition_id AS market_id, "
+            f"{traded_outcome} AS outcome_id, g.source_time_unix AS entry_ts, "
+            f"CAST({payout}.end_date_unix - g.source_time_unix AS BIGINT) AS ttr_secs, "
+            "CAST(TRY_CAST(g.price_weighted_share_amount_str AS DECIMAL(38,12)) / "
+            "TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) AS DOUBLE) AS price, "
+            "g.share_amount_str AS contracts, "
+            f"CAST(json_extract_string({payout}.payout_vector_json, "
+            f"'$[' || CAST({traded_outcome} AS VARCHAR) || ']') AS DOUBLE) AS payoff, "
+            f"{payout}.end_date_unix AS resolved_at, {marker}.source_trade_id "
+            f"{source} JOIN universe u ON u.wallet_hex = g.wallet_hex "
+            f"WHERE g.source_time_unix >= {int(win_start)} AND g.source_time_unix < {int(win_end)}) "
+            f"TO '{_q(staged)}' (FORMAT PARQUET)"
+        )
+        result = con.execute(
+            f"SELECT * EXCLUDE (source_trade_id) FROM read_parquet('{_q(staged)}') "
+            "ORDER BY wallet, entry_ts, source_trade_id"
+        )
+        while not (chunk := result.fetch_df_chunk(64)).empty:
+            yield chunk
+    finally:
+        con.unregister("universe")
+        if os.path.exists(staged):
+            os.remove(staged)
+
+
+def _pass_one_before_scope_sql(engine, wallets, prm):
+    """Frozen schema-two loop and artifact tail from 6c1c78e, before SQL scope filtering."""
+    import pandas as pd
+
+    os.makedirs(prm.out_dir, exist_ok=True)
+    summaries = []
+    diag = dict(wallets_seen=len(wallets), first_buys=0, no_ref=0, ttr_fail=0, unresolved=0,
+                bad_price=0, out_of_band=0, out_of_window=0, qualified=0)
+
+    def position(row):
+        return {
+            "market_id": row.market_id, "outcome_id": int(row.outcome_id),
+            "entry_ts": int(row.entry_ts), "ttr": int(row.ttr_secs),
+            "price": float(row.price), "contracts": str(row.contracts),
+            "payoff": float(row.payoff), "resolved_at": int(row.resolved_at),
+        }
+
+    with open(Path(prm.out_dir) / "qualifying_positions_72hr.csv", "w", newline="") as pos_fh:
+        writer = csv.writer(pos_fh)
+        writer.writerow(["wallet", "market_id", "outcome_id", "entry_ts", "ttr_secs", "price",
+                         "contracts", "payoff", "gross", "net", "resolved_at"])
+        total_qualified = 0
+        for w, rows in rk.wallet_groups(_extract_positions_v2_at_6c1c78e(
+                engine, wallets, prm.win_start, prm.win_end)):
+            diag["qualified"] += len(rows)
+            total_qualified += rk.process_wallet_positions(
+                w, [position(row) for row in rows], prm, writer, summaries, None)
+
+    stats = pd.DataFrame(summaries)
+    stats["eligible"] = (
+        (stats["avg_per_active_month"] >= prm.min_avg_per_month)
+        & (stats["active_months"] >= prm.min_active_months)
+        & (stats["n"] >= prm.min_trl)
+        & (stats["n"] > 1)
+        & stats["tstat_net"].notna()
+    )
+    stats = stats.sort_values("tstat_net", ascending=False, na_position="last").reset_index(drop=True)
+    n_elig = int(stats["eligible"].sum())
+    stats.to_csv(Path(prm.out_dir) / "ranked_72hr_buyandhold.csv", index=False)
+    elig = stats[stats["eligible"]].copy().reset_index(drop=True)
+    with open(Path(prm.out_dir) / "ranked_72hr_buyandhold.txt", "w") as f:
+        f.write("# ranked_72hr_buyandhold — eligible wallets ranked by t-stat(net, price-aware)\n")
+        f.write(f"# n_eligible={n_elig}\n")
+        for wlt in elig["wallet"].tolist():
+            f.write(wlt + "\n")
+    return diag, total_qualified
+
+
 def export(db: str, parquet_dir: str) -> None:
     argv = ["export_trades_parquet.py", "--db", db, "--out-dir", parquet_dir]
     with mock.patch.object(sys, "argv", argv):
@@ -1215,6 +1336,134 @@ class DuckParityTest(unittest.TestCase):
             self.assertFalse((Path(tmp) / "rank/250_72hr_buyandhold_variance.txt").exists())
             self.assertFalse((Path(pq) / "activity_groups_v2.parquet").exists())
             self.assertIn("tökén雪".encode(), Path(db + ".projection-v3.jsonl").read_bytes())
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_format_three_market_scope_matches_unscoped_subsequence(self):
+        import pandas as pd
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "candidate.db"), str(Path(tmp) / "export")
+            rows, entry, _ = build_format_three_cache(db)
+            export(db, pq)
+            scope = frozenset(f"0x{index:064x}" for index in range(3, 6))
+            engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, schema_version=2)
+            try:
+                wallets = rk.load_universe_from_export(engine)
+                unscoped = pd.concat(ranker_duck.duck_extract_positions_v2(
+                    engine, wallets, entry - 1, entry + 1), ignore_index=True)
+                expected = unscoped[unscoped["market_id"].isin(scope)].reset_index(drop=True)
+                self.assertEqual(len(unscoped), 5)
+                self.assertEqual(len(expected), 3)
+                self.assertEqual(set(expected["wallet"]), {W("b")})
+                scoped = pd.concat(ranker_duck.duck_extract_positions_v2(
+                    engine, wallets, entry - 1, entry + 1, market_scope=scope), ignore_index=True)
+                pd.testing.assert_frame_equal(scoped, expected, check_exact=True)
+                all_markets = frozenset(row["condition_id"] for row in rows)
+                complete = pd.concat(ranker_duck.duck_extract_positions_v2(
+                    engine, wallets, entry - 1, entry + 1, market_scope=all_markets), ignore_index=True)
+                pd.testing.assert_frame_equal(complete, unscoped, check_exact=True)
+                for empty_scope in (frozenset(), frozenset({"not-in-the-projection"})):
+                    with self.subTest(scope=empty_scope):
+                        self.assertEqual(list(ranker_duck.duck_extract_positions_v2(
+                            engine, wallets, entry - 1, entry + 1, market_scope=empty_scope)), [])
+                self.assertEqual(engine.execute(
+                    "SELECT COUNT(*) FROM duckdb_views() WHERE view_name IN ('universe', 'scope')"
+                ).fetchone()[0], 0)
+                self.assertFalse((Path(pq) / ".duckdb_tmp/positions_v2.parquet").exists())
+            finally:
+                engine.close()
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_format_three_market_scope_still_validates_the_full_projection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "candidate.db"), str(Path(tmp) / "export")
+            _, entry, _ = build_format_three_cache(db)
+            export(db, pq)
+            engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, schema_version=2)
+            try:
+                engine.execute("CREATE TEMP TABLE damaged_projection AS SELECT * FROM projection")
+                engine.execute("CREATE OR REPLACE VIEW projection AS SELECT * FROM damaged_projection")
+                scope = frozenset(f"0x{index:064x}" for index in range(3, 6))
+                for wallets in ([W("a"), W("b")], [W("b")]):
+                    for invalid_time in (entry, entry - 2):
+                        with self.subTest(wallets=wallets, invalid_time=invalid_time):
+                            engine.execute("UPDATE damaged_projection SET share_amount_str='0', "
+                                           "source_time_unix=? WHERE wallet_hex=?", [invalid_time, W("a")])
+                            with self.assertRaisesRegex(RuntimeError, "contains 1 structurally invalid row"):
+                                list(ranker_duck.duck_extract_positions_v2(
+                                    engine, wallets, entry - 1, entry + 1, market_scope=scope))
+                            self.assertEqual(engine.execute(
+                                "SELECT COUNT(*) FROM duckdb_views() WHERE view_name IN ('universe', 'scope')"
+                            ).fetchone()[0], 0)
+                            self.assertFalse((Path(pq) / ".duckdb_tmp/positions_v2.parquet").exists())
+            finally:
+                engine.close()
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_schema_two_window_count_matches_unscoped_extraction(self):
+        for build in (build_certified_cache, build_format_three_cache):
+            with self.subTest(format=build.__name__), tempfile.TemporaryDirectory() as tmp:
+                db, pq = str(Path(tmp) / "candidate.db"), str(Path(tmp) / "export")
+                _, entry, _ = build(db)
+                export(db, pq)
+                engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, schema_version=2)
+                try:
+                    for wallets, size in (([W("a"), W("b")], 5), ([W("b")], 4), ([], 0)):
+                        for start, end, expected in ((entry, entry + 1, size),
+                                                     (entry - 1, entry, 0), (entry + 1, entry + 2, 0)):
+                            with self.subTest(wallets=wallets, start=start, end=end):
+                                count = ranker_duck.count_window_positions_v2(engine, wallets, start, end)
+                                self.assertEqual(count, expected)
+                                self.assertEqual(count, sum(len(chunk) for chunk in
+                                    ranker_duck.duck_extract_positions_v2(engine, wallets, start, end)))
+                finally:
+                    engine.close()
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_format_three_scoped_pass_one_matches_frozen_loop_bytes_and_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db, pq = str(root / "candidate.db"), str(root / "export")
+            build_format_three_cache(db)
+            export(db, pq)
+            before, after = root / "before", root / "after"
+            scope = write_market_scope(root / "scope.json", [f"0x{index:064x}" for index in range(3, 6)])
+            argv = ["rank_72hr_buyandhold.py", "--db", db, "--out-dir", str(before),
+                    "--universe-from-trades", "--win-start", WIN_START_ISO, "--win-end", WIN_END_ISO,
+                    "--as-of", AS_OF_ISO, "--min-active-months", "1", "--min-trl", "0",
+                    "--min-avg-per-month", "1", "--market-scope", scope]
+            with mock.patch.object(sys, "argv", argv):
+                prm = rk.parse_args()
+            engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, schema_version=2)
+            try:
+                wallets = rk.load_universe_from_export(engine)
+                with mock.patch.object(rk, "process_wallet_positions", wraps=rk.process_wallet_positions) as scored:
+                    baseline_diag, total = _pass_one_before_scope_sql(engine, wallets, prm)
+                self.assertEqual([(call.args[0], len(call.args[1])) for call in scored.call_args_list],
+                                 [(W("a"), 1), (W("b"), 4)])
+            finally:
+                engine.close()
+            self.assertEqual((baseline_diag["wallets_seen"], baseline_diag["qualified"], total), (2, 5, 3))
+            names = ("qualifying_positions_72hr.csv", "ranked_72hr_buyandhold.csv", "ranked_72hr_buyandhold.txt")
+            for name in names:
+                self.assertTrue((before / name).is_file(), name)
+            argv[argv.index(str(before))] = str(after)
+            env = {"PE_RANKER_ENGINE": "duck", "PE_RANKER_PARQUET_DIR": pq,
+                   "PE_RANKER_PARQUET_MAX_AGE_HOURS": "0"}
+            with mock.patch.dict(os.environ, env), mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(rk, "log") as logged, \
+                 mock.patch.object(rk, "process_wallet_positions", wraps=rk.process_wallet_positions) as scored:
+                self.assertEqual(rk.main(), 0)
+            self.assertEqual([(call.args[0], len(call.args[1])) for call in scored.call_args_list], [(W("b"), 3)])
+            self.assertEqual([call.args[0] for call in logged.call_args_list
+                              if call.args[0].startswith("  diagnostics:")], [f"  diagnostics: {baseline_diag}"])
+            for name in names:
+                self.assertEqual((before / name).read_bytes(), (after / name).read_bytes(), name)
+            positions = read_rows(str(after / names[0]))
+            ranked = read_rows(str(after / names[1]))
+            self.assertEqual(len(positions), 3)
+            self.assertEqual({row["wallet"] for row in positions}, {W("b")})
+            self.assertEqual([(row["wallet"], row["n"], row["eligible"]) for row in ranked], [(W("b"), "3", "True")])
 
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_identity_five_classifier_seven_exports_format_three_and_loads(self):
