@@ -4346,40 +4346,14 @@ async fn venue_refusals_bad_envelopes_and_combo_conflicts_defer_only_their_walle
         assert_eq!(deferred.kind, kind);
         assert!(paper.position_anchors(&deferred.wallet).unwrap().is_empty());
         assert_eq!(paper.cursor(&deferred.wallet).unwrap(), None);
+        assert!(
+            paper
+                .activity_groups_after(&deferred.wallet, 0)
+                .unwrap()
+                .is_empty()
+        );
     }
     assert_eq!(paper.position_anchors(&healthy).unwrap().len(), 1);
-    drop(preparer);
-    actor.await.unwrap();
-}
-
-#[tokio::test]
-async fn venue_combo_conflict_defers_admission_without_committing_failed_read() {
-    let a = wallet(0x64);
-    let b = wallet(0x65);
-    let (_dir, paper, engine) = fresh(&[]);
-    let mut responses = stable_responses(&[(b, 1, "1")]);
-    let mut rows = vec![activity(a, 1, "1", "0xcombo", 10); 2];
-    rows[1]["isCombo"] = json!(true);
-    responses.insert(activity_url(a), vec![serde_json::to_vec(&rows).unwrap()]);
-    let (tx, rx) = mpsc::channel(2);
-    let actor = spawn_control_actor(rx, engine, paper.clone());
-    let preparer = AdmissionPreparer::with_validator(tx, paper.clone(), validator(responses));
-    let result = preparer.prepare(&[a, b]).await;
-    assert!(
-        result.is_ok(),
-        "combo venue rows must defer only A: {result:?}"
-    );
-    let outcome = result.unwrap();
-    assert_eq!(outcome.admitted, vec![b]);
-    assert_eq!(outcome.deferred.len(), 1);
-    assert_eq!(outcome.deferred[0].wallet, a);
-    assert_eq!(
-        outcome.deferred[0].class,
-        pe_service::position_seeder::FailureClass::WalletTransient
-    );
-    assert_eq!(paper.cursor(&a).unwrap(), None);
-    assert!(paper.position_anchors(&a).unwrap().is_empty());
-    assert!(paper.activity_groups_after(&a, 0).unwrap().is_empty());
     drop(preparer);
     actor.await.unwrap();
 }

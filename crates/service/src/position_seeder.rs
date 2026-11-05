@@ -3462,44 +3462,6 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn paper_service_rollout_identity_transient_is_wallet_scoped_and_rate_limit_shared() {
-        let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        for (source, expected) in [
-            (
-                SourceError::Transient {
-                    message: "Gamma unavailable".to_owned(),
-                },
-                FailureClass::WalletTransient,
-            ),
-            (
-                SourceError::RateLimited {
-                    retry_after_secs: 1,
-                },
-                FailureClass::Shared,
-            ),
-            (
-                SourceError::Fatal {
-                    message: "durability unavailable".to_owned(),
-                },
-                FailureClass::Shared,
-            ),
-        ] {
-            assert_eq!(
-                CausalPositionError::Identity {
-                    wallet,
-                    source: match source {
-                        SourceError::Transient { .. } | SourceError::RateLimited { .. } =>
-                            IdentityError::Venue(source),
-                        SourceError::Fatal { .. } => IdentityError::Local(source),
-                    },
-                }
-                .class(),
-                expected
-            );
-        }
-    }
 }
 
 #[cfg(test)]

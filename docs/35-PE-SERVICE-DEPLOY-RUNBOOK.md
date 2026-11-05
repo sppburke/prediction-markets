@@ -2359,7 +2359,8 @@ deployment actions described above; this procedure makes no trading or policy ch
     deferred` warnings (wallet, kind, error); admission warnings carry wallet/stage/kind while
     `pe-service.watchlist-deferral` carries the detailed message; reconciliation retains `fixed-end
     activity reconciliation will retry` (wallet, error). Query admission counts with
-    `jq '[.deferrals[].deferrals[] | {wallet,stage,kind,message}] | group_by([.stage,.wallet,.kind]) | map({stage:.[0].stage,wallet:.[0].wallet,kind:.[0].kind,count:length,messages:map(.message)|unique})' ac16-population.json`;
+    `jq '. as $p | [$p.deferrals[] | select(.received_at_ns >= $p.window_start * 1000000000 and .received_at_ns < $p.window_end * 1000000000) | .deferrals[] | {wallet,stage,kind,message}] | group_by([.stage,.wallet,.kind]) | map({stage:.[0].stage,wallet:.[0].wallet,kind:.[0].kind,count:length,messages:map(.message)|unique})' ac16-population.json`
+    (capture with the declared window so only its deferrals count);
     for refresh/reconciliation use `jq -s '[.[] | .MESSAGE | fromjson | select(.message == "anchor refresh deferred" or .message == "fixed-end activity reconciliation will retry") | {stage:(if .message == "anchor refresh deferred" then "refresh" else "reconciliation" end),wallet,kind:(.kind // (if (.error | startswith("asset identity resolution:")) then "identity" else "activity_or_membership" end)),error}] | group_by([.stage,.wallet,.kind]) | map({stage:.[0].stage,wallet:.[0].wallet,kind:.[0].kind,count:length,errors:map(.error)|unique})' admission-journal.jsonl`.
     Classify the retained messages/errors by venue versus local origin before reporting venue
     counts; reconciliation distinguishes identity lookup errors from other retry causes. Report zero restarts and zero `critical owner exited` over the full
