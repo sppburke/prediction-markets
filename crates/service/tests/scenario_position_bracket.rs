@@ -9447,8 +9447,16 @@ async fn streamed_membership_102_record_wave_size_and_append_counts() {
     let client = reqwest::Client::new();
     let applied = AppliedWatchlistCapacity::new(usize::MAX);
     let mut state = ScenarioMaintenanceState::new(Some(1), 0);
+    let source_ids = |path: &std::path::Path| {
+        Reader::replay(path)
+            .unwrap()
+            .map(|frame| frame.unwrap().1.source_id.0)
+            .collect::<Vec<_>>()
+    };
     let paper_before = std::fs::metadata(&h.paper_path).unwrap().len();
     let source_before = std::fs::metadata(&h.source_path).unwrap().len();
+    let paper_appends_before = scan_paper_log(&h.paper_path).unwrap().len();
+    let source_appends_before = source_ids(&h.source_path).len();
     let started = std::time::Instant::now();
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -9469,8 +9477,9 @@ async fn streamed_membership_102_record_wave_size_and_append_counts() {
     let elapsed = started.elapsed();
     let paper_growth = std::fs::metadata(&h.paper_path).unwrap().len() - paper_before;
     let source_growth = std::fs::metadata(&h.source_path).unwrap().len() - source_before;
-    let membership_records = scan_paper_log(&h.paper_path)
-        .unwrap()
+    let paper_frames = scan_paper_log(&h.paper_path).unwrap();
+    let paper_appends = paper_frames.len() - paper_appends_before;
+    let membership_records = paper_frames
         .iter()
         .filter(|frame| {
             matches!(
@@ -9479,19 +9488,27 @@ async fn streamed_membership_102_record_wave_size_and_append_counts() {
             )
         })
         .count();
-    let ranking_artifacts = Reader::replay(&h.source_path)
-        .unwrap()
-        .map(Result::unwrap)
-        .filter(|(_, frame)| frame.source_id.0 == "pe-service.watchlist-ranking")
-        .count();
+    let appended_sources = source_ids(&h.source_path).split_off(source_appends_before);
+    let artifacts = |id: &str| {
+        appended_sources
+            .iter()
+            .filter(|source| *source == id)
+            .count()
+    };
+    let ranking_artifacts = artifacts("pe-service.watchlist-ranking");
+    let admission_artifacts = artifacts("pe-service.watchlist-admission");
     eprintln!(
-        "production streamed wave: newcomers=102 paper_bytes={paper_growth} source_bytes={source_growth} membership_changed={membership_records} ranking_artifacts={ranking_artifacts} elapsed_ms={}",
+        "production streamed wave: newcomers=102 paper_bytes={paper_growth} source_bytes={source_growth} paper_appends={paper_appends} source_appends={} membership_changed={membership_records} ranking_artifacts={ranking_artifacts} admission_artifacts={admission_artifacts} elapsed_ms={}",
+        appended_sources.len(),
         elapsed.as_millis()
     );
     assert!(paper_growth > 0);
     assert!(source_growth > 0);
+    // One synchronized record, one ranking artifact and one admission proof per newcomer.
+    assert_eq!(paper_appends, 102);
     assert_eq!(membership_records, 102);
     assert_eq!(ranking_artifacts, 102);
+    assert_eq!(admission_artifacts, 102);
     assert!(elapsed < std::time::Duration::from_secs(30));
     let mut admitted = h
         .live
