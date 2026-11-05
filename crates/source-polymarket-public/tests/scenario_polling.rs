@@ -1,6 +1,6 @@
-//! Scenario test: FixtureFetcher drives all 4 endpoint shapes.
+//! Scenario test: FixtureFetcher drives the three retained endpoint shapes.
 //!
-//! PASS: connector emits exactly 4 `SourceEvent`s (one per endpoint, one rotation),
+//! PASS: connector emits exactly 3 `SourceEvent`s (one per endpoint, one rotation),
 //!       each with non-empty payload matching the fixture bytes.
 //! FAIL: wrong count, empty payload, or payload mismatch.
 
@@ -12,8 +12,7 @@ use std::collections::HashMap;
 use pe_core_types::SourceId;
 use pe_source_core::SourceConnector;
 use pe_source_polymarket_public::{
-    FixtureFetcher, LeaderboardCategory, LeaderboardSort, LeaderboardWindow, PollingConfig,
-    PolymarketEndpoint, PolymarketPublicConnector,
+    FixtureFetcher, PollingConfig, PolymarketEndpoint, PolymarketPublicConnector,
 };
 
 const BASE: &str = "https://data-api.polymarket.com";
@@ -26,13 +25,6 @@ fn fixture(name: &str) -> Vec<u8> {
 
 fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
     let endpoints = vec![
-        PolymarketEndpoint::Leaderboard {
-            sort: LeaderboardSort::Profit,
-            window: LeaderboardWindow::AllTime,
-            category: LeaderboardCategory::Overall,
-            limit: 500,
-            offset: 0,
-        },
         PolymarketEndpoint::UserTradeActivity {
             user: USER.into(),
             end: None,
@@ -49,17 +41,6 @@ fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
     ];
 
     let mut responses: HashMap<String, Vec<u8>> = HashMap::new();
-    responses.insert(
-        PolymarketEndpoint::Leaderboard {
-            sort: LeaderboardSort::Profit,
-            window: LeaderboardWindow::AllTime,
-            category: LeaderboardCategory::Overall,
-            limit: 500,
-            offset: 0,
-        }
-        .url(BASE),
-        fixture("leaderboard.json"),
-    );
     responses.insert(
         PolymarketEndpoint::UserTradeActivity {
             user: USER.into(),
@@ -102,11 +83,10 @@ fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
 }
 
 #[tokio::test]
-async fn all_four_endpoints_emit_non_empty_events() {
+async fn all_three_endpoints_emit_non_empty_events() {
     let mut connector = build_connector();
 
     let fixture_bytes = [
-        fixture("leaderboard.json"),
         fixture("user_trade_activity.json"),
         fixture("current_positions.json"),
         fixture("closed_positions.json"),

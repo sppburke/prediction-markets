@@ -101,46 +101,6 @@ impl PositionPartition {
     }
 }
 
-/// Sort dimension for the `/v1/leaderboard` endpoint (API `orderBy`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LeaderboardSort {
-    Profit,
-    Volume,
-}
-
-impl LeaderboardSort {
-    /// API `orderBy` query value.
-    pub fn as_order_by(self) -> &'static str {
-        match self {
-            Self::Profit => "PNL",
-            Self::Volume => "VOL",
-        }
-    }
-}
-
-/// Time window for the `/v1/leaderboard` endpoint (API `timePeriod`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum LeaderboardWindow {
-    Day,
-    Week,
-    Monthly,
-    AllTime,
-}
-
-impl LeaderboardWindow {
-    /// API `timePeriod` query value.
-    pub fn as_time_period(self) -> &'static str {
-        match self {
-            Self::Day => "DAY",
-            Self::Week => "WEEK",
-            Self::Monthly => "MONTH",
-            Self::AllTime => "ALL",
-        }
-    }
-}
-
 /// Category filter for the `/v1/leaderboard` endpoint (API `category`).
 ///
 /// All ten values return HTTP 200 live (verified 2026-06-14). A bad value yields
@@ -196,18 +156,6 @@ impl LeaderboardCategory {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolymarketEndpoint {
-    /// Leaderboard endpoint — top traders by `sort` within `window` for `category`.
-    ///
-    /// `limit`: entries per request. The API hard-caps this at 50; larger values are
-    /// silently truncated server-side (verified live 2026-06-14).
-    /// `offset`: rank offset of the first entry; the official maximum is 1000.
-    Leaderboard {
-        sort: LeaderboardSort,
-        window: LeaderboardWindow,
-        category: LeaderboardCategory,
-        limit: u32,
-        offset: u32,
-    },
     /// Cursor-based trade history for a single wallet via `/activity?type=TRADE`.
     ///
     /// `end` (inclusive): return trades with `timestamp <= end`. `None` = no upper bound.
@@ -271,7 +219,6 @@ impl PolymarketEndpoint {
     /// Returns a stable string key for use in config maps and metrics.
     pub fn key(&self) -> &'static str {
         match self {
-            Self::Leaderboard { .. } => "leaderboard",
             Self::UserTradeActivity { .. } | Self::UserTradeActivityPage { .. } => {
                 "user_trade_activity"
             }
@@ -288,20 +235,6 @@ impl PolymarketEndpoint {
     /// Build the request URL given a base URL (no trailing slash).
     pub fn url(&self, base: &str) -> String {
         match self {
-            Self::Leaderboard {
-                sort,
-                window,
-                category,
-                limit,
-                offset,
-            } => {
-                format!(
-                    "{base}/v1/leaderboard?orderBy={}&timePeriod={}&category={}&limit={limit}&offset={offset}",
-                    sort.as_order_by(),
-                    window.as_time_period(),
-                    category.as_param(),
-                )
-            }
             Self::UserTradeActivity { user, end, start } => {
                 let mut url = format!("{base}/activity?user={user}&type=TRADE&limit=500&offset=0");
                 if let Some(e) = end {
@@ -408,59 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn leaderboard_profit_monthly() {
-        let ep = PolymarketEndpoint::Leaderboard {
-            sort: LeaderboardSort::Profit,
-            window: LeaderboardWindow::Monthly,
-            category: LeaderboardCategory::Overall,
-            limit: 50,
-            offset: 0,
-        };
-        assert_eq!(ep.key(), "leaderboard");
-        assert_eq!(
-            ep.url("https://data-api.polymarket.com"),
-            "https://data-api.polymarket.com/v1/leaderboard?orderBy=PNL&timePeriod=MONTH&category=OVERALL&limit=50&offset=0"
-        );
-    }
-
-    #[test]
-    fn leaderboard_volume_alltime_crypto() {
-        let ep = PolymarketEndpoint::Leaderboard {
-            sort: LeaderboardSort::Volume,
-            window: LeaderboardWindow::AllTime,
-            category: LeaderboardCategory::Crypto,
-            limit: 50,
-            offset: 0,
-        };
-        assert_eq!(
-            ep.url("https://data-api.polymarket.com"),
-            "https://data-api.polymarket.com/v1/leaderboard?orderBy=VOL&timePeriod=ALL&category=CRYPTO&limit=50&offset=0"
-        );
-    }
-
-    #[test]
-    fn leaderboard_offset_in_url() {
-        let ep = PolymarketEndpoint::Leaderboard {
-            sort: LeaderboardSort::Profit,
-            window: LeaderboardWindow::Week,
-            category: LeaderboardCategory::Sports,
-            limit: 50,
-            offset: 1000,
-        };
-        assert_eq!(
-            ep.url("https://data-api.polymarket.com"),
-            "https://data-api.polymarket.com/v1/leaderboard?orderBy=PNL&timePeriod=WEEK&category=SPORTS&limit=50&offset=1000"
-        );
-    }
-
-    #[test]
-    fn leaderboard_param_mappings() {
-        assert_eq!(LeaderboardSort::Profit.as_order_by(), "PNL");
-        assert_eq!(LeaderboardSort::Volume.as_order_by(), "VOL");
-        assert_eq!(LeaderboardWindow::Day.as_time_period(), "DAY");
-        assert_eq!(LeaderboardWindow::Week.as_time_period(), "WEEK");
-        assert_eq!(LeaderboardWindow::Monthly.as_time_period(), "MONTH");
-        assert_eq!(LeaderboardWindow::AllTime.as_time_period(), "ALL");
+    fn leaderboard_category_mappings() {
         assert_eq!(LeaderboardCategory::ALL.len(), 10);
         assert_eq!(LeaderboardCategory::Overall.as_param(), "OVERALL");
         assert_eq!(LeaderboardCategory::Finance.as_param(), "FINANCE");

@@ -1,7 +1,7 @@
 //! Operator-level scenario tests for the decomposed pe-bootstrap phases (issue #195).
 //!
 //! Verifies the independent invocability and correctness of the phase functions
-//! `fetch` and `watchlist_phase`. No network calls; deterministic. (The Dune
+//! `watchlist_phase`. No network calls; deterministic. (The Dune
 //! `enumerate` / `seed-historical` phases were removed in #335; their scenarios
 //! went with them.)
 //!
@@ -10,37 +10,20 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::HashMap;
-
 use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::config::BootstrapConfig;
-use pe_bootstrap::error::BootstrapError;
-use pe_bootstrap::fetch;
 use pe_bootstrap::pile::SRC_WALLET_SET_JSON;
-use pe_bootstrap::polymarket::PolymarketBulkFetcher;
+#[path = "support/cache_seed.rs"]
+mod cache_seed;
+use cache_seed::insert_page;
 use pe_bootstrap::watchlist_phase;
 use pe_core_types::WalletAddress;
-use pe_source_polymarket_public::{FixtureFetcher, PolymarketEndpoint};
 use tempfile::TempDir;
 
 const BASE_URL: &str = "https://data-api.polymarket.com";
 
 fn wallet(byte: u8) -> WalletAddress {
     WalletAddress::from_hex(&format!("0x{:040x}", byte)).unwrap()
-}
-
-fn trade_url_cold(w: WalletAddress) -> String {
-    PolymarketEndpoint::UserTradeActivityPage {
-        user: w.to_string(),
-        end: 2_000_000_000,
-        start: Some(1),
-        offset: 0,
-    }
-    .url(BASE_URL)
-}
-
-fn end_page() -> Vec<u8> {
-    b"[]".to_vec()
 }
 
 /// Build a page JSON with N synthetic trades for a wallet.
@@ -78,76 +61,6 @@ fn config_with_dir(dir: &TempDir) -> BootstrapConfig {
     }
 }
 
-// ── Scenario 2: run_fetch honours skip_trade_fetch=true ──────────────────────
-//
-// PASS: FetchReport { attempted: 0, failed: 0 }; no trades inserted.
-// FAIL: attempts fetch, returns non-zero counts, or errors.
-
-#[tokio::test]
-async fn scenario_fetch_skip_trade_fetch_flag_is_a_noop() {
-    let dir = TempDir::new().unwrap();
-    let mut config = config_with_dir(&dir);
-    config.skip_trade_fetch = true;
-
-    let mut cache = WalletCache::open(&config.cache_path).unwrap();
-
-    let wallets = vec![wallet(0x01), wallet(0x02)];
-    let report = fetch::run_fetch(&config, &mut cache, &wallets)
-        .await
-        .unwrap();
-
-    assert_eq!(
-        report.attempted, 0,
-        "skip_trade_fetch must not attempt any fetch"
-    );
-    assert_eq!(report.failed, 0);
-    // No trades should have been inserted.
-    assert!(
-        cache.trades_for(&wallets[0].to_string()).is_empty(),
-        "no trades expected when skip_trade_fetch=true"
-    );
-}
-
-// ── Scenario 3: run_fetch returns PartialFetch when wallets fail ──────────────
-//
-// PASS: fetch::run_fetch returns Err(BootstrapError::PartialFetch { failed_wallets: 1 })
-//       when the wallet's HTTP request fails (connection refused to non-listening port).
-// FAIL: returns Ok or a different error variant.
-
-#[tokio::test]
-async fn scenario_fetch_partial_fail_returns_partial_fetch_error() {
-    let dir = TempDir::new().unwrap();
-    let mut config = config_with_dir(&dir);
-    config.polymarket_wallet_timeout_secs = 2; // fast but not flaky
-    // Point at a port with no listener; connection refused → wallet-level failure.
-    config.polymarket_base_url = "http://127.0.0.1:12321".to_owned();
-
-    let mut cache = WalletCache::open(&config.cache_path).unwrap();
-
-    let w = wallet(0xCC);
-    cache
-        .upsert_wallets_bulk(&[(
-            w.to_string(),
-            SRC_WALLET_SET_JSON,
-            false,
-            None,
-            None,
-            None,
-            0,
-        )])
-        .unwrap();
-
-    // run_fetch itself must propagate the per-wallet failure as PartialFetch.
-    let result = fetch::run_fetch(&config, &mut cache, &[w]).await;
-    assert!(
-        matches!(
-            result,
-            Err(BootstrapError::PartialFetch { failed_wallets: 1 })
-        ),
-        "expected PartialFetch {{failed_wallets:1}}, got {result:?}"
-    );
-}
-
 // ── Scenario 4: run_watchlist standalone — reads cache without re-fetching ───
 //
 // PASS: WatchlistReport.ledger_count reflects pre-inserted trades; watchlist.json
@@ -175,23 +88,7 @@ async fn scenario_watchlist_standalone_reads_existing_cache_trades() {
         )])
         .unwrap();
 
-    // Insert 10 trades via fixture fetcher (same pattern as scenario_pile).
-    let mut pages: HashMap<String, Vec<u8>> = HashMap::new();
-    pages.insert(trade_url_cold(w), trades_page(10, "cc"));
-    let end_url = PolymarketEndpoint::UserTradeActivityPage {
-        user: w.to_string(),
-        end: 1_700_000_010,
-        start: Some(1),
-        offset: 0,
-    }
-    .url(BASE_URL);
-    pages.insert(end_url, end_page());
-
-    let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(pages))
-        .with_clock_for_test(|| 2_000_000_120)
-        .with_concurrency(1)
-        .with_wallet_timeout(30);
-    fetcher.fetch_all(&[w], &mut cache).await.unwrap();
+    insert_page(&mut cache, w, &trades_page(10, "cc"));
 
     // Now call run_watchlist standalone — must not attempt any re-fetch.
     let wallets = vec![w];

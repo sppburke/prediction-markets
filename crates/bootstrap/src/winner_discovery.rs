@@ -260,22 +260,6 @@ impl DiscoverySpool {
             match &entry.result {
                 DiscoveryOutcome::Collected { data } => {
                     let wallets = match (entry.source, data) {
-                        (WalletDiscoverySource::Leaderboard, CollectedSource::Leaderboard(c)) => {
-                            let r = c.report;
-                            if r.unique_wallets != c.wallets.len()
-                                || r.raw_entries < r.unique_wallets
-                                || r.slices_attempted
-                                    != config.leaderboard_categories.len()
-                                        * crate::leaderboard_discovery::SORT_WINDOW_SLICES.len()
-                                || r.slices_fetched == 0
-                                || r.slices_fetched > r.slices_attempted
-                                || r.activated != 0
-                                || c.wallets.is_empty()
-                            {
-                                return Err(refused("invalid leaderboard counts"));
-                            }
-                            &c.wallets
-                        }
                         (WalletDiscoverySource::Datadash, CollectedSource::Datadash(c)) => {
                             let r = c.report;
                             if r.unique_wallets != c.wallets.len()
@@ -658,18 +642,120 @@ mod tests {
     }
 
     use crate::datadash_discovery::{CohortMeta, FixtureCohortFetcher, collect_datadash};
-    use crate::leaderboard_discovery::{
-        LeaderboardFetcher, SORT_WINDOW_SLICES, collect_leaderboard,
-    };
     use crate::market_scope::{FetchedPage, MarketScope, ScopeFetcher, ScopeSeries};
     use crate::wallet_discovery::{
         ParticipantDiscoveryCoverage, ParticipantScope, collect_participants,
     };
-    use pe_source_polymarket_public::{FixtureFetcher, endpoint::PolymarketEndpoint};
     use serde_json::json;
     use std::collections::HashMap;
 
     const NOW: i64 = 1_800_057_600; // UTC midnight: the not-before test crosses it.
+
+    #[tokio::test]
+    async fn retired_leaderboard_spool_terminal_and_old_variant_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("candidate.db");
+        let cache = WalletCache::open(&candidate).unwrap();
+        cache
+            .raw_conn_for_test()
+            .execute_batch("PRAGMA user_version=2")
+            .unwrap();
+        drop(cache);
+        let config = BootstrapConfig {
+            cache_path: candidate.clone(),
+            leaderboard_base_url: Some("invalid URL must never be fetched".into()),
+            ..BootstrapConfig::default()
+        };
+        let path = dir.path().join("spool.json");
+        collect_winner_discovery(&config, &path, &candidate, 0, None)
+            .await
+            .unwrap();
+        let spool = read_discovery_spool(&config, &path, None).unwrap();
+        assert!(!spool.coverage_read);
+        assert_eq!(spool.outcomes.len(), 1);
+        assert!(
+            matches!(&spool.outcomes[0].result, DiscoveryOutcome::Terminal { exit_code: 1, message } if message.contains("PE_BOOTSTRAP_LEADERBOARD_TOP_N=0"))
+        );
+        bind_discovery_spool(&spool, &candidate).unwrap();
+        let mut cache = WalletCache::open(&candidate).unwrap();
+        let error = apply_discovery_spool(spool.clone(), &mut cache).unwrap_err();
+        assert_eq!(error.exit_code(), 1);
+        assert!(
+            error
+                .to_string()
+                .contains("retired with Data API v1 (#842)")
+        );
+        let mut old = serde_json::to_value(spool).unwrap();
+        old["outcomes"][0]["result"] = json!({"outcome":"collected", "data":{"source":"leaderboard","data":{"wallets":[wallet(1)],"report":{"slices_attempted":80,"slices_fetched":80,"raw_entries":1,"unique_wallets":1,"activated":0}}}});
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(
+            read_discovery_spool(&config, &path, None)
+                .unwrap_err()
+                .exit_code(),
+            77
+        );
+    }
+
+    #[tokio::test]
+    async fn production_discovery_spool_matches_base_golden_and_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("candidate.db");
+        let mut cache = WalletCache::open(&candidate).unwrap();
+        cache
+            .raw_conn_for_test()
+            .execute_batch("PRAGMA user_version=2")
+            .unwrap();
+        cache
+            .set_participant_discovery_coverage(&coverage())
+            .unwrap();
+        drop(cache);
+        let config = BootstrapConfig {
+            cache_path: candidate.clone(),
+            leaderboard_top_n: 0,
+            datadash_api_url: None,
+            participant_lookback_secs: 100,
+            ..BootstrapConfig::default()
+        };
+        let path = dir.path().join("spool.json");
+        let mut calls = Vec::new();
+        collect_winner_discovery_with_collector(
+            &config,
+            &path,
+            &candidate,
+            NOW,
+            Some(0),
+            async |source, now, prior| {
+                fixture_collect(source, &config, prior, "success", &mut calls, now, Some(0)).await
+            },
+            || NOW,
+            async |_| panic!("fixed clock must not sleep"),
+        )
+        .await
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes,
+            include_bytes!("../tests/fixtures/production_discovery_spool.json")
+        );
+        assert_eq!(calls, SOURCES);
+        let spool = read_discovery_spool(&config, &path, Some(0)).unwrap();
+        let _lock = crate::lock::CacheMutationLock::acquire(&candidate).unwrap();
+        bind_discovery_spool(&spool, &candidate).unwrap();
+        let mut cache = WalletCache::open(&candidate).unwrap();
+        let report = apply_discovery_spool(spool, &mut cache).unwrap();
+        assert_eq!(report.leaderboard_unique, 0);
+        assert_eq!(report.datadash_unique, 0);
+        assert_eq!(report.participants_unique, 2);
+        assert_eq!(cache.wallet_pile_size().unwrap(), 2);
+        assert_eq!(
+            cache
+                .participant_discovery_coverage()
+                .unwrap()
+                .unwrap()
+                .covered_through_unix,
+            NOW
+        );
+    }
 
     fn wallet(n: u8) -> String {
         format!("0x{n:040x}")
@@ -677,7 +763,7 @@ mod tests {
     fn fixture_config(path: &Path) -> BootstrapConfig {
         BootstrapConfig {
             cache_path: path.to_owned(),
-            leaderboard_top_n: 50,
+            leaderboard_top_n: 0,
             participant_lookback_secs: 100,
             polymarket_base_url: "https://fixture".into(),
             ..BootstrapConfig::default()
@@ -722,40 +808,7 @@ mod tests {
         calls.push(source);
         match source {
             WalletDiscoverySource::Leaderboard => {
-                if config.leaderboard_top_n == 0 {
-                    return Ok(CollectedSource::Disabled);
-                }
-                let body = if case == "leaderboard_empty" || case == "terminal_existing" {
-                    json!([])
-                } else {
-                    json!([{"proxyWallet":wallet(1)}, {"proxyWallet":wallet(1)}])
-                };
-                let mut fixtures = HashMap::new();
-                for &category in &config.leaderboard_categories {
-                    for (sort, window) in SORT_WINDOW_SLICES {
-                        fixtures.insert(
-                            PolymarketEndpoint::Leaderboard {
-                                sort,
-                                window,
-                                category,
-                                limit: 50,
-                                offset: 0,
-                            }
-                            .url(&config.polymarket_base_url),
-                            serde_json::to_vec(&body).unwrap(),
-                        );
-                    }
-                }
-                collect_leaderboard(
-                    &LeaderboardFetcher::new(
-                        config.polymarket_base_url.clone(),
-                        FixtureFetcher::new(fixtures),
-                    ),
-                    &config.leaderboard_categories,
-                    config.leaderboard_top_n,
-                )
-                .await
-                .map(CollectedSource::Leaderboard)
+                collect_source_discovery(source, config, market_floor, now, read_prior).await
             }
             WalletDiscoverySource::Datadash => {
                 if config.datadash_api_url.is_none() {
@@ -870,7 +923,7 @@ mod tests {
                 cache.raw_conn_for_test().execute_batch("CREATE TRIGGER stop_coverage BEFORE INSERT ON meta WHEN NEW.key='participant_discovery_coverage' BEGIN SELECT RAISE(ABORT, 'coverage fixture'); END;").unwrap();
             }
             let fail = match case {
-                "leaderboard_upsert" | "earlier_upsert" => Some(16),
+                "earlier_upsert" => Some(128),
                 "datadash_upsert" => Some(128),
                 "participant_upsert" => Some(256),
                 _ => None,
@@ -880,6 +933,9 @@ mod tests {
             }
         }
         let mut config = fixture_config(&paths[0]);
+        if case == "leaderboard_retired" {
+            config.leaderboard_top_n = 50;
+        }
         if case == "disabled" {
             config.leaderboard_top_n = 0;
             config.datadash_api_url = None;
@@ -953,13 +1009,11 @@ mod tests {
         );
         assert_eq!(snapshot(&plain), snapshot(&split), "{case}");
         let plain_prefix = match case {
-            "leaderboard_empty" | "terminal_existing" | "leaderboard_upsert" | "earlier_upsert" => {
-                &SOURCES[..1]
-            }
-            "datadash_upsert" => &SOURCES[..2],
+            "leaderboard_retired" => &SOURCES[..1],
+            "datadash_upsert" | "earlier_upsert" => &SOURCES[..2],
             _ => &SOURCES[..],
         };
-        let split_prefix = if matches!(case, "leaderboard_empty" | "terminal_existing") {
+        let split_prefix = if case == "leaderboard_retired" {
             &SOURCES[..1]
         } else {
             &SOURCES[..]
@@ -998,7 +1052,7 @@ mod tests {
                         I(0),
                         I(0),
                         I(0),
-                        I(144),
+                        I(128),
                         N,
                         I(0),
                         N,
@@ -1054,7 +1108,7 @@ mod tests {
                 NOW
             );
         }
-        if case == "leaderboard_empty" || case == "terminal_existing" {
+        if case == "leaderboard_retired" {
             assert_eq!(plain_calls, vec![SOURCES[0]]);
             assert_eq!(split_calls, plain_calls);
         }
@@ -1062,39 +1116,37 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_spool_same_writes_success_and_apply_timestamps() {
-        parity("success", 0, &[144, 128, 256]).await;
+        parity("success", 0, &[128, 128, 256]).await;
     }
     #[tokio::test]
     async fn discovery_spool_same_writes_soft_failure_and_disabled() {
-        parity("soft_datadash", 0, &[16, 256]).await;
+        parity("soft_datadash", 0, &[256]).await;
         parity("disabled", 0, &[]).await;
     }
     #[tokio::test]
     async fn discovery_spool_participant_failure_preserves_earlier_commits() {
-        parity("participant_75", 75, &[144, 128]).await;
+        parity("participant_75", 75, &[128, 128]).await;
     }
     #[tokio::test]
     async fn discovery_spool_leaderboard_terminal_stops_requests_and_skips_binding() {
-        parity("leaderboard_empty", 1, &[]).await;
-        parity("terminal_existing", 1, &[]).await;
+        parity("leaderboard_retired", 1, &[]).await;
     }
     #[tokio::test]
     async fn discovery_spool_malformed_coverage_terminal_and_disabled_parity() {
         for case in ["bad_coverage", "same_malformed"] {
-            parity(case, 1, &[144, 128]).await;
+            parity(case, 1, &[128, 128]).await;
         }
-        parity("disabled_malformed", 0, &[144, 128]).await;
+        parity("disabled_malformed", 0, &[128, 128]).await;
     }
     #[tokio::test]
     async fn discovery_spool_coverage_commit_failure_keeps_participant_upsert() {
-        parity("coverage_trigger", 1, &[144, 128, 256]).await;
+        parity("coverage_trigger", 1, &[128, 128, 256]).await;
     }
     #[tokio::test]
     async fn discovery_spool_each_upsert_failure_and_earlier_error_precedence() {
         for (case, bits) in [
-            ("leaderboard_upsert", vec![]),
-            ("datadash_upsert", vec![16]),
-            ("participant_upsert", vec![144, 128]),
+            ("datadash_upsert", vec![]),
+            ("participant_upsert", vec![128, 128]),
             ("earlier_upsert", vec![]),
         ] {
             parity(case, 1, &bits).await;
@@ -1708,7 +1760,8 @@ with sqlite3.connect(':memory:') as c:
 
     #[test]
     fn discovery_spool_coverage_flag_outcome_and_count_validation() {
-        let config = fixture_config(Path::new("unused"));
+        let mut config = fixture_config(Path::new("unused"));
+        config.leaderboard_top_n = 50;
         let mut spool = DiscoverySpool {
             version: 1,
             settings: discovery_settings(&config, None),
@@ -1738,18 +1791,7 @@ with sqlite3.connect(':memory:') as c:
         };
         assert!(spool.validate(&config, None).is_err());
         spool.outcomes[0].result = DiscoveryOutcome::Collected {
-            data: CollectedSource::Leaderboard(
-                crate::leaderboard_discovery::CollectedLeaderboard {
-                    wallets: vec![wallet(1), wallet(1)],
-                    report: crate::leaderboard_discovery::LeaderboardDiscoveryReport {
-                        slices_attempted: 80,
-                        slices_fetched: 80,
-                        raw_entries: 2,
-                        unique_wallets: 2,
-                        activated: 0,
-                    },
-                },
-            ),
+            data: CollectedSource::Disabled,
         };
         assert!(spool.validate(&config, None).is_err());
         let mut config = disabled_config(Path::new("unused"));

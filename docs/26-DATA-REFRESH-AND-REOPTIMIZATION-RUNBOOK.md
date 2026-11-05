@@ -257,7 +257,15 @@ memory sizing is performed.
    through the [same release procedure](#forge-release-deployment-and-rollback).
    Keep the cache generation and recovery pointers.
 
-## Part 1 — Backfill tradeable wallets (no new wallet discovery)
+## Part 1 — Historical schema-one backfill (retired #842)
+
+This section records the retired writer's contracts and rollout evidence. Its v1 acquisition,
+cold probe and wallet-history auditor are removed; these commands are no longer operating
+procedures. `fetch`, `backfill`, `all`, no-argument and positional-TOML invocations fail before
+opening or creating a cache, including `all --create-cache`. Use the
+[seeded schema-two procedure](#155-minute-loop-seeded-cache-switch-and-revert) with its
+complete seed file, verified finalized format-three drops source and capacity prerequisites.
+`classify-infra` remains operator-only and unchanged; existing infra marks remain permanent.
 
 **Goal:** bring trade history, resolutions, and event mappings current for the
 wallets **already** marked tradeable in the pile, *without* discovering or adding
@@ -395,28 +403,11 @@ No cohort wallet's acquired row count may decrease. Every marked **active,
 non-infrastructure** wallet must be re-selected. Universal completion is not the
 gate: each wallet must match its disposition.
 
-Audit one completed nonempty cohort wallet with the read-only operational tool:
-
-```bash
-python3 scripts/audit_wallet_history.py --db data/wallet_cache.db --wallet "$wallet" --cutoff "$cutoff"
-```
-
-The cutoff must be at or below the stored frontier and the marker must be zero,
-checked from one consistent snapshot with the rows. The auditor walks full
-activity with complete boundary-second pagination, mirrors DTO/conversion rules,
-and reports per-UTC-day counts and the symmetric transaction-ID difference.
-That mirroring is enforced, not asserted: the auditor and the Rust writer both
-read `crates/bootstrap/tests/fixtures/dto_parity.jsonl`, so any input the two
-parsers judge differently fails CI. Python's `json` and `Decimal` accept several
-inputs serde rejects — duplicate recognized fields, `NaN`/`Infinity`, the `-0`
-literal in an integer field, surrounding whitespace, Unicode digits and unpaired
-surrogates — and serde accepts some the auditor must not reject, such as a
-repeated field the DTO ignores. Extend the corpus when either parser changes.
-It reports intra-wallet collisions **before** collapsing IDs, with all conflicting
-normalized rows and the stored representative. A failed page or saturated second
-refuses comparison. Acceptance requires an empty difference for that completed
-wallet; collisions remain explicit evidence of schema-one loss, not a false clean
-audit. `--base-url` supports a deterministic test endpoint.
+The read-only `audit_wallet_history.py` v1 harness and its DTO parity corpus were
+retired in #842. Historical acceptance compared completed nonempty cohort wallets at a
+cutoff no later than the stored frontier, requiring an empty symmetric transaction-ID
+difference and preserving collision evidence. Recorded v1 receipt/frozen-payload
+verification remains available; no replacement acquisition audit is introduced here.
 
 **Historical writer compatibility:** the release procedure restores a matching binary/checkout
 pair; the following describes the old writer's behavior.
@@ -572,26 +563,16 @@ push (`scripts/push_ranking_to_supabase.py`) publishes (#370).
 bash scripts/rank_and_push.sh
 ```
 
-In order it runs: **Step 0** data refresh — `winner-discovery
---defer-activation` (leaderboard, datadash and market participants) → one transactionally
-audited `activate-next` batch (`bootstrap_pipeline_activation_batch_wallets`;
-`PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` admits none; keep the value unchanged
-while a cycle is in flight, because a resumed `activate-next` stops on a changed
-count) →
-`backfill --defer-activation` (trades only) → `events` → `resolutions` →
-The production wrapper performs no infrastructure or ordinary purge; exclusions gate
-acquisition (discovery, activation, and backfill), and production rank/export applies
-trade-recency, current-eligibility and schema-one completeness filters without deleting history
-(`docs/37`). Every wallet that ever carried an infra mark gets an excluded receipt with no read in
-fresh collection and never reaches finalize, ranking or publication (#826, `docs/37` §6).
-`resolutions` performs a full CLOB closed-market re-walk, backfills missing
-schedule `end_date`s, then audits and repairs every traded, scheduled past-end
-market still missing a terminal row. The subcommand runs the full
-`fetch_resolutions_and_schedules`, so no separate `schedules` stage is needed
-(#383/#519). Before discovery or collection the wrapper resolves the window end and default
-decay anchor: production cycles use their directory's UTC creation day across retries and pauses;
-parameterized runs use today's date, and explicit overrides win
-([`ranker_window_days`](_GLOSSARY.md#live-wallet-source-supabase-ranking-handoff-issue-339), #821).
+The installed schema-two path runs the [private-candidate sequence](#fresh-private-candidate-cycles-and-the-scheduled-schema-two-lane-588-648):
+stage → deferred discovery → controlled activation → activity → payout → finalize,
+then export, rank and exact-request publication. Leaderboard depth must be zero; datadash
+and participant discovery retain their recorded contracts. Ever-infra exclusion remains
+unchanged. The wrapper never purges automatically.
+
+When both discovery and backfill are skipped, Step 0 is a no-op before lane dispatch.
+This preserves pending publication recovery and pure re-push. A schema-one, non-cutover
+invocation that would execute discovery or backfill exits 2 with an explicit FATAL (#842),
+stopping the supervisor. Skip flags and recorded lane/manifest/resume keys stay unchanged.
 
 For an eligible schema-two attempt (both candidate and prior absent), winner collection starts
 beside cache staging, then joins after staging/migration and the activation-batch probe. Apply
@@ -677,17 +658,16 @@ Latency shift uses the canonical print window; deterministic first-entry order r
 > surprising cohort shift is attributable to the wider universe rather than the decay;
 > drop the override on subsequent runs (#370).
 
-> **Backfill is built in.** Step 0 backfills before ranking, and the push aborts if the
-> cache's newest trade is older than `upload_max_cache_staleness_hours` ([glossary](_GLOSSARY.md);
-> the issue #350 WS3 freshness guard above). A
-> standalone Part-1 run is only needed for a faster iteration loop or to debug.
+> **Schema-two collection is built in.** Use the private-candidate lane and its
+> accepted generation/freshness proofs before publication. The historical Part 1 v1
+> refresh and auditor are retired (#842).
 
 ### Overrides (research / re-push)
 
 - `--universe <file>` — rank a curated wallet file instead of all-trade-wallets.
 - `--half-life-days N` — override the production decay half-life.
-- `--skip-discovery` / `--skip-backfill` — skip Step-0 stages. Every backfill
-  launched through this wrapper still defers global activation;
+- `--skip-discovery` / `--skip-backfill` — retain the recorded lane's skip semantics.
+  Both skipped is a no-op before lane dispatch; legacy refresh otherwise refuses;
   `--skip-discovery` also skips `activate-next`, so it activates no new wallet.
 - `--skip-rank` — reuse existing CSVs in `--out-dir`; just (re-)push. Preparing the request
   refuses an oracle manifest without its market scope (15-minute series by default, #784;
@@ -862,12 +842,9 @@ before any rename. It validates the candidate `C` against the prepared request, 
 there is no copy fallback. `D` holds the exact old bytes. A crash in the gap leaves `F` absent and
 `D + C` present. The next activation or pending-publication resume validates `D` against `H0` and
 `C` against the prepared candidate hash before completing `C → F`. Unknown combinations refuse
-without moving or deleting files. Payout and every ordinary writable CLI invocation, including named,
-no-argument and positional-config `all`, refuse an absent database instead of opening it with SQLite
-CREATE. First installation explicitly opts in with `pe-bootstrap --create-cache` (also accepted by
-named `all` and with a positional TOML config path). The flag creates and initializes an absent cache,
-opens an existing regular cache file normally, and refuses other existing path types, including
-symlinks. The supervised wrapper never passes it, and its preceding probes use read-only opens.
+without moving or deleting files. Ordinary writable commands require an existing database.
+Legacy pipeline forms and `--create-cache` provisioning are retired (#842); they refuse
+before opening or creating a cache. First installation uses the seeded schema-two procedure.
 `cache-stage-v2` still provisions verified candidate copies. Legacy activation/restoration retain
 their explicit backup-copy behavior; those paths never initialize an empty installed cache.
 Legacy cycles with an existing prior and no new staging evidence retain their existing activation
@@ -1186,8 +1163,9 @@ The zero-argument `rank_and_push.sh` production cycle enters this lane automatic
 the installed cache is schema two, and for the one-time initial cutover when `.env` sets
 `PE_RANK_SCHEMA_TWO_CUTOVER` (`_GLOSSARY.md`). The lane is frozen in the cycle's
 `cycle_configuration.json` (`cache_lane`), so a resumed cycle keeps its lane even if the
-opt-in changes and an outstanding legacy cycle completes under its original contract. In
-the lane, Step 0 is the sequence above (legacy `backfill`, `events` and `resolutions` read
+opt-in changes. A retained legacy refresh refuses (#842); its pending publication recovery
+still publishes the exact request. In the fresh lane, Step 0 is the sequence above (legacy
+`backfill`, `events` and `resolutions` read
 retired `trades`/`source_cursor` and do not run), followed by the existing cutover path:
 candidate capture into `candidate_cycle_manifest.json` alongside Parquet export, capture join,
 then export-bound second finalization with `--stage-record`, `--export-manifest` and `--ready-file`.
@@ -2231,7 +2209,7 @@ history-preserving research re-push.
 ## Adding new wallets
 
 New-wallet discovery is **Step 0** of `rank_and_push.sh` (`pe-bootstrap
-winner-discovery`: Polymarket leaderboard, datadash and market participants). The wrapper
+winner-discovery`: datadash and market participants; leaderboard depth zero). The wrapper
 defers legacy immediate activation and records its controlled batch; participant holds can require
 additional named completion batches on the retained side cache. Those wallets are collected and
 ranked in the same cycle — there is no separate

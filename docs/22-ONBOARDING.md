@@ -5,6 +5,14 @@
 
 This guide covers everything needed to run the system locally: toolchain install, environment configuration, startup sequence, and three first-run recipes.
 
+Legacy bootstrap `fetch`, `backfill`, `all`, no-argument and positional-TOML forms are
+retired (#842). Provision through [docs/26's seeded schema-two procedure](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md#155-minute-loop-seeded-cache-switch-and-revert),
+with a complete seed-wallet file and verified finalized format-three drops source.
+`polymarket_concurrency`, `skip_trade_fetch`, `backfill_limit` and `fetch_resolutions`
+(and their `PE_BOOTSTRAP_*` environment names, aliases and defaults) remain accepted but inert.
+Set `PE_BOOTSTRAP_LEADERBOARD_TOP_N=0` for discovery. The `resolutions` command runs
+independently of `PE_BOOTSTRAP_FETCH_RESOLUTIONS`.
+
 ## Prerequisites
 
 ### Rust toolchain
@@ -63,8 +71,8 @@ Variables are grouped by binary. Required fields are marked **[req]**.
 | `PE_BOOTSTRAP_OUTPUT` | Path for bootstrap SQLite output | **[req]** | — |
 | `PE_BOOTSTRAP_CACHE_PATH` | Path for wallet cache SQLite | **[req]** | — |
 | `PE_BOOTSTRAP_WALLET_SET_PATH` | Path for wallet set JSON | **[req]** | — |
-| `PE_BOOTSTRAP_FETCH_RESOLUTIONS` | `1` to populate `market_resolutions` table | | `0` |
-| `PE_BOOTSTRAP_SKIP_TRADE_FETCH` | `1` to skip Polymarket trade fetch (use cached data) | | `0` |
+| `PE_BOOTSTRAP_FETCH_RESOLUTIONS` | Inert after #842; standalone `resolutions` runs independently | | `0` |
+| `PE_BOOTSTRAP_SKIP_TRADE_FETCH` | Inert after #842; retained config compatibility | | `0` |
 | `PE_BOOTSTRAP_DUNE_MIN_MARKETS` | Min distinct resolved markets for Dune seed | | `15` |
 | `PE_BOOTSTRAP_DUNE_MIN_WIN_RATE_PCT` | Min win rate % for Dune seed | | `95` |
 | `PE_BOOTSTRAP_DUNE_ACTIVE_DAYS` | Recency window days for Dune seed | | `30` |
@@ -138,8 +146,8 @@ Runs the full walk-forward simulation on historical data. No live credentials ne
 #    PE_BOOTSTRAP_WALLET_SET_PATH, PE_BOOTSTRAP_FETCH_RESOLUTIONS=1,
 #    PE_BACKTEST_OUTPUT_DIR
 
-# 2. Run bootstrap (takes ~2-4 hours on first run; ~20-30 min on re-runs with cache)
-cargo run --release --bin pe-bootstrap
+# 2. Complete the seeded schema-two procedure in docs/26, including seed and drops-source prerequisites.
+#    The retired no-argument bootstrap pipeline refuses before cache creation (#842).
 
 # 3. Run backtest
 cargo run --release --bin pe-backtest

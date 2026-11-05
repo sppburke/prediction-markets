@@ -1,16 +1,9 @@
-//! `pe-bootstrap` — wallet discovery and seed watchlist generation.
+//! `pe-bootstrap` — wallet discovery, seeded schema-two cache collection and watchlists.
 //!
-//! Pipeline (invoked as `pe-bootstrap all` or no-arg):
-//! 1. `migrate::auto_migrate_legacy` — one-shot SQLite consolidation.
-//! 2. `winner_discovery::run_winner_discovery` — discover wallets via the
-//!    Polymarket leaderboard (all categories) + datadash.
-//! 3. `fetch::run_fetch` — fetch Polymarket trade history per wallet.
-//! 4. `watchlist_phase::run_watchlist` — reconstruct ledgers, filter, write watchlist.json.
-//! 5. `fetch_resolutions_and_schedules` — fetch market resolution data (opt-in).
-//!
-//! Canonical defaults in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
+//! Provisioning prerequisites: docs/26, "15/5-minute loop: seeded cache".
+//! The legacy Data API v1 bulk pipeline was retired in #842.
+//! Canonical defaults: `docs/_GLOSSARY.md`, "Bootstrap defaults".
 
-pub mod backfill;
 pub mod cache;
 pub mod cache_migration;
 pub mod chain;
@@ -20,16 +13,12 @@ pub mod coverage;
 pub mod datadash_discovery;
 pub mod error;
 pub mod events;
-pub mod fetch;
 pub mod filter;
 pub mod gamma;
-pub mod infra_probe;
-pub mod leaderboard_discovery;
 pub mod lock;
 pub mod market_scope;
 pub mod migrate;
 pub mod pile;
-pub mod polymarket;
 pub mod prices_history;
 pub mod purge;
 pub mod reclamation_evidence;

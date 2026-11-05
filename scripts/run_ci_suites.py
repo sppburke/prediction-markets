@@ -27,7 +27,6 @@ DRIFT_SUITES = (
     "test_push_ranking_filter.py",
     "test_ranker_decay.py",
     "test_rank_72hr_consolidated.py",
-    "test_audit_wallet_history.py",
     "test_clob_reconciliation.py",
     "test_rank_and_push.py",
     "test_rank_cycle_manifest.py",

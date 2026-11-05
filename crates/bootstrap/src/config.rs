@@ -138,20 +138,15 @@ pub struct BootstrapConfig {
     #[serde(default = "default_polymarket_base_url")]
     pub polymarket_base_url: String,
 
-    /// Concurrent wallet fetches against the Polymarket Data API.
-    /// `PE_BOOTSTRAP_POLYMARKET_CONCURRENCY` overrides.
+    /// Inert after Data API v1 pipeline retirement (#842); retained for config compatibility.
+    /// `PE_BOOTSTRAP_POLYMARKET_CONCURRENCY` and serialization/aliases retain their existing defaults.
     #[serde(
         default = "default_polymarket_concurrency",
         alias = "bootstrap_polymarket_concurrency"
     )]
     pub polymarket_concurrency: usize,
 
-    /// Per-wallet wall-clock budget (seconds) for the Polymarket `fetch_all`
-    /// loop. `0` disables the timeout; positive values wrap each
-    /// `walk_wallet` call in `tokio::time::timeout`. Wallets that
-    /// trip the timeout are soft-failed (added to `FetchOutcome::failed`) so
-    /// the post-fetch pipeline still runs and the old `last_polymarket_fetch_at`
-    /// is preserved. The partial marker makes active, non-infra wallets due again.
+    /// Per-wallet acquisition budget for the schema-two collector.
     /// The schema-two collector (`cache-populate-activity-v2`) applies the same
     /// budget to each wallet's acquisition: recoverable read failures are
     /// retried in place under it, and expiry records the wallet's exclusion
@@ -164,9 +159,9 @@ pub struct BootstrapConfig {
     )]
     pub polymarket_wallet_timeout_secs: u64,
 
-    /// Fetch market resolutions from the primary CLOB sweep plus auxiliary
-    /// Gamma schedule/liquidity stages after trade fetch (off by default).
-    /// Env `PE_BOOTSTRAP_FETCH_RESOLUTIONS`: `"1"` or `"true"` to enable.
+    /// Inert after Data API v1 pipeline retirement (#842); retained for config compatibility.
+    /// `PE_BOOTSTRAP_FETCH_RESOLUTIONS` and serialization/aliases retain their existing defaults.
+    /// The standalone `resolutions` command runs independently of this setting.
     #[serde(
         default,
         alias = "bootstrap_fetch_resolutions",
@@ -258,8 +253,8 @@ pub struct BootstrapConfig {
     )]
     pub prices_history_coverage_warn_pct: u8,
 
-    /// Skip the Polymarket trade-fetch step (off by default).
-    /// Env `PE_BOOTSTRAP_SKIP_TRADE_FETCH`: `"1"` or `"true"` to enable.
+    /// Inert after Data API v1 pipeline retirement (#842); retained for config compatibility.
+    /// `PE_BOOTSTRAP_SKIP_TRADE_FETCH` and serialization/aliases retain their existing defaults.
     #[serde(
         default,
         alias = "bootstrap_skip_trade_fetch",
@@ -293,10 +288,8 @@ pub struct BootstrapConfig {
     pub write_snapshot: bool,
 
     // ── Wallet pile (issue #166) ─────────────────────────────────────────────
-    /// Per-run cap on `pe-bootstrap backfill`. `0` = no limit (process every
-    /// due wallet in the queue). The loop's zero-argument cycles run with `0`;
-    /// set a positive value only to bound an ad-hoc run.
-    /// `PE_BOOTSTRAP_BACKFILL_LIMIT` overrides.
+    /// Inert after Data API v1 pipeline retirement (#842); retained for config compatibility.
+    /// `PE_BOOTSTRAP_BACKFILL_LIMIT` and serialization/aliases retain their existing defaults.
     #[serde(default = "default_backfill_limit", alias = "bootstrap_backfill_limit")]
     pub backfill_limit: usize,
 
@@ -317,7 +310,7 @@ pub struct BootstrapConfig {
     #[serde(default)]
     pub leaderboard_base_url: Option<String>,
 
-    /// Minimum interval (ms) between leaderboard HTTP requests. Default 500.
+    /// Retained spool/config setting; leaderboard HTTP acquisition is retired (#842).
     /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
     /// `PE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS` overrides.
     #[serde(
@@ -326,8 +319,7 @@ pub struct BootstrapConfig {
     )]
     pub leaderboard_request_interval_ms: u64,
 
-    /// List depth per leaderboard (category × sort × window) slice; 0 disables the source.
-    /// Default 1,050, read in 50-row pages through offset 1,000.
+    /// Retained leaderboard depth: 0 disables; any positive value refuses acquisition (#842).
     /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
     /// `PE_BOOTSTRAP_LEADERBOARD_TOP_N` overrides.
     #[serde(
@@ -336,10 +328,8 @@ pub struct BootstrapConfig {
     )]
     pub leaderboard_top_n: u32,
 
-    /// Leaderboard categories to sweep. Default = all ten. Each category is
-    /// crossed with {PNL,VOL} × {DAY,WEEK,MONTH,ALL}; results are deduped before
-    /// the pile upsert. `PE_BOOTSTRAP_LEADERBOARD_CATEGORIES` overrides (a TOML
-    /// array of category names, e.g. `["OVERALL", "CRYPTO"]`).
+    /// Retained leaderboard category settings for spool/config compatibility (#842).
+    /// `PE_BOOTSTRAP_LEADERBOARD_CATEGORIES` remains a TOML array of category names.
     #[serde(
         default = "default_leaderboard_categories",
         alias = "bootstrap_leaderboard_categories"

@@ -51,8 +51,8 @@ pub use clob_resolution::{
 pub use config::PollingConfig;
 pub use connector::PolymarketPublicConnector;
 pub use endpoint::{
-    ActivitySortDirection, LeaderboardCategory, LeaderboardSort, LeaderboardWindow,
-    PolymarketEndpoint, PositionPartition, V2_PAGE_LIMIT, activity_v2_url, positions_v2_url,
+    ActivitySortDirection, LeaderboardCategory, PolymarketEndpoint, PositionPartition,
+    V2_PAGE_LIMIT, activity_v2_url, positions_v2_url,
 };
 pub use fetcher::{
     FixtureFetcher, HttpRequestContext, PageFetcher, RECONCILIATION_RATE_LIMIT_RETRY_SECS,
