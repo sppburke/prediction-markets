@@ -11861,6 +11861,76 @@ mod tests {
         assert!(replayed.closed_fill_final_conditions.is_empty());
     }
 
+    #[test]
+    fn streamed_eviction_free_knockout_moves_anchor_past_the_intervening_mark() {
+        let mut start = started("hot");
+        start.financial_semantic_version = FINANCIAL_SEMANTIC_VERSION;
+        let mut frames = vec![test_frame(
+            1,
+            1,
+            PaperLogRecord::QualificationStarted(Arc::new(start)),
+        )];
+        let knockout = |removed, added| PaperLogRecord::MembershipChanged {
+            reason: MembershipReason::KnockoutInactivity,
+            removed,
+            added,
+            capacity: 2,
+            ranking_batch_id: Some(2),
+            evidence: serde_json::json!({}),
+        };
+        let mark = |cutoff_unix| {
+            PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
+                boundary_receipt: test_receipt(10_000),
+                cutoff_unix,
+                source_tail: TailBinding {
+                    physical_tail: 0,
+                    last_sequence: Some(EventSeq(10_000)),
+                    last_hash: "0".repeat(64),
+                },
+                financial_prefix_seq: None,
+                prices: Vec::new(),
+                cash: dec!(100),
+                equity: dec!(100),
+                invalid: None,
+            }))
+        };
+        frames.push(test_frame(
+            2,
+            2,
+            knockout(vec![WalletAddress([9; 20])], vec![WalletAddress([1; 20])]),
+        ));
+        frames.push(test_frame(3, 86_400, mark(86_400)));
+        frames.push(test_frame(4, 172_800, mark(172_800)));
+        assert_eq!(
+            qualification_completion(&crate::paper_recovery::paper_era(frames.clone()))
+                .unwrap()
+                .complete_days,
+            1
+        );
+        frames.push(test_frame(
+            5,
+            172_801,
+            knockout(Vec::new(), vec![WalletAddress([2; 20])]),
+        ));
+        assert!(
+            qualification_completion(&crate::paper_recovery::paper_era(frames.clone())).is_none()
+        );
+        frames.push(test_frame(6, 259_200, mark(259_200)));
+        assert_eq!(
+            qualification_completion(&crate::paper_recovery::paper_era(frames.clone()))
+                .unwrap()
+                .complete_days,
+            0
+        );
+        frames.push(test_frame(7, 345_600, mark(345_600)));
+        assert_eq!(
+            qualification_completion(&crate::paper_recovery::paper_era(frames))
+                .unwrap()
+                .complete_days,
+            1
+        );
+    }
+
     /// PASS: boundary C supplies day 30 but a ninetieth Resolution Final excluded from C's causal
     /// financial state does not complete the close threshold.
     #[test]

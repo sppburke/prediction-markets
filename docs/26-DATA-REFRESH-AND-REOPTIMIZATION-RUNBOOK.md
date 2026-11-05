@@ -1905,9 +1905,12 @@ Every post-boot addition on either path is prepared first
 (#542/#544): its prior-market history is complete and its current positions pass the
 five-step causal bracket before the orchestrator records the validation and the wallet is
 published. A typed wallet failure defers that wallet and replans from the remaining ranked
-survivors; each published structural change is one atomic record with proofs for its additions.
-Shared failures keep full-rerank and capacity unchanged for their next retry, while knockout
-may publish decided evictions without a failed backfill. `active_watchlist_size` is
+survivors. Each accepted newcomer publishes its batch selection restricted to structural members
+and ready wallets; every record proves exactly its additions. A later shared failure stops further
+publication and retains acknowledged records, while knockout may publish decided evictions when no
+record has carried them yet. Newcomers and eligible non-failed re-entries share one admission wave
+per round using the existing wallet queue; failed re-entries wait in the closing call behind additions.
+Capacity keeps its atomic contract. `active_watchlist_size` is
 Supabase-authoritative ([default and valid values](_GLOSSARY.md#active-watchlist-size)) and is
 polled at `config_poll_interval_secs`. Every read pins one batch and pages all survivors before
 selection; a failed page or foreign batch id applies nothing. A grow selects from that pinned

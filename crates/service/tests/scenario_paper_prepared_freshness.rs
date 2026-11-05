@@ -4,6 +4,10 @@
 
 mod support;
 
+#[path = "support/position_validation.rs"]
+mod position_validation;
+use position_validation::ControlValidationExt;
+
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;

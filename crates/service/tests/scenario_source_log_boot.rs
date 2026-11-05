@@ -4005,10 +4005,14 @@ async fn previous_binary_rollback_matrix() {
             .output()
             .unwrap();
         assert!(version.status.success());
-        eprintln!(
-            "rollback embedded identity: {}",
-            String::from_utf8(version.stdout).unwrap().trim()
-        );
+        let identity = String::from_utf8(version.stdout).unwrap();
+        eprintln!("rollback embedded identity: {}", identity.trim());
+        if binary == previous.as_path() {
+            assert!(
+                identity.contains("1f6b30c8"),
+                "rollback matrix requires retained predecessor 1f6b30c8: {identity}"
+            );
+        }
     }
     for row in ["absent", "inactive", "active", "unreadable"] {
         eprintln!("rollback row {row}: declared allowed; all preservation criteria required");
@@ -4295,6 +4299,7 @@ async fn previous_binary_rollback_matrix() {
             "rollback row {row}: PASS for the previous binary and this build; corrupt control refused; retry idempotent; balances/history/decisions/fences preserved"
         );
     }
+    checkpoint_rollout::streamed_membership_rollback_rows(&previous, current).await;
 }
 
 /// PASS: the real service defers an exhausted unreadable refresh without moving its anchor,
@@ -7756,4 +7761,13 @@ async fn retention_open_continuation_census_and_preparation_authenticate_pinned_
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, b"open_rows=1 validated=1\n");
+}
+
+#[tokio::test]
+async fn streamed_membership_102_record_wave_size_and_append_counts() {
+    for knockout in [false, true] {
+        let mut fixture = checkpoint_rollout::CheckpointFixture::new().await;
+        let members = fixture.append_streamed_membership(knockout, 102);
+        assert_eq!(members.len(), 102);
+    }
 }

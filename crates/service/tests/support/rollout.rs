@@ -2365,6 +2365,197 @@ impl CheckpointFixture {
             server,
         }
     }
+    /// Ordinary per-wallet records, including interrupted prefixes, are old-reader inputs.
+    pub fn append_streamed_membership(
+        &mut self,
+        knockout: bool,
+        newcomers: usize,
+    ) -> Vec<WalletAddress> {
+        use pe_service::paper_recovery::{MembershipChange, MembershipReason};
+        let started = std::time::Instant::now();
+        let paper_before = std::fs::metadata(&self.cfg.event_log_path).unwrap().len();
+        let source_before = std::fs::metadata(&self.cfg.source_event_log_path)
+            .unwrap()
+            .len();
+        let source_seq = Scanner::verify(&self.cfg.source_event_log_path)
+            .unwrap()
+            .last_sequence
+            .map_or(0, |seq| seq.0);
+        let members = (2..newcomers + 2).map(wallet).collect::<Vec<_>>();
+        let mut entries = Vec::new();
+        for (index, member) in members.iter().enumerate() {
+            crate::support::install_full_history_anchor(&self.paper, *member, self.state.now - 10);
+            self.paper
+                .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                    wallet: *member,
+                    complete: true,
+                    proof_json: "{}".to_owned(),
+                    updated_at_unix: self.state.now - 10,
+                })
+                .unwrap();
+            let mut entry = crate::golden::BracketFinancialHarness::entries(&[*member]);
+            entries.append(&mut entry);
+            let ranking = Writer::open(&self.cfg.source_event_log_path)
+                .unwrap()
+                .append_synced(envelope(
+                    serde_json::to_vec(&json!({"batch_id":2,"entries":entries})).unwrap(),
+                    "pe-service.watchlist-ranking",
+                    self.state.now,
+                    1,
+                    1,
+                ))
+                .unwrap();
+            let binding =
+                pe_service::qualification::scenario_membership_proofs_hash(&self.paper, &[*member])
+                    .unwrap();
+            let binding: Value = serde_json::from_str(&binding).unwrap();
+            let admission = Writer::open(&self.cfg.source_event_log_path)
+                .unwrap()
+                .append_synced(envelope(
+                    serde_json::to_vec(&json!({"wallet":member,"proof":binding["manifest"]}))
+                        .unwrap(),
+                    "pe-service.watchlist-admission",
+                    self.state.now,
+                    1,
+                    1,
+                ))
+                .unwrap();
+            let mut evictions = Vec::new();
+            if knockout && index == 0 {
+                let causal = Writer::open(&self.cfg.source_event_log_path)
+                    .unwrap()
+                    .append_synced(envelope(
+                        serde_json::to_vec(&json!({
+                            "wallet":self.wallet(), "evaluated_at_unix":self.state.now,
+                            "last_trade_unix":self.state.now - 700_000,
+                            "inactivity_threshold_secs":self.cfg.inactivity_threshold_secs,
+                            "inactivity_hard_cap_secs":self.cfg.inactivity_hard_cap_secs,
+                            "demotion_min_trades":self.cfg.demotion_min_trades,
+                            "demotion_cb_alpha":self.cfg.demotion_cb_alpha,
+                            "demotion_pnl_window_secs":self.cfg.demotion_pnl_window_secs,
+                            "fills":[], "settlements":[],
+                        }))
+                        .unwrap(),
+                        "pe-service.watchlist-knockout",
+                        self.state.now,
+                        1,
+                        1,
+                    ))
+                    .unwrap();
+                evictions.push(json!({"wallet":self.wallet(),"reason":"knockout_inactivity","causal_receipt":causal}));
+            }
+            let receipts = json!([{"wallet":member,"receipt":admission}]);
+            let evidence = if knockout {
+                json!({"kind":"knockout_backfill","evictions":evictions,"ranking_receipt":ranking,"admission_receipts":receipts})
+            } else {
+                json!({"kind":"full_rerank","ranking_receipt":ranking,"admission_receipts":receipts})
+            };
+            let record = MembershipChange {
+                reason: if knockout {
+                    MembershipReason::KnockoutInactivity
+                } else {
+                    MembershipReason::FullRerank
+                },
+                removed: if index == 0 {
+                    vec![self.wallet()]
+                } else {
+                    Vec::new()
+                },
+                added: vec![*member],
+                capacity: usize::MAX,
+                ranking_batch_id: Some(2),
+                evidence,
+            }
+            .into_record();
+            Writer::open(&self.cfg.event_log_path)
+                .unwrap()
+                .append_synced(envelope(
+                    serde_json::to_vec(&record).unwrap(),
+                    "pe-service.paper",
+                    self.state.now,
+                    2,
+                    1,
+                ))
+                .unwrap();
+        }
+        let mut initial = crate::golden::BracketFinancialHarness::entries(&[self.wallet()]);
+        let initial = pe_trader_index::Watchlist {
+            active_count: initial.len(),
+            incubator_count: 0,
+            entries: std::mem::take(&mut initial),
+            snapshot_at: SourceTimestamp(
+                OffsetDateTime::from_unix_timestamp(self.state.now).unwrap(),
+            ),
+        };
+        let replayed = replay_membership(
+            &paper_era(scan_paper_log(&self.cfg.event_log_path).unwrap()),
+            initial,
+            &self.cfg.source_event_log_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            replayed
+                .watchlist
+                .entries
+                .iter()
+                .map(|entry| entry.wallet)
+                .collect::<std::collections::HashSet<_>>(),
+            members.iter().copied().collect()
+        );
+        let source_appends = Scanner::verify(&self.cfg.source_event_log_path)
+            .unwrap()
+            .last_sequence
+            .map_or(0, |seq| seq.0)
+            - source_seq;
+        assert_eq!(
+            source_appends,
+            u64::try_from(2 * newcomers + usize::from(knockout)).unwrap()
+        );
+        eprintln!(
+            "streamed record wave: knockout={knockout} newcomers={newcomers} paper_bytes={} source_bytes={} paper_appends={newcomers} source_appends={} elapsed_ms={}",
+            std::fs::metadata(&self.cfg.event_log_path).unwrap().len() - paper_before,
+            std::fs::metadata(&self.cfg.source_event_log_path)
+                .unwrap()
+                .len()
+                - source_before,
+            Scanner::verify(&self.cfg.source_event_log_path)
+                .unwrap()
+                .last_sequence
+                .map_or(0, |seq| seq.0)
+                - source_seq,
+            started.elapsed().as_millis()
+        );
+        self.cfg.maintenance_interval_secs = 0;
+        self.cfg.supabase_refresh_interval_secs = 0;
+        std::fs::write(&self.config_path, toml::to_string(&self.cfg).unwrap()).unwrap();
+        members
+    }
+
+    pub fn copy_wallet(&self, member: WalletAddress) {
+        self.state.activity.lock().unwrap().insert(
+            member.to_string(),
+            vec![row(
+                member,
+                1,
+                OffsetDateTime::now_utc().unix_timestamp(),
+                1001,
+            )],
+        );
+    }
+
+    pub fn assert_members(&self, expected: &[WalletAddress]) {
+        let status: Value =
+            serde_json::from_slice(&std::fs::read(&self.cfg.status_path).unwrap()).unwrap();
+        let actual = status["live_wallets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|wallet| wallet.as_str().unwrap().to_owned())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(actual, expected.iter().map(ToString::to_string).collect());
+    }
+
     pub fn copy(&self) {
         self.state.activity.lock().unwrap().insert(
             wallet(1).to_string(),
@@ -2428,6 +2619,51 @@ impl CheckpointFixture {
                 .any(|row| row["wallet_hex"] == wallet(1).to_string())
         );
         assert!(!self.paper.is_wallet_fenced(&wallet(1)).unwrap());
+    }
+}
+
+/// Run every streamed prefix through the retained predecessor, then repeat its one copy.
+pub async fn streamed_membership_rollback_rows(previous: &Path, current: &Path) {
+    for knockout in [false, true] {
+        for count in [1, 2] {
+            let mut fixture = CheckpointFixture::new().await;
+            let members = fixture.append_streamed_membership(knockout, count);
+            for (direction, binary) in [("previous", previous), ("current", current)] {
+                fixture.clear_logs();
+                let child = Child::start_checkpoint(&fixture.config_path, binary, &[]);
+                fixture.wait_log("pe-service listening").await;
+                if direction == "previous" {
+                    fixture.copy_wallet(members[0]);
+                }
+                fixture.wait_copy().await;
+                until(|| {
+                    std::fs::read(&fixture.cfg.status_path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .is_some_and(|status| {
+                            status["uptime_secs"]
+                                .as_u64()
+                                .is_some_and(|uptime| uptime >= 2)
+                        })
+                })
+                .await;
+                fixture.assert_members(&members);
+                let output = child.finish_checkpoint(Some("-INT")).await;
+                assert!(
+                    output.status.success(),
+                    "{direction} knockout={knockout} prefix={count}: {output:?}"
+                );
+                assert_eq!(
+                    fixture.paper.list_fills().unwrap().len(),
+                    1,
+                    "copy must remain idempotent"
+                );
+                fixture.mirror_positions();
+                eprintln!(
+                    "streamed rollback row: {direction} knockout={knockout} prefix={count} membership and idempotent copy verified"
+                );
+            }
+        }
     }
 }
 

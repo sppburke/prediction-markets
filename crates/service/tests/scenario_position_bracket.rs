@@ -4,6 +4,10 @@
 #[path = "support/golden.rs"]
 mod golden;
 
+#[path = "support/position_validation.rs"]
+mod position_validation;
+use position_validation::ControlValidationExt;
+
 use golden::support;
 
 use support::data_api_v2;
@@ -4400,7 +4404,10 @@ async fn five_wallet_prepare_defers_mapping_failure_and_preserves_accepted_order
         .prepare(&[healthy[0], deferred, raced, healthy[1], healthy[2]])
         .await
         .unwrap();
-    assert_eq!(outcome.admitted, healthy);
+    assert_eq!(
+        outcome.admitted.iter().copied().collect::<HashSet<_>>(),
+        healthy.into_iter().collect()
+    );
     assert_eq!(outcome.deferred.len(), 2);
     assert_eq!(outcome.deferred[0].wallet, deferred);
     assert_eq!(
@@ -4530,9 +4537,9 @@ async fn anchor_install_ledger_race_defers_one_wallet_and_durability_aborts() {
         assert_eq!(
             actor.await.unwrap(),
             if durability {
-                vec![vec![raced, healthy]]
+                vec![vec![raced]]
             } else {
-                vec![vec![raced, healthy], vec![healthy]]
+                vec![vec![raced], vec![healthy]]
             }
         );
     }
@@ -4697,9 +4704,8 @@ async fn boot_bracket_keeps_a_scoped_problem_wallet_and_accepts_the_rest() {
 fn financial_preparer(
     h: &golden::BracketFinancialHarness,
     paper: &Arc<PaperStateDb>,
-    fetcher: Arc<QueueFetcher>,
+    fetcher: Arc<dyn ReconciliationFetcher>,
 ) -> AdmissionPreparer {
-    let fetcher: Arc<dyn ReconciliationFetcher> = fetcher;
     let identity = Arc::new(AssetIdentityResolver::new_runtime(
         fetcher.clone(),
         BASE.to_owned(),
@@ -7075,6 +7081,7 @@ struct RolloutDeadlineFetcher {
     starts: mpsc::UnboundedSender<WalletAddress>,
     first: Mutex<HashSet<WalletAddress>>,
     release: Arc<tokio::sync::Semaphore>,
+    held: Option<WalletAddress>,
 }
 impl PageFetcher for RolloutDeadlineFetcher {
     async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
@@ -7089,7 +7096,9 @@ impl PageFetcher for RolloutDeadlineFetcher {
             let wallet = WalletAddress::from_hex(wallet).unwrap();
             if self.first.lock().unwrap().insert(wallet) {
                 self.starts.send(wallet).unwrap();
-                self.release.acquire().await.unwrap().forget();
+                if self.held.is_none_or(|held| held == wallet) {
+                    self.release.acquire().await.unwrap().forget();
+                }
             }
         }
         self.inner.fetch_page(url).await
@@ -7112,6 +7121,7 @@ async fn paper_service_rollout_deadline_drains_four_and_leaves_fifth_unstarted()
         starts,
         first: Mutex::new(HashSet::new()),
         release: release.clone(),
+        held: None,
     });
     let validator = validator_from_reconciliation(fetcher);
     let (tx, rx) = mpsc::channel(4);
@@ -7187,6 +7197,7 @@ async fn paper_service_rollout_deadline_suppresses_optional_retry_and_maps_filte
         starts,
         first: Mutex::new(HashSet::new()),
         release: release.clone(),
+        held: None,
     });
     let validator = validator_from_reconciliation(fetcher.clone());
     let (tx, rx) = mpsc::channel(4);
@@ -7210,7 +7221,10 @@ async fn paper_service_rollout_deadline_suppresses_optional_retry_and_maps_filte
     let outcome = task.await.unwrap();
     assert_eq!(outcome.started, wallets[1..5]);
     assert_eq!(outcome.unstarted, vec![wallets[5]]);
-    assert_eq!(outcome.admitted, wallets[2..5]);
+    assert_eq!(
+        outcome.admitted.iter().copied().collect::<HashSet<_>>(),
+        wallets[2..5].iter().copied().collect()
+    );
     assert_eq!(outcome.deferred.len(), 2);
     assert_eq!(outcome.deferred[0].wallet, wallets[0]);
     assert_eq!(outcome.deferred[1].wallet, wallets[1]);
@@ -7688,7 +7702,7 @@ async fn reentry_attempts(
     wallet: WalletAddress,
     tx: &mpsc::Sender<OrchestratorControl>,
     paper: &PaperStateDb,
-) -> (pe_service::position_seeder::ValidationOutcomes, Vec<String>) {
+) -> (position_validation::ValidationOutcomes, Vec<String>) {
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
         .json()
@@ -9024,4 +9038,280 @@ async fn runtime_reentry_retains_anomaly_only_baseline_tokens_and_clocks() {
         drop(preparer);
         actor.await.unwrap();
     }
+}
+
+/// A completed bracket installs its own anchor while a peer's activity request is held.
+#[tokio::test]
+async fn ready_admission_installs_before_held_peer_finishes() {
+    let wallets = [wallet(0xe1), wallet(0xe2), wallet(0xe3)];
+    let (_dir, paper, engine) = fresh(&wallets);
+    let specs = [
+        (wallets[0], 1, "1"),
+        (wallets[1], 2, "1"),
+        (wallets[2], 3, "1"),
+    ];
+    let (starts, mut started) = mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let fetcher = Arc::new(RolloutDeadlineFetcher {
+        inner: QueueFetcher::new(stable_responses(&specs)),
+        starts,
+        first: Mutex::new(HashSet::new()),
+        release: release.clone(),
+        held: Some(wallets[1]),
+    });
+    let validator = validator_from_reconciliation(fetcher);
+    let (tx, rx) = mpsc::channel(4);
+    let actor = spawn_control_actor(rx, engine, paper.clone());
+    let preparer = AdmissionPreparer::with_validator(tx.clone(), paper.clone(), validator);
+    let task = tokio::spawn(async move { preparer.prepare(&wallets).await });
+    for _ in 0..3 {
+        started.recv().await.unwrap();
+    }
+    let installed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while paper.position_validation(&wallets[0]).unwrap().is_none()
+            || paper.position_validation(&wallets[2]).unwrap().is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        installed.is_ok(),
+        "accepted peers must install before the held activity read finishes"
+    );
+    assert!(paper.position_validation(&wallets[1]).unwrap().is_none());
+    release.add_permits(1);
+    let outcome = task.await.unwrap().unwrap();
+    assert_eq!(
+        outcome.admitted.iter().copied().collect::<HashSet<_>>(),
+        wallets.into_iter().collect()
+    );
+    drop(tx);
+    actor.await.unwrap();
+}
+
+async fn ready_ranking_server(wallets: &[WalletAddress]) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{Json, Router, extract::Query, routing::get};
+    let rows = wallets
+        .iter()
+        .enumerate()
+        .map(|(rank, wallet)| {
+            json!({
+                "batch_id": 2, "rank": rank + 1, "wallet_hex": wallet.to_string(),
+                "hit_rate": "0.60", "ls_tstat": "2.0", "n_trades": 10,
+                "last_trade_unix": 10, "survives": true,
+            })
+        })
+        .collect::<Vec<_>>();
+    let app = Router::new()
+        .route(
+            "/rest/v1/ranking_batches",
+            get(|| async { Json(json!([{"batch_id": 2}])) }),
+        )
+        .route(
+            "/rest/v1/ranking_entries",
+            get(move |Query(q): Query<HashMap<String, String>>| {
+                let rows = rows.clone();
+                async move {
+                    let offset = q["offset"].parse::<usize>().unwrap();
+                    let limit = q["limit"].parse::<usize>().unwrap();
+                    Json(
+                        rows.into_iter()
+                            .skip(offset)
+                            .take(limit)
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/rest/v1/ranking_scope_drops",
+            get(|| async { Json(json!([])) }),
+        )
+        .route(
+            "/rest/v1/ranking_neg_risk_group_spans",
+            get(|| async { Json(json!([])) }),
+        )
+        .route(
+            "/rest/v1/wallet_lifecycle_events",
+            axum::routing::post(|| async { axum::http::StatusCode::CREATED }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    (
+        url,
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+    )
+}
+
+fn ready_record(
+    frame: &pe_service::paper_recovery::ScannedPaperFrame,
+) -> Option<&pe_service::paper_recovery::PaperLogRecord> {
+    match &frame.frame {
+        pe_service::paper_recovery::PaperLogFrame::Record(record) => Some(record),
+        pe_service::paper_recovery::PaperLogFrame::LegacyFill => None,
+    }
+}
+
+async fn ready_streamed_membership(mode: pe_service::watchlist_maintenance::MembershipMode) {
+    use pe_service::paper_recovery::{
+        PaperLogRecord, paper_era, replay_membership, scan_paper_log,
+    };
+    use pe_service::runtime_config::AppliedWatchlistCapacity;
+    use pe_service::watchlist_maintenance::{MembershipMode, ScenarioMaintenanceState};
+    let (a, b, c, old) = (wallet(0xe1), wallet(0xe2), wallet(0xe3), wallet(0xe9));
+    let (dir, paper, mut engine) = fresh(&[a, b, c, old]);
+    install_empty_anchor(&mut engine, &paper, old, 1);
+    drop(engine);
+    let h = golden::BracketFinancialHarness::new(dir.path(), paper.clone(), &[old]).await;
+    let (starts, mut started) = mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let fetcher = Arc::new(RolloutDeadlineFetcher {
+        inner: QueueFetcher::new(stable_responses(&[(a, 1, "1"), (b, 2, "1"), (c, 3, "1")])),
+        starts,
+        first: Mutex::new(HashSet::new()),
+        release: release.clone(),
+        held: Some(b),
+    });
+    let preparer = financial_preparer(&h, &paper, fetcher);
+    let (base_url, server) = ready_ranking_server(&[a, b, c]).await;
+    let mut cfg = inactivity_config();
+    cfg.membership_mode = mode;
+    cfg.interval_secs = 600;
+    cfg.inactivity_threshold_secs = 5;
+    cfg.inactivity_hard_cap_secs = 10;
+    paper.set_cursor(&old, 1).unwrap();
+    let mut state = ScenarioMaintenanceState::new(Some(1), 0);
+    let client = reqwest::Client::new();
+    let applied = AppliedWatchlistCapacity::new(3);
+    {
+        let tick = state.tick(
+            &h.live,
+            &paper,
+            &client,
+            &base_url,
+            &h.writer_lock,
+            &applied,
+            &preparer,
+            &cfg,
+            END,
+        );
+        tokio::pin!(tick);
+        let observation = async {
+            for _ in 0..3 {
+                started.recv().await.unwrap();
+            }
+            let ready = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while ![a, c].iter().all(|wallet| {
+                    h.live
+                        .snapshot()
+                        .entries
+                        .iter()
+                        .any(|entry| entry.wallet == *wallet)
+                }) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(
+                ready.is_ok(),
+                "newcomers must publish before the held peer is released"
+            );
+            let frames = scan_paper_log(&h.paper_path).unwrap();
+            let records = frames
+                .iter()
+                .filter(|frame| {
+                    matches!(
+                        ready_record(frame),
+                        Some(PaperLogRecord::MembershipChanged { .. })
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 2);
+            for (index, frame) in records.iter().enumerate() {
+                let PaperLogRecord::MembershipChanged { added, removed, .. } =
+                    ready_record(frame).unwrap()
+                else {
+                    unreachable!()
+                };
+                assert_eq!(added.len(), 1);
+                assert_ne!(added[0], b);
+                assert_eq!(removed, &if index == 0 { vec![old] } else { Vec::new() });
+                let prefix = frames
+                    .iter()
+                    .take_while(|candidate| candidate.envelope.seq <= frame.envelope.seq)
+                    .cloned()
+                    .collect();
+                let replayed =
+                    replay_membership(&paper_era(prefix), h.initial.clone(), &h.source_path)
+                        .unwrap()
+                        .unwrap();
+                assert!(
+                    replayed
+                        .watchlist
+                        .entries
+                        .iter()
+                        .any(|entry| entry.wallet == added[0])
+                );
+            }
+            let copied = h.ordinary_entry(a, END + 1).await;
+            assert_eq!(copied.pending.len(), 1);
+            assert!(h.ordinary_entry(a, END + 1).await.pending.is_empty());
+            assert_eq!(h.mutations(), 1);
+            release.add_permits(1);
+        };
+        tokio::join!(tick, observation);
+    }
+    assert_eq!(h.live.structural_membership(), HashSet::from([a, b, c]));
+    let era = paper_era(scan_paper_log(&h.paper_path).unwrap());
+    let replayed = replay_membership(&era, h.initial.clone(), &h.source_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        replayed
+            .watchlist
+            .entries
+            .iter()
+            .map(|entry| entry.wallet)
+            .collect::<HashSet<_>>(),
+        HashSet::from([a, b, c])
+    );
+    let records = era
+        .frames
+        .iter()
+        .filter_map(|frame| ready_record(frame))
+        .filter(|record| matches!(record, PaperLogRecord::MembershipChanged { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 3);
+    let PaperLogRecord::MembershipChanged { added, removed, .. } = records[2] else {
+        unreachable!()
+    };
+    assert_eq!(added, &vec![b]);
+    assert!(removed.is_empty());
+    let ranking_artifacts = Reader::replay(&h.source_path)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|(_, frame)| frame.source_id.0 == "pe-service.watchlist-ranking")
+        .count();
+    assert_eq!(
+        ranking_artifacts, 3,
+        "the final unchanged plan records no artifacts"
+    );
+    assert!(matches!(
+        mode,
+        MembershipMode::FullRerank | MembershipMode::Knockout
+    ));
+    server.abort();
+    drop(preparer);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn ready_full_rerank_records_replay_and_copy_before_held_peer() {
+    ready_streamed_membership(pe_service::watchlist_maintenance::MembershipMode::FullRerank).await;
+}
+
+#[tokio::test]
+async fn ready_knockout_records_replay_and_copy_before_held_peer() {
+    ready_streamed_membership(pe_service::watchlist_maintenance::MembershipMode::Knockout).await;
 }
