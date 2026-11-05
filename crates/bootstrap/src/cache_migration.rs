@@ -5,6 +5,10 @@
 //! unions the generations. This makes a cross-generation ranking/state read a
 //! schema/API error instead of a filter callers can forget.
 
+/// Settled read bound for fresh cache collection: the venue may still be
+/// indexing the newest seconds (`activity_settle_lag_secs` in the glossary).
+pub const ACTIVITY_SETTLE_LAG_SECS: i64 = 120;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::future::Future;

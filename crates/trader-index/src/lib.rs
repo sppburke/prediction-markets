@@ -1,13 +1,11 @@
-//! `pe-trader-index` — wallet-level ledger reconstruction, ranking, and watchlist fetching.
+//! `pe-trader-index` — wallet-level ledger reconstruction, ranking, and watchlists.
 //!
 //! Reconstructs trade histories from raw public event snapshots and produces
 //! [`TraderLedger`] records. The walk-forward ranker then scores each wallet
 //! with LCB_5pct and returns a [`Watchlist`] ready for `copy-signal-engine`.
 //!
 //! # Architecture constraints
-//! - All modules except `fetcher` are pure: NO I/O, NO network, NO async.
-//! - `fetcher` is the single I/O boundary: it queries the Polymarket leaderboard
-//!   and returns a [`Watchlist`] for service-layer bootstrapping.
+//! - All modules are pure: NO I/O, NO network, NO async.
 //! - `float_arithmetic = "deny"` — all numeric operations use [`rust_decimal::Decimal`]
 //!   or integers.
 //! - No `unwrap`/`expect`/`panic!` in production code.
@@ -15,7 +13,6 @@
 
 pub mod config;
 pub mod error;
-pub mod fetcher;
 pub mod incremental;
 pub mod ledger;
 pub mod ranker;
@@ -26,7 +23,6 @@ pub mod watchlist;
 
 pub use config::{LedgerConfig, RankerConfig};
 pub use error::TraderIndexError;
-pub use fetcher::{WatchlistFetchConfig, WatchlistFetchError, WatchlistFetcher};
 pub use incremental::IncrementalLedger;
 pub use ledger::{ClosedTrade, OpenPosition, TraderLedger};
 pub use ranker::build_watchlist;

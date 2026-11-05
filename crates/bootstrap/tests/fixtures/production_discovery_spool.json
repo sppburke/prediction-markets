@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "settings": {
+    "leaderboard_categories": [
+      "OVERALL",
+      "POLITICS",
+      "SPORTS",
+      "CRYPTO",
+      "CULTURE",
+      "MENTIONS",
+      "WEATHER",
+      "ECONOMICS",
+      "TECH",
+      "FINANCE"
+    ],
+    "leaderboard_top_n": 0,
+    "leaderboard_request_interval_ms": 500,
+    "leaderboard_url": "https://data-api.polymarket.com",
+    "polymarket_base_url": "https://data-api.polymarket.com",
+    "gamma_base_url": "https://gamma-api.polymarket.com",
+    "datadash_api_url": null,
+    "datadash_request_interval_ms": 500,
+    "datadash_exclude_ids": [
+      "07NQHFRAGB6HV"
+    ],
+    "datadash_exclude_titles": [
+      "Polymarket Twitter/X Linked Traders"
+    ],
+    "datadash_max_cohort_wallets": 10000,
+    "participant_lookback_secs": 100,
+    "market_recurrences": [
+      "15m"
+    ],
+    "market_floor": 0,
+    "activation_policy": "deferred"
+  },
+  "coverage_read": true,
+  "prior_coverage_raw": "{\"version\":1,\"scope\":{\"recurrences\":[\"15m\"],\"series\":[{\"id\":\"7\",\"slug\":\"seven\"}]},\"market_floor_unix\":0,\"covered_from_unix\":1800057400,\"covered_through_unix\":1800057550}",
+  "outcomes": [
+    {
+      "source": "leaderboard",
+      "result": {
+        "outcome": "disabled"
+      }
+    },
+    {
+      "source": "datadash",
+      "result": {
+        "outcome": "disabled"
+      }
+    },
+    {
+      "source": "market_participants",
+      "result": {
+        "outcome": "collected",
+        "data": {
+          "source": "market_participants",
+          "data": {
+            "wallets": [
+              "0x0000000000000000000000000000000000000003",
+              "0x0000000000000000000000000000000000000004"
+            ],
+            "now": 1800057600,
+            "coverage": {
+              "version": 1,
+              "scope": {
+                "recurrences": [
+                  "15m"
+                ],
+                "series": [
+                  {
+                    "id": "7",
+                    "slug": "seven"
+                  }
+                ]
+              },
+              "market_floor_unix": 0,
+              "covered_from_unix": 1800057400,
+              "covered_through_unix": 1800057600
+            }
+          }
+        }
+      }
+    }
+  ]
+}

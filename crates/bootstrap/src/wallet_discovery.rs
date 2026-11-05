@@ -24,9 +24,6 @@ use crate::datadash_discovery::{
     CollectedDatadash, ReqwestCohortFetcher, apply_datadash, collect_datadash,
 };
 use crate::error::BootstrapError;
-use crate::leaderboard_discovery::{
-    CollectedLeaderboard, LeaderboardFetcher, apply_leaderboard, collect_leaderboard,
-};
 use crate::market_scope::{
     MarketScope, ScopeFetcher, ScopePage, ScopeSeries, canonical_recurrences, list_market_series,
     recent_market_scope,
@@ -260,7 +257,6 @@ pub async fn run_source_discovery_with_policy(
     deny_unknown_fields
 )]
 pub(crate) enum CollectedSource {
-    Leaderboard(CollectedLeaderboard),
     Datadash(CollectedDatadash),
     MarketParticipants(CollectedParticipants),
     Disabled,
@@ -278,27 +274,9 @@ pub(crate) async fn collect_source_discovery(
             if config.leaderboard_top_n == 0 {
                 return Ok(CollectedSource::Disabled);
             }
-            let base_url = config
-                .leaderboard_base_url
-                .as_deref()
-                .unwrap_or(&config.polymarket_base_url)
-                .to_owned();
-            let client = reqwest::Client::builder()
-                .pool_idle_timeout(Duration::from_secs(15))
-                .build()
-                .map_err(|_| BootstrapError::Internal)?;
-            let fetcher = LeaderboardFetcher::new(
-                base_url,
-                ReqwestFetcher::new(client)
-                    .with_min_interval_ms(config.leaderboard_request_interval_ms),
-            );
-            let collected = collect_leaderboard(
-                &fetcher,
-                &config.leaderboard_categories,
-                config.leaderboard_top_n,
-            )
-            .await?;
-            Ok(CollectedSource::Leaderboard(collected))
+            Err(BootstrapError::Leaderboard {
+                message: "HTTP acquisition retired with Data API v1 (#842); set PE_BOOTSTRAP_LEADERBOARD_TOP_N=0".to_owned(),
+            })
         }
         WalletDiscoverySource::Datadash => {
             // Datadash is on by default; an empty/unset URL disables it.
@@ -361,14 +339,6 @@ pub(crate) fn apply_source_discovery(
     collected: CollectedSource,
 ) -> Result<SourceDiscoveryResult, BootstrapError> {
     match collected {
-        CollectedSource::Leaderboard(data) => {
-            let r = apply_leaderboard(cache, policy, data)?;
-            Ok(SourceDiscoveryResult {
-                unique_wallets: r.unique_wallets,
-                activated: r.activated,
-                ..SourceDiscoveryResult::default()
-            })
-        }
         CollectedSource::Datadash(data) => {
             let r = apply_datadash(cache, policy, data)?;
             Ok(SourceDiscoveryResult {

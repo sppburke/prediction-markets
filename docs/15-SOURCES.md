@@ -61,6 +61,18 @@
 > and offset contracts below are historical. These dates retain the supplied source-pass and live
 > check provenance; this documentation pass read the local spec and made no network requests.
 
+> **Ranker v1 caller retirement (#842).** The legacy bulk fetch/backfill/all pipeline,
+> cold density probe, leaderboard HTTP acquisition, trader-index auto-fetcher, wallet-history
+> auditor and activity-latency harness are retired. Production schema-two collection and
+> participant discovery retain their existing scope and proof contracts. Leaderboard config
+> and the disabled spool slot remain; discovery requires `PE_BOOTSTRAP_LEADERBOARD_TOP_N=0`.
+> Recorded v1 parsing, receipts, history and frozen-payload verification remain available.
+> Residual v1 acquisition is intentionally retained for frozen-reference
+> `cache-populate-activity-v2` (`populate_activity_v2`), recorded pre-five identity resumes
+> (`walk.read` / `fetch_complete_activity_semantic`), and pe-service's canary (#499).
+> Retiring those compatibility paths requires an explicit lifecycle revision. No external
+> source was re-checked for this cleanup; historical check dates remain unchanged.
+
 > **Bootstrap `/v2/activity` contract (phase 2).** Last checked: **2026-11-03**;
 > re-verify by **2027-01-02**. The official
 > [OpenAPI spec](https://data-api.polymarket.com/v2/openapi.json) documents keyset order by
@@ -91,7 +103,7 @@
 > next UTC midnight, preserving the raw marker as evidence. This is a scheduled-day projection,
 > not proof of actual closure or a Gamma real-time end lookup. Re-verify by **2026-12-08**.
 > Last checked: **2026-10-10** for the [leaderboard contract](https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings):
-> `/v1/leaderboard` accepts `offset` through **1000**; discovery pages to the canonical
+> `/v1/leaderboard` accepts `offset` through **1000**; historical discovery paged to the canonical
 > [`bootstrap_leaderboard_top_n`](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap) depth.
 > Re-verify by **2026-12-09**. These dates retain the issue's source-pass provenance;
 > the documentation implementation made no network requests.
@@ -255,7 +267,7 @@
 >
 > **Heartbeat contract (2026-06-10, issue #317, `wss-overview`).** The CLOB market **and** user channels require an **application-level** heartbeat: the client sends the text message `PING` every ~10s and the server replies the text `PONG`; the troubleshooting section attributes "connection drops after about 10 seconds" to a missing heartbeat. This is **not** a WS protocol Ping frame — it is a literal text payload. `pe-crypto-shadow` sends `Message::Text("PING")` every `crypto_shadow_clob_ping_interval_secs` (10) and filters the `PONG` reply (case-insensitive — sports channel lowercases it) out of the frame stream. The same page documents dynamic-subscription ops `{"operation":"subscribe"|"unsubscribe"}`; the harness intentionally does not use `unsubscribe` (prune applies at the next reconnect — a filed follow-up). The heartbeat lives only on this overview page, which is why it was missed until #317 (the `market-channel` page, checked 2026-06-09, has no heartbeat section).
 >
-> **`/activity` indexing latency measured (2026-06-14).** The REST `data-api.polymarket.com/activity` feed (the wallet-attributed FALLBACK source since #530; the activity websocket above is primary) indexes a trade within **~1–4s of its `timestamp`** — proven lower bound p50 1.2s / p95 3.8s / p99 5.2s / max 23s, from 4,655 live trades (`scripts/measure_activity_latency.py`, jitter-free lower-bound method). End-to-end FALLBACK-path copy latency (indexing + the 30s production poll + order placement) ≈ **~20–35s**, so a **1-minute** TTR floor is reliably copyable for near-resolution first-bets. Full methodology + run record: `docs/29-ACTIVITY-LATENCY-MEASUREMENT.md`.
+> **`/activity` indexing latency measured (2026-06-14).** The REST `data-api.polymarket.com/activity` feed (the wallet-attributed FALLBACK source since #530; the activity websocket above is primary) indexes a trade within **~1–4s of its `timestamp`** — proven lower bound p50 1.2s / p95 3.8s / p99 5.2s / max 23s, from 4,655 live trades (the jitter-free lower-bound harness, retired with #842; recorded measurement retained). End-to-end FALLBACK-path copy latency (indexing + the 30s production poll + order placement) ≈ **~20–35s**, so a **1-minute** TTR floor is reliably copyable for near-resolution first-bets. Full methodology + run record: `docs/29-ACTIVITY-LATENCY-MEASUREMENT.md`.
 >
 > **CLOB `/book` is public/no-auth (2026-06-16, issue #350 WS2 PR-G live re-confirm).** `GET https://clob.polymarket.com/book?token_id=<id>` returns HTTP **200 with no auth header**; a bogus token id returns **404** `{"error":"No orderbook exists for the requested token id"}`. Body shape: `asks`/`bids` are arrays of `{price, size}` where **both fields are strings** (Decimal-safe), plus scalar string meta (`market`, `asset_id`, `tick_size`, `min_order_size`, `last_trade_price`, `timestamp`, `hash`) and `neg_risk` (bool). Asks are returned **high→low price** (best/lowest ask is not at index 0). `crates/service/src/clob_book.rs` parses the ask side only (liquidity capture is buy-only) into `Decimal`, deriving `best_ask` as the minimum price.
 >

@@ -2070,7 +2070,6 @@ class BulkRootFence(unittest.TestCase):
         from partial_backfill_wallets import partial_backfill_wallets
         from push_ranking_to_supabase import _cache_schema, CacheStaleError
         from rank_cycle_manifest import snapshot, candidate_targets
-        from audit_wallet_history import load_cache
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "bulk.db"
             with sqlite3.connect(db) as connection:
@@ -2081,7 +2080,6 @@ class BulkRootFence(unittest.TestCase):
             for read in (
                 lambda: snapshot(db, "2026-09-17", {}, {}),
                 lambda: candidate_targets(db, db),
-                lambda: load_cache(str(db), W("1"), 1),
             ):
                 with self.assertRaisesRegex(ValueError, "unfinished bulk root"):
                     read()

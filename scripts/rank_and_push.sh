@@ -942,58 +942,6 @@ PYGUARD
   return "$rc"
 }
 
-# Always-on data refresh (discover → activate → backfill → events → resolutions). Each half is
-# independently bypassable; when both are skipped the whole step is a no-op (no binary needed).
-refresh_data() {
-  if [[ "$SKIP_DISCOVERY" == "1" && "$SKIP_BACKFILL" == "1" ]]; then
-    echo "── Step 0: data refresh fully skipped (--skip-discovery --skip-backfill) ─────────"
-    return 0
-  fi
-
-  [[ -x "$PE_BOOTSTRAP_BIN" ]] || {
-    echo "FATAL: $PE_BOOTSTRAP_BIN not found/executable. Build: cargo build --release -p pe-bootstrap" >&2
-    exit 2
-  }
-
-  # Step 0 and the ranker MUST read the SAME cache. pe-bootstrap's config default for
-  # cache_path is bare "wallet_cache.db" (crates/bootstrap/src/config.rs:419-420), so force it
-  # onto $DB (default data/wallet_cache.db) to prevent Step 0 refreshing a different file than
-  # the ranker reads.
-  export PE_BOOTSTRAP_CACHE_PATH="$DB"
-
-  echo "── Step 0: data refresh (discover → activate the next batch → backfill → events → resolutions) ──"
-
-  if [[ "$SKIP_DISCOVERY" == "1" ]]; then
-    echo "   discovery skipped (--skip-discovery)"
-  else
-    # winner-discovery hits both sources: leaderboard (errors propagate → fatal),
-    # datadash (soft-fails internally → still exit 0). #324/#365.
-    run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation \
-      "${DISCOVERY_SCOPE_ARGS[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
-    run_refresh_stage "activate-next" "$PE_BOOTSTRAP_BIN" activate-next \
-      --batch-id "$ACTIVATION_BATCH_ID" --audit-csv "$ACTIVATION_AUDIT_CSV" \
-      "${BOOTSTRAP_CONFIG_ARGS[@]}"
-  fi
-
-  if [[ "$SKIP_BACKFILL" == "1" ]]; then
-    echo "   backfill + market-data skipped (--skip-backfill)"
-  else
-    run_refresh_stage "backfill" "$PE_BOOTSTRAP_BIN" backfill --defer-activation "${BOOTSTRAP_CONFIG_ARGS[@]}"
-    run_refresh_stage "events" "$PE_BOOTSTRAP_BIN" events "${BOOTSTRAP_CONFIG_ARGS[@]}"
-    # The explicit `resolutions` subcommand runs the CLOB→Gamma resolutions+schedules pipeline
-    # UNCONDITIONALLY (main.rs:199) — it does NOT gate on PE_BOOTSTRAP_FETCH_RESOLUTIONS. `backfill`
-    # above runs trades-only because the var was unset right after `source ./.env` (issue #383); THAT
-    # top-level unset is what prevents the double refresh, not the export below. The export is kept
-    # only as a docs/26 canonical-invocation parity signal (operator "explicit env" preference) and
-    # is bounded by the matching unset so it never leaks past this stage. fetch_resolutions_and_schedules
-    # already runs run_schedule_backfill internally (lib.rs:131), so there is no separate `schedules`
-    # stage: after `resolutions`, resolved−scheduled is empty and a standalone pass would be a no-op.
-    export PE_BOOTSTRAP_FETCH_RESOLUTIONS=1
-    run_refresh_stage "resolutions" "$PE_BOOTSTRAP_BIN" resolutions "${BOOTSTRAP_CONFIG_ARGS[@]}"
-    unset PE_BOOTSTRAP_FETCH_RESOLUTIONS
-  fi
-}
-
 # Schema-two private-candidate lane (#588). Every path is a Rust owner that
 # resumes from its own durable state; the wrapper only derives the cycle's
 # physical names, the recorded initial activity/payout targets, and the
@@ -1184,8 +1132,11 @@ if [[ "$FRESH_LANE" == "1" ]]; then
   refresh_candidate_v2
 elif [[ "$CUTOVER_MODE" == "1" ]]; then
   echo "── Step 0: finalized schema-two side cache; legacy refresh skipped ──"
+elif [[ "$SKIP_DISCOVERY" == "1" && "$SKIP_BACKFILL" == "1" ]]; then
+  echo "── Step 0: data refresh fully skipped (--skip-discovery --skip-backfill) ─────────"
 else
-  refresh_data
+  echo "FATAL: legacy schema-one refresh retired with Data API v1 (#842); provision a cache with the seeded schema-two procedure, docs/26 '15/5-minute loop: seeded cache'" >&2
+  exit 2
 fi
 if [[ "$SKIP_RANK" == "0" ]]; then
   # Read the ranking scope after refresh, using the cycle's resolved bounds. The fresh lane

@@ -1,5 +1,5 @@
 use pe_bootstrap::{
-    BootstrapConfig, backfill,
+    BootstrapConfig,
     cache::WalletCache,
     cache_migration::{
         CacheActivationRequest, PriorCacheBinding, SeedPlan, SupabasePublicationProbe,
@@ -10,8 +10,8 @@ use pe_bootstrap::{
     },
     config, coverage,
     error::BootstrapError,
-    fetch, fetch_resolutions_and_schedules, infra_probe, migrate, pile, purge,
-    reclamation_evidence, run_schedule_backfill, watchlist_phase, winner_discovery,
+    fetch_resolutions_and_schedules, pile, purge, reclamation_evidence, run_schedule_backfill,
+    watchlist_phase, winner_discovery,
 };
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -62,6 +62,10 @@ async fn main() {
         std::process::exit(1);
     }
 
+    if matches!(first_arg, Some("fetch" | "backfill" | "all")) {
+        retired_pipeline();
+    }
+
     // ── Subcommand dispatch ──────────────────────────────────────────────────
     // Precedence: named subcommands > flag-style args > positional TOML path.
     //
@@ -80,13 +84,10 @@ async fn main() {
     let known_sub = matches!(
         first_arg,
         Some(
-            "all"
-                | "fetch"
-                | "watchlist"
+            "watchlist"
                 | "resolutions"
                 | "schedules"
                 | "events"
-                | "backfill"
                 | "classify-infra"
                 | "coverage"
                 | "winner-discovery"
@@ -131,7 +132,6 @@ async fn main() {
         // as flag values so the TOML positional search doesn't mistake
         // `--dump-ledgers /path` for a config file path.
         let rest: Vec<&str> = args[2..].iter().map(|s| s.as_str()).collect();
-        let mut strict = false;
         let mut create_cache = false;
         let mut dry_run = false;
         let mut dump_ledgers_path: Option<std::path::PathBuf> = None;
@@ -180,9 +180,7 @@ async fn main() {
         let mut i = 0;
         while i < rest.len() {
             let a = rest[i];
-            if a == "--strict" {
-                strict = true;
-            } else if a == "--create-cache" {
+            if a == "--create-cache" {
                 create_cache = true;
             } else if a == "--reset-clob-cursor" {
                 reset_clob_cursor = true;
@@ -454,8 +452,8 @@ async fn main() {
             std::process::exit(1);
         }
 
-        if create_cache && sub != "all" {
-            tracing::error!("bootstrap: --create-cache is only supported by all");
+        if create_cache {
+            tracing::error!("bootstrap: --create-cache is retired with all (#842)");
             std::process::exit(1);
         }
 
@@ -606,7 +604,7 @@ async fn main() {
                                 None => Vec::new(),
                             };
                             let settled_end = || time::OffsetDateTime::now_utc().unix_timestamp()
-                                .checked_sub(pe_bootstrap::polymarket::ACTIVITY_SETTLE_LAG_SECS)
+                                .checked_sub(pe_bootstrap::cache_migration::ACTIVITY_SETTLE_LAG_SECS)
                                 .ok_or_else(|| BootstrapError::Invalid { message: "settled activity clock underflow".to_owned() });
                             if bulk_root {
                                 if generation != 1 || flag_present("--full-read-wallets") {
@@ -1024,7 +1022,7 @@ async fn main() {
                             &spool,
                             &bootstrap_config.cache_path,
                         )?;
-                        let mut cache = open_cli_cache(&bootstrap_config, false)?;
+                        let mut cache = WalletCache::open_existing_configured(&bootstrap_config)?;
                         winner_discovery::apply_discovery_spool(spool, &mut cache)
                     })
                 })();
@@ -1033,14 +1031,13 @@ async fn main() {
             DiscoveryMode::Plain => {}
         }
 
-        // Every named command below opens WalletCache read-write (including
-        // `all`), so the one central guard must precede that open (#544).
+        // Every named command below opens WalletCache read-write, so the
+        // central guard must precede that open (#544).
         // Genuine readers return above through `open_read_only`.
         let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, sub);
 
-        // Ordinary commands require an installed cache so a rename gap remains
-        // vacant. Only `all --create-cache` opts into first-install provisioning.
-        let mut cache = match open_cli_cache(&bootstrap_config, create_cache) {
+        // Ordinary commands require an installed cache so a rename gap remains vacant.
+        let mut cache = match WalletCache::open_existing_configured(&bootstrap_config) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "bootstrap: cache open failed");
@@ -1049,37 +1046,6 @@ async fn main() {
         };
 
         let exit = match sub {
-            // ── New decomposed subcommands ───────────────────────────────────
-            "all" => handle_all(&bootstrap_config, &mut cache, strict).await,
-
-            "fetch" => {
-                let wallets = match wallets_from_cache(&mut cache) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        tracing::error!(error = %e, "fetch: cache read failed");
-                        std::process::exit(1);
-                    }
-                };
-                match fetch::run_fetch(&bootstrap_config, &mut cache, &wallets).await {
-                    Ok(r) => {
-                        tracing::info!(
-                            attempted = r.attempted,
-                            failed = r.failed,
-                            "fetch: complete"
-                        );
-                        0
-                    }
-                    Err(e @ BootstrapError::PartialFetch { .. }) if !strict => {
-                        tracing::warn!(error = %e, "fetch: partial — failed wallets will retry");
-                        2
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "fetch: fatal");
-                        1
-                    }
-                }
-            }
-
             "watchlist" => {
                 let wallets = match wallets_from_cache(&mut cache) {
                     Ok(w) => w,
@@ -1220,40 +1186,6 @@ async fn main() {
                 }
             }
 
-            "backfill" => match backfill::run_backfill_with_policy(
-                &bootstrap_config,
-                &mut cache,
-                if defer_activation {
-                    pile::ActivationPolicy::Deferred
-                } else {
-                    pile::ActivationPolicy::Immediate
-                },
-            )
-            .await
-            {
-                Ok(r) => {
-                    tracing::info!(
-                        due = r.due,
-                        fetched = r.fetched,
-                        failed = r.failed,
-                        activated = r.activated,
-                        "backfill: complete"
-                    );
-                    0
-                }
-                Err(e @ BootstrapError::PartialFetch { .. }) => {
-                    tracing::warn!(
-                        error = %e,
-                        "backfill: partial — failed wallets will retry on next run"
-                    );
-                    2
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "backfill: fatal");
-                    1
-                }
-            },
-
             "classify-infra" => {
                 // Issue #197: retroactive sweep that mirrors the cold-start
                 // probe semantics over cached trades. `--dry-run` previews
@@ -1261,7 +1193,7 @@ async fn main() {
                 let threshold = std::env::var("PE_BOOTSTRAP_INFRA_SPAN_SECS")
                     .ok()
                     .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(infra_probe::DEFAULT_INFRA_SPAN_SECS);
+                    .unwrap_or(pe_bootstrap::cache::DEFAULT_INFRA_SPAN_SECS);
                 match cache.classify_infra_retroactive(threshold, dry_run) {
                     Ok(r) => {
                         tracing::info!(
@@ -1506,59 +1438,15 @@ async fn main() {
         }
     }
 
-    // ── No-arg / positional TOML path → default "all" ───────────────────────
-    // Like named `all`, only the exact bare flag permits cache creation.
-    let create_cache = args[1..].iter().any(|arg| arg == "--create-cache");
-    let config_path = args[1..]
-        .iter()
-        .find(|arg| arg.as_str() != "--create-cache")
-        .map(std::path::PathBuf::from);
-    let bootstrap_config = match config::load(config_path.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "bootstrap: config error");
-            std::process::exit(1);
-        }
-    };
-
-    // No-arg → run "all" with strict=false (soft-fail default). It follows the
-    // same central lock-before-open contract as the named `all` command (#544).
-    let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, "all");
-    let mut cache = match open_cli_cache(&bootstrap_config, create_cache) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(error = %e, "bootstrap: cache open failed");
-            std::process::exit(1);
-        }
-    };
-    let exit = handle_all(&bootstrap_config, &mut cache, false).await;
-    std::process::exit(exit);
+    // No-argument and positional-TOML forms were aliases for the retired pipeline.
+    retired_pipeline();
 }
 
-/// Called with the cache mutation lock held. Provisioning is a CLI-only opt-in;
-/// existing regular files retain the existing-only opener and schema behavior.
-fn open_cli_cache(
-    config: &BootstrapConfig,
-    create_cache: bool,
-) -> Result<WalletCache, BootstrapError> {
-    if create_cache {
-        match std::fs::symlink_metadata(&config.cache_path) {
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => {
-                return Err(BootstrapError::Invalid {
-                    message: format!(
-                        "--create-cache requires an absent path or a regular file: {}",
-                        config.cache_path.display()
-                    ),
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return WalletCache::open_configured(config);
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    WalletCache::open_existing_configured(config)
+fn retired_pipeline() -> ! {
+    tracing::error!(
+        "retired with Data API v1 (#842); provision a cache with the seeded schema-two procedure, docs/26 '15/5-minute loop: seeded cache'"
+    );
+    std::process::exit(1);
 }
 
 fn acquire_cache_lock_or_exit(
@@ -1576,103 +1464,6 @@ fn acquire_cache_lock_or_exit(
             std::process::exit(1);
         }
     }
-}
-
-/// Orchestrate all bootstrap phases in sequence.
-///
-/// Exit codes: 0 = clean, 1 = fatal, 2 = soft-fail (partial fetch; cache
-/// durable; re-run to retry). The `strict` flag promotes soft-fail to fatal.
-async fn handle_all(config: &BootstrapConfig, cache: &mut WalletCache, strict: bool) -> i32 {
-    // Step 0: one-shot migration (synchronous).
-    if let Err(e) = migrate::auto_migrate_legacy(config, cache) {
-        tracing::error!(error = %e, "all: migrate fatal");
-        return 1;
-    }
-
-    // Step 1: discover wallets via the Polymarket leaderboard (all categories)
-    // + datadash and market participants. Replaces the retired Dune `enumerate` (#335).
-    match winner_discovery::run_winner_discovery(config, cache).await {
-        Ok(r) => {
-            tracing::info!(
-                leaderboard_unique = r.leaderboard_unique,
-                leaderboard_activated = r.leaderboard_activated,
-                datadash_unique = r.datadash_unique,
-                datadash_activated = r.datadash_activated,
-                participants_unique = r.participants_unique,
-                participants_activated = r.participants_activated,
-                participants_status = r.participants_status,
-                "all: winner-discovery complete"
-            );
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "all: winner-discovery fatal");
-            return 1;
-        }
-    }
-
-    let wallets = match wallets_from_cache(cache) {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::error!(error = %e, "all: wallets read failed");
-            return 1;
-        }
-    };
-
-    // Step 2: fetch Polymarket trades.
-    let mut soft_fail = false;
-    match fetch::run_fetch(config, cache, &wallets).await {
-        Ok(_) => {}
-        Err(BootstrapError::PartialFetch { .. }) if !strict => {
-            soft_fail = true;
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "all: fetch fatal");
-            return 1;
-        }
-    }
-
-    // Step 3: watchlist build.
-    match watchlist_phase::run_watchlist(config, cache, &wallets, None).await {
-        Ok(r) => {
-            tracing::info!(
-                active = r.active_count,
-                output = %r.output_path.display(),
-                "all: watchlist complete"
-            );
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "all: watchlist fatal");
-            return 1;
-        }
-    }
-
-    // Step 4: resolutions (optional).
-    if config.fetch_resolutions {
-        let ids = cache.all_market_ids();
-        let result = fetch_resolutions_and_schedules(config, cache, &ids).await;
-        log_token_coverage(cache, config.clob_token_coverage_warn_pct);
-        match result {
-            Ok(report) if report.has_failures() => {
-                // Issue #201: optional stages soft-failed; or #429: CLOB token-order
-                // divergences quarantined markets (both folded into has_failures) →
-                // partial (exit 2), not fatal. The primary CLOB fetch still
-                // propagates failures as Err.
-                tracing::warn!(
-                    stages_failed = ?report.stages_failed,
-                    clob_order_mismatches = report.clob_order_mismatches,
-                    "all: resolutions partial — soft-failed stages and/or CLOB token-order divergences"
-                );
-                soft_fail = true;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!(error = %e, "all: resolutions fatal");
-                return 1;
-            }
-        }
-    }
-
-    if soft_fail { 2 } else { 0 }
 }
 
 /// Log the CLOB token→condition coverage of resolved-with-winner markets and

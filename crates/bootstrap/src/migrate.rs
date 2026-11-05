@@ -233,7 +233,7 @@ pub fn auto_migrate_legacy(
     //    helper issues a full-table UPDATE against the ~2.7M-row `wallets`
     //    table; running them on every steady-state `run()` (after the
     //    one-shot migration has fired) would add multi-second per-run cost
-    //    for zero state change. The pre-existing `backfill::run_backfill`
+    //    for zero state change. The pre-existing retired bulk backfill
     //    already calls `apply_activation_rules` on its own cadence so the
     //    sticky 0→1 activation gate keeps firing for newly-active wallets.
     if did_ingest {

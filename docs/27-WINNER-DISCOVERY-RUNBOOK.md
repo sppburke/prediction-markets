@@ -1,7 +1,7 @@
 # 27 — Winner-Discovery Runbook
 
-Automates the ingest of new candidate wallets from the Polymarket leaderboard
-(plus the datadash.xyz cohorts and ranking-scope maker and taker participants). The
+Automates the ingest of new candidate wallets from datadash.xyz cohorts and ranking-scope
+maker and taker participants. Leaderboard HTTP acquisition is retired (#842). The
 `pe-bootstrap winner-discovery` subcommand upserts each discovered wallet into the
 local `wallet_cache.db`. A standalone invocation immediately applies the legacy
 activation rules; the full rank-and-push wrapper explicitly defers that behavior
@@ -19,25 +19,17 @@ acquisition, not first-entry classification; pe-service release 2's alignment is
 
 ## Required environment
 
-No mandatory environment variables. The `winner-discovery` subcommand does not
-read `discovery_enabled` (that flag gates only the legacy `discovery` subcommand).
-
-Optional overrides (all have safe defaults — see `_GLOSSARY.md` "Bootstrap
-defaults"):
+Set `PE_BOOTSTRAP_LEADERBOARD_TOP_N=0`. The retained positive default now refuses
+acquisition before building an HTTP client. Other settings and defaults remain in the glossary.
 
 ```
 PE_BOOTSTRAP_LEADERBOARD_BASE_URL        # override leaderboard host (testing)
-PE_BOOTSTRAP_LEADERBOARD_TOP_N           # list depth; paged (canonical default in _GLOSSARY.md); 0 disables the source
+PE_BOOTSTRAP_LEADERBOARD_TOP_N           # must be 0; a positive depth refuses retired acquisition
 PE_BOOTSTRAP_MARKET_RECURRENCES          # participant markets' Gamma recurrences, TOML array (canonical default in _GLOSSARY.md)
 PE_BOOTSTRAP_DATADASH_API_URL            # default https://api.datadash.xyz (on by default; "" disables)
 PE_BOOTSTRAP_PARTICIPANT_LOOKBACK_SECS    # overlap from persisted coverage; 0 disables with no HTTP or coverage change
 PE_BOOTSTRAP_CACHE_PATH                  # default wallet_cache.db
 ```
-
-Each leaderboard slice is read to the configured list depth in fixed-size pages; see
-[`bootstrap_leaderboard_top_n`](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap) for depth, page size
-and maximum offset. A short page ends the list; a failed page preserves earlier pages and moves
-to the next list. Dedupe and source-bit upserts remain unchanged.
 
 ## Invocation
 
@@ -126,40 +118,19 @@ at apply. On the first installed eligible cycle, measure overlap, join wait and 
 from these journal lines; this rollout measurement is not a test claim. Earlier collection can
 advance coverage less far than serial discovery; the next cycle's canonical overlap prevents a gap.
 
-## Leaderboard slices
+## Retired leaderboard acquisition (#842)
 
-Eight API slices are always fetched per category — `{profit, volume}` ×
-`{day, week, monthly, allTime}` (`SORT_WINDOW_SLICES` in
-`crates/bootstrap/src/leaderboard_discovery.rs`):
+A positive leaderboard depth returns `BootstrapError::Leaderboard` before HTTP client
+construction. Plain discovery exits 1 with the retirement and `PE_BOOTSTRAP_LEADERBOARD_TOP_N=0`
+fix. C9 collection exits 0 and writes a version-1 spool with a leaderboard
+`Terminal { exit_code: 1, message }`; application returns that recorded failure after the
+existing binding and writable-opener checks. Depth zero retains the `Disabled` slot and
+zero leaderboard report counts. An old spool containing collected leaderboard data refuses
+with exit 77. Settings, source order and the production-config spool bytes are unchanged.
 
-| Sort | Window |
-|---|---|
-| `profit` | `day` |
-| `profit` | `week` |
-| `profit` | `monthly` |
-| `profit` | `allTime` |
-| `volume` | `day` |
-| `volume` | `week` |
-| `volume` | `monthly` |
-| `volume` | `allTime` |
-
-All slices are deduplicated on `proxyWallet` before upsert.  A wallet already
-in the pile keeps its row (`ON CONFLICT(wallet_hex) DO UPDATE`); only its
-`source_bits` column is OR-merged to record the new source, so a repeated
-snapshot changes nothing once its bit is present.
-
-The `SRC_LEADERBOARD` bit (16) bypasses the 100-trade activation gate in
-`pe_bootstrap::pile::apply_activation_rules`, matching the curation-list
-behaviour of the `SRC_GAP502` (64), `SRC_DATADASH` (128) and
-`SRC_MARKET_PARTICIPANT` (256) bits.
-
-> **Retired source — Radion.** A third source, the Radion `traders/analysis`
-> trader-ranking API (issue #373), was removed once Radion deprecated that
-> endpoint upstream (the REST API is now market-data only, no ranked-trader
-> route). Its `radion_*` config knobs, `PE_BOOTSTRAP_RADION_*` env keys, and the
-> `SRC_RADION` (bit 32) source bit were retired; bit 32 is now a reserved gap in
-> `source_bits` (not reused), and existing radion-tagged rows stay inert. Discovery
-> now runs leaderboard, datadash and market participant sources.
+`SRC_LEADERBOARD` remains a persisted source bit with its existing activation and tombstone
+semantics. Historical rows stay valid. Participant scope and interval guarantees are unchanged;
+this retirement introduces no new wallet-coverage claim. The retired Radion bit stays reserved.
 
 ## Market participants (#800, #821)
 
@@ -275,7 +246,7 @@ cycle can skip discovery, so one invocation's log is insufficient.
   publishes it to Supabase `latest_ranking` and the service admits it (maintenance-tick
   backfill in knockout mode; the next batch swap in `full_rerank`) — never directly
   from discovery.
-- **Idempotent.** Re-running with the same leaderboard snapshot is safe:
+- **Idempotent.** Re-running participant discovery is safe:
   the upsert is `ON CONFLICT(wallet_hex) DO UPDATE` and only OR-merges source bits, so a
   repeated snapshot changes nothing once its bits are present.
 - **Logical-cycle retries reuse activation.** A zero-argument production cycle
@@ -292,8 +263,7 @@ cycle can skip discovery, so one invocation's log is insufficient.
   The [classifier-6 catch-up](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md#classifier-6-catch-up-and-coordinated-release-739)
   and first ordinary cycle are distinct batches; change the owner's count only between them.
 - **Bounded inside the wrapper.** `--skip-discovery` skips both discovery and
-  controlled activation. Backfill launched by the wrapper always defers global
-  activation, so no wrapper override can silently activate an unbounded cohort.
+  controlled activation. The schema-two candidate lane owns collection; legacy refresh refuses.
 - **Infrastructure exclusions do not require deletion.** Ordinary publication is
   purge-free. A cold-probe flag (`is_infra = 1`, no tombstone) and a historical
   `reason='infra'` tombstone are both enforced at acquisition time: discovery skips an

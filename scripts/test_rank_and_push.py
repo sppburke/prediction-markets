@@ -10,13 +10,8 @@ drives the real wrapper against it. No network, no real data, deterministic.
 What it locks (the things that would silently break cron if wired wrong):
   - default universe source is `--universe-from-trades`, never `--universe ""` (the ranker
     hard-errors on neither/both);
-  - Step 0 runs deferred discovery → controlled activation → deferred backfill → events →
-    resolutions, in that order (issue #383 removed
-    the redundant trailing `schedules` stage — fetch_resolutions_and_schedules already covers it);
-  - PE_BOOTSTRAP_FETCH_RESOLUTIONS is unset for `backfill` (trades-only) and =1 for `resolutions`,
-    so the CLOB→Gamma refresh runs exactly once, not twice (issue #383);
-  - a pe-bootstrap stage exiting 2 (partial soft-fail) does NOT abort the run — backfill
-    and resolutions return 2 routinely at full scale;
+  - schema-one refresh refuses before discovery or backfill; schema-two uses its candidate lane;
+  - both refresh stages skipped remains a no-op for publication recovery and pure re-push;
   - a stage exiting 1 (fatal) DOES abort, before ranking;
   - the persistent kernel lock blocks a real concurrent holder and never removes its inode;
   - the skip flags bypass Step 0 / ranking for a pure re-push;
@@ -411,8 +406,24 @@ Path('stage2_done').write_text('yes')
         self.assertEqual(record["configuration"]["cache_lane"], "fresh_v2")
         return record
 
+    def _fresh_fixture(self):
+        self._install_candidate_layout(schema=2)
+        self._install_candidate_stub()
+
     # ── scenarios ────────────────────────────────────────────────────────────────────
+    def test_legacy_refresh_refuses_before_any_refresh_stage(self):
+        for args in ((), ("--skip-discovery",), ("--skip-backfill",),
+                     ("--out-dir", "directory with spaces/shared name")):
+            with self.subTest(args=args):
+                result = self._run(*args)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("FATAL: legacy schema-one refresh retired with Data API v1 (#842)", result.stderr)
+                self.assertIsNone(self._log("pe_bootstrap.log"))
+                self.assertIsNone(self._log("rank.log"))
+                self.assertIsNone(self._log("push.log"))
+
     def test_zero_arg_clean_path_uses_repository_python(self):
+        self._fresh_fixture()
         poison_dir = self.root / "poison-bin"
         poison_dir.mkdir()
         poison_log = self.root / "poison_python.log"
@@ -429,7 +440,9 @@ Path('stage2_done').write_text('yes')
         self.assertIn(str(self.repo_python), r.stdout)
         print("PASS: zero-arg clean-PATH run uses the repository Python, never ambient python3")
 
+
     def test_pe_python_override_with_spaces_wins(self):
+        self._fresh_fixture()
         custom_log = self.root / "custom_python.log"
         custom_python = self.root / "custom python" / "bin" / "python3"
         self._write_python_shim(custom_python, custom_log)
@@ -440,7 +453,9 @@ Path('stage2_done').write_text('yes')
         self.assertIn(str(custom_python), r.stdout)
         print("PASS: PE_PYTHON executable path with spaces overrides repository environments")
 
+
     def test_venv_fallback_when_analysis_environment_absent(self):
+        self._fresh_fixture()
         shutil.rmtree(self.root / ".venv-analysis")
         fallback_log = self.root / "venv_python.log"
         fallback_python = self.root / ".venv" / "bin" / "python3"
@@ -450,6 +465,7 @@ Path('stage2_done').write_text('yes')
         self.assertTrue(fallback_log.exists(), ".venv fallback was never invoked")
         self.assertIn(str(fallback_python), r.stdout)
         print("PASS: .venv/bin/python3 is the automatic fallback when .venv-analysis is absent")
+
 
     def test_missing_repository_python_fails_before_mutation(self):
         shutil.rmtree(self.root / ".venv-analysis")
@@ -502,11 +518,12 @@ Path('stage2_done').write_text('yes')
             "if [[ \"$1\" == '-c' && \"${2:-}\" == 'import duckdb' ]]; then exit 1; fi\n"
             f"exec {shlex.quote(sys.executable)} \"$@\"\n",
         )
-        r = self._run()
+        r = self._run("--skip-discovery", "--skip-backfill")
         self.assertEqual(r.returncode, 0, f"auto DuckDB fallback failed\nstdout={r.stdout}\nstderr={r.stderr}")
         self.assertIn("engine=auto will fall back to SQLite", r.stderr)
         self.assertIsNotNone(self._log("rank.log"), "ranking did not run through SQLite fallback")
         print("PASS: auto engine preserves the reviewed SQLite fallback when duckdb is absent")
+
 
     def _assert_preflight_left_no_pipeline_state(self):
         self.assertIsNone(self._log("pe_bootstrap.log"), "refresh ran despite failed preflight")
@@ -521,206 +538,29 @@ Path('stage2_done').write_text('yes')
         )
 
     def test_market_scope_failure_stops_before_export_and_ranking(self):
+        self._fresh_fixture()
         for code in ("75", "1"):
             with self.subTest(code=code):
-                self.tearDown(); self.setUp()
+                self.tearDown(); self.setUp(); self._fresh_fixture()
                 result = self._run(exit_env={"STUB_EXIT_market_scope": code})
                 self.assertEqual(result.returncode, int(code), result.stdout + result.stderr)
-                self.assertEqual(self._bootstrap_ops()[-1], "market-scope")
+                self.assertEqual(self._bootstrap_ops().count("market-scope"), 1)
                 for log in ("export.log", "rank.log", "rerank.log", "push.log"):
                     self.assertIsNone(self._log(log), log)
 
+
     def test_ranking_recurrences_are_independent_of_discovery(self):
+        self._fresh_fixture()
         for ranking in (None, "15m,5m"):
             with self.subTest(ranking=ranking):
-                self.tearDown(); self.setUp()
+                self.tearDown(); self.setUp(); self._fresh_fixture()
                 env = {"PE_BOOTSTRAP_MARKET_RECURRENCES": '["5m"]',
                        "PE_RANK_MARKET_RECURRENCES": ranking or ""}
                 result = self._run(exit_env=env)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
+                scope = shlex.split(self._bootstrap_lines("market-scope")[0])
                 self.assertEqual(scope[scope.index("--recurrences") + 1], ranking or "15m")
 
-    def test_schema_one_scope_lists_the_catalog_with_discoverys_recurrences_and_floor(self):
-        result = self._run(exit_env={"PE_RANK_MARKET_RECURRENCES": "5m,15m",
-                                     "PE_RANK_MARKET_SERIES": "7:ignored"})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
-        discovery = shlex.split(self._log("pe_bootstrap.log").splitlines()[0])
-        for call in (scope, discovery):
-            self.assertNotIn("--series", call)
-            self.assertEqual(call[call.index("--recurrences") + 1], "5m,15m")
-            self.assertEqual(call[call.index("--end-date-min") + 1],
-                             scope[scope.index("--end-date-min") + 1])
-
-    def test_refresh_crossing_utc_midnight_keeps_cycle_day_and_parameterized_today(self):
-        sys.path.insert(0, str(WRAPPER.parent))
-        from ranker_decay import window_bounds
-        real_date = shutil.which("date")
-        for production in (True, False):
-            for win_end, as_of in ((None, None), ("2026-02-28", None), (None, "2026-02-27")):
-                with self.subTest(production=production, win_end=win_end, as_of=as_of):
-                    self.tearDown(); self.setUp()
-                    shim = self.root / "shim"; shim.mkdir()
-                    _write_exec(shim / "date", "#!/usr/bin/env bash\nday=2026-03-01\n"
-                                "[[ -f crossed ]] && day=2026-03-02\n"
-                                f'exec {real_date} -d "$day 23:59:00 UTC" "$@"\n')
-                    boot = self.root / "target/release/pe-bootstrap"
-                    boot.write_text(boot.read_text().replace(
-                        'sub="$1"', 'if [[ "$1" == "resolutions" ]]; then touch crossed; fi\nsub="$1"'))
-                    args = () if production else ("--out-dir", str(self.root / "parameterized"))
-                    with (self.root / ".env").open("a") as handle:
-                        if win_end:
-                            handle.write(f"WIN_END={win_end}\n")
-                        if as_of:
-                            handle.write(f"AS_OF={as_of}\n")
-                    env = {"PATH": f"{shim}:{os.environ['PATH']}"}
-                    for attempt in range(2):
-                        result = self._run(*args, exit_env=dict(env, STUB_EXIT_rank="75" if attempt == 0 else "0"))
-                        self.assertEqual(result.returncode, 75 if attempt == 0 else 0,
-                                         result.stdout + result.stderr)
-                        expected = win_end or ("2026-03-01" if production or attempt == 0 else "2026-03-02")
-                        rank = shlex.split(self._log("rank.log").splitlines()[-1])
-                        self.assertEqual(rank[rank.index("--win-end") + 1], expected)
-                        self.assertEqual(rank[rank.index("--as-of") + 1], as_of or expected)
-                        calls = [shlex.split(line) for line in self._log("pe_bootstrap.log").splitlines()]
-                        for operation in ("winner-discovery", "market-scope"):
-                            call = [call for call in calls if call[0] == operation][-1]
-                            self.assertEqual(call[call.index("--end-date-min") + 1],
-                                             str(window_bounds(None, expected)[0] - 86_400))
-                    rerank = shlex.split(self._log("rerank.log"))
-                    self.assertEqual(rerank[rerank.index("--as-of") + 1], as_of or expected)
-
-    def test_happy_path_default_universe_and_step0_order(self):
-        r = self._run()
-        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
-
-        boot = self._log("pe_bootstrap.log")
-        self.assertIsNotNone(boot, "Step 0 never invoked pe-bootstrap")
-        subs = [ln.split()[0] for ln in boot.splitlines() if ln.strip()]
-        self.assertEqual(
-            subs,
-            [
-                "winner-discovery",
-                "activate-next",
-                "backfill",
-                "events",
-                "resolutions",
-                "market-scope",
-            ],
-            "refresh/rank stages ran out of canonical purge-free order",
-        )
-        boot_lines = boot.splitlines()
-        self.assertIn("--defer-activation", boot_lines[0])
-        self.assertIn("--batch-id", boot_lines[1])
-        self.assertIn("--audit-csv", boot_lines[1])
-        self.assertIn("--defer-activation", boot_lines[2])
-
-        rank = self._log("rank.log")
-        self.assertIn("--universe-from-trades", rank)
-        self.assertNotIn("--universe ", rank)  # never the curated-file form by default
-
-        # #784: one resolved window end feeds the scope floor, pass one and the default anchor,
-        # and both passes read the run's scope file.
-        sys.path.insert(0, str(WRAPPER.parent))
-        from ranker_decay import window_bounds
-        rank_args, rerank_args = rank.split(), self._log("rerank.log").split()
-        win_end = rank_args[rank_args.index("--win-end") + 1]
-        self.assertEqual(rank_args[rank_args.index("--as-of") + 1], win_end)
-        self.assertNotIn("--win-start", rank_args)
-        scope = shlex.split(self._log("pe_bootstrap.log").splitlines()[-1])
-        out_dir = (self.root / "data" / "eval-results").glob("cron-*")
-        scope_file = str(next(out_dir).relative_to(self.root) / "market_scope.json")
-        self.assertEqual(scope, ["market-scope", "--out", scope_file,
-                                 "--end-date-min", str(window_bounds(None, win_end)[0] - 86_400),
-                                 "--recurrences", "15m"])
-        for args in (rank_args, rerank_args):
-            self.assertEqual(args[args.index("--market-scope") + 1], scope_file)
-
-        # Auto-timestamped out-dir was created.
-        crons = list((self.root / "data" / "eval-results").glob("cron-*"))
-        self.assertEqual(len(crons), 1, f"expected one auto out-dir, got {crons}")
-        self.assertIn(f"RANK_AND_PUSH_RUN_DIR={crons[0].relative_to(self.root)}", r.stdout)
-        cycle_observations = (self._log("pe_bootstrap_cycle.log") or "").splitlines()
-        self.assertTrue(cycle_observations)
-        self.assertNotIn("missing", cycle_observations)
-        self.assertTrue(
-            all(observation == str(crons[0].relative_to(self.root)) for observation in cycle_observations),
-            f"cache mutation ran without the exact logical-cycle pointer: {cycle_observations}",
-        )
-        self.assertFalse(
-            (self.root / "data" / "eval-results" / "rank_and_push.cycle").exists(),
-            "successful cycle did not clear its logical-cycle pointer",
-        )
-        print("PASS: happy path — default --universe-from-trades, Step-0 order, auto out-dir")
-
-    def test_activation_batch_id_binds_complete_output_path(self):
-        first_out = self.root / "first" / "shared-name"
-        second_out = self.root / "second" / "shared-name"
-        first = self._run("--out-dir", str(first_out))
-        self.assertEqual(first.returncode, 0, first.stderr)
-        first_line = next(
-            line
-            for line in (self._log("pe_bootstrap.log") or "").splitlines()
-            if line.startswith("activate-next")
-        )
-
-        (self.root / "pe_bootstrap.log").unlink()
-        second = self._run("--out-dir", str(second_out))
-        self.assertEqual(second.returncode, 0, second.stderr)
-        second_line = next(
-            line
-            for line in (self._log("pe_bootstrap.log") or "").splitlines()
-            if line.startswith("activate-next")
-        )
-
-        def batch_id(line):
-            args = line.split()
-            return args[args.index("--batch-id") + 1]
-
-        self.assertNotEqual(
-            batch_id(first_line),
-            batch_id(second_line),
-            "distinct output paths with the same basename reused an activation cohort",
-        )
-
-    def test_activation_batch_id_accepts_output_path_with_spaces(self):
-        out = self.root / "directory with spaces" / "shared name"
-        result = self._run("--out-dir", str(out))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        activation = next(
-            line
-            for line in (self._log("pe_bootstrap.log") or "").splitlines()
-            if line.startswith("activate-next")
-        )
-        args = activation.split()
-        batch_id = args[args.index("--batch-id") + 1]
-        self.assertRegex(batch_id, r"^run-[0-9a-f]{16}$")
-
-    def test_fetch_resolutions_env_scoped_to_resolutions_only(self):
-        # Issue #383: PE_BOOTSTRAP_FETCH_RESOLUTIONS must be UNSET (empty) when `backfill` runs
-        # (trades-only) and =1 only when `resolutions` runs, so the CLOB→Gamma refresh executes
-        # exactly once, not twice. The stub logs argv (pe_bootstrap.log) and the env value
-        # (pe_bootstrap_env.log) one line per invocation in the same order → zip by index.
-        r = self._run()
-        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
-        subs = [ln.split()[0] for ln in (self._log("pe_bootstrap.log") or "").splitlines() if ln.strip()]
-        envs = (self._log("pe_bootstrap_env.log") or "").splitlines()
-        self.assertEqual(len(subs), len(envs), f"argv/env logs misaligned: {subs} vs {envs}")
-        pairs = list(zip(subs, envs))
-        self.assertEqual(
-            [e for s, e in pairs if s == "backfill"], [""],
-            "backfill must run exactly once, trades-only (FETCH_RESOLUTIONS unset)",
-        )
-        self.assertEqual(
-            [e for s, e in pairs if s == "resolutions"], ["1"],
-            "resolutions must run exactly once with FETCH_RESOLUTIONS=1",
-        )
-        # winner-discovery + events run between the top-level unset and the resolutions export,
-        # so neither should see a leaked refresh var.
-        self.assertEqual([e for s, e in pairs if s == "winner-discovery"], [""], "discovery saw a leaked var")
-        self.assertEqual([e for s, e in pairs if s == "events"], [""], "events saw a leaked var")
-        print("PASS: FETCH_RESOLUTIONS unset for discovery/backfill/events, =1 only for resolutions")
 
     def _df_stub(self, avail):
         """A `df` first on PATH that reports AVAIL free bytes for any path (the gate's only free-space source)."""
@@ -730,6 +570,7 @@ Path('stage2_done').write_text('yes')
         return {"PATH": f"{stub}:{os.environ['PATH']}"}
 
     def test_capacity_gate_refuses_a_copy_without_room_and_never_gates_a_staged_resume(self):
+        self._fresh_fixture()
         cycle = self.root / "data/eval-results/rank_and_push.cycle"
         installed = os.stat(os.path.realpath(self.root / "data" / "wallet_cache.db")).st_size
         need = installed + 1_000_000_000  # PE_RANK_MIN_FREE_GB=1
@@ -745,7 +586,7 @@ Path('stage2_done').write_text('yes')
             self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
             self.assertIn("PE_RANK_MIN_FREE_GB must be a whole number of GB", r.stderr)
         self.assertFalse(cycle.exists())
-        retained = self._run(exit_env={"STUB_EXIT_events": "75"})
+        retained = self._run(exit_env={"STUB_EXIT_cache_stage_v2": "75"})
         self.assertEqual(retained.returncode, 75, retained.stdout + retained.stderr)
         self.assertTrue(cycle.exists())
         (run_dir,) = self.root.glob("data/eval-results/cron-*")
@@ -757,7 +598,8 @@ Path('stage2_done').write_text('yes')
         self.assertTrue(cycle.exists())
         self.assertEqual(self._log("pe_bootstrap.log"), stages_before)  # refused before any stage
         side = Path(os.path.realpath(self.root / "data" / "wallet_cache.db")).parent / f"wallet_cache.{run_dir.name}.side.db"
-        side.write_bytes(b"")
+        shutil.copyfile(os.path.realpath(self.root / "data/wallet_cache.db"), side)
+        shutil.copyfile(os.path.realpath(self.root / "data/wallet_cache.db"), str(side).replace(".side.db", ".prior.db"))
         staged = self._run(exit_env={"PE_RANK_MIN_FREE_GB": "1", **self._df_stub(0)})
         self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
         self.assertNotIn("FATAL: capacity", staged.stderr)
@@ -765,10 +607,12 @@ Path('stage2_done').write_text('yes')
         self.assertEqual(exact.returncode, 0, exact.stdout + exact.stderr)
         print("PASS: capacity gate refuses a copy one byte short; staged resumes and exact room proceed")
 
+
     def test_capacity_gate_counts_a_retained_cycles_interrupted_copy_as_free(self):
+        self._fresh_fixture()
         installed = os.stat(os.path.realpath(self.root / "data" / "wallet_cache.db")).st_size
         need = installed + 1_000_000_000  # PE_RANK_MIN_FREE_GB=1
-        retained = self._run(exit_env={"STUB_EXIT_events": "75"})
+        retained = self._run(exit_env={"STUB_EXIT_cache_stage_v2": "75"})
         self.assertEqual(retained.returncode, 75, retained.stdout + retained.stderr)
         (run_dir,) = self.root.glob("data/eval-results/cron-*")
         side = Path(os.path.realpath(self.root / "data" / "wallet_cache.db")).parent / f"wallet_cache.{run_dir.name}.side.db"
@@ -781,7 +625,9 @@ Path('stage2_done').write_text('yes')
         self.assertEqual(fits.returncode, 0, fits.stdout + fits.stderr)
         print("PASS: capacity gate counts a retained cycle's interrupted copy as free space")
 
+
     def test_capacity_sampler_is_off_unless_configured(self):
+        self._fresh_fixture()
         r = self._run()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(list(self.root.glob("data/eval-results/cron-*/capacity_*")), [])
@@ -792,12 +638,14 @@ Path('stage2_done').write_text('yes')
             self.assertIn("PE_RANK_CAPACITY_SAMPLE_SECS must be a whole number", r.stderr)
         print("PASS: no capacity samples unless PE_RANK_CAPACITY_SAMPLE_SECS is set")
 
+
     def test_capacity_sampler_keeps_a_transient_peak_and_ends_with_the_run(self):
-        transient = self.root / "data" / "wallet_cache.transient.db"
+        self._fresh_fixture()
+        transient = Path(os.path.realpath(self.root / "data/wallet_cache.db")).parent / "wallet_cache.transient.db"
         sampler = self.root / "scripts" / "capacity_sampler.py"
         # The failing stage waits for the sampler's first line, so the run never ends before a sample exists.
-        retained = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "1", "STUB_EXIT_events": "75",
-                                       "STUB_WAIT_SAMPLE": "events"})
+        retained = self._run(exit_env={"PE_RANK_CAPACITY_SAMPLE_SECS": "1", "STUB_EXIT_cache_populate_payout_v2": "75",
+                                       "STUB_WAIT_SAMPLE": "cache-populate-payout-v2"})
         self.assertEqual(retained.returncode, 75, retained.stdout + retained.stderr)
         (run_dir,) = self.root.glob("data/eval-results/cron-*")
         samples = run_dir / "capacity_samples.jsonl"
@@ -834,6 +682,7 @@ Path('stage2_done').write_text('yes')
                              f"the sampler outlived its run: {cmdline}")
         print("PASS: capacity samples keep a transient peak, survive a torn line, append on resume, end with the run")
 
+
     def test_capacity_sampler_ends_at_once_when_its_parent_is_gone(self):
         out = self.root / "orphan.jsonl"
         ended = subprocess.run(
@@ -847,6 +696,7 @@ Path('stage2_done').write_text('yes')
     def test_capacity_sampler_first_sample_precedes_every_stage(self):
         # The background sampler starts only once the first stage has recorded what it saw, so the margin's F0 and S0
         # exist at that stage only if the wrapper sampled before running it.
+        self._fresh_fixture()
         scripts = self.root / "scripts"
         shutil.move(scripts / "capacity_sampler.py", scripts / "capacity_sampler_real.py")
         _write_exec(
@@ -868,40 +718,9 @@ Path('stage2_done').write_text('yes')
         self.assertGreaterEqual(len((run_dir / "capacity_samples.jsonl").read_text().splitlines()), 1)
         print("PASS: the first capacity sample is written before any stage runs, even with a late sampler")
 
-    def test_backfill_partial_exit2_does_not_abort(self):
-        r = self._run(exit_env={"STUB_EXIT_backfill": "2"})
-        self.assertEqual(r.returncode, 0, f"exit 2 aborted the run\nstderr={r.stderr}")
-        self.assertIsNotNone(self._log("rank.log"), "ranking did not run after a partial backfill")
-        print("PASS: backfill exit 2 (partial) → run continues to ranking")
-
-    def test_resolutions_partial_exit2_does_not_abort(self):
-        # resolutions is the other Step-0 stage that returns 2 routinely at scale.
-        r = self._run(exit_env={"STUB_EXIT_resolutions": "2"})
-        self.assertEqual(r.returncode, 0, f"exit 2 aborted the run\nstderr={r.stderr}")
-        self.assertIsNotNone(self._log("rank.log"), "ranking did not run after a partial resolutions")
-        print("PASS: resolutions exit 2 (partial) → run continues to ranking")
-
-    def test_resolutions_temporary_failure_exit75_aborts_and_retains_cycle_pointer(self):
-        # Exit 75 from the resolutions stage covers both temporary conditions:
-        # the incomplete resolution audit AND an exhausted-transient CLOB page
-        # walk (#534). The wrapper seam is identical for both.
-        r = self._run(exit_env={"STUB_EXIT_resolutions": "75"})
-        self.assertEqual(r.returncode, 75, f"stdout={r.stdout}\nstderr={r.stderr}")
-        self.assertIsNone(self._log("rank.log"), "ranking ran after a resolutions temporary failure")
-        self.assertIsNone(self._log("push.log"), "publication ran after a resolutions temporary failure")
-        cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
-        self.assertTrue(cycle.is_file(), "resolutions tempfail lost the cycle recovery pointer")
-        # The stage label must reflect the temporary-failure semantics: the loop
-        # retries exit 75, so the wrapper must not call it FATAL (#534).
-        self.assertIn("[resolutions] TEMPFAIL exit 75", r.stderr)
-        self.assertNotIn("[resolutions] FATAL", r.stderr)
-        self.assertIn("cron-", cycle.read_text())
-        boot = (self._log("pe_bootstrap.log") or "").splitlines()
-        self.assertTrue(any(line.startswith("resolutions") for line in boot))
-        self.assertFalse(any(line.startswith("purge-infra") for line in boot))
-        print("PASS: resolutions exit 75 aborts before rank/push and retains cycle pointer")
 
     def test_print_rerank_manifest_reaches_push_without_fetch_stages(self):
+        self._fresh_fixture()
         r = self._run()
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         rerank = (self._log("rerank.log") or "").splitlines()
@@ -911,67 +730,41 @@ Path('stage2_done').write_text('yes')
         self.assertNotIn("prices-history", self._log("pe_bootstrap.log") or "")
         self.assertIn("--manifest-file", self._log("push.log") or "")
 
+
     def test_forced_export_failure_stops_before_rank_and_publish(self):
-        r = self._run("--engine", "duck", exit_env={"STUB_EXIT_export": "1"})
+        self._fresh_fixture()
+        r = self._run(exit_env={"STUB_EXIT_export": "1"})
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIsNone(self._log("rank.log"))
-        self.assertIsNone(self._log("push.log"))
+        self.assertTrue(all(line.startswith("--snapshot-current ") for line in (self._log("push.log") or "").splitlines()))
+
 
     def test_pass1_failure_stops_before_rerank_and_publish(self):
+        self._fresh_fixture()
         r = self._run(exit_env={"STUB_EXIT_rank": "1"})
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIsNone(self._log("rerank.log"))
-        self.assertIsNone(self._log("push.log"))
+        self.assertTrue(all(line.startswith("--snapshot-current ") for line in (self._log("push.log") or "").splitlines()))
         self.assertTrue(
             (self.root / "data/eval-results/rank_and_push.cycle").is_file()
         )
 
+
     def test_fresh_run_without_manifest_fails_closed_before_push(self):
         # #536: a fresh rerank always writes the manifest before success, so exit 0
         # with no manifest is corruption -- never a silent config_hash = null publish.
+        self._fresh_fixture()
         r = self._run(exit_env={"STUB_NO_MANIFEST": "1"})
         self.assertEqual(r.returncode, 1, f"stderr={r.stderr}")
         self.assertIn("refusing provenance-less publish", r.stderr)
-        self.assertIsNone(self._log("push.log"), "published without an oracle manifest")
+        calls = (self._log("push.log") or "").splitlines()
+        self.assertTrue(all(line.startswith("--snapshot-current ") for line in calls), calls)
+        self.assertFalse(list(self.root.glob("data/eval-results/cron-*/ranking_publish_request.json")))
         print("PASS: fresh run with missing manifest fails closed before publication")
 
-    def test_backfill_fatal_exit1_aborts_before_ranking(self):
-        r = self._run(exit_env={"STUB_EXIT_backfill": "1"})
-        self.assertNotEqual(r.returncode, 0, "fatal backfill should abort the run")
-        self.assertIsNone(self._log("rank.log"), "ranking ran despite a fatal backfill")
-        boot = self._log("pe_bootstrap.log").splitlines()
-        self.assertTrue(any(l.startswith("backfill") for l in boot))
-        # `events` is the stage immediately after backfill; a fatal backfill must abort before it.
-        self.assertFalse(any(l.startswith("events") for l in boot), "continued past a fatal stage")
-        self.assertFalse(any(l.startswith("resolutions") for l in boot), "continued past a fatal stage")
-        print("PASS: backfill exit 1 (fatal) → run aborts before ranking")
-
-    def test_discovery_fatal_exit1_aborts_before_backfill(self):
-        r = self._run(exit_env={"STUB_EXIT_winner_discovery": "1"})
-        self.assertNotEqual(r.returncode, 0, "fatal discovery should abort the run")
-        boot = self._log("pe_bootstrap.log").splitlines()
-        self.assertTrue(any(l.startswith("winner-discovery") for l in boot))
-        self.assertFalse(any(l.startswith("backfill") for l in boot), "ran backfill after fatal discovery")
-        print("PASS: winner-discovery exit 1 (leaderboard fatal) → run aborts before backfill")
-
-    def test_activation_fatal_aborts_before_backfill(self):
-        r = self._run(exit_env={"STUB_EXIT_activate_next": "1"})
-        self.assertNotEqual(r.returncode, 0)
-        boot = self._log("pe_bootstrap.log").splitlines()
-        self.assertTrue(any(l.startswith("activate-next") for l in boot))
-        self.assertFalse(any(l.startswith("backfill") for l in boot))
-
-    def test_skip_discovery_skips_activation_and_still_defers_backfill(self):
-        r = self._run("--skip-discovery")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        boot = (self._log("pe_bootstrap.log") or "").splitlines()
-        self.assertFalse(any(l.startswith("winner-discovery") for l in boot))
-        self.assertFalse(any(l.startswith("activate-next") for l in boot))
-        backfill = [l for l in boot if l.startswith("backfill")]
-        self.assertEqual(len(backfill), 1)
-        self.assertIn("--defer-activation", backfill[0])
 
     def test_concurrent_run_blocked_by_live_lock(self):
+        self._fresh_fixture()
         lock = self.root / "data" / "eval-results" / ".rank_and_push.lock"
         holder = subprocess.Popen(
             [
@@ -1011,6 +804,7 @@ Path('stage2_done').write_text('yes')
         self.assertEqual(lock.stat().st_ino, inode, "post-kill acquisition replaced the inode")
         print("PASS: real holder blocks; kill releases kernel lock without stale-file reclamation")
 
+
     def test_pure_repush_skips_step0_and_ranking(self):
         out = self.root / "data" / "eval-results" / "prior"
         out.mkdir()
@@ -1047,6 +841,7 @@ Path('stage2_done').write_text('yes')
         print("PASS: unique-notes re-push publishes exactly once with no purge path")
 
     def test_transient_push_retains_request_and_resume_runs_only_tail(self):
+        self._fresh_fixture()
         first = self._run(exit_env={"STUB_PUSH_EXIT": "75"})
         self.assertEqual(first.returncode, 75, first.stderr)
         pending = self.root / "data" / "eval-results" / "rank_and_push.pending"
@@ -1070,12 +865,12 @@ Path('stage2_done').write_text('yes')
             "resume activated a second wallet cohort",
         )
         self.assertEqual(
-            sum(line.startswith("backfill") for line in boot_after),
+            sum(line.startswith("cache-populate-activity-v2") for line in boot_after),
             1,
             "resume reran the expensive refresh",
         )
         self.assertEqual(
-            boot_after,
+            [line for line in boot_after if not line.startswith("cache-activate")],
             boot_before,
             "publication resume invoked a cache-mutating maintenance stage",
         )
@@ -1088,7 +883,9 @@ Path('stage2_done').write_text('yes')
         )
         print("PASS: transient push resume replays only the exact publication request")
 
+
     def test_new_publication_records_ranking_floor_and_resume_keeps_old_floor(self):
+        self._fresh_fixture()
         with (self.root / ".env").open("a") as env_file:
             env_file.write("MIN_TTR_SECS=99\n")
         first = self._run(exit_env={"STUB_PUSH_EXIT": "75", "MIN_TTR_SECS": "88"})
@@ -1105,6 +902,8 @@ Path('stage2_done').write_text('yes')
         payload = json.loads(request.read_text())
         payload["batch"]["ttr_floor_secs"] = 30
         identity = {"batch": payload["batch"], "entries": payload["entries"]}
+        if payload.get("cache_activation") is not None:
+            identity["cache_activation"] = payload["cache_activation"]
         import hashlib
         payload["publish_key"] = hashlib.sha256(json.dumps(
             identity, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
@@ -1118,8 +917,10 @@ Path('stage2_done').write_text('yes')
         self.assertEqual(resume_args, ["--resume-request", str(request)])
         self.assertEqual(json.loads(before)["batch"]["ttr_floor_secs"], 30)
 
+
     def test_zero_arg_transient_cycle_reuses_run_directory_and_activation_batch(self):
-        first = self._run(exit_env={"STUB_EXIT_events": "75"})
+        self._fresh_fixture()
+        first = self._run(exit_env={"STUB_EXIT_cache_populate_payout_v2": "75"})
         self.assertEqual(first.returncode, 75, first.stderr)
         cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
         self.assertTrue(cycle.is_file(), "temporary events failure lost logical-cycle identity")
@@ -1150,6 +951,7 @@ Path('stage2_done').write_text('yes')
             "cycle retry created another production run directory",
         )
         self.assertFalse(cycle.exists(), "completed retried cycle did not clear its pointer")
+
 
     def _install_cycle_probe(self):
         probe = self.root / "scripts" / "_cycle_probe.py"
@@ -1259,12 +1061,13 @@ Path('stage2_done').write_text('yes')
         link = research / out.name
         link.symlink_to(out)
         inode = link.lstat().st_ino
-        result = self._run("--out-dir", str(out), exit_env={
+        result = self._run("--skip-discovery", "--skip-backfill", "--out-dir", str(out), exit_env={
             "PE_RANK_RESEARCH_LINK_DIR": str(research),
         })
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(link.lstat().st_ino, inode)
         self.assertIsNotNone(self._log("push.log"))
+
 
     def test_research_link_collision_stops_resumed_candidate_before_staging(self):
         self._install_candidate_layout(schema=2)
@@ -1287,10 +1090,11 @@ Path('stage2_done').write_text('yes')
         self.assertEqual(link.read_text(), "keep me\n")
 
     def test_cycle_settings_override_changed_env_and_unset_absent_keys_on_every_resume(self):
+        self._fresh_fixture()
         for entry in ("cycle", "pending", "recovered", "recovered-explicit"):
             for recorded in (True, False):
                 with self.subTest(entry=entry, recorded=recorded):
-                    self.tearDown(); self.setUp()
+                    self.tearDown(); self.setUp(); self._fresh_fixture()
                     self._install_cycle_probe()
                     settings = dict(zip(CYCLE_SETTINGS.values(), (
                         "15m,5m", "",
@@ -1300,7 +1104,7 @@ Path('stage2_done').write_text('yes')
                         for variable, value in settings.items():
                             handle.write(f"{variable}={shlex.quote(value)}\n")
                     first = self._run(exit_env={
-                        "STUB_EXIT_events" if entry == "cycle" else "STUB_PUSH_EXIT": "75",
+                        "STUB_EXIT_cache_populate_payout_v2" if entry == "cycle" else "STUB_PUSH_EXIT": "75",
                     })
                     self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
                     cycle = self.root / "data/eval-results/rank_and_push.cycle"
@@ -1327,17 +1131,19 @@ Path('stage2_done').write_text('yes')
                     self.assertEqual(configuration.read_bytes(), before)
                     self.assertFalse((self.root / "changed research").exists())
 
+
     def test_cycle_settings_record_the_discovery_alias_and_clear_it_when_absent(self):
         # The bootstrap configuration also reads PE_MARKET_RECURRENCES (config.rs `load`): a cycle records the value
         # discovery used, and a resume restores it through the canonical variable or clears both spellings.
+        self._fresh_fixture()
         for recorded in ('["15m","5m"]', None):
             with self.subTest(recorded=recorded):
-                self.tearDown(); self.setUp()
+                self.tearDown(); self.setUp(); self._fresh_fixture()
                 self._install_cycle_probe()
                 if recorded:
                     with (self.root / ".env").open("a") as handle:
                         handle.write(f"PE_MARKET_RECURRENCES={shlex.quote(recorded)}\n")
-                first = self._run(exit_env={"STUB_EXIT_events": "75"})
+                first = self._run(exit_env={"STUB_EXIT_cache_populate_payout_v2": "75"})
                 self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
                 out = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
                 self.assertEqual(json.loads((out / "cycle_configuration.json").read_text()).get("market_recurrences"),
@@ -1351,16 +1157,19 @@ Path('stage2_done').write_text('yes')
                 want = {"PE_BOOTSTRAP_MARKET_RECURRENCES": recorded} if recorded else {}
                 self.assertTrue(probes and all(probe == want for probe in probes), probes)
 
+
     def test_unset_cycle_settings_preserve_configuration_bytes(self):
+        self._fresh_fixture()
         result = self._run()
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         configuration = next((self.root / "data/eval-results").glob("cron-*/cycle_configuration.json"))
         self.assertEqual(configuration.read_bytes(), (
-            b'{"fill_window_secs": "120", "floor_tstat": "3.0", "half_life_days": "30", '
+            b'{"cache_lane": "fresh_v2", "fill_window_secs": "120", "floor_tstat": "3.0", "half_life_days": "30", '
             b'"latency_shift_secs": "2", "min_active_months": "0", "min_avg_per_month": "0", '
             b'"min_trl": "20", "price_max": "0.65", "price_min": "0.15", "top_n": "200", '
             b'"ttr_hours": "24"}\n'
         ))
+
 
     def test_research_service_matches_default_unit(self):
         # Only the checkout differs: each loop's own stop flag keeps the stopped one stopped.
@@ -1371,6 +1180,7 @@ Path('stage2_done').write_text('yes')
         self.assertEqual((units / "pe-rank-loop-15m5m.service").read_text(), expected)
 
     def test_direct_zero_arg_prefers_pending_publication_over_cycle_replay(self):
+        self._fresh_fixture()
         first = self._run(exit_env={"STUB_PUSH_EXIT": "75"})
         self.assertEqual(first.returncode, 75, first.stderr)
         boot_before = (self._log("pe_bootstrap.log") or "").splitlines()
@@ -1379,13 +1189,15 @@ Path('stage2_done').write_text('yes')
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertIn("RANK_AND_PUSH_AUTO_RESUME_PENDING=", resumed.stdout)
         self.assertEqual(
-            (self._log("pe_bootstrap.log") or "").splitlines(),
+            [line for line in (self._log("pe_bootstrap.log") or "").splitlines() if not line.startswith("cache-activate")],
             boot_before,
             "direct zero-argument recovery reran pre-publication stages",
         )
         self.assertIn("--resume-request", (self._log("push.log") or "").splitlines()[-1])
 
+
     def test_successful_zero_arg_cycle_clears_its_pending_pointer(self):
+        self._fresh_fixture()
         result = self._run()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(
@@ -1396,61 +1208,6 @@ Path('stage2_done').write_text('yes')
             (self.root / "data" / "eval-results" / "rank_and_push.cycle").exists()
         )
 
-    def test_unchanged_daily_watermark_exits_before_refresh_or_publish(self):
-        first = self._run()
-        self.assertEqual(first.returncode, 0, first.stderr)
-        boot_before = self._log("pe_bootstrap.log")
-        rank_before = self._log("rank.log")
-        push_before = self._log("push.log")
-        cron_before = sorted((self.root / "data/eval-results").glob("cron-*"))
-
-        second = self._run()
-        self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", second.stdout)
-        self.assertEqual(self._log("pe_bootstrap.log"), boot_before)
-        self.assertEqual(self._log("rank.log"), rank_before)
-        self.assertEqual(self._log("push.log"), push_before)
-        self.assertEqual(sorted((self.root / "data/eval-results").glob("cron-*")), cron_before)
-        self.assertFalse(
-            (self.root / "data/eval-results/rank_and_push.cycle").exists(),
-            "watermark no-op invented a recovery pointer",
-        )
-
-    def test_marker_set_changes_fingerprint_even_for_inactive_wallets(self):
-        db = self.root / "data" / "wallet_cache.db"
-        with sqlite3.connect(db) as conn:
-            conn.execute("ALTER TABLE wallets ADD COLUMN backfill_partial INTEGER NOT NULL DEFAULT 0")
-            conn.execute("INSERT INTO wallets VALUES ('inactive',0,0,0)")
-        first = self._run()
-        self.assertEqual(first.returncode, 0, first.stderr)
-        before = self._log("pe_bootstrap.log")
-        with sqlite3.connect(db) as conn:
-            conn.execute("UPDATE wallets SET backfill_partial = 1 WHERE wallet_hex = 'inactive'")
-        second = self._run()
-        self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertNotIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", second.stdout)
-        self.assertNotEqual(self._log("pe_bootstrap.log"), before)
-        third = self._run()
-        self.assertEqual(third.returncode, 0, third.stderr)
-        self.assertIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", third.stdout)
-
-    def test_unchanged_active_partial_wallet_forces_same_day_refresh(self):
-        db = self.root / "data" / "wallet_cache.db"
-        with sqlite3.connect(db) as conn:
-            conn.execute("ALTER TABLE wallets ADD COLUMN backfill_partial INTEGER NOT NULL DEFAULT 0")
-            conn.execute("UPDATE wallets SET backfill_partial = 1 WHERE wallet_hex = '0xabc'")
-        first = self._run()
-        self.assertEqual(first.returncode, 0, first.stderr)
-        before = self._log("pe_bootstrap.log")
-        # The stub leaves both the marker and source watermark unchanged.
-        second = self._run()
-        self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertNotIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", second.stdout)
-        self.assertNotEqual(self._log("pe_bootstrap.log"), before)
-        manifests = sorted((self.root / "data/eval-results").glob("cron-*/accepted_cycle_manifest.json"))
-        for path in manifests:
-            manifest = json.loads(path.read_text())
-            self.assertEqual(manifest["universe"]["backfill_partial_wallets"], ["0xabc"])
 
     def test_v2_cycle_manifest_uses_only_completed_generations_and_stamps_versions(self):
         db = self.root / "data" / "wallet_cache.db"
@@ -1667,6 +1424,7 @@ Path('stage2_done').write_text('yes')
         )
 
     def test_old_capture_and_lane_record_select_the_newest_accepted_request(self):
+        self._fresh_fixture()
         root = self.root / "data/eval-results"
         older = root / "cron-20000101T000000Z"
         newer = root / "cron-20000102T000000Z"
@@ -1688,24 +1446,6 @@ Path('stage2_done').write_text('yes')
             self.assertEqual(result.stdout.strip(),
                              f"data/eval-results/{newer.name}/ranking_publish_request.json")
 
-    def test_legacy_same_day_gate_ignores_newer_lane_record(self):
-        first = self._run()
-        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
-        root = self.root / "data/eval-results"
-        accepted = next(root.glob("cron-*/accepted_cycle_manifest.json"))
-        current = accepted.parent / "cycle_manifest.json"
-        newer = root / "cron-29990101T000000Z"
-        newer.mkdir()
-        (newer / "accepted_cycle_manifest.json").write_text(json.dumps(
-            {"version": 1, "configuration": {"cache_lane": "fresh_v2"}}))
-        result = subprocess.run(
-            [sys.executable, "scripts/rank_cycle_manifest.py", "unchanged",
-             "--db", "data/wallet_cache.db", "--current", str(current),
-             "--root", "data/eval-results"],
-            cwd=self.root, capture_output=True, text=True,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), json.loads(accepted.read_text())["fingerprint_sha256"])
 
     def test_schema_two_prepares_then_activates_then_resumes_exact_request(self):
         """The corrected batch request is durable before cache activation and the
@@ -1799,7 +1539,7 @@ Path('stage2_done').write_text('yes')
         self.assertEqual(regular.read_text(), "{}\n")
 
     def test_parameterized_research_run_never_owns_production_pending_pointer(self):
-        result = self._run("--skip-purge")
+        result = self._run("--skip-discovery", "--skip-backfill", "--skip-purge")
         self.assertEqual(result.returncode, 0, result.stderr)
         push = self._log("push.log") or ""
         self.assertIn("--request-file", push)
@@ -1811,6 +1551,7 @@ Path('stage2_done').write_text('yes')
             (self.root / "data" / "eval-results" / "rank_and_push.cycle").exists()
         )
 
+
     def test_parameterized_run_ignores_existing_production_cycle_pointer(self):
         cycle_dir = self.root / "data" / "eval-results" / "cron-20260728T092155Z"
         cycle_dir.mkdir()
@@ -1818,11 +1559,12 @@ Path('stage2_done').write_text('yes')
         cycle.write_text(f"{cycle_dir.relative_to(self.root)}\n")
         research_out = self.root / "research-output"
 
-        result = self._run("--skip-purge", "--out-dir", str(research_out))
+        result = self._run("--skip-discovery", "--skip-backfill", "--skip-purge", "--out-dir", str(research_out))
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(cycle.read_text().strip(), str(cycle_dir.relative_to(self.root)))
         self.assertIn(str(research_out), self._log("rank.log") or "")
+
 
     def test_cycle_pointer_validation_fails_closed_before_cache_mutation(self):
         cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
@@ -1856,6 +1598,7 @@ Path('stage2_done').write_text('yes')
         self.assertIsNone(self._log("pe_bootstrap.log"))
 
     def test_success_compare_clear_preserves_changed_cycle_pointer(self):
+        self._fresh_fixture()
         result = self._run(exit_env={"STUB_REPLACE_CYCLE": "1"})
         cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
 
@@ -1866,12 +1609,15 @@ Path('stage2_done').write_text('yes')
         )
         self.assertIn("cycle pointer changed; leaving it intact", result.stderr)
 
+
     def test_permanent_failure_preserves_cycle_pointer(self):
-        result = self._run(exit_env={"STUB_EXIT_events": "1"})
+        self._fresh_fixture()
+        result = self._run(exit_env={"STUB_EXIT_cache_populate_payout_v2": "1"})
         self.assertEqual(result.returncode, 1)
         cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
         self.assertTrue(cycle.is_file())
         self.assertIn("cron-", cycle.read_text())
+
 
     def test_resume_rejects_pointer_outside_production_cron_directory(self):
         request = self.root / "outside.json"
@@ -1889,6 +1635,7 @@ Path('stage2_done').write_text('yes')
     def test_resume_rejects_tampered_request_before_cache_activation(self):
         """PASS: the publisher validates publish_key before the wrapper invokes activation.
         FAIL: a modified activation tuple reaches pe-bootstrap."""
+        self._fresh_fixture()
         request_dir = self.root / "data" / "eval-results" / "cron-tampered"
         request_dir.mkdir()
         request = request_dir / "ranking_publish_request.json"
@@ -1926,7 +1673,9 @@ Path('stage2_done').write_text('yes')
         self.assertTrue(pending.is_file())
         print("PASS: tampered pending request is rejected before activation")
 
+
     def test_default_half_life_threaded_to_both_passes(self):
+        self._fresh_fixture()
         r = self._run()
         self.assertEqual(r.returncode, 0, f"stderr={r.stderr}")
         flag = f"--half-life-days {EXPECTED_DEFAULT_HALF_LIFE}"
@@ -1934,7 +1683,9 @@ Path('stage2_done').write_text('yes')
         self.assertIn(flag, self._log("rerank.log"), "pass-2 missing the default half-life")
         print(f"PASS: production default half-life ({EXPECTED_DEFAULT_HALF_LIFE}) threaded to both passes")
 
+
     def test_copy_pipeline_defaults_reach_both_passes_and_manifest(self):
+        self._fresh_fixture()
         r = self._run()
         self.assertEqual(r.returncode, 0, r.stderr)
         for logname in ("rank.log", "rerank.log"):
@@ -1953,6 +1704,7 @@ Path('stage2_done').write_text('yes')
         self.assertEqual(manifest["scheduled_horizon"]["maximum_secs_exclusive"], 86400)
         self.assertEqual(manifest["price_band"]["maximum_exclusive"], .65)
         self.assertIn("--manifest-file", self._log("push.log"))
+
 
     def test_missing_bootstrap_binary_is_fatal(self):
         (self.root / "target" / "release" / "pe-bootstrap").unlink()
@@ -1973,6 +1725,7 @@ Path('stage2_done').write_text('yes')
     def test_automatic_physical_maintenance_is_absent(self):
         # Even failure-injected direct-command stubs must be unreachable from a
         # production publication. The static assertions catch hidden branches.
+        self._fresh_fixture()
         r = self._run(
             exit_env={"STUB_EXIT_purge": "91", "STUB_EXIT_purge_infra": "92"}
         )
@@ -1992,7 +1745,9 @@ Path('stage2_done').write_text('yes')
         self.assertIsNotNone(self._log("push.log"), "purge-free path did not publish")
         print("PASS: production publication performs no purge, reclamation, index rebuild, or checkpoint")
 
+
     def test_wrapper_never_opts_into_first_install_cache_creation(self):
+        self._fresh_fixture()
         r = self._run()
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
         bootstrap_log = self._log("pe_bootstrap.log")
@@ -2004,8 +1759,9 @@ Path('stage2_done').write_text('yes')
             self.assertNotIn("--create-cache", script.read_text(), str(script))
         print("PASS: wrapper and supervisor never opt into first-install cache creation")
 
+
     def test_skip_purge_remains_a_backward_compatible_noop(self):
-        r = self._run("--skip-purge")
+        r = self._run("--skip-discovery", "--skip-backfill", "--skip-purge")
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
         subs = [
             ln.split()[0]
@@ -2017,9 +1773,11 @@ Path('stage2_done').write_text('yes')
         self.assertIsNotNone(self._log("push.log"), "legacy flag prevented publication")
         print("PASS: --skip-purge remains accepted while automatic purge stays retired")
 
+
     def test_auto_prune_removes_positions_csv(self):
         # After pass-2 consumes it, the multi-GB qualifying_positions_72hr.csv is pruned; the ranked
         # (purge decision/audit) and latency (push input) CSVs are kept.
+        self._fresh_fixture()
         r = self._run()
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
         crons = list((self.root / "data" / "eval-results").glob("cron-*"))
@@ -2034,14 +1792,16 @@ Path('stage2_done').write_text('yes')
         self.assertIn("Pruned pass-1 intermediate", r.stdout)
         print("PASS: auto-prune removes qualifying_positions_72hr.csv, keeps ranked + latency CSVs")
 
+
     def test_keep_intermediates_retains_positions(self):
-        r = self._run("--keep-intermediates")
+        r = self._run("--skip-discovery", "--skip-backfill", "--keep-intermediates")
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
         out = list((self.root / "data" / "eval-results").glob("cron-*"))[0]
         self.assertTrue((out / "qualifying_positions_72hr.csv").exists(),
                         "--keep-intermediates must retain the positions intermediate")
         self.assertNotIn("Pruned pass-1 intermediate", r.stdout)
         print("PASS: --keep-intermediates retains qualifying_positions_72hr.csv")
+
 
     def test_skip_rank_does_not_prune_positions(self):
         # A pure re-push didn't generate the positions file this run, so it must not be pruned.
@@ -2098,6 +1858,7 @@ Path('stage2_done').write_text('yes')
         return {"PATH": str(bindir)}
 
     def test_publication_never_invokes_ionice(self):
+        self._fresh_fixture()
         r = self._run(exit_env=self._install_ionice_stub())
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
         self.assertEqual(
@@ -2110,11 +1871,14 @@ Path('stage2_done').write_text('yes')
         self.assertNotIn("purge", boot)
         print("PASS: purge-free publication never invokes ionice")
 
+
     def test_missing_ionice_allows_normal_publication(self):
+        self._fresh_fixture()
         r = self._run(exit_env=self._path_without_ionice())
         self.assertEqual(r.returncode, 0, f"missing ionice blocked publication\nstderr={r.stderr}")
         self.assertIsNotNone(self._log("push.log"))
         print("PASS: ionice is no longer a publication dependency")
+
 
     def test_missing_ionice_ok_for_pure_repush(self):
         out = self.root / "data" / "eval-results" / "prior"
@@ -2131,6 +1895,7 @@ Path('stage2_done').write_text('yes')
         print("PASS: absent ionice allows a purge-free re-push")
 
     def test_ionice_failure_injection_cannot_reach_retired_infra_purge(self):
+        self._fresh_fixture()
         env = self._install_ionice_stub()
         env["STUB_IONICE_EXIT_purge_infra"] = "9"
         r = self._run(exit_env=env)
@@ -2141,7 +1906,9 @@ Path('stage2_done').write_text('yes')
         self.assertIsNotNone(self._log("push.log"))
         print("PASS: retired infra-purge injection cannot affect publication")
 
+
     def test_infra_purge_exit_injection_is_unreachable(self):
+        self._fresh_fixture()
         env = self._install_ionice_stub()
         env["STUB_EXIT_purge_infra"] = "2"
         r = self._run(exit_env=env)
@@ -2151,7 +1918,9 @@ Path('stage2_done').write_text('yes')
         self.assertIsNotNone(self._log("push.log"))
         print("PASS: direct purge-infra exit injection is unreachable from publication")
 
+
     def test_ordinary_purge_ionice_failure_injection_is_unreachable(self):
+        self._fresh_fixture()
         env = self._install_ionice_stub()
         env["STUB_IONICE_EXIT_purge"] = "9"
         r = self._run(exit_env=env)
@@ -2163,7 +1932,9 @@ Path('stage2_done').write_text('yes')
         self.assertNotIn("purge", boot)
         print("PASS: direct purge exit injection is unreachable from publication")
 
+
     def test_resume_pending_has_no_ionice_maintenance_tail(self):
+        self._fresh_fixture()
         env = self._install_ionice_stub()
         first = self._run(exit_env={**env, "STUB_PUSH_EXIT": "75"})
         self.assertEqual(first.returncode, 75, first.stderr)
@@ -2181,11 +1952,11 @@ Path('stage2_done').write_text('yes')
         )
         print("PASS: publication resume has no purge/ionice maintenance tail")
 
+
     def test_wrapper_passes_bash_syntax_check(self):
         r = subprocess.run(["bash", "-n", str(WRAPPER)], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, f"bash -n failed: {r.stderr}")
         print("PASS: bash -n syntax check")
-
 
 
     # ── #588 schema-two private-candidate lane ───────────────────────────────────────
@@ -4321,7 +4092,7 @@ finally:
     def test_lane_is_frozen_with_the_cycle_across_opt_in_changes(self):
         """PASS: a cycle keeps the lane it was created with when the opt-in flips
         between attempts, in both directions. FAIL: an interrupted fresh cycle
-        resumes as legacy refresh, or an interrupted legacy cycle switches lanes."""
+        resumes as legacy refresh, or a retained legacy cycle switches lanes."""
         self._install_candidate_layout(schema=1)
         self._install_candidate_stub()
         env_path = self.root / ".env"
@@ -4337,20 +4108,20 @@ finally:
         self.assertEqual(ops.count("cache-populate-activity-v2"), 2)
         self.assertEqual(ops[-1], "cache-activate")
 
-        # Opposite direction on a fresh sandbox state: a legacy cycle interrupted
-        # before publication completes as legacy after the opt-in is enabled.
+        # A retained schema-one cycle must keep its lane and refuse its retired refresh,
+        # even after the operator enables the cutover opt-in.
         self.tearDown(); self.setUp()
         (self.root / ".env").write_text(base)
-        legacy = self._run(exit_env={"STUB_EXIT_events": "75"})
-        self.assertEqual(legacy.returncode, 75, legacy.stderr)
+        legacy = self._run()
+        self.assertEqual(legacy.returncode, 2, legacy.stderr)
+        self.assertIn("legacy schema-one refresh retired", legacy.stderr)
         (self.root / ".env").write_text(base + "PE_RANK_SCHEMA_TWO_CUTOVER=1\n")
         finished = self._run()
-        self.assertEqual(finished.returncode, 0, finished.stderr + finished.stdout)
-        ops = self._bootstrap_ops()
-        self.assertNotIn("cache-stage-v2", ops)
-        self.assertEqual(ops.count("events"), 2)
-        self.assertNotIn("cache_lane", (self.root / "data/eval-results" / Path(
-            next((self.root / "data/eval-results").glob("cron-*")).name) / "cycle_configuration.json").read_text())
+        self.assertEqual(finished.returncode, 2, finished.stderr + finished.stdout)
+        self.assertIn("legacy schema-one refresh retired", finished.stderr)
+        self.assertIsNone(self._log("pe_bootstrap.log"))
+        configuration = next(self.root.glob("data/eval-results/cron-*/cycle_configuration.json"))
+        self.assertNotIn("cache_lane", configuration.read_text())
         print("PASS: the lane is a frozen cycle property")
 
     def test_prepare_boundary_stops_before_activation_and_recovery_publishes_the_exact_request(self):
@@ -4419,10 +4190,11 @@ finally:
         self.assertNotIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", third.stdout)
         print("PASS: prepare boundary, exact recovery, accepted record and successor cycle")
 
-    def test_explicit_resume_pending_captures_accepted_cycle_so_the_next_run_skips(self):
-        """The legacy lane's explicit --resume-pending entry also records the
+    def test_explicit_resume_pending_captures_accepted_lane_before_the_next_cycle(self):
+        """The fresh lane's explicit --resume-pending entry also records the
         accepted watermark; before #588 the next same-day run repeated the
         whole refresh."""
+        self._fresh_fixture()
         first = self._run(exit_env={"STUB_PUSH_EXIT": "75"})
         self.assertEqual(first.returncode, 75, first.stderr)
         out = next((self.root / "data/eval-results").glob("cron-*"))
@@ -4433,9 +4205,10 @@ finally:
         ops_before = self._bootstrap_ops()
         third = self._run()
         self.assertEqual(third.returncode, 0, third.stderr + third.stdout)
-        self.assertIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", third.stdout)
-        self.assertEqual(self._bootstrap_ops(), ops_before)
+        self.assertIn("RANK_AND_PUSH_CYCLE_CREATED=", third.stdout)
+        self.assertGreater(len(self._bootstrap_ops()), len(ops_before))
         print("PASS: explicit pending recovery captures the accepted cycle")
+
 
     def test_lane_preflight_refuses_missing_physical_aliases_before_staging(self):
         self._install_candidate_layout(schema=2)
@@ -4585,52 +4358,6 @@ raise SystemExit(real_ranker.main())
         self.assertFalse((self.root / "transport.log").exists())
         self.assertTrue((self.root / "data/eval-results/rank_and_push.cycle").exists())
 
-    def test_real_empty_owners_retry_with_partial_and_fail_without(self):
-        for case in ("all", "eligible", "floor", "pass2", "publish_empty", "publish_stale"):
-            for marked in (True, False):
-                with self.subTest(case=case, marked=marked):
-                    self.tearDown(); self.setUp()
-                    self.prepare(case, marked=marked)
-                    result = self._run()
-                    self.assertEqual(result.returncode, 75 if marked else 1, result.stdout+result.stderr)
-                    self.assertIn("exit 76", result.stderr)
-                    self.assert_unprepared()
-                    due = json.loads((self.root / "due.log").read_text().splitlines()[0])
-                    self.assertEqual(self.wa in due, marked)
-
-    def test_current_state_both_directions_including_reused_manifest(self):
-        for transition, marked, expected in [("partial",False,75), ("recovered_empty",True,1)]:
-            with self.subTest(transition=transition):
-                self.tearDown(); self.setUp()
-                self.prepare("all", marked=marked, transition=transition)
-                first=self._run()
-                self.assertEqual(first.returncode,expected,first.stdout+first.stderr)
-                pointer=self.root/"data/eval-results/rank_and_push.cycle"
-                manifest=self.root/pointer.read_text().strip()/"cycle_manifest.json"
-                frozen=manifest.read_bytes()
-                second=self._run()
-                self.assertEqual(second.returncode,expected,second.stdout+second.stderr)
-                self.assertEqual(manifest.read_bytes(),frozen)
-                self.assert_unprepared()
-
-    def test_inactive_excluded_but_does_not_trigger_retry_then_activation_recovers_retry(self):
-        db=self.prepare("publish_empty",active=False)
-        first=self._run()
-        self.assertEqual(first.returncode,1,first.stdout+first.stderr)
-        self.assert_unprepared()
-        with sqlite3.connect(db) as con: con.execute("UPDATE wallets SET is_active=1")
-        second=self._run()
-        self.assertEqual(second.returncode,75,second.stdout+second.stderr)
-
-    def test_integrity_failure_stays_permanent_after_request_is_persisted(self):
-        self.prepare("integrity")
-        result=self._run()
-        self.assertEqual(result.returncode,1,result.stdout+result.stderr)
-        self.assertIn("stored config_hash",result.stderr)
-        self.assertNotIn("exit 76",result.stderr)
-        requests=list((self.root/"data/eval-results").glob("cron-*/ranking_publish_request.json"))
-        self.assertEqual(len(requests),1)
-        self.assertTrue((self.root/"data/eval-results/rank_and_push.pending").exists())
 
     def test_real_pure_repush_excludes_before_limit_and_resume_is_immutable_without_analytics(self):
         db=self.prepare("publish_partial",active=False)
@@ -4667,25 +4394,6 @@ raise SystemExit(real_ranker.main())
         (self.root/"stop_after_two").touch()
         result=subprocess.run(["bash",str(loop)],cwd=self.root,capture_output=True,text=True,timeout=60)
         return result
-
-    def test_supervisor_retries_same_cycle_and_reselects_each_empty_owner(self):
-        for case in ("all","eligible","floor","pass2","publish_empty","publish_stale"):
-            with self.subTest(case=case):
-                self.tearDown();self.setUp()
-                result=self.run_real_loop(case)
-                self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-                self.assertIn("LOOP_TEMPFAIL",result.stdout)
-                self.assertIn("kind=cycle-resume",result.stdout)
-                due=(self.root/"due.log").read_text().splitlines()
-                self.assertEqual(len(due),2)
-                self.assertTrue(all(self.wa in json.loads(line) for line in due))
-                self.assert_unprepared()
-
-    def test_supervisor_stops_on_persisted_integrity_failure(self):
-        result=self.run_real_loop("integrity")
-        self.assertEqual(result.returncode,1,result.stdout+result.stderr)
-        self.assertNotIn("LOOP_TEMPFAIL",result.stdout)
-        self.assertEqual(len((self.root/"due.log").read_text().splitlines()),1)
 
 
 class CapacitySamplerUnitTest(unittest.TestCase):

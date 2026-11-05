@@ -18,6 +18,9 @@
 //! WAL mode provides per-commit durability — no atomic-rename or checkpoint batching
 //! is needed. Per-wallet streaming reads keep peak memory bounded.
 
+/// Default density threshold for the operator-only retroactive classifier.
+pub const DEFAULT_INFRA_SPAN_SECS: i64 = 3600;
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
@@ -3900,7 +3903,7 @@ impl WalletCache {
 
     /// Backfill `trade_count` for every wallet from the `trades` table.
     ///
-    /// Idempotent. Run after migrate ingests trades and after each `run_backfill`
+    /// Idempotent. Run after migrate ingests trades and after each cache collection
     /// pass so the activation rule sees up-to-date counts.
     pub fn refresh_trade_counts(&mut self) -> Result<usize, BootstrapError> {
         let affected = self.conn.execute(
@@ -3937,98 +3940,6 @@ impl WalletCache {
             [],
         )?;
         Ok(affected)
-    }
-
-    /// Quarantine incomplete schema-one history before any incremental trade write.
-    /// Legacy fetch callers can supply wallets absent from the pile; create their
-    /// default row too so retained partial history cannot become rankable.
-    pub(crate) fn begin_walk(
-        &mut self,
-        wallet_hex: &str,
-        anchor: Option<i64>,
-    ) -> Result<(), BootstrapError> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO wallets (wallet_hex, backfill_partial, forward_frontier_unix) VALUES (?1, 1, ?2) \
-             ON CONFLICT(wallet_hex) DO UPDATE SET backfill_partial = 1, \
-             forward_frontier_unix = COALESCE(wallets.forward_frontier_unix, ?2)",
-            params![wallet_hex, anchor],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn forward_frontier(&self, wallet_hex: &str) -> Result<Option<i64>, BootstrapError> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT forward_frontier_unix FROM wallets WHERE wallet_hex = ?1",
-                params![wallet_hex],
-                |r| r.get::<_, Option<i64>>(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
-    pub(crate) fn backward_floor(&self, wallet_hex: &str) -> Result<Option<i64>, BootstrapError> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT backward_floor_unix FROM wallets WHERE wallet_hex = ?1",
-                params![wallet_hex],
-                |r| r.get::<_, Option<i64>>(0),
-            )
-            .optional()?
-            .flatten())
-    }
-
-    /// Commit a proved piece and its outward-only coverage bounds together, even
-    /// when conversion or duplicate filtering leaves no rows to insert.
-    pub(crate) fn commit_walk_piece(
-        &mut self,
-        wallet_hex: &str,
-        rows: Vec<RawTrade>,
-        frontier_unix: Option<i64>,
-        floor_unix: Option<i64>,
-    ) -> Result<u64, BootstrapError> {
-        let tx = self.conn.transaction()?;
-        let inserted = insert_rows(&tx, wallet_hex, &rows)?;
-        if let Some(frontier) = frontier_unix {
-            tx.execute(
-                "UPDATE wallets SET forward_frontier_unix = ?2 WHERE wallet_hex = ?1 \
-                AND (forward_frontier_unix IS NULL OR forward_frontier_unix < ?2)",
-                params![wallet_hex, frontier],
-            )?;
-        }
-        if let Some(floor) = floor_unix {
-            tx.execute(
-                "UPDATE wallets SET backward_floor_unix = ?2 WHERE wallet_hex = ?1 \
-                AND (backward_floor_unix IS NULL OR backward_floor_unix > ?2)",
-                params![wallet_hex, floor],
-            )?;
-        }
-        tx.commit()?;
-        Ok(inserted)
-    }
-
-    /// Finalize only after both phases completed. Failure preserves quarantine,
-    /// the old stamp and all previously committed pieces.
-    pub(crate) fn finish_walk(
-        &mut self,
-        wallet_hex: &str,
-        stamp: Option<i64>,
-        hi: i64,
-    ) -> Result<(), BootstrapError> {
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "UPDATE wallets SET backfill_partial = 0, \
-             forward_frontier_unix = MAX(COALESCE(forward_frontier_unix, ?3), ?3), \
-             last_polymarket_fetch_at = COALESCE(?2, last_polymarket_fetch_at) \
-             WHERE wallet_hex = ?1",
-            params![wallet_hex, stamp, hi],
-        )?;
-        tx.commit()?;
-        Ok(())
     }
 
     /// All quarantined wallets, including inactive and infrastructure rows.
@@ -5751,33 +5662,6 @@ mod tests {
     }
 
     #[test]
-    fn backfill_marker_is_durable_before_and_after_optional_stamp_finalization() {
-        for stamp in [None, Some(2000)] {
-            for old_stamp in [None, Some(1000)] {
-                let dir = TempDir::new().unwrap();
-                let path = dir.path().join("marker.db");
-                let wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-                let mut cache = WalletCache::open(&path).unwrap();
-                cache.begin_walk(wallet, None).unwrap();
-                if let Some(old) = old_stamp {
-                    cache.update_last_polymarket_fetch(wallet, old).unwrap();
-                }
-                drop(cache);
-                let mut cache = WalletCache::open(&path).unwrap();
-                let read = |cache: &WalletCache| -> (i64, Option<i64>) {
-                    cache.conn.query_row("SELECT backfill_partial, last_polymarket_fetch_at FROM wallets WHERE wallet_hex = ?1",
-                        [wallet], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
-                };
-                assert_eq!(read(&cache), (1, old_stamp));
-                cache.finish_walk(wallet, stamp, 2000).unwrap();
-                drop(cache);
-                let cache = WalletCache::open(&path).unwrap();
-                assert_eq!(read(&cache), (0, stamp.or(old_stamp)));
-            }
-        }
-    }
-
-    #[test]
     fn legacy_schema_gains_default_zero_marker_idempotently() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("legacy.db");
@@ -5793,8 +5677,11 @@ mod tests {
             };
             let cache = WalletCache::open_configured(&config).unwrap();
             assert_connection_tuning(&cache, -8 * 1024, 0);
-            assert_eq!(cache.forward_frontier("legacy").unwrap(), None);
-            assert_eq!(cache.backward_floor("legacy").unwrap(), None);
+            let bounds: (Option<i64>, Option<i64>) = cache.conn.query_row(
+                "SELECT forward_frontier_unix, backward_floor_unix FROM wallets WHERE wallet_hex='legacy'",
+                [], |r| Ok((r.get(0)?, r.get(1)?)),
+            ).unwrap();
+            assert_eq!(bounds, (None, None));
             let marker: i64 = cache
                 .conn
                 .query_row(
@@ -5805,29 +5692,6 @@ mod tests {
                 .unwrap();
             assert_eq!(marker, 0);
         }
-    }
-
-    #[test]
-    fn walk_bounds_are_atomic_outward_only_even_for_empty_pieces() {
-        let dir = TempDir::new().unwrap();
-        let mut cache = WalletCache::open(&dir.path().join("bounds.db")).unwrap();
-        cache.begin_walk("wallet", Some(100)).unwrap();
-        cache
-            .commit_walk_piece("wallet", vec![], Some(200), Some(50))
-            .unwrap();
-        cache
-            .commit_walk_piece("wallet", vec![], Some(150), Some(75))
-            .unwrap();
-        assert_eq!(cache.forward_frontier("wallet").unwrap(), Some(200));
-        assert_eq!(cache.backward_floor("wallet").unwrap(), Some(50));
-        cache.conn.execute_batch("CREATE TRIGGER fail_floor BEFORE UPDATE OF backward_floor_unix ON wallets BEGIN SELECT RAISE(ABORT,'floor'); END").unwrap();
-        assert!(
-            cache
-                .commit_walk_piece("wallet", vec![], Some(300), Some(1))
-                .is_err()
-        );
-        assert_eq!(cache.forward_frontier("wallet").unwrap(), Some(200));
-        assert_eq!(cache.backward_floor("wallet").unwrap(), Some(50));
     }
 
     #[test]

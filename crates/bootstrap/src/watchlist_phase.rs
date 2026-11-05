@@ -52,7 +52,7 @@ pub struct WatchlistReport {
 /// # Precondition
 /// `wallets` should be the set that had trades fetched (typically obtained via
 /// `cache.wallets_with_source_bit(SRC_LEADERBOARD)` after winner-discovery and
-/// `run_fetch` complete). An empty `wallets` slice produces an empty watchlist.
+/// cache collection complete). An empty `wallets` slice produces an empty watchlist.
 pub async fn run_watchlist(
     config: &BootstrapConfig,
     cache: &mut WalletCache,

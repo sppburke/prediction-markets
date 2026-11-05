@@ -14,6 +14,10 @@ floor for the Winner-Follow 72h buy-and-hold cohort.
 
 Harness: `scripts/measure_activity_latency.py` (stdlib-only; re-runnable).
 
+The v1 `scripts/measure_activity_latency.py` harness was retired in #842. The
+measurements and methodology below are historical evidence; no replacement measurement
+or external source check was performed for that cleanup.
+
 ## Method
 
 1. Seed an "active-today" basket from the VOL/PNL `timePeriod=DAY` leaderboard (wallets

@@ -1,7 +1,7 @@
 //! Scenario tests for the wallet pile (issue #166).
 //!
 //! Operator-level checks of the migrate → backfill → activation flow against a
-//! synthetic SQLite + fixture-backed Polymarket fetcher. No network calls;
+//! synthetic SQLite + direct fixture inserts. No network calls;
 //! deterministic.
 //!
 //! Each scenario has a single PASS/FAIL criterion stated before the test body.
@@ -9,17 +9,14 @@
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::HashMap;
-
 use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::migrate::run_migrate;
 use pe_bootstrap::pile::{self, PILE_ACTIVATION_MIN_TRADES, SRC_LEADERBOARD, SRC_WALLET_SET_JSON};
-use pe_bootstrap::polymarket::PolymarketBulkFetcher;
+#[path = "support/cache_seed.rs"]
+mod cache_seed;
+use cache_seed::insert_page;
 use pe_core_types::WalletAddress;
-use pe_source_polymarket_public::{FixtureFetcher, PolymarketEndpoint};
 use tempfile::TempDir;
-
-const BASE_URL: &str = "https://data-api.polymarket.com";
 
 fn wallet_hex(byte: u8) -> String {
     format!("0x{:040x}", byte)
@@ -27,16 +24,6 @@ fn wallet_hex(byte: u8) -> String {
 
 fn wallet(byte: u8) -> WalletAddress {
     WalletAddress::from_hex(&wallet_hex(byte)).unwrap()
-}
-
-fn trade_url_cold(w: WalletAddress) -> String {
-    PolymarketEndpoint::UserTradeActivityPage {
-        user: w.to_string(),
-        end: 2_000_000_000,
-        start: Some(1),
-        offset: 0,
-    }
-    .url(BASE_URL)
 }
 
 fn page_json(trades: &[(&str, &str, i64)]) -> Vec<u8> {
@@ -122,7 +109,7 @@ async fn scenario_closed_markets_proxy_activates_wallet() {
 
 // ── Scenario 4: backfill drains the queue and refreshes trade_count ─────────
 //
-// PASS: After PolymarketBulkFetcher returns N>=PILE_ACTIVATION_MIN_TRADES new
+// PASS: After direct cache insertion stores N>=PILE_ACTIVATION_MIN_TRADES new
 //       trades for a wallet known only from the set (source_bits =
 //       SRC_WALLET_SET_JSON, no closed-markets proxy), running
 //       refresh_trade_counts + apply_activation_rules promotes it to is_active=1.
@@ -158,12 +145,7 @@ async fn scenario_backfill_refreshes_trade_count_and_activates() {
         .map(|(t, m, ts)| (t.as_str(), m.as_str(), *ts))
         .collect();
     let page = page_json(&trades_refs);
-    let mut responses = HashMap::new();
-    responses.insert(trade_url_cold(w), page);
-
-    let fetcher = PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
-        .with_clock_for_test(|| 2_000_000_120);
-    fetcher.fetch_all(&[w], &mut cache).await.unwrap();
+    insert_page(&mut cache, w, &page);
 
     let count_in_db = cache.trade_count();
     assert!(
@@ -276,7 +258,7 @@ async fn scenario_migrate_seeds_timestamps_before_activating() {
     let w = wallet(0x77);
     let n_trades = usize::try_from(PILE_ACTIVATION_MIN_TRADES).unwrap();
 
-    // Seed trades directly via the public fetch fixture path.
+    // Seed trades directly via the direct cache writes.
     let mut trades_owned: Vec<(String, String, i64)> = Vec::new();
     for i in 0..n_trades {
         let tid = format!("0x{:064x}", 0xa0 + i);
@@ -288,13 +270,7 @@ async fn scenario_migrate_seeds_timestamps_before_activating() {
         .iter()
         .map(|(t, m, ts)| (t.as_str(), m.as_str(), *ts))
         .collect();
-    let mut responses = HashMap::new();
-    responses.insert(trade_url_cold(w), page_json(&trades_refs));
-    PolymarketBulkFetcher::new(BASE_URL.to_owned(), FixtureFetcher::new(responses))
-        .with_clock_for_test(|| 2_000_000_120)
-        .fetch_all(&[w], &mut cache)
-        .await
-        .unwrap();
+    insert_page(&mut cache, w, &page_json(&trades_refs));
 
     // Run migrate (no wallet_set entries; trades-derived wallet only).
     let wallet_set_path = dir.path().join("wallet_set.json");

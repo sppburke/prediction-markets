@@ -53,34 +53,11 @@ const CREATE_CACHE_INVOCATIONS: &[&[&str]] = &[
     &["--create-cache", "bootstrap.toml"],
 ];
 
-fn run_all_until_legacy_fixture_error(root: &Path, cache_path: &Path, args: &[&str]) {
-    std::fs::write(root.join("bootstrap.toml"), "").unwrap();
-    let legacy_path = root.join("wallet_set.json");
-    // Stop after the real CLI opener initializes the schema, before discovery
-    // can use the network. No library opener may provision the fresh fixture.
-    std::fs::write(&legacy_path, "invalid fixture JSON").unwrap();
-    let output = run_cli_with_env(
-        root,
-        cache_path,
-        args,
-        &[
-            ("RUST_LOG", "info"),
-            (
-                "PE_BOOTSTRAP_WALLET_SET_PATH",
-                legacy_path.to_str().unwrap(),
-            ),
-        ],
-    );
+fn assert_retired(root: &Path, cache_path: &Path, args: &[&str]) {
+    let output = run_cli(root, cache_path, args);
     assert_eq!(output.status.code(), Some(1), "args={args:?}");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("all: migrate fatal"),
-        "args={args:?}: {stderr}"
-    );
-    assert!(
-        stderr.contains("wallet cache: connection tuning applied"),
-        "args={args:?}: {stderr}"
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("retired with Data API v1 (#842); provision a cache with the seeded schema-two procedure, docs/26 '15/5-minute loop: seeded cache'"));
+    assert!(!pe_bootstrap::lock::lock_path_for(cache_path).exists());
 }
 
 #[test]
@@ -145,30 +122,30 @@ fn cache_init_cli_refuses_bad_input_before_touching_the_target() {
 }
 
 #[test]
-fn create_cache_flag_provisions_and_initializes_a_fresh_install_through_cli() {
-    for args in CREATE_CACHE_INVOCATIONS {
+fn retired_pipeline_forms_refuse_before_cache_or_network() {
+    for args in [
+        &[][..],
+        &["bootstrap.toml"],
+        &["fetch"],
+        &["backfill"],
+        &["all"],
+        &["all", "--create-cache"],
+        &["--create-cache"],
+        &["bootstrap.toml", "--create-cache"],
+        &["all", "--create-cache", "bootstrap.toml"],
+    ] {
         let dir = TempDir::new().unwrap();
         let cache_path = dir.path().join("cache.db");
+        // Even invalid config and an invalid URL cannot preempt the retirement refusal.
+        std::fs::write(dir.path().join("bootstrap.toml"), "invalid TOML").unwrap();
+        assert_retired(dir.path(), &cache_path, args);
         assert!(!cache_path.exists());
-        run_all_until_legacy_fixture_error(dir.path(), &cache_path, args);
-
-        // Read-only inspection cannot hide missing CLI provisioning or DDL.
-        let cache = WalletCache::open_read_only(&cache_path).unwrap();
-        assert_eq!(cache.schema_version().unwrap(), CACHE_SCHEMA_VERSION_V1);
-        for table in ["wallets", "trades", "source_cursor", "market_resolutions"] {
-            let count: i64 = cache
-                .raw_conn_for_test()
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(count, 0, "args={args:?}: {table}");
-        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
 
 #[test]
-fn create_cache_flag_preserves_existing_schema_versions_and_data() {
+fn retired_pipeline_preserves_existing_schema_versions_and_data() {
     for args in CREATE_CACHE_INVOCATIONS {
         for version in [CACHE_SCHEMA_VERSION_V1, CACHE_SCHEMA_VERSION_V2] {
             let dir = TempDir::new().unwrap();
@@ -189,7 +166,7 @@ fn create_cache_flag_preserves_existing_schema_versions_and_data() {
                         .unwrap();
                 }
             }
-            run_all_until_legacy_fixture_error(dir.path(), &cache_path, args);
+            assert_retired(dir.path(), &cache_path, args);
 
             let cache = WalletCache::open_read_only(&cache_path).unwrap();
             assert_eq!(cache.schema_version().unwrap(), version, "args={args:?}");
@@ -211,7 +188,7 @@ fn create_cache_flag_preserves_existing_schema_versions_and_data() {
 }
 
 #[test]
-fn create_cache_flag_requires_the_mutation_lock_before_provisioning() {
+fn retirement_refusal_precedes_the_mutation_lock() {
     for args in CREATE_CACHE_INVOCATIONS {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("bootstrap.toml"), "").unwrap();
@@ -219,7 +196,9 @@ fn create_cache_flag_requires_the_mutation_lock_before_provisioning() {
         let _holder = CacheMutationLock::acquire(&cache_path).unwrap();
         let output = run_cli(dir.path(), &cache_path, args);
         assert_eq!(output.status.code(), Some(1), "args={args:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("cache mutation lock failed"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("retired with Data API v1 (#842)")
+        );
         assert!(!cache_path.exists(), "args={args:?}");
     }
 }
@@ -234,8 +213,7 @@ fn create_cache_flag_refuses_an_existing_directory() {
         let output = run_cli(dir.path(), &cache_path, args);
         assert_eq!(output.status.code(), Some(1), "args={args:?}");
         assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("requires an absent path or a regular file")
+            String::from_utf8_lossy(&output.stderr).contains("retired with Data API v1 (#842)")
         );
         assert!(cache_path.is_dir());
         assert_eq!(std::fs::read_dir(&cache_path).unwrap().count(), 0);
@@ -258,8 +236,7 @@ fn create_cache_flag_refuses_existing_and_dangling_symlinks() {
             let output = run_cli(dir.path(), &cache_path, args);
             assert_eq!(output.status.code(), Some(1), "args={args:?}");
             assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("requires an absent path or a regular file")
+                String::from_utf8_lossy(&output.stderr).contains("retired with Data API v1 (#842)")
             );
             assert_eq!(std::fs::read_link(&cache_path).unwrap(), target);
             if existing_target {
@@ -274,7 +251,6 @@ fn create_cache_flag_refuses_existing_and_dangling_symlinks() {
 #[test]
 fn create_cache_flag_is_rejected_by_other_subcommands() {
     for sub in [
-        "fetch",
         "winner-discovery",
         "participants-import",
         "cache-populate-payout-v2",
@@ -286,7 +262,7 @@ fn create_cache_flag_is_rejected_by_other_subcommands() {
         assert_eq!(output.status.code(), Some(1), "sub={sub}");
         assert!(
             String::from_utf8_lossy(&output.stderr)
-                .contains("--create-cache is only supported by all")
+                .contains("--create-cache is retired with all (#842)")
         );
         assert!(!cache_path.exists());
     }
@@ -590,7 +566,11 @@ fn every_locking_cli_entry_refuses_before_creating_the_cache() {
 
 #[test]
 fn invalid_cache_tuning_refuses_before_any_opener_creates_database_or_lock() {
-    let openers: [&[&str]; 3] = [&["activate-next"], &[], &["cache-populate-payout-v2"]];
+    let openers: [&[&str]; 3] = [
+        &["activate-next"],
+        &["watchlist"],
+        &["cache-populate-payout-v2"],
+    ];
     for args in openers {
         for (key, value, setting) in [
             (
@@ -634,7 +614,7 @@ fn invalid_cache_tuning_refuses_before_any_opener_creates_database_or_lock() {
 fn every_writable_opener_logs_requested_and_effective_cache_tuning_from_env() {
     let openers: [&[&str]; 6] = [
         &["activate-next"],
-        &[],
+        &["watchlist"],
         &["cache-populate-payout-v2"],
         &[
             "cache-populate-activity-v2",
@@ -715,9 +695,7 @@ fn every_writable_opener_logs_requested_and_effective_cache_tuning_from_env() {
             migrate_cache_v2(&cache_path, &build).unwrap();
         }
         let legacy_path = dir.path().join("wallet_set.json");
-        // Stop no-argument `all` in the local legacy reader after the open,
-        // before wallet discovery can perform any network I/O. The other two
-        // commands stop at their missing-wallet / v2-schema checks.
+        // Retained commands stop at their empty-wallet or v2-schema checks.
         std::fs::write(&legacy_path, "invalid fixture JSON").unwrap();
         let output = run_cli_with_env(
             dir.path(),
@@ -737,7 +715,11 @@ fn every_writable_opener_logs_requested_and_effective_cache_tuning_from_env() {
         );
         assert_eq!(
             output.status.code(),
-            Some(if activity { 0 } else { 1 }),
+            Some(if activity || args.first() == Some(&"watchlist") {
+                0
+            } else {
+                1
+            }),
             "args={args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -997,7 +979,8 @@ fn non_provisioning_openers_never_create_fixed_cache_in_a_rename_gap() {
         assert!(!output.status.success(), "{args:?}");
         let logged = String::from_utf8_lossy(&output.stderr);
         assert!(
-            logged.contains("unable to open database file"),
+            logged.contains("unable to open database file")
+                || logged.contains("retired with Data API v1 (#842)"),
             "{args:?}: {logged}"
         );
         assert!(!fixed.exists(), "{args:?} created an empty installed cache");

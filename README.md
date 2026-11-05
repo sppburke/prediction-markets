@@ -22,20 +22,20 @@ cargo install cargo-nextest cargo-deny cargo-audit
 cp .env.example .env
 # Fill in the env-driven inputs; ordinary live credentials use the sealed #508 custody path, not .env
 
-# 3. Provision the cache and run bootstrap (~2-4 hours first run)
-cargo run --release --bin pe-bootstrap -- --create-cache
+# 3. Provision a seeded schema-two cache using docs/26 (linked below).
+#    Requires a verified finalized format-three drops source and a complete seed-wallet file.
 
-# 4a. Run backtest (requires completed bootstrap)
+# 4a. Run backtest (requires a completed seeded cache)
 cargo run --release --bin pe-backtest
 
 # 4b. Or run the acceptance gate
 cargo nextest run --workspace --all-features
 ```
 
-`--create-cache` explicitly permits first-install cache creation; omit it on subsequent runs.
-It also works with `all` or a positional TOML config path. An existing regular cache file
-opens normally; other existing path types are refused. Without the flag, bootstrap requires
-an existing cache. The supervised ranking wrapper never passes this flag.
+Follow the [15/5-minute loop: seeded cache procedure](docs/26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md#155-minute-loop-seeded-cache-switch-and-revert),
+including its seed, carried-drop and capacity prerequisites. Legacy `fetch`, `backfill`, `all`,
+no-argument and positional-TOML bootstrap invocations refuse before cache creation (#842).
+`cache-init` retains its seed and finalized format-three drops-source requirements.
 
 See [`docs/22-ONBOARDING.md`](docs/22-ONBOARDING.md) for the full environment-variable catalogue, startup sequence, and first-run recipes (backtest-only, paper trading, live-tiny).
 
