@@ -30,6 +30,15 @@ use crate::activity_ingest::{SourceLogHandle, SourceLogHandleError};
 use crate::risk_inputs::SourceReceiptIndex;
 use crate::source_event_sink::SourceEventSink;
 
+/// Venue failures can defer one wallet; local failures retain owner-level propagation.
+#[derive(Debug, thiserror::Error)]
+pub enum IdentityError {
+    #[error(transparent)]
+    Venue(SourceError),
+    #[error(transparent)]
+    Local(#[from] SourceError),
+}
+
 type IdentityPage = (MetadataPageEvidence, Vec<u8>);
 
 #[derive(Clone, Default)]
@@ -325,7 +334,7 @@ impl AssetIdentityResolver {
     pub async fn resolve_live(
         &self,
         tokens: impl IntoIterator<Item = PolymarketTokenId>,
-    ) -> Result<ResolvedIdentities, SourceError> {
+    ) -> Result<ResolvedIdentities, IdentityError> {
         self.resolve_inner(tokens, LookupPurpose::Live).await
     }
 
@@ -333,7 +342,7 @@ impl AssetIdentityResolver {
     pub async fn resolve_historical_for_bracket(
         &self,
         tokens: impl IntoIterator<Item = PolymarketTokenId>,
-    ) -> Result<ResolvedIdentities, SourceError> {
+    ) -> Result<ResolvedIdentities, IdentityError> {
         self.resolve_inner(tokens, LookupPurpose::Historical).await
     }
 
@@ -343,7 +352,7 @@ impl AssetIdentityResolver {
     pub async fn discover_conditions_for_bracket(
         &self,
         conditions: impl IntoIterator<Item = PolymarketConditionId>,
-    ) -> Result<ResolvedIdentities, SourceError> {
+    ) -> Result<ResolvedIdentities, IdentityError> {
         let requested = conditions
             .into_iter()
             .map(|condition| condition.0)
@@ -438,12 +447,12 @@ impl AssetIdentityResolver {
                         let result = if fetched.markets.unfetched.is_empty() {
                             Ok(())
                         } else {
-                            Err(SourceError::Fatal {
+                            Err(IdentityError::Venue(SourceError::Fatal {
                                 message: format!(
                                     "gamma condition lookup rejected: {}",
                                     fetched.markets.unfetched.join(",")
                                 ),
-                            })
+                            }))
                         };
                         (fetched.pages, result)
                     }
@@ -481,6 +490,9 @@ impl AssetIdentityResolver {
                     .await;
                 if let Err(error) = fetched {
                     if let Err(save_error) = saved {
+                        if matches!(error, IdentityError::Venue(SourceError::Fatal { .. })) {
+                            return Err(save_error.into());
+                        }
                         tracing::error!(%save_error, "failed to save partial Gamma condition identity progress");
                     }
                     return Err(error);
@@ -531,7 +543,7 @@ impl AssetIdentityResolver {
         &self,
         tokens: impl IntoIterator<Item = PolymarketTokenId>,
         purpose: LookupPurpose,
-    ) -> Result<ResolvedIdentities, SourceError> {
+    ) -> Result<ResolvedIdentities, IdentityError> {
         let requested = tokens.into_iter().collect::<BTreeSet<_>>();
         {
             let cache = self.cache.read().await;
@@ -606,7 +618,7 @@ impl AssetIdentityResolver {
                     Ok(true) => break,
                     Ok(false) => delays = retry_delays.iter(),
                     Err(error) => {
-                        if matches!(error, SourceError::Transient { .. })
+                        if matches!(error, IdentityError::Venue(SourceError::Transient { .. }))
                             && let Some(delay) = delays.next()
                         {
                             tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
@@ -630,7 +642,7 @@ impl AssetIdentityResolver {
         read_pages: &mut BTreeMap<u64, IdentityPage>,
         open_phase: &Arc<()>,
         resolved: &mut ResolvedIdentities,
-    ) -> Result<bool, SourceError> {
+    ) -> Result<bool, IdentityError> {
         let requested = &chunk.requested;
         if let Some(store) = store {
             let misses = requested
@@ -773,6 +785,9 @@ impl AssetIdentityResolver {
             .await;
         if let Err(error) = fetched {
             if let Err(save_error) = saved {
+                if matches!(error, IdentityError::Venue(SourceError::Fatal { .. })) {
+                    return Err(save_error.into());
+                }
                 tracing::error!(%save_error, "failed to save partial Gamma identity progress");
             }
             return Err(error);
@@ -1155,7 +1170,7 @@ impl AssetIdentityResolver {
         filter: MarketFilter,
         rejected_message: &str,
         recorded: &mut RecordedIdentityPages,
-    ) -> Result<(), SourceError> {
+    ) -> Result<(), IdentityError> {
         for chunk in tokens.chunks(self.gamma_batch_size) {
             let fetched = match self
                 .client
@@ -1186,12 +1201,12 @@ impl AssetIdentityResolver {
                 recorded.pages.push(page);
             }
             if !fetched.markets.unfetched.is_empty() {
-                return Err(SourceError::Fatal {
+                return Err(IdentityError::Venue(SourceError::Fatal {
                     message: format!(
                         "{rejected_message}: {}",
                         fetched.markets.unfetched.join(",")
                     ),
-                });
+                }));
             }
         }
         Ok(())
@@ -1618,9 +1633,9 @@ fn collect_verified(
     }
 }
 
-fn map_gamma_error(error: GammaMarketsError) -> SourceError {
+fn map_gamma_error(error: GammaMarketsError) -> IdentityError {
     match error {
-        GammaMarketsError::Fetch(message) => {
+        GammaMarketsError::Fetch(message) => IdentityError::Venue({
             let prefix = "rate limited: retry after ";
             let suffix = "s";
             if let Some(seconds) = message
@@ -1634,18 +1649,20 @@ fn map_gamma_error(error: GammaMarketsError) -> SourceError {
             } else {
                 SourceError::Transient { message }
             }
-        }
-        GammaMarketsError::Parse(message) => SourceError::Fatal {
+        }),
+        GammaMarketsError::Parse(message) => IdentityError::Venue(SourceError::Fatal {
             message: format!("gamma metadata parse failed: {message}"),
-        },
-        GammaMarketsError::InvalidTokenId { token } => SourceError::Fatal {
+        }),
+        GammaMarketsError::InvalidTokenId { token } => IdentityError::Venue(SourceError::Fatal {
             message: format!("gamma metadata token invalid: {token}"),
-        },
-        GammaMarketsError::TooManyTokenIds { tokens, limit } => SourceError::Fatal {
-            message: format!(
-                "gamma metadata token batch has {tokens} ids, above per-request limit {limit}"
-            ),
-        },
+        }),
+        GammaMarketsError::TooManyTokenIds { tokens, limit } => {
+            IdentityError::Local(SourceError::Fatal {
+                message: format!(
+                    "gamma metadata token batch has {tokens} ids, above per-request limit {limit}"
+                ),
+            })
+        }
     }
 }
 
@@ -1816,7 +1833,7 @@ mod tests {
                     PolymarketTokenId("token-b".to_owned())
                 ])
                 .await,
-            Err(SourceError::Transient { .. })
+            Err(IdentityError::Venue(SourceError::Transient { .. }))
         ));
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 6);
         assert_eq!(
@@ -1853,7 +1870,7 @@ mod tests {
             resolver
                 .resolve_live([PolymarketTokenId("token-a".to_owned())])
                 .await,
-            Err(SourceError::Transient { .. })
+            Err(IdentityError::Venue(SourceError::Transient { .. }))
         ));
         assert_eq!(fetcher.attempts.lock().unwrap().len(), 1);
         assert_eq!(tokio::time::Instant::now(), start);
@@ -1903,7 +1920,7 @@ mod tests {
     // Keep local socket I/O runnable while advancing only the deterministic test clock.
     async fn resolve_http(
         resolver: &AssetIdentityResolver,
-    ) -> Result<ResolvedIdentities, SourceError> {
+    ) -> Result<ResolvedIdentities, IdentityError> {
         let resolve =
             resolver.resolve_historical_for_bracket([PolymarketTokenId("token-a".to_owned())]);
         tokio::pin!(resolve);
@@ -1936,7 +1953,7 @@ mod tests {
             let expected = if mixed { 70 } else { 20 };
             let (_dir, _path, _sink, resolver, hits, server) = http_resolver(responses).await;
             assert!(
-                matches!(resolve_http(&resolver).await, Err(SourceError::Transient { message }) if message.contains("HTTP 500"))
+                matches!(resolve_http(&resolver).await, Err(IdentityError::Venue(SourceError::Transient { message })) if message.contains("HTTP 500"))
             );
             assert_eq!(hits.load(Ordering::SeqCst), expected);
             assert!(resolver.cache.read().await.identities.is_empty());
@@ -2001,18 +2018,18 @@ mod tests {
             match case {
                 "rate_limit" => assert!(matches!(
                     result,
-                    Err(SourceError::RateLimited {
+                    Err(IdentityError::Venue(SourceError::RateLimited {
                         retry_after_secs: 1
-                    })
+                    }))
                 )),
                 "fatal" => assert!(
-                    matches!(result, Err(SourceError::Fatal { message }) if message.contains("gamma token lookup rejected"))
+                    matches!(result, Err(IdentityError::Venue(SourceError::Fatal { message })) if message.contains("gamma token lookup rejected"))
                 ),
                 "parse" => assert!(
-                    matches!(result, Err(SourceError::Fatal { message }) if message.contains("gamma metadata parse failed"))
+                    matches!(result, Err(IdentityError::Venue(SourceError::Fatal { message })) if message.contains("gamma metadata parse failed"))
                 ),
                 _ => assert!(
-                    matches!(result, Err(SourceError::Fatal { message }) if message.contains("source-log append failed"))
+                    matches!(result, Err(IdentityError::Local(SourceError::Fatal { message })) if message.contains("source-log append failed"))
                 ),
             }
             assert_eq!(
@@ -2289,7 +2306,7 @@ mod tests {
                 resolver
                     .discover_conditions_for_bracket([condition.clone()])
                     .await,
-                Err(SourceError::Transient { .. })
+                Err(IdentityError::Venue(SourceError::Transient { .. }))
             ));
             assert!(resolver.cache.read().await.discovered_conditions.is_empty());
         }
@@ -2356,7 +2373,7 @@ mod tests {
             resolver
                 .discover_conditions_for_bracket(conditions.clone())
                 .await,
-            Err(SourceError::Transient { .. })
+            Err(IdentityError::Venue(SourceError::Transient { .. }))
         ));
         assert_eq!(
             resolver
@@ -2586,7 +2603,7 @@ mod tests {
             resolver
                 .discover_conditions_for_bracket([PolymarketConditionId("condition".into())])
                 .await,
-            Err(SourceError::Fatal { .. })
+            Err(IdentityError::Venue(SourceError::Fatal { .. }))
         ));
         assert_eq!(
             Reader::replay(path)
@@ -2605,7 +2622,7 @@ mod tests {
             resolver
                 .discover_conditions_for_bracket([PolymarketConditionId("condition".into())])
                 .await,
-            Err(SourceError::Transient { .. })
+            Err(IdentityError::Venue(SourceError::Transient { .. }))
         ));
     }
 
@@ -4794,7 +4811,7 @@ mod tests {
                 resolver
                     .resolve_historical_for_bracket([token.clone()])
                     .await,
-                Err(SourceError::Transient { .. })
+                Err(IdentityError::Venue(SourceError::Transient { .. }))
             ));
             assert!(
                 paper
@@ -4966,7 +4983,7 @@ mod tests {
         paper.begin_batch().unwrap();
         let start = tokio::time::Instant::now();
         assert!(matches!(resolver.resolve_live([token.clone()]).await,
-            Err(SourceError::Fatal { message }) if message.contains("waited 30 s")));
+            Err(IdentityError::Local(SourceError::Fatal { message })) if message.contains("waited 30 s")));
         assert_eq!(
             tokio::time::Instant::now().duration_since(start).as_secs(),
             30
@@ -5225,7 +5242,7 @@ mod tests {
             ];
             let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 1);
             assert!(matches!(resolver.resolve_live(tokens.clone()).await,
-                Err(SourceError::Transient { message }) if message.contains("failed second chunk")));
+                Err(IdentityError::Venue(SourceError::Transient { message })) if message.contains("failed second chunk")));
             let saved = paper.asset_identities("installed", &tokens).unwrap();
             assert_eq!(saved.len(), 1);
             assert_eq!(saved[0].token, tokens[0]);
@@ -5604,7 +5621,7 @@ mod tests {
 
         assert!(matches!(
             resolver.resolve_live([token_a.clone(), token_b]).await,
-            Err(SourceError::Transient { message })
+            Err(IdentityError::Venue(SourceError::Transient { message }))
                 if message.contains("injected second chunk failure")
         ));
         let entries_after_failure = Reader::replay(&path)
@@ -5662,7 +5679,7 @@ mod tests {
 
             assert!(matches!(
                 resolver.resolve_live([token]).await,
-                Err(SourceError::Fatal { message })
+                Err(IdentityError::Venue(SourceError::Fatal { message }))
                     if message.starts_with("gamma metadata parse failed:")
             ));
             assert!(resolver.cache.read().await.identities.is_empty());
@@ -5681,6 +5698,159 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn historical_identity_terminal_origins_are_not_retried() {
+        struct Terminal {
+            kind: &'static str,
+            calls: AtomicUsize,
+        }
+        impl ReconciliationFetcher for Terminal {
+            fn fetch<'a>(
+                &'a self,
+                _url: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    match self.kind {
+                        "refused" => Err(SourceError::Fatal {
+                            message: "HTTP 410".to_owned(),
+                        }),
+                        "rate_limited" => Err(SourceError::RateLimited {
+                            retry_after_secs: 1,
+                        }),
+                        _ => Ok(br#"{"not":"an array"}"#.to_vec()),
+                    }
+                })
+            }
+        }
+        for kind in ["refused", "parse", "append", "rate_limited"] {
+            let fetcher = Arc::new(Terminal {
+                kind,
+                calls: AtomicUsize::new(0),
+            });
+            let (_dir, _path, sink, resolver) = boot_resolver(fetcher.clone());
+            if kind == "append" {
+                sink.lock().await.fail_next_append();
+            }
+            let started = tokio::time::Instant::now();
+            let error = resolver
+                .resolve_historical_for_bracket([PolymarketTokenId("token-a".to_owned())])
+                .await
+                .err()
+                .unwrap();
+            assert!(match kind {
+                "append" => matches!(error, IdentityError::Local(SourceError::Fatal { .. })),
+                "rate_limited" =>
+                    matches!(error, IdentityError::Venue(SourceError::RateLimited { .. })),
+                _ => matches!(error, IdentityError::Venue(SourceError::Fatal { .. })),
+            });
+            assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1, "{kind}");
+            assert_eq!(started, tokio::time::Instant::now(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn gamma_error_origins_are_explicit() {
+        for source in [
+            GammaMarketsError::Fetch("transport".to_owned()),
+            GammaMarketsError::Parse("metadata".to_owned()),
+            GammaMarketsError::InvalidTokenId {
+                token: "invalid".to_owned(),
+            },
+        ] {
+            assert!(matches!(map_gamma_error(source), IdentityError::Venue(_)));
+        }
+        assert!(matches!(
+            map_gamma_error(GammaMarketsError::TooManyTokenIds {
+                tokens: 501,
+                limit: 500
+            }),
+            IdentityError::Local(_)
+        ));
+        assert!(matches!(
+            IdentityError::from(SourceError::Transient {
+                message: String::new()
+            }),
+            IdentityError::Local(_)
+        ));
+    }
+
+    struct FetchAndSaveFailure {
+        path: std::path::PathBuf,
+        kind: &'static str,
+    }
+    impl ReconciliationFetcher for FetchAndSaveFailure {
+        fn fetch<'a>(
+            &'a self,
+            _url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move {
+                rusqlite::Connection::open(&self.path)
+                    .unwrap()
+                    .execute_batch("DROP TABLE asset_identities")
+                    .unwrap();
+                match self.kind {
+                    "transient" => Err(SourceError::Transient {
+                        message: "injected transport failure".to_owned(),
+                    }),
+                    "rate_limited" => Err(SourceError::RateLimited {
+                        retry_after_secs: 1,
+                    }),
+                    _ => Err(SourceError::Fatal {
+                        message: "HTTP 410".to_owned(),
+                    }),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn local_save_failure_wins_over_venue_fatal_but_preserves_transport_precedence() {
+        for conditions in [false, true] {
+            for kind in ["fatal", "transient", "rate_limited"] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("paper.db");
+                let paper = Arc::new(PaperStateDb::open(&path).unwrap());
+                let resolver = durable_resolver(
+                    &dir.path().join("source.log"),
+                    paper,
+                    "test",
+                    Arc::new(FetchAndSaveFailure { path, kind }),
+                    50,
+                );
+                let error = if conditions {
+                    resolver
+                        .discover_conditions_for_bracket([PolymarketConditionId(
+                            "condition".to_owned(),
+                        )])
+                        .await
+                        .err()
+                        .unwrap()
+                } else {
+                    resolver
+                        .resolve_live([PolymarketTokenId("token".to_owned())])
+                        .await
+                        .err()
+                        .unwrap()
+                };
+                let message = match kind {
+                    "transient" => "injected transport failure",
+                    "rate_limited" => "rate limited",
+                    _ => "asset identity cache failed",
+                };
+                assert!(error.to_string().contains(message), "{error}");
+                assert!(match kind {
+                    "transient" =>
+                        matches!(error, IdentityError::Venue(SourceError::Transient { .. })),
+                    "rate_limited" =>
+                        matches!(error, IdentityError::Venue(SourceError::RateLimited { .. })),
+                    _ => matches!(error, IdentityError::Local(SourceError::Fatal { .. })),
+                });
+            }
+        }
+    }
+
     #[tokio::test]
     async fn boot_append_failure_aborts_before_identity_is_returned() {
         let fetcher = Arc::new(GammaFixture::new(
@@ -5694,7 +5864,7 @@ mod tests {
             resolver
                 .resolve_live([PolymarketTokenId("token-a".to_owned())])
                 .await,
-            Err(SourceError::Fatal { message }) if message.contains("source-log append failed")
+            Err(IdentityError::Local(SourceError::Fatal { message })) if message.contains("source-log append failed")
         ));
     }
 
@@ -5712,7 +5882,7 @@ mod tests {
             resolver
                 .resolve_live([PolymarketTokenId("token-a".to_owned())])
                 .await,
-            Err(SourceError::Fatal { message }) if message == "source-log coordinator closed"
+            Err(IdentityError::Local(SourceError::Fatal { message })) if message == "source-log coordinator closed"
         ));
     }
 }

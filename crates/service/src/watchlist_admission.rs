@@ -1492,6 +1492,7 @@ impl AdmissionPreparer {
             // Periodic refresh retains its existing retry cadence for venue transport
             // failures. Admission attempts still abort on these shared errors.
             if is_deferred_causal_position_error(&error) {
+                warn!(wallet = %wallet, kind = error.kind(), error = %error, "anchor refresh deferred");
                 return Ok(AnchorRefreshOutcome::Deferred);
             }
             return Err(AdmissionError::PositionValidation(error));
@@ -1502,6 +1503,7 @@ impl AdmissionPreparer {
                 return Ok(AnchorRefreshOutcome::Skipped);
             }
             if is_deferred_causal_position_error(&error) || error.class() != FailureClass::Shared {
+                warn!(wallet = %wallet, kind = error.kind(), error = %error, "anchor refresh deferred");
                 return Ok(AnchorRefreshOutcome::Deferred);
             }
             return Err(AdmissionError::PositionValidation(error));

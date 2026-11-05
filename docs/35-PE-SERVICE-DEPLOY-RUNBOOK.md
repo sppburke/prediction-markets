@@ -2354,6 +2354,21 @@ deployment actions described above; this procedure makes no trading or policy ch
     conversion-created holdings are reported with their `positions.missing_activity_mapping` evidence;
     ranks 3 and 27 must be live or excluded by an existing owner policy.
 
+    For #840 AC3, retain the same invocation's journal through the closing cutoff and the
+    receipt-bound `ac16-population.json` export: refresh venue deferrals appear as `anchor refresh
+    deferred` warnings (wallet, kind, error); admission warnings carry wallet/stage/kind while
+    `pe-service.watchlist-deferral` carries the detailed message; reconciliation retains `fixed-end
+    activity reconciliation will retry` (wallet, error). Query admission counts with
+    `jq '[.deferrals[].deferrals[] | {wallet,stage,kind,message}] | group_by([.stage,.wallet,.kind]) | map({stage:.[0].stage,wallet:.[0].wallet,kind:.[0].kind,count:length,messages:map(.message)|unique})' ac16-population.json`;
+    for refresh/reconciliation use `jq -s '[.[] | .MESSAGE | fromjson | select(.message == "anchor refresh deferred" or .message == "fixed-end activity reconciliation will retry") | {stage:(if .message == "anchor refresh deferred" then "refresh" else "reconciliation" end),wallet,kind:(.kind // (if (.error | startswith("asset identity resolution:")) then "identity" else "activity_or_membership" end)),error}] | group_by([.stage,.wallet,.kind]) | map({stage:.[0].stage,wallet:.[0].wallet,kind:.[0].kind,count:length,errors:map(.error)|unique})' admission-journal.jsonl`.
+    Classify the retained messages/errors by venue versus local origin before reporting venue
+    counts; reconciliation distinguishes identity lookup errors from other retry causes. Report zero restarts and zero `critical owner exited` over the full
+    24-hour window. Recovery requires closing-cutoff authority: refresh needs an anchor installed
+    after that wallet's latest refusal, admission needs closing effective `live_wallets` membership,
+    reconciliation needs disposition of the affected receipt-bound obligations. List still-deferred,
+    terminally excluded and unavailable outcomes. Earlier anchors/membership, accepted-bracket logs
+    and silence cannot prove recovery; zero refusals establishes availability only.
+
     For each continuously eligible wallet, count ticks where its path ran first and started at least
     one bracket. N is the distinct eligible-wallet count across those path calls; k is their smallest
     positive started count. The wallet must start within ⌈N ÷ k⌉ such ticks. Report zero-start calls

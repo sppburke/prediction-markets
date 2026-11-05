@@ -45,6 +45,7 @@ const NOW: i64 = 100;
 struct PollFetcher {
     pages: Mutex<VecDeque<Vec<u8>>>,
     calls: AtomicUsize,
+    trade: Option<(WalletAddress, Vec<u8>)>,
     /// Issue #599: park every fetch forever (a round that never completes); the sender fires
     /// when the first fetch is entered so a test can order shutdown after the round started.
     parked: Option<Mutex<Option<oneshot::Sender<()>>>>,
@@ -55,6 +56,7 @@ impl PollFetcher {
         Self {
             pages: Mutex::new((0..count).map(|_| b"[]".to_vec()).collect()),
             calls: AtomicUsize::new(0),
+            trade: None,
             parked: None,
         }
     }
@@ -83,6 +85,16 @@ impl ReconciliationFetcher for PollFetcher {
                     let _ = started.send(());
                 }
                 std::future::pending::<()>().await;
+            }
+            if let Some((wallet, page)) = &self.trade {
+                return Ok(data_api_v2::fixture_page(
+                    url,
+                    if url.contains(&wallet.to_string()) {
+                        page.clone()
+                    } else {
+                        b"[]".to_vec()
+                    },
+                ));
             }
             self.pages
                 .lock()
@@ -133,7 +145,7 @@ impl PageFetcher for MapFetcher {
                 .collect::<Vec<_>>();
             return Ok(serde_json::to_vec(&markets).unwrap());
         }
-        data_api_v2::queued_fixture(
+        let response = data_api_v2::queued_fixture(
             url,
             &mut self
                 .responses
@@ -142,7 +154,13 @@ impl PageFetcher for MapFetcher {
         )
         .ok_or_else(|| SourceError::Fatal {
             message: format!("no queued bracket fixture for {url}"),
-        })
+        })?;
+        if response == b"HTTP 410" {
+            return Err(SourceError::Fatal {
+                message: "HTTP 410".to_owned(),
+            });
+        }
+        Ok(response)
     }
 }
 
@@ -993,4 +1011,208 @@ async fn shutdown_mid_round_cancels_the_round_and_exits_cleanly() {
     assert!(result.is_ok(), "{result:?}");
     assert!(paper.position_anchors(&wallets[0]).unwrap().is_empty());
     finish_harness(ingest, actor, preparer).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn venue_refresh_refusals_keep_prior_anchor_and_other_wallet_copying() {
+    assert_venue_refresh_failure(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn venue_refresh_combo_conflicts_keep_prior_anchor_and_other_wallet_copying() {
+    assert_venue_refresh_failure(true).await;
+}
+
+async fn assert_venue_refresh_failure(combo_conflict: bool) {
+    let a = wallet(0x91);
+    let b = wallet(0x92);
+    let (dir, paper) = paper(&[a, b]);
+    for index in 0..2 {
+        paper
+            .record_market_group(&format!("0x{index:0>64}"), "")
+            .unwrap();
+    }
+    paper.set_cursor(&a, 10).unwrap();
+    paper.set_cursor(&b, 0).unwrap();
+    paper
+        .install_anchors(&[
+            AnchorInstallRecord {
+                repaired_history: Vec::new(),
+                expected_fence: None,
+                history_status: None,
+                wallet: a,
+                balances: Vec::new(),
+                activity_cutoff_unix: 10,
+                anchored_at_unix: NOW - 3_601,
+                ledger_hash_after: "prior".to_owned(),
+                positions_proof_hash: "prior".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                proof_json: "{}".to_owned(),
+                recorded_at_unix: NOW - 3_601,
+            },
+            AnchorInstallRecord {
+                repaired_history: Vec::new(),
+                expected_fence: None,
+                history_status: None,
+                wallet: b,
+                balances: Vec::new(),
+                activity_cutoff_unix: 0,
+                anchored_at_unix: NOW,
+                ledger_hash_after: "healthy".to_owned(),
+                positions_proof_hash: "healthy".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                proof_json: "{}".to_owned(),
+                recorded_at_unix: NOW,
+            },
+        ])
+        .unwrap();
+    let mut responses = stable_bracket_responses(&[a, b]);
+    let a_activity = responses[&activity_url(a)][0].clone();
+    let failed_page = if combo_conflict {
+        let mut rows: Vec<serde_json::Value> = serde_json::from_slice(&a_activity).unwrap();
+        rows.push(rows[0].clone());
+        rows[1]["isCombo"] = json!(true);
+        serde_json::to_vec(&rows).unwrap()
+    } else {
+        b"HTTP 410".to_vec()
+    };
+    responses.insert(
+        activity_url(a),
+        [vec![failed_page; 3], vec![a_activity; 8]].concat(),
+    );
+    let a_positions = responses
+        .get_mut(&position_url(a, PositionPartition::NotRedeemable))
+        .unwrap();
+    a_positions.insert(0, br#"{"data":[]}"#.to_vec());
+    let b_trade = stable_bracket_responses(&[a, b])[&activity_url(b)][0].clone();
+    // B's bracket defers to ordinary reconciliation, which alone owns the copy.
+    let installed = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = Arc::new(PollFetcher {
+        trade: Some((b, b_trade)),
+        ..PollFetcher::empty_pages(0)
+    });
+    let harness = poller_harness_with_fetcher(
+        &dir,
+        paper.clone(),
+        &[a, b],
+        responses,
+        99,
+        false,
+        installed,
+        None,
+        fetcher,
+        None,
+        false,
+        1,
+    );
+    let PollerHarness {
+        poller,
+        ingest,
+        actor,
+        preparer,
+        ..
+    } = harness;
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_writer(RefreshLogs(bytes.clone()))
+        .finish();
+    let _capture = tracing::subscriber::set_default(subscriber);
+    let warning_count = || {
+        String::from_utf8(bytes.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("anchor refresh deferred"))
+            .count()
+    };
+    let (progress, mut completed) = mpsc::channel(16);
+    let (stop, stopped) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        poller
+            .with_progress(progress)
+            .run_until(async {
+                let _ = stopped.await;
+            })
+            .await
+    });
+    for expected in 1..=4 {
+        for _ in 0..8 {
+            let progress = completed.recv().await;
+            assert!(progress.is_some(), "venue read terminated the poller owner");
+            if matches!(progress, Some(PollerProgress::RoundCompleted))
+                && warning_count() >= expected
+            {
+                break;
+            }
+        }
+        assert_eq!(warning_count(), expected);
+        assert_eq!(paper.position_anchors(&a).unwrap().len(), 1);
+        assert_eq!(paper.cursor(&a).unwrap(), Some(10));
+        assert!(paper.wallet_history_complete(&a).unwrap());
+        assert!(!paper.wallet_coverage(&a).unwrap().reanchor_required);
+        assert_eq!(
+            paper.decision_pending_history().unwrap().len(),
+            1,
+            "{}",
+            String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+        );
+        tokio::time::advance(Duration::from_secs(
+            pe_service::trade_poller::ANCHOR_REFRESH_SECS,
+        ))
+        .await;
+    }
+    let warnings = String::from_utf8(bytes.lock().unwrap().clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|line| line["fields"]["message"] == "anchor refresh deferred")
+        .collect::<Vec<_>>();
+    assert_eq!(warnings[3]["fields"]["kind"], "positions.v2_envelope");
+    for warning in &warnings {
+        assert_eq!(warning["level"], "WARN");
+        assert_eq!(warning["fields"]["wallet"], a.to_string());
+        assert!(warning["fields"]["error"].is_string());
+    }
+    for _ in 0..64 {
+        let progress = completed.recv().await;
+        assert!(
+            progress.is_some(),
+            "owner must survive until venue recovery"
+        );
+        if paper.position_anchors(&a).unwrap().len() == 2 {
+            break;
+        }
+    }
+    stop.send(()).unwrap();
+    assert!(task.await.unwrap().is_ok());
+    assert_eq!(paper.decision_pending_history().unwrap().len(), 1);
+    assert_eq!(
+        paper.position_anchors(&a).unwrap().len(),
+        2,
+        "{}",
+        String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+    );
+    assert_eq!(paper.activity_groups_after(&b, 0).unwrap().len(), 1);
+    finish_harness(ingest, actor, preparer).await;
+}
+
+#[derive(Clone)]
+struct RefreshLogs(Arc<Mutex<Vec<u8>>>);
+impl std::io::Write for RefreshLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RefreshLogs {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
 }

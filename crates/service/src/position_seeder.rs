@@ -35,14 +35,14 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::asset_identity::{
-    AssetIdentityResolver, BootSourceLog, IdentityProvenance, ResolvedIdentities,
+    AssetIdentityResolver, BootSourceLog, IdentityError, IdentityProvenance, ResolvedIdentities,
 };
 use crate::bucket_commit::{
     AnchorInstallError, BucketCommitEngine, BucketCommitError, BucketDecisionContext,
     IdentityOverride, ReconciliationBucket,
 };
 use crate::orchestrator_control::{AdmissionLedgerCapture, OrchestratorControl};
-use crate::trade_poller::{ACTIVITY_POLL_SOURCE_ID, restamp_twins};
+use crate::trade_poller::{ACTIVITY_POLL_SOURCE_ID, ReconciliationError, restamp_twins};
 
 #[cfg(feature = "scenario")]
 type BracketStepHook = Arc<dyn Fn(WalletAddress, usize, &mut BucketCommitEngine) + Send + Sync>;
@@ -186,7 +186,7 @@ pub enum CausalPositionError {
     #[error("asset identity resolution for {wallet}: {source}")]
     Identity {
         wallet: WalletAddress,
-        source: SourceError,
+        source: IdentityError,
     },
     #[error("activity bucket proof encoding failed: {0}")]
     ProofEncoding(#[from] serde_json::Error),
@@ -247,6 +247,13 @@ pub enum FailureClass {
 
 fn classify_source(error: &SourceError) -> FailureClass {
     match error {
+        SourceError::Fatal { message }
+            if message.strip_prefix("HTTP ").is_some_and(|status| {
+                status.len() == 3 && status.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            FailureClass::WalletTransient
+        }
         SourceError::Transient { .. }
         | SourceError::RateLimited { .. }
         | SourceError::Fatal { .. } => FailureClass::Shared,
@@ -254,11 +261,11 @@ fn classify_source(error: &SourceError) -> FailureClass {
 }
 
 fn classify_activity_read(error: &pe_source_polymarket_public::ActivityReadError) -> FailureClass {
-    use pe_source_polymarket_public::ActivityReadError;
     use pe_source_polymarket_public::activity::{
         ActivityAggregationError, ActivityIdentityError, ActivityParseError,
         ActivityValidationError,
     };
+    use pe_source_polymarket_public::{ActivityReadError, V2AuthenticationError};
     match error {
         ActivityReadError::Fetch { source, .. } => classify_source(source),
         ActivityReadError::Parse(ActivityParseError::InvalidRow { source, .. }) => match source {
@@ -271,13 +278,13 @@ fn classify_activity_read(error: &pe_source_polymarket_public::ActivityReadError
             | ActivityValidationError::InvalidConditionOutcomeMapping
             | ActivityValidationError::InvalidTimestampValue { .. }
             | ActivityValidationError::LegacyProjectionOutOfRange => FailureClass::WalletPersistent,
-            ActivityValidationError::Identity
-            | ActivityValidationError::MissingField { .. }
-            | ActivityValidationError::InvalidTimestamp(_) => FailureClass::Shared,
+            ActivityValidationError::MissingField { .. }
+            | ActivityValidationError::InvalidTimestamp(_) => FailureClass::WalletTransient,
+            ActivityValidationError::Identity => FailureClass::Shared,
         },
         ActivityReadError::Parse(
             ActivityParseError::Json { .. } | ActivityParseError::WindowInvalidated(_),
-        ) => FailureClass::Shared,
+        ) => FailureClass::WalletTransient,
         ActivityReadError::Aggregate(source) => match source {
             ActivityAggregationError::Identity(inner) => match inner {
                 ActivityIdentityError::ComponentTooLong
@@ -285,9 +292,11 @@ fn classify_activity_read(error: &pe_source_polymarket_public::ActivityReadError
             },
             ActivityAggregationError::CausalAmbiguity { .. }
             | ActivityAggregationError::MixedComboState { .. }
-            | ActivityAggregationError::EmptyGroup { .. }
             | ActivityAggregationError::AmountOverflow { .. }
-            | ActivityAggregationError::PriceWeightedSumOverflow { .. }
+            | ActivityAggregationError::PriceWeightedSumOverflow { .. } => {
+                FailureClass::WalletTransient
+            }
+            ActivityAggregationError::EmptyGroup { .. }
             | ActivityAggregationError::ZeroShareSum { .. }
             | ActivityAggregationError::InvalidWeightedPrice { .. } => FailureClass::Shared,
         },
@@ -296,20 +305,28 @@ fn classify_activity_read(error: &pe_source_polymarket_public::ActivityReadError
             | ActivityIdentityError::ComponentMismatch { .. } => FailureClass::Shared,
         },
         ActivityReadError::SaturatedTerminalSecond { .. } => FailureClass::WalletPersistent,
-        ActivityReadError::InvalidOffset { .. }
-        | ActivityReadError::V2Envelope(_)
-        | ActivityReadError::V2Authentication(_)
-        | ActivityReadError::InvalidBounds { .. }
+        ActivityReadError::V2Envelope(_)
+        | ActivityReadError::V2Authentication(V2AuthenticationError::RepeatedCursor(_))
         | ActivityReadError::RowOutsideBounds { .. }
+        | ActivityReadError::CanonicalPage(_) => FailureClass::WalletTransient,
+        ActivityReadError::InvalidOffset { .. }
+        | ActivityReadError::V2Authentication(
+            V2AuthenticationError::PageCountMismatch
+            | V2AuthenticationError::EmptyContinuation { .. }
+            | V2AuthenticationError::PageAfterTermination
+            | V2AuthenticationError::MissingTerminalPage
+            | V2AuthenticationError::RequestUrlMismatch { .. }
+            | V2AuthenticationError::EvidenceMismatch { .. },
+        )
+        | ActivityReadError::InvalidBounds { .. }
         | ActivityReadError::InvalidSplit { .. }
-        | ActivityReadError::CanonicalPage(_)
         | ActivityReadError::RowCountOverflow
         | ActivityReadError::PageTooLarge { .. } => FailureClass::Shared,
     }
 }
 
 fn classify_position_read(error: &pe_source_polymarket_public::PositionReadError) -> FailureClass {
-    use pe_source_polymarket_public::PositionReadError;
+    use pe_source_polymarket_public::{PositionReadError, V2AuthenticationError};
     match error {
         PositionReadError::Fetch { source, .. } => classify_source(source),
         PositionReadError::InvalidAmount { .. }
@@ -321,14 +338,22 @@ fn classify_position_read(error: &pe_source_polymarket_public::PositionReadError
         | PositionReadError::SaturatedTerminalPage { .. } => FailureClass::WalletPersistent,
         PositionReadError::MetadataUnresolved { .. }
         | PositionReadError::V2Envelope(_)
-        | PositionReadError::V2Authentication(_)
-        | PositionReadError::ProofComponentTooLong
-        | PositionReadError::PageTooLarge { .. }
+        | PositionReadError::V2Authentication(V2AuthenticationError::RepeatedCursor(_))
         | PositionReadError::Json(_)
         | PositionReadError::MissingField { .. }
         | PositionReadError::InvalidWallet { .. }
         | PositionReadError::WalletMismatch { .. }
-        | PositionReadError::CanonicalPage(_)
+        | PositionReadError::CanonicalPage(_) => FailureClass::WalletTransient,
+        PositionReadError::ProofComponentTooLong
+        | PositionReadError::PageTooLarge { .. }
+        | PositionReadError::V2Authentication(
+            V2AuthenticationError::PageCountMismatch
+            | V2AuthenticationError::EmptyContinuation { .. }
+            | V2AuthenticationError::PageAfterTermination
+            | V2AuthenticationError::MissingTerminalPage
+            | V2AuthenticationError::RequestUrlMismatch { .. }
+            | V2AuthenticationError::EvidenceMismatch { .. },
+        )
         | PositionReadError::RowCountOverflow => FailureClass::Shared,
     }
 }
@@ -339,10 +364,15 @@ impl CausalPositionError {
             Self::Activity { source, .. } => classify_activity_read(source),
             Self::Positions { source, .. } => classify_position_read(source),
             Self::Identity {
-                source: SourceError::Transient { .. },
+                source:
+                    IdentityError::Venue(SourceError::Transient { .. } | SourceError::Fatal { .. }),
                 ..
             } => FailureClass::WalletTransient,
-            Self::Identity { source, .. } => classify_source(source),
+            Self::Identity {
+                source:
+                    IdentityError::Venue(SourceError::RateLimited { .. }) | IdentityError::Local(_),
+                ..
+            } => FailureClass::Shared,
             Self::UnsafeRecovery { .. } | Self::Fenced { .. } | Self::DuplicateOutcome { .. } => {
                 FailureClass::WalletPersistent
             }
@@ -384,7 +414,9 @@ impl CausalPositionError {
                 ..
             }
             | Self::Identity {
-                source: SourceError::Transient { .. },
+                source:
+                    IdentityError::Venue(SourceError::Transient { .. })
+                    | IdentityError::Local(SourceError::Transient { .. }),
                 ..
             } => "source.transient",
             Self::Activity {
@@ -404,7 +436,9 @@ impl CausalPositionError {
                 ..
             }
             | Self::Identity {
-                source: SourceError::RateLimited { .. },
+                source:
+                    IdentityError::Venue(SourceError::RateLimited { .. })
+                    | IdentityError::Local(SourceError::RateLimited { .. }),
                 ..
             } => "source.rate_limited",
             Self::Activity {
@@ -424,7 +458,9 @@ impl CausalPositionError {
                 ..
             }
             | Self::Identity {
-                source: SourceError::Fatal { .. },
+                source:
+                    IdentityError::Venue(SourceError::Fatal { .. })
+                    | IdentityError::Local(SourceError::Fatal { .. }),
                 ..
             } => "source.fatal",
             Self::Activity {
@@ -657,7 +693,10 @@ pub fn is_deferred_causal_position_error(error: &CausalPositionError) -> bool {
             source: PositionReadError::Fetch { source, .. },
             ..
         }
-        | CausalPositionError::Identity { source, .. } => matches!(
+        | CausalPositionError::Identity {
+            source: IdentityError::Venue(source) | IdentityError::Local(source),
+            ..
+        } => matches!(
             source,
             SourceError::Transient { .. } | SourceError::RateLimited { .. }
         ),
@@ -1558,7 +1597,8 @@ impl CausalPositionValidator {
                             "discovered token {} has no durable metadata provenance",
                             asset.0
                         ),
-                    },
+                    }
+                    .into(),
                 });
             };
             mapping
@@ -1678,11 +1718,14 @@ impl CausalPositionValidator {
         purpose: ValidationPurpose,
         ordinary_reconciliation_needed: &mut bool,
     ) -> Result<HashSet<SourceTradeId>, CausalPositionError> {
-        let twins = restamp_twins(paper_state, &activity.rows).map_err(|error| {
-            CausalPositionError::BucketCommit {
+        let twins = restamp_twins(paper_state, &activity.rows).map_err(|error| match error {
+            ReconciliationError::Activity(source) => {
+                CausalPositionError::Activity { wallet, source }
+            }
+            error => CausalPositionError::BucketCommit {
                 wallet,
                 message: error.to_string(),
-            }
+            },
         })?;
         if let ValidationPurpose::RoutineRefresh { cutoff } = purpose {
             for bucket in activity
@@ -1909,7 +1952,8 @@ fn apply_resolved_mapping(
                         "verified token {} has no durable metadata provenance",
                         asset.0
                     ),
-                },
+                }
+                .into(),
             });
         }
     }
@@ -2539,6 +2583,351 @@ mod tests {
     }
 
     #[test]
+    fn venue_http_refusal_is_wallet_transient_and_local_fatal_stays_shared() {
+        assert_eq!(
+            classify_source(&SourceError::Fatal {
+                message: "HTTP 410".to_owned()
+            }),
+            FailureClass::WalletTransient
+        );
+        for message in [
+            "HTTP attempt ordinal overflow",
+            "HTTP 4100",
+            "HTTP 41",
+            "HTTP abc",
+            "invalid URL",
+        ] {
+            assert_eq!(
+                classify_source(&SourceError::Fatal {
+                    message: message.to_owned()
+                }),
+                FailureClass::Shared
+            );
+        }
+    }
+
+    #[test]
+    fn venue_read_allowlist_preserves_local_and_legacy_failures() {
+        use pe_source_polymarket_public::{
+            ActivityAggregationError as Aggregate, ActivityIdentityError,
+            ActivityWindowInvalidation, V2AuthenticationError as Auth, V2PageError,
+        };
+        let json_error = || serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let transient = FailureClass::WalletTransient;
+        let shared = FailureClass::Shared;
+        for (error, expected) in [
+            (
+                ActivityReadError::Parse(ActivityParseError::InvalidRow {
+                    row_index: 0,
+                    source: ActivityValidationError::MissingField { field: "price" },
+                }),
+                transient,
+            ),
+            (
+                ActivityReadError::Parse(ActivityParseError::InvalidRow {
+                    row_index: 0,
+                    source: ActivityValidationError::InvalidTimestamp(i64::MAX),
+                }),
+                transient,
+            ),
+            (
+                ActivityReadError::Parse(ActivityParseError::InvalidRow {
+                    row_index: 0,
+                    source: ActivityValidationError::Identity,
+                }),
+                shared,
+            ),
+            (
+                ActivityReadError::Parse(ActivityParseError::Json {
+                    message: String::new(),
+                }),
+                transient,
+            ),
+            (
+                ActivityReadError::Parse(ActivityParseError::WindowInvalidated(
+                    ActivityWindowInvalidation::MissingWallet { row_index: 0 },
+                )),
+                transient,
+            ),
+            (
+                ActivityReadError::Aggregate(Aggregate::CausalAmbiguity {
+                    group_id: String::new(),
+                    expected: 0,
+                    actual: 1,
+                }),
+                transient,
+            ),
+            (
+                ActivityReadError::Aggregate(Aggregate::MixedComboState {
+                    group_id: String::new(),
+                }),
+                transient,
+            ),
+            (
+                ActivityReadError::Aggregate(Aggregate::AmountOverflow {
+                    group_id: String::new(),
+                }),
+                transient,
+            ),
+            (
+                ActivityReadError::Aggregate(Aggregate::PriceWeightedSumOverflow {
+                    group_id: String::new(),
+                }),
+                transient,
+            ),
+            (
+                ActivityReadError::Aggregate(Aggregate::EmptyGroup {
+                    group_id: String::new(),
+                }),
+                shared,
+            ),
+            (
+                ActivityReadError::Aggregate(Aggregate::ZeroShareSum {
+                    group_id: String::new(),
+                }),
+                shared,
+            ),
+            (
+                ActivityReadError::Aggregate(Aggregate::InvalidWeightedPrice {
+                    group_id: String::new(),
+                    value: Decimal::ZERO,
+                }),
+                shared,
+            ),
+            (
+                ActivityReadError::Aggregate(Aggregate::Identity(
+                    ActivityIdentityError::ComponentTooLong,
+                )),
+                shared,
+            ),
+            (
+                ActivityReadError::Aggregate(Aggregate::Identity(
+                    ActivityIdentityError::ComponentMismatch {
+                        stored: String::new(),
+                        derived: String::new(),
+                    },
+                )),
+                shared,
+            ),
+            (
+                ActivityReadError::Identity(ActivityIdentityError::ComponentTooLong),
+                shared,
+            ),
+            (
+                ActivityReadError::Identity(ActivityIdentityError::ComponentMismatch {
+                    stored: String::new(),
+                    derived: String::new(),
+                }),
+                shared,
+            ),
+            (
+                ActivityReadError::V2Envelope(V2PageError::InvalidLimit(1001)),
+                transient,
+            ),
+            (
+                ActivityReadError::V2Envelope(V2PageError::PageTooLarge {
+                    row_count: 2,
+                    limit: 1,
+                }),
+                transient,
+            ),
+            (
+                ActivityReadError::V2Envelope(V2PageError::Json(json_error())),
+                transient,
+            ),
+            (
+                ActivityReadError::V2Envelope(V2PageError::ContradictoryPagination {
+                    has_more: true,
+                    next_cursor: None,
+                }),
+                transient,
+            ),
+            (
+                ActivityReadError::V2Authentication(Auth::RepeatedCursor("cursor".to_owned())),
+                transient,
+            ),
+            (
+                ActivityReadError::RowOutsideBounds {
+                    timestamp: 2,
+                    start: Some(0),
+                    end: 1,
+                },
+                transient,
+            ),
+            (ActivityReadError::CanonicalPage(json_error()), transient),
+            (
+                ActivityReadError::InvalidOffset {
+                    offset: 1,
+                    limit: 500,
+                },
+                shared,
+            ),
+            (
+                ActivityReadError::InvalidBounds {
+                    start: Some(2),
+                    end: 1,
+                },
+                shared,
+            ),
+            (
+                ActivityReadError::InvalidSplit {
+                    start: Some(0),
+                    end: 1,
+                    boundary: 2,
+                },
+                shared,
+            ),
+            (ActivityReadError::RowCountOverflow, shared),
+            (
+                ActivityReadError::PageTooLarge {
+                    row_count: 501,
+                    limit: 500,
+                },
+                shared,
+            ),
+        ] {
+            assert_eq!(classify_activity_read(&error), expected, "{error:?}");
+        }
+        for error in [
+            PositionReadError::MetadataUnresolved {
+                asset: String::new(),
+                reason: String::new(),
+            },
+            PositionReadError::V2Envelope(V2PageError::InvalidLimit(1001)),
+            PositionReadError::V2Authentication(Auth::RepeatedCursor(String::new())),
+            PositionReadError::CanonicalPage(json_error()),
+            PositionReadError::Json(json_error()),
+            PositionReadError::MissingField {
+                row_index: 0,
+                field: "asset",
+            },
+            PositionReadError::InvalidWallet {
+                row_index: 0,
+                value: String::new(),
+            },
+            PositionReadError::WalletMismatch {
+                row_index: 0,
+                requested_wallet: WalletAddress([1; 20]),
+                payload_wallet: WalletAddress([2; 20]),
+            },
+        ] {
+            assert_eq!(classify_position_read(&error), transient, "{error:?}");
+        }
+        for source in [
+            ActivityValidationError::InvalidActivityType {
+                value: String::new(),
+            },
+            ActivityValidationError::EmptyField { field: "price" },
+            ActivityValidationError::InvalidSide {
+                value: String::new(),
+            },
+            ActivityValidationError::InvalidPrice {
+                value: Decimal::ZERO,
+                reason: String::new(),
+            },
+            ActivityValidationError::InvalidShareAmount {
+                value: Decimal::ZERO,
+                reason: String::new(),
+            },
+            ActivityValidationError::InvalidCollateralAmount {
+                value: Decimal::ZERO,
+                reason: String::new(),
+            },
+            ActivityValidationError::InvalidConditionOutcomeMapping,
+            ActivityValidationError::InvalidTimestampValue {
+                value: String::new(),
+            },
+            ActivityValidationError::LegacyProjectionOutOfRange,
+        ] {
+            assert_eq!(
+                classify_activity_read(&ActivityReadError::Parse(ActivityParseError::InvalidRow {
+                    row_index: 0,
+                    source
+                })),
+                FailureClass::WalletPersistent
+            );
+        }
+        for source in [
+            ActivityWindowInvalidation::InvalidWallet {
+                row_index: 0,
+                value: String::new(),
+            },
+            ActivityWindowInvalidation::WalletMismatch {
+                row_index: 0,
+                requested_wallet: WalletAddress([1; 20]),
+                payload_wallet: WalletAddress([2; 20]),
+            },
+        ] {
+            assert_eq!(
+                classify_activity_read(&ActivityReadError::Parse(
+                    ActivityParseError::WindowInvalidated(source)
+                )),
+                transient
+            );
+        }
+        for error in [
+            PositionReadError::InvalidAmount {
+                row_index: 0,
+                value: Decimal::ZERO,
+                reason: String::new(),
+            },
+            PositionReadError::MissingActivityMapping {
+                asset: String::new(),
+            },
+            PositionReadError::ConflictingActivityMapping {
+                asset: String::new(),
+            },
+            PositionReadError::MixedActivityClassification {
+                asset: String::new(),
+            },
+            PositionReadError::ConflictingOutcomeMapping {
+                condition_id: String::new(),
+                outcome: 0,
+            },
+            PositionReadError::DuplicateAsset {
+                asset: String::new(),
+            },
+            PositionReadError::SaturatedTerminalPage {
+                partition: PositionPartition::Redeemable,
+                offset: 0,
+            },
+        ] {
+            assert_eq!(
+                classify_position_read(&error),
+                FailureClass::WalletPersistent,
+                "{error:?}"
+            );
+        }
+        for error in [
+            PositionReadError::ProofComponentTooLong,
+            PositionReadError::RowCountOverflow,
+            PositionReadError::PageTooLarge {
+                row_count: 501,
+                limit: 500,
+            },
+        ] {
+            assert_eq!(classify_position_read(&error), shared, "{error:?}");
+        }
+        for error in [
+            Auth::PageCountMismatch,
+            Auth::EmptyContinuation { index: 0 },
+            Auth::PageAfterTermination,
+            Auth::MissingTerminalPage,
+            Auth::RequestUrlMismatch { index: 0 },
+            Auth::EvidenceMismatch { index: 0 },
+        ] {
+            assert_eq!(
+                classify_activity_read(&ActivityReadError::V2Authentication(error.clone())),
+                shared
+            );
+            assert_eq!(
+                classify_position_read(&PositionReadError::V2Authentication(error)),
+                shared
+            );
+        }
+    }
+
+    #[test]
     fn admission_failure_classes_follow_typed_origins() {
         let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         let source = |index| match index {
@@ -2583,7 +2972,11 @@ mod tests {
             assert_eq!(
                 CausalPositionError::Identity {
                     wallet,
-                    source: source(index)
+                    source: if index == 2 {
+                        IdentityError::Local(source(index))
+                    } else {
+                        IdentityError::Venue(source(index))
+                    }
                 }
                 .class(),
                 identity_class
@@ -2600,7 +2993,7 @@ mod tests {
                 asset: "a".to_owned(),
                 reason: String::new()
             }),
-            FailureClass::Shared
+            FailureClass::WalletTransient
         );
         assert_eq!(
             classify_position_read(&PositionReadError::PageTooLarge {
@@ -2634,7 +3027,7 @@ mod tests {
                 start: None,
                 end: 0
             }),
-            FailureClass::Shared
+            FailureClass::WalletTransient
         );
         assert_eq!(
             classify_activity_read(&ActivityReadError::PageTooLarge {
@@ -2665,13 +3058,13 @@ mod tests {
                 row_index: 0,
                 source: ActivityValidationError::MissingField { field: "price" }
             })),
-            FailureClass::Shared
+            FailureClass::WalletTransient
         );
         assert_eq!(
             classify_activity_read(&ActivityReadError::Parse(ActivityParseError::Json {
                 message: String::new()
             })),
-            FailureClass::Shared
+            FailureClass::WalletTransient
         );
         assert_eq!(
             classify_position_read(&PositionReadError::WalletMismatch {
@@ -2682,7 +3075,7 @@ mod tests {
                 )
                 .unwrap()
             }),
-            FailureClass::Shared
+            FailureClass::WalletTransient
         );
         assert_eq!(
             CausalPositionError::NonMonotonicActivityBounds {
@@ -3023,6 +3416,54 @@ mod tests {
         );
     }
     #[test]
+    fn identity_class_and_kind_preserve_local_origin_and_rate_limits() {
+        let wallet = WalletAddress([0xaa; 20]);
+        for venue in [false, true] {
+            for (source, kind, venue_class) in [
+                (
+                    SourceError::Transient {
+                        message: String::new(),
+                    },
+                    "source.transient",
+                    FailureClass::WalletTransient,
+                ),
+                (
+                    SourceError::RateLimited {
+                        retry_after_secs: 1,
+                    },
+                    "source.rate_limited",
+                    FailureClass::Shared,
+                ),
+                (
+                    SourceError::Fatal {
+                        message: "HTTP 410".to_owned(),
+                    },
+                    "source.fatal",
+                    FailureClass::WalletTransient,
+                ),
+            ] {
+                let error = CausalPositionError::Identity {
+                    wallet,
+                    source: if venue {
+                        IdentityError::Venue(source)
+                    } else {
+                        source.into()
+                    },
+                };
+                assert_eq!(
+                    error.class(),
+                    if venue {
+                        venue_class
+                    } else {
+                        FailureClass::Shared
+                    }
+                );
+                assert_eq!(error.kind(), kind);
+            }
+        }
+    }
+
+    #[test]
     fn paper_service_rollout_identity_transient_is_wallet_scoped_and_rate_limit_shared() {
         let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         for (source, expected) in [
@@ -3046,7 +3487,15 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                CausalPositionError::Identity { wallet, source }.class(),
+                CausalPositionError::Identity {
+                    wallet,
+                    source: match source {
+                        SourceError::Transient { .. } | SourceError::RateLimited { .. } =>
+                            IdentityError::Venue(source),
+                        SourceError::Fatal { .. } => IdentityError::Local(source),
+                    },
+                }
+                .class(),
                 expected
             );
         }
@@ -3074,6 +3523,92 @@ mod anomaly_recording_tests {
             "conditionId":"0xca", "token_id":"asset-a", "side":"BUY", "isCombo":false,
             "outcomeIndex":0, "outcome":"Yes", "price":if anomalous {"2"} else {"0.5"}, "size":"1", "usdcSize":"1"
         }], "pagination":{"limit":1000,"offset":0,"has_more":false,"next_cursor":null}})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn local_identity_append_failure_ends_refresh_and_migration_boot() {
+        for migration in [false, true] {
+            let wallet = WalletAddress([0xaa; 20]);
+            let dir = tempfile::tempdir().unwrap();
+            let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            paper
+                .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                    wallet,
+                    complete: true,
+                    proof_json: "{}".to_owned(),
+                    updated_at_unix: 1,
+                })
+                .unwrap();
+            let fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(Page(payload(wallet, false)));
+            let sink = Arc::new(tokio::sync::Mutex::new(
+                SourceEventSink::open(dir.path().join("source.log")).unwrap(),
+            ));
+            sink.lock().await.fail_next_append();
+            let identity = Arc::new(AssetIdentityResolver::new(
+                fetcher.clone(),
+                "https://example.test".to_owned(),
+                100,
+                sink.clone(),
+            ));
+            let validator = if migration {
+                CausalPositionValidator::new_recording(
+                    fetcher,
+                    "https://example.test",
+                    "test",
+                    sink,
+                    identity,
+                    paper.clone(),
+                )
+            } else {
+                CausalPositionValidator::new(fetcher, "https://example.test", "test", identity)
+            }
+            .with_clock(Arc::new(|| 100));
+            let mut engine =
+                BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
+            if migration {
+                let error = validator
+                    .validate_direct(&[wallet], &mut engine, &paper)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("append"), "{error}");
+                assert_eq!(error.class(), FailureClass::Shared);
+            } else {
+                let (tx, mut rx) = mpsc::channel(2);
+                let actor_paper = paper.clone();
+                let actor = tokio::spawn(async move {
+                    while let Some(command) = rx.recv().await {
+                        match command {
+                            OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                                let _ = captured.send(
+                                    ledger_capture(engine.ledger(), &actor_paper, wallet)
+                                        .map_err(|error| error.to_string()),
+                                );
+                            }
+                            OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
+                                let _ = acknowledged.send(());
+                            }
+                            _ => unreachable!("identity fails before commitment"),
+                        }
+                    }
+                });
+                let preparer = crate::watchlist_admission::AdmissionPreparer::with_validator(
+                    tx,
+                    paper.clone(),
+                    validator,
+                );
+                let error = preparer
+                    .prepare_if_due(wallet, 100, 3_600)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("source-log append failed"),
+                    "{error}"
+                );
+                drop(preparer);
+                actor.await.unwrap();
+            }
+            assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

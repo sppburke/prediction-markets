@@ -5786,7 +5786,7 @@ mod tests {
         struct AdmissionFetcher {
             paper: Arc<PaperStateDb>,
             busy: Arc<StdMutex<HashSet<WalletAddress>>>,
-            /// Wallets whose positions read is malformed: a `Shared`-class bracket failure.
+            /// Wallets whose positions transport fails: a `Shared`-class bracket failure.
             shared: HashSet<WalletAddress>,
             activity_reads: StdMutex<HashMap<WalletAddress, usize>>,
             spend_budget: bool,
@@ -5813,7 +5813,9 @@ mod tests {
                         tokio::time::advance(Duration::from_secs(11)).await;
                     }
                 } else if url.contains("/v2/positions?") && self.shared.contains(&wallet) {
-                    return Ok(b"{".to_vec());
+                    return Err(SourceError::Transient {
+                        message: "injected positions transport failure".to_owned(),
+                    });
                 } else if url.contains("/v2/positions?")
                     && self.busy.lock().unwrap().contains(&wallet)
                 {
