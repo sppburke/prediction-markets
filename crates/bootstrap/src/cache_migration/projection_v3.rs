@@ -205,6 +205,12 @@ struct WalletClassifier {
     wallet_hex: String,
     generation: u64,
     drops: BTreeMap<Scope, ScopeDrop>,
+    /// The scopes whose drop is at or before the last second classified. A
+    /// drop only moves earlier and seconds only advance, so a scope never
+    /// leaves: this is every later second's dropped set, kept as drops arrive.
+    dropped: std::collections::BTreeSet<Scope>,
+    /// Stored drops not yet in `dropped`, latest first, so the next due is last.
+    upcoming: Vec<(i64, Scope)>,
     positions: HashMap<MarketOutcomeId, PositionState>,
     history: HashSet<String>,
     ignored: BTreeMap<String, u64>,
@@ -230,14 +236,22 @@ impl WalletClassifier {
         let quality = ReconstructionQuality::new(100).map_err(|error| BootstrapError::Invalid {
             message: format!("invalid bootstrap reconstruction quality: {error}"),
         })?;
+        let drops: BTreeMap<Scope, ScopeDrop> = stored
+            .into_iter()
+            .map(|drop| (drop.scope(), drop))
+            .collect();
+        let mut upcoming: Vec<_> = drops
+            .iter()
+            .map(|(scope, drop)| (drop.dropped_at_unix, scope.clone()))
+            .collect();
+        upcoming.sort_unstable_by(|a, b| b.cmp(a));
         Ok(Self {
             wallet,
             wallet_hex: wallet_hex.to_owned(),
             generation,
-            drops: stored
-                .into_iter()
-                .map(|drop| (drop.scope(), drop))
-                .collect(),
+            drops,
+            dropped: std::collections::BTreeSet::new(),
+            upcoming,
             positions: HashMap::new(),
             history: HashSet::new(),
             ignored: BTreeMap::new(),
@@ -246,6 +260,37 @@ impl WalletClassifier {
             anomalies: anomalies.into(),
             unresolved_anomalies: Vec::new(),
         })
+    }
+
+    /// Brings `dropped` up to `second`, a second later than every one before
+    /// it, and tells whether a drop is at exactly `second`. That can only be a
+    /// stored drop no problem has moved: recorded drops are all earlier.
+    fn advance_to(&mut self, second: i64) -> Result<bool, BootstrapError> {
+        let mut certified = false;
+        while self.upcoming.last().is_some_and(|(at, _)| *at <= second) {
+            let (at, scope) = self.upcoming.pop().ok_or(BootstrapError::Internal)?;
+            certified |= at == second
+                && self
+                    .drops
+                    .get(&scope)
+                    .is_some_and(|drop| drop.dropped_at_unix == second);
+            self.dropped.insert(scope);
+        }
+        Ok(certified)
+    }
+
+    /// Records a problem's drop at the current second unless the scope already
+    /// has one at or before it. The shared owner chooses (trigger, cause); a
+    /// certified cause wins a tied second.
+    fn record_drop(&mut self, scope: Scope, drop: ScopeDrop) {
+        if self
+            .drops
+            .get(&scope)
+            .is_none_or(|previous| drop.dropped_at_unix < previous.dropped_at_unix)
+        {
+            self.dropped.insert(scope.clone());
+            self.drops.insert(scope, drop);
+        }
     }
 
     fn seconds(
@@ -265,16 +310,7 @@ impl WalletClassifier {
             anomalies.push(self.anomalies.pop_front().ok_or(BootstrapError::Internal)?);
         }
         for (second, aggregates, anomalies) in historical_seconds(aggregates, &anomalies) {
-            let dropped = self
-                .drops
-                .iter()
-                .filter(|(_, drop)| drop.dropped_at_unix <= second)
-                .map(|(scope, _)| scope.clone())
-                .collect();
-            let certified_problem_second = self
-                .drops
-                .values()
-                .any(|drop| drop.dropped_at_unix == second);
+            let certified_problem_second = self.advance_to(second)?;
             let records: Vec<_> = aggregates
                 .iter()
                 .map(|aggregate| SecondRecord {
@@ -301,7 +337,7 @@ impl WalletClassifier {
                     second,
                     &records,
                     anomalies,
-                    &dropped,
+                    &self.dropped,
                     certified_problem_second,
                     self.quality,
                     &|market: &MarketId| self.history.contains(&market.to_string()),
@@ -312,7 +348,7 @@ impl WalletClassifier {
                     &ledger,
                     self.wallet,
                     &records,
-                    &dropped,
+                    &self.dropped,
                     certified_problem_second,
                     self.quality,
                     &|market: &MarketId| self.history.contains(&market.to_string()),
@@ -332,14 +368,7 @@ impl WalletClassifier {
                     scope_id: problem.scope.id.clone(),
                     scope_kind: problem.scope.kind,
                 };
-                // The shared owner chooses (trigger, cause); a certified cause wins a tied second.
-                if self
-                    .drops
-                    .get(&problem.scope)
-                    .is_none_or(|previous| second < previous.dropped_at_unix)
-                {
-                    self.drops.insert(problem.scope, drop);
-                }
+                self.record_drop(problem.scope, drop);
             }
             for (id, activity_type) in classified.ignored {
                 if id.0.starts_with(ACTIVITY_ROW_ANOMALY_NAMESPACE) {
@@ -1604,6 +1633,213 @@ mod tests {
         assert!(finished.ignored.is_empty());
         assert!(finished.causes.is_empty());
         assert_eq!(finished.certificate.aggregate_count, 5);
+    }
+
+    /// The rule `dropped` replaces: every scope whose drop is at or before
+    /// `second`, and whether any drop is at exactly `second`.
+    fn per_second_rule(
+        drops: &BTreeMap<Scope, ScopeDrop>,
+        second: i64,
+    ) -> (std::collections::BTreeSet<Scope>, bool) {
+        (
+            drops
+                .iter()
+                .filter(|(_, drop)| drop.dropped_at_unix <= second)
+                .map(|(scope, _)| scope.clone())
+                .collect(),
+            drops.values().any(|drop| drop.dropped_at_unix == second),
+        )
+    }
+
+    fn market_drop(id: &str, cause: DropCause, at: i64) -> ScopeDrop {
+        ScopeDrop {
+            cause,
+            dropped_at_unix: at,
+            scope_id: id.to_owned(),
+            scope_kind: ScopeKind::Market,
+        }
+    }
+
+    fn market_scope(id: &str) -> Scope {
+        Scope {
+            kind: ScopeKind::Market,
+            id: id.to_owned(),
+        }
+    }
+
+    /// One classified second: the scopes dropped there, whether a drop is at
+    /// exactly that second, and the problems' drops recorded in it.
+    struct Step {
+        second: i64,
+        dropped: &'static [&'static str],
+        tie: bool,
+        recorded: &'static [(&'static str, DropCause)],
+    }
+
+    #[test]
+    fn dropped_scopes_follow_stored_and_recorded_drops_second_by_second() {
+        // Stored drops before the first second, exactly at one, between two,
+        // moved earlier by a problem, and after the last, and one scope twice
+        // (the later entry wins).
+        let stored = [
+            market_drop("0xa", DropCause::Underflow, 5),
+            market_drop("0xb", DropCause::Underflow, 20),
+            market_drop("0xc", DropCause::Underflow, 25),
+            market_drop("0xd", DropCause::Underflow, 100),
+            market_drop("0xe", DropCause::Underflow, 15),
+            market_drop("0xe", DropCause::Overflow, 45),
+            market_drop("0xff", DropCause::Underflow, 500),
+        ];
+        let mut classifier = WalletClassifier::new(
+            &wallet_hex(1),
+            1,
+            &serde_json::to_string(&stored).unwrap(),
+            7,
+            Vec::new(),
+        )
+        .unwrap();
+        const ALL: &[&str] = &["0xa", "0xb", "0xc", "0xd", "0xe", "0xf"];
+        let steps = [
+            Step {
+                second: 10,
+                dropped: &["0xa"],
+                tie: false,
+                recorded: &[],
+            },
+            // The stored drop at 20 is certified there and keeps its cause.
+            Step {
+                second: 20,
+                dropped: &["0xa", "0xb"],
+                tie: true,
+                recorded: &[("0xb", DropCause::Conversion)],
+            },
+            Step {
+                second: 30,
+                dropped: &["0xa", "0xb", "0xc"],
+                tie: false,
+                recorded: &[("0xf", DropCause::Underflow)],
+            },
+            // 0xd's stored drop at 100 moves to 40.
+            Step {
+                second: 40,
+                dropped: &["0xa", "0xb", "0xc", "0xf"],
+                tie: false,
+                recorded: &[("0xd", DropCause::Overflow)],
+            },
+            Step {
+                second: 50,
+                dropped: ALL,
+                tie: false,
+                recorded: &[],
+            },
+            // Nothing is left at 100 once 0xd's drop moved to 40.
+            Step {
+                second: 100,
+                dropped: ALL,
+                tie: false,
+                recorded: &[],
+            },
+            Step {
+                second: 110,
+                dropped: ALL,
+                tie: false,
+                recorded: &[],
+            },
+        ];
+        for step in steps {
+            let second = step.second;
+            let expected = per_second_rule(&classifier.drops, second);
+            let certified = classifier.advance_to(second).unwrap();
+            assert_eq!(
+                (classifier.dropped.clone(), certified),
+                expected,
+                "second {second}"
+            );
+            assert_eq!(
+                classifier.dropped,
+                step.dropped
+                    .iter()
+                    .copied()
+                    .map(market_scope)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                "second {second}"
+            );
+            assert_eq!(certified, step.tie, "second {second}");
+            for (id, cause) in step.recorded {
+                classifier.record_drop(market_scope(id), market_drop(id, *cause, second));
+            }
+        }
+        // The drop after the last second is still due, and is certified as stored.
+        assert_eq!(classifier.upcoming, [(500, market_scope("0xff"))]);
+        let drops: Vec<_> = classifier
+            .drops
+            .values()
+            .map(|drop| (drop.scope_id.as_str(), drop.cause, drop.dropped_at_unix))
+            .collect();
+        assert_eq!(
+            drops,
+            [
+                ("0xa", DropCause::Underflow, 5),
+                ("0xb", DropCause::Underflow, 20),
+                ("0xc", DropCause::Underflow, 25),
+                ("0xd", DropCause::Overflow, 40),
+                ("0xe", DropCause::Overflow, 45),
+                ("0xf", DropCause::Underflow, 30),
+                ("0xff", DropCause::Underflow, 500),
+            ]
+        );
+    }
+
+    #[test]
+    fn dropped_scopes_match_the_per_second_rule_on_generated_histories() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let causes = [
+            DropCause::Underflow,
+            DropCause::Overflow,
+            DropCause::Conversion,
+        ];
+        for case in 0..400 {
+            let pool = 1 + next(12);
+            let stored: Vec<_> = (0..next(10))
+                .map(|_| {
+                    market_drop(
+                        &format!("0x{:x}", next(pool)),
+                        causes[usize::try_from(next(3)).unwrap()],
+                        i64::try_from(next(80)).unwrap(),
+                    )
+                })
+                .collect();
+            let mut classifier = WalletClassifier::new(
+                &wallet_hex(1),
+                1,
+                &serde_json::to_string(&stored).unwrap(),
+                7,
+                Vec::new(),
+            )
+            .unwrap();
+            let mut second = i64::try_from(next(5)).unwrap();
+            for _ in 0..next(30) {
+                second += 1 + i64::try_from(next(6)).unwrap();
+                let expected = per_second_rule(&classifier.drops, second);
+                let certified = classifier.advance_to(second).unwrap();
+                assert_eq!(
+                    (classifier.dropped.clone(), certified),
+                    expected,
+                    "case {case} second {second}"
+                );
+                for _ in 0..next(3) {
+                    let id = format!("0x{:x}", next(pool));
+                    let cause = causes[usize::try_from(next(3)).unwrap()];
+                    classifier.record_drop(market_scope(&id), market_drop(&id, cause, second));
+                }
+            }
+        }
     }
 
     fn empty_payouts() -> BoundPayouts {
