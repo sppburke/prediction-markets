@@ -84,7 +84,7 @@ struct HttpState {
     import_reads: Mutex<Vec<i64>>,
     rows: Vec<ConfigRow>,
     now: i64,
-    ranked_wallets: usize,
+    ranked_wallets: std::sync::atomic::AtomicUsize,
     newcomer: Option<WalletAddress>,
     activity_requests: Mutex<Vec<HashMap<String, String>>>,
     full_history_requests: Mutex<Vec<String>>,
@@ -124,7 +124,7 @@ pub async fn boundary_mark() {
         import_reads: Mutex::new(Vec::new()),
         rows: Vec::new(),
         now: 0,
-        ranked_wallets: 0,
+        ranked_wallets: std::sync::atomic::AtomicUsize::new(0),
         newcomer: None,
         activity_requests: Mutex::new(Vec::new()),
         full_history_requests: Mutex::new(Vec::new()),
@@ -410,7 +410,7 @@ async fn serve(
         "/rest/v1/ranking_neg_risk_group_spans"=>json!(*state.group_spans.lock().unwrap()),
         "/rest/v1/service_config"=>json!(state.rows),
         "/rest/v1/ranking_batches"=>json!([{"batch_id":batch}]),
-        "/rest/v1/ranking_entries"|"/rest/v1/latest_ranking"=>json!((1..=state.ranked_wallets).filter(|n| batch != 1 || state.newcomer != Some(wallet(*n))).map(|n|json!({"batch_id":batch,"rank":n,"wallet_hex":wallet(n).to_string(),"ls_tstat":"3","hit_rate":"0.65","n_trades":100,"last_trade_unix":if n == 2 && state.stale_ranked_wallet_2.load(Ordering::SeqCst) { state.now - 300_000 } else { state.now - 20 },"survives":true})).collect::<Vec<_>>()),
+        "/rest/v1/ranking_entries"|"/rest/v1/latest_ranking"=>json!((1..=state.ranked_wallets.load(Ordering::SeqCst)).filter(|n| batch != 1 || state.newcomer != Some(wallet(*n))).map(|n|json!({"batch_id":batch,"rank":n,"wallet_hex":wallet(n).to_string(),"ls_tstat":"3","hit_rate":"0.65","n_trades":100,"last_trade_unix":if n == 2 && state.stale_ranked_wallet_2.load(Ordering::SeqCst) { state.now - 300_000 } else { state.now - 20 },"survives":true})).collect::<Vec<_>>()),
         "/rest/v1/service_runtime"=>json!([{"updated_at":a.projection_generation.to_string(),"watchlist_size":a.projection.len()}]),
         "/rest/v1/rpc/service_watchlist_replace_v1"=> { assert_eq!(body["expected_token"],a.projection_generation.to_string());a.projection=body["entries"].as_array().unwrap().clone();a.projection_generation+=1;json!([{"new_token":a.projection_generation.to_string(),"count":a.projection.len()}]) },
         "/rest/v1/paper_bankroll"=>json!([{"bankroll_str":a.cash.to_string(),"last_prepared_seq":a.progress}]),
@@ -671,13 +671,13 @@ async fn run_case(boot_waves: bool, scope_drops: bool, waiting_admission: bool) 
         import_reads: Mutex::new(Vec::new()),
         rows: crate::golden::golden_config_rows(&runtime),
         now,
-        ranked_wallets: if boot_waves {
+        ranked_wallets: std::sync::atomic::AtomicUsize::new(if boot_waves {
             5
         } else if waiting_admission {
             3
         } else {
             4
-        },
+        }),
         newcomer: waiting_admission.then_some(wallet(3)),
         activity_requests: Mutex::new(Vec::new()),
         full_history_requests: Mutex::new(Vec::new()),
@@ -745,7 +745,7 @@ async fn run_case(boot_waves: bool, scope_drops: bool, waiting_admission: bool) 
     drop(side);
     boot.session.unwrap().finish().unwrap();
     let paper = Arc::new(PaperStateDb::open(&cfg.paper_state_db_path).unwrap());
-    let wallets = (1..=state.ranked_wallets)
+    let wallets = (1..=state.ranked_wallets.load(Ordering::SeqCst))
         .map(wallet)
         .filter(|wallet| Some(*wallet) != state.newcomer)
         .collect::<Vec<_>>();
@@ -2247,7 +2247,7 @@ impl CheckpointFixture {
             import_reads: Mutex::new(Vec::new()),
             rows: crate::golden::golden_config_rows(&runtime),
             now,
-            ranked_wallets: 1,
+            ranked_wallets: std::sync::atomic::AtomicUsize::new(1),
             newcomer: None,
             activity_requests: Mutex::new(Vec::new()),
             full_history_requests: Mutex::new(Vec::new()),
@@ -2493,6 +2493,13 @@ impl CheckpointFixture {
             .collect::<Vec<_>>();
         replayed_wallets.sort_by_key(|wallet| wallet.0);
         assert_eq!(replayed_wallets, members);
+        // Boot's score refresh keeps only wallets the current batch ranks.
+        self.state
+            .ranking_batch
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        self.state
+            .ranked_wallets
+            .store(newcomers + 1, std::sync::atomic::Ordering::SeqCst);
         self.cfg.maintenance_interval_secs = 0;
         self.cfg.supabase_refresh_interval_secs = 0;
         std::fs::write(&self.config_path, toml::to_string(&self.cfg).unwrap()).unwrap();
@@ -2648,7 +2655,7 @@ mod data_api_tests {
             import_reads: Mutex::new(Vec::new()),
             rows: Vec::new(),
             now: 0,
-            ranked_wallets: 0,
+            ranked_wallets: std::sync::atomic::AtomicUsize::new(0),
             newcomer: None,
             activity_requests: Mutex::new(Vec::new()),
             full_history_requests: Mutex::new(Vec::new()),
