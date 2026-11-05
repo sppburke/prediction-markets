@@ -2305,6 +2305,8 @@ deployment actions described above; this procedure makes no trading or policy ch
       select($line.message == "maintenance admission budget completed" or
              $line.message == "admission launch order" or
              $line.message == "wallet bracket completed" or
+             $line.message == "full_rerank: ready wallets published" or
+             $line.message == "knockout: ready wallets published" or
              $line.message == "membership admission deferred") |
       (if $line.message == "maintenance admission budget completed" then
          ["elapsed_ms","deadline_expired","started","accepted","deferred","unstarted","capacity_generation"]
@@ -2312,6 +2314,7 @@ deployment actions described above; this procedure makes no trading or policy ch
          ["path","eligible","started","started_previous_keys"] +
          (if $line.path == "addition" or $line.path == "reentry" then ["first"] else [] end)
        elif $line.message == "wallet bracket completed" then ["wallet","elapsed_ms","outcome"]
+       elif ($line.message | endswith(": ready wallets published")) then ["batch_id","added","paper_seq"]
        else ["wallet","stage","kind","deferral.class","context"] end) as $required |
       if all($required[]; . as $key | $line | has($key)) then
         {journal_unix_us:$journal.__REALTIME_TIMESTAMP, event:$line}
@@ -2321,7 +2324,7 @@ deployment actions described above; this procedure makes no trading or policy ch
 
     `attempted_batch_id` is absent when no batch was attempted; retain it and `applied_batch_id`
     wherever present. The journal's class field is `deferral.class`; the artifact uses `class`.
-    Decode `eligible` and `started_previous_keys` as JSON-encoded strings for
+    Decode `eligible`, `started_previous_keys` and publication `added` as JSON-encoded strings for
     launch-order analysis. From docs/29's proven closing-batch result, set `closing_batch` to its
     integer ID. Capture survivors for the baseline, every attempted and applied batch, the closing
     batch and every published batch in between:
@@ -2369,9 +2372,14 @@ deployment actions described above; this procedure makes no trading or policy ch
     terminally excluded and unavailable outcomes. Earlier anchors/membership, accepted-bracket logs
     and silence cannot prove recovery; zero refusals establishes availability only.
 
-    For each continuously eligible wallet, count ticks where its path ran first and started at least
-    one bracket. N is the distinct eligible-wallet count across those path calls; k is their smallest
-    positive started count. The wallet must start within ⌈N ÷ k⌉ such ticks. Report zero-start calls
+    For each continuously eligible wallet, count first admission waves (`first=true`) that started
+    at least one bracket. The eligible population is that wave's additions plus eligible non-failed
+    structural re-entries, using its selected pinned batch; queue keys determine their common order.
+    N is the distinct eligible-wallet count across those combined calls; k is their smallest positive
+    started count. Failed re-entries wait behind additions in the closing call; report their retry
+    eligibility and launches separately. If there is no addition wave, that closing call offers the
+    whole eligible re-entry population and is the round's first wave. The wallet must start within
+    ⌈N ÷ k⌉ such ticks. Report zero-start calls
     separately. A remaining absence justified by fairness requires failures all
     `validation.intervening_activity`; missing launches, too few measured ticks or missing evidence
     leave fairness unproven. Unaccounted survivors or an unobserved final transition leave AC-B
@@ -2386,6 +2394,23 @@ deployment actions described above; this procedure makes no trading or policy ch
     Retain every census row and its raw-versus-export receipt count. Apply its failure and insufficient
     evidence rules without substituting AC16's source-time population for the receipt census.
 
+
+## #843 streamed-admission AC3 capture
+
+At installation declare the observation start and end in UTC, the installed release revision,
+status schema/revision and capture cadence. Retain the invocation-filtered journal above, including
+both `ready wallets published` events, and every status update during the wave. In the first
+admission wave with a newcomer, join each accepted `wallet bracket completed` to its publication
+by wallet within the wave. Each must log its publication within 10 s of its accepted bracket and
+appear in `live_wallets` in the next captured status whose `live_wallets_at_unix_ms` follows that
+publication. Account for every typed install, history or proof rejection. Retain
+paper sequences, batch identities and the status captures; report waits beside historical batches
+118 and 120. A single-newcomer wave establishes latency only; AC1's held-peer scenarios establish
+peer independence. Missing capture evidence leaves acceptance pending.
+
+If no newcomer wave occurs in the declared window, record “not observed; production acceptance
+pending”, name a follow-up capture, and retain the window evidence. Do not manufacture an admission
+or restart.
 
 ## Release 2: retention rehearsal, deployment and recovery
 

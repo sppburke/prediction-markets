@@ -124,6 +124,8 @@ impl SupabaseWatchlistCapacity {
                 &mut prepared,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             {

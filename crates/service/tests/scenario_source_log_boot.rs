@@ -4295,6 +4295,7 @@ async fn previous_binary_rollback_matrix() {
             "rollback row {row}: PASS for the previous binary and this build; corrupt control refused; retry idempotent; balances/history/decisions/fences preserved"
         );
     }
+    checkpoint_rollout::streamed_membership_rollback_rows(&previous, current).await;
 }
 
 /// PASS: the real service defers an exhausted unreadable refresh without moving its anchor,

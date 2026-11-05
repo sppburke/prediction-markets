@@ -642,14 +642,6 @@ impl CausalPositionError {
     }
 }
 
-pub struct ValidationOutcomes {
-    pub started_prefix: usize,
-    pub(crate) completed_at: HashMap<WalletAddress, Instant>,
-    pub accepted: Vec<AnchorInstall>,
-    pub deferred: Vec<(WalletAddress, CausalPositionError)>,
-    pub shared: Option<CausalPositionError>,
-}
-
 pub struct DirectValidationOutcome {
     pub(crate) completed_at: HashMap<WalletAddress, Instant>,
     pub accepted: Vec<AnchorInstall>,
@@ -872,61 +864,21 @@ impl CausalPositionValidator {
         self
     }
 
-    /// Validate every wallet through the live orchestrator owner. The caller
-    /// sends all returned acceptances in one final installation command.
-    pub async fn validate_via_control(
+    pub async fn validate_logged(
         &self,
-        wallets: &[WalletAddress],
+        wallet: WalletAddress,
         control_tx: &mpsc::Sender<OrchestratorControl>,
         paper_state: &PaperStateDb,
         purpose: ValidationPurpose,
         deadline: Option<Instant>,
-    ) -> ValidationOutcomes {
-        let mut running = futures::stream::FuturesUnordered::new();
-        let mut started_prefix = 0;
-        let mut completed = Vec::new();
-        loop {
-            while running.len() < BRACKET_CONCURRENCY
-                && started_prefix < wallets.len()
-                && deadline.is_none_or(|end| Instant::now() < end)
-            {
-                let index = started_prefix;
-                let wallet = wallets[index];
-                started_prefix += 1;
-                running.push(async move {
-                    let started = Instant::now();
-                    let result = self.validate_control_with_retry(wallet, control_tx, paper_state, purpose, deadline).await;
-                    tracing::info!(wallet = %wallet, elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        outcome = result.as_ref().map_or_else(|error| error.kind(), |_| "accepted"), "wallet bracket completed");
-                    (index, result, Instant::now())
-                });
-            }
-            let Some(result) = running.next().await else {
-                break;
-            };
-            completed.push(result);
-        }
-        completed.sort_by_key(|(index, _, _)| *index);
-        let mut outcomes = ValidationOutcomes {
-            started_prefix,
-            completed_at: HashMap::new(),
-            accepted: Vec::with_capacity(completed.len()),
-            deferred: Vec::new(),
-            shared: None,
-        };
-        for (index, result, completed_at) in completed {
-            outcomes.completed_at.insert(wallets[index], completed_at);
-            match result {
-                Ok(install) => outcomes.accepted.push(install),
-                Err(error) if error.class() == FailureClass::Shared => {
-                    if outcomes.shared.is_none() {
-                        outcomes.shared = Some(error);
-                    }
-                }
-                Err(error) => outcomes.deferred.push((wallets[index], error)),
-            }
-        }
-        outcomes
+    ) -> Result<AnchorInstall, CausalPositionError> {
+        let started = Instant::now();
+        let result = self
+            .validate_control_with_retry(wallet, control_tx, paper_state, purpose, deadline)
+            .await;
+        tracing::info!(wallet = %wallet, elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            outcome = result.as_ref().map_or_else(|error| error.kind(), |_| "accepted"), "wallet bracket completed");
+        result
     }
 
     /// Boot-time form used before producers start. The same bucket engine is

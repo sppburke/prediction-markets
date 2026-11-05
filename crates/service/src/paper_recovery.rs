@@ -4451,10 +4451,13 @@ mod paper_log_tests {
                 AdmissionPreparer::new(tx, state)
             }
             .with_source_log(source.clone());
-            let outcome = preparer
-                .prepare(&[deferred, selected[0], selected[1], selected[2], selected[3]])
-                .await
-                .unwrap();
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                preparer.prepare(&[deferred, selected[0], selected[1], selected[2], selected[3]]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(outcome.admitted, selected.to_vec());
             assert_eq!(outcome.deferred.len(), 1);
             assert_eq!(outcome.deferred[0].wallet, deferred);

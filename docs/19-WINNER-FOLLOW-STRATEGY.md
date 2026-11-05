@@ -669,12 +669,17 @@ inactivity. They do not change the owner's requested live mode.
 
 The followed-wallet set is refreshed from Supabase `latest_ranking`, filtered to the ranker's
 `survives` verdict. Score-only refresh stays on its existing locked path and never changes structural
-membership. Capacity, full-rerank, and knockout changes recheck their prepared evidence under the
-structural writer lock, synchronize one `MembershipChanged` record, then publish its exact snapshot.
-Typed wallet-specific admission failures defer the affected wallets and replan from the same
-ranked bench; a shared failure leaves full-rerank and capacity unchanged, while independently
-decided knockout evictions may publish without backfill. Every added wallet has a cited immutable
-admission proof, and the writer lock checks the prepared structural set and proof digests.
+membership. Capacity changes retain their atomic contract. Full-rerank and knockout backfill publish
+each newcomer after its own accepted bracket, anchor installation and history check. Each publication
+uses its batch's selection restricted to structural members and ready wallets, with immutable proofs
+for exactly that record's additions. The writer lock rechecks the structural set and proof digests
+before synchronizing each `MembershipChanged` record and publishing its exact snapshot. Typed wallet
+failures defer that wallet and replan from the same ranked bench. A later shared failure stops further
+publication and keeps acknowledged records; knockout can still publish independently decided
+evictions when no record has carried them. Each round offers newcomers and eligible non-failed
+re-entries together through the existing wallet queue; failed re-entries wait behind additions in the
+closing call. See [`_GLOSSARY.md`](./_GLOSSARY.md#live-wallet-source-supabase-ranking-handoff-issue-339)
+for failure, deadline and qualification-anchor semantics.
 Boot replays the initial membership and later structural records before producers, then applies the
 separate wallet fences. Before using any ranking batch, it imports that batch's published drops and
 group set; boot includes the first-Start batch and every batch applied by membership replay before
