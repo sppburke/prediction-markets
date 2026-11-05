@@ -1539,6 +1539,7 @@ impl AdmissionPreparer {
                 if is_deferred_causal_position_error(&error)
                     || error.class() != FailureClass::Shared =>
             {
+                warn!(wallet = %wallet, kind = error.kind(), error = %error, "anchor refresh deferred");
                 return Ok(AnchorRefreshOutcome::Deferred);
             }
             Err(error) => return Err(AdmissionError::PositionValidation(error)),

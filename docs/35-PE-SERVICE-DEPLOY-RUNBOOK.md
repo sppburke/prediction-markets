@@ -2357,13 +2357,29 @@ deployment actions described above; this procedure makes no trading or policy ch
     conversion-created holdings are reported with their `positions.missing_activity_mapping` evidence;
     ranks 3 and 27 must be live or excluded by an existing owner policy.
 
+    For #840 AC3, copy the release artifact directory (`cp -a`), set `art` to the copy and re-derive
+    `invocation` and `restart_utc` from its `invocation.after` as in step 6. Rerun step 7's bound
+    block with `86400000000` in place of `7200000000`, then steps 8–10 (start step 8 before its
+    sampling begins), so every input ends 24 hours after listening. Count venue deferrals from that
+    journal extract:
+    `jq -s '[.[] | .MESSAGE | fromjson | select(.message == "membership admission deferred" or .message == "anchor refresh deferred" or .message == "fixed-end activity reconciliation will retry") | {stage:(if .message == "anchor refresh deferred" then "refresh" elif .message == "membership admission deferred" then .stage else "reconciliation" end),wallet,kind:(.kind // (if (.error | startswith("asset identity resolution:")) then "identity" else "activity_or_membership" end)),error}] | group_by([.stage,.wallet,.kind]) | map({stage:.[0].stage,wallet:.[0].wallet,kind:.[0].kind,count:length,errors:map(.error // empty)|unique})' "$art/admission-journal.jsonl"`.
+    Admission warnings omit the message; read it from the matching `pe-service.watchlist-deferral`
+    records in that capture's `ac16-population.json`. Classify every message or error by venue versus
+    local origin before reporting venue counts. Report zero restarts and zero `critical owner exited`
+    over the 24 hours. Recovery requires closing-cutoff authority: refresh needs an anchor installed
+    after that wallet's latest refusal, admission needs closing effective `live_wallets` membership,
+    reconciliation needs disposition of the affected receipt-bound obligations. List still-deferred,
+    terminally excluded and unavailable outcomes. Earlier anchors/membership, accepted-bracket logs
+    and silence cannot prove recovery; zero refusals establishes availability only.
+
     For each continuously eligible wallet, count first admission waves (`first=true`) that started
     at least one bracket. The eligible population is that wave's additions plus eligible non-failed
     structural re-entries, using its selected pinned batch; queue keys determine their common order.
     N is the distinct eligible-wallet count across those combined calls; k is their smallest positive
     started count. Failed re-entries wait behind additions in the closing call; report their retry
     eligibility and launches separately. If there is no addition wave, that closing call offers the
-    whole eligible re-entry population and is the round's first wave. The wallet must start within ⌈N ÷ k⌉ such ticks. Report zero-start calls
+    whole eligible re-entry population and is the round's first wave. The wallet must start within
+    ⌈N ÷ k⌉ such ticks. Report zero-start calls
     separately. A remaining absence justified by fairness requires failures all
     `validation.intervening_activity`; missing launches, too few measured ticks or missing evidence
     leave fairness unproven. Unaccounted survivors or an unobserved final transition leave AC-B
@@ -2385,19 +2401,16 @@ At installation declare the observation start and end in UTC, the installed rele
 status schema/revision and capture cadence. Retain the invocation-filtered journal above, including
 both `ready wallets published` events, and every status update during the wave. In the first
 admission wave with a newcomer, join each accepted `wallet bracket completed` to its publication
-by wallet within the wave. Check the [canonical publication latency bound](_GLOSSARY.md#live-wallet-source-supabase-ranking-handoff-issue-339)
-and the next captured status whose `live_wallets_at_unix_ms` follows that publication: the wallet
-must appear in `live_wallets`. Account for every typed install, history or proof rejection. Retain
+by wallet within the wave. Each must log its publication within 10 s of its accepted bracket and
+appear in `live_wallets` in the next captured status whose `live_wallets_at_unix_ms` follows that
+publication. Account for every typed install, history or proof rejection. Retain
 paper sequences, batch identities and the status captures; report waits beside historical batches
 118 and 120. A single-newcomer wave establishes latency only; AC1's held-peer scenarios establish
 peer independence. Missing capture evidence leaves acceptance pending.
 
 If no newcomer wave occurs in the declared window, record “not observed; production acceptance
 pending”, name a follow-up capture, and retain the window evidence. Do not manufacture an admission
-or restart. Current disposition: **production acceptance pending**; install and observation are
-operator tasks. AC1 additionally requires the retained predecessor rollback matrix without skips;
-AC2 requires release-bound stage/reverse scripts, the old-unit checkpoint preparation and guarded
-readiness/checkpoint-prefix evidence. This implementation alone does not establish those gates.
+or restart.
 
 ## Release 2: retention rehearsal, deployment and recovery
 

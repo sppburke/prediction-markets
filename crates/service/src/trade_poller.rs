@@ -43,7 +43,7 @@ use tracing::{info, warn};
 use crate::activity_ingest::{
     ACTIVITY_WS_SOURCE_ID, ReconciliationTrigger, SourceLogHandle, SourceLogHandleError,
 };
-use crate::asset_identity::{AssetIdentityResolver, IdentityProvenance};
+use crate::asset_identity::{AssetIdentityResolver, IdentityError, IdentityProvenance};
 use crate::bucket_commit::{
     ACTIVITY_READ_COMMITMENT_PARSER_VERSION, ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
     ACTIVITY_READ_COMMITMENT_SOURCE_ID, AmbiguousObservation, AnomalyCounterpart,
@@ -1011,7 +1011,7 @@ pub(crate) enum ReconciliationError {
     #[error("injected reconciliation crash after {0:?}")]
     InjectedCrash(ReconciliationCrashBoundary),
     #[error("asset identity resolution: {0}")]
-    Identity(SourceError),
+    Identity(IdentityError),
     #[error("market membership acquisition: {0}")]
     Membership(anyhow::Error),
     #[error("source-log coordinator closed")]
@@ -1035,10 +1035,7 @@ pub(crate) enum ReconciliationError {
 impl ReconciliationError {
     fn retryable(&self) -> bool {
         matches!(self, Self::Activity(_) | Self::Membership(_))
-            || matches!(
-                self,
-                Self::Identity(SourceError::Transient { .. } | SourceError::RateLimited { .. })
-            )
+            || matches!(self, Self::Identity(IdentityError::Venue(_)))
     }
 }
 
@@ -3061,18 +3058,23 @@ impl WalletOperation {
             .keys()
             .any(|token| resolved.verified.contains_key(token))
         {
-            return Err(ReconciliationError::Binding(
-                "anomaly condition metadata rejects a verified token".to_owned(),
-            ));
+            return Err(ReconciliationError::Identity(IdentityError::Venue(
+                SourceError::Fatal {
+                    message: "anomaly condition metadata rejects a verified token".to_owned(),
+                },
+            )));
         }
         for (token, identity) in discovered.verified {
             if resolved.verified.get(&token).is_some_and(|existing| {
                 existing.condition_id != identity.condition_id
                     || existing.outcome != identity.outcome
             }) {
-                return Err(ReconciliationError::Binding(
-                    "anomaly condition metadata conflicts with token identity".to_owned(),
-                ));
+                return Err(ReconciliationError::Identity(IdentityError::Venue(
+                    SourceError::Fatal {
+                        message: "anomaly condition metadata conflicts with token identity"
+                            .to_owned(),
+                    },
+                )));
             }
             if tokens.contains(&token) {
                 continue;
@@ -3499,6 +3501,31 @@ mod tests {
     use crate::paper_recovery::{
         PAPER_LOG_SCHEMA_VERSION, PaperLogRecord, PortfolioMark, QualificationStarted, TailBinding,
     };
+
+    #[test]
+    fn identity_retryability_requires_venue_origin() {
+        for venue in [false, true] {
+            for source in [
+                SourceError::Transient {
+                    message: String::new(),
+                },
+                SourceError::RateLimited {
+                    retry_after_secs: 1,
+                },
+                SourceError::Fatal {
+                    message: String::new(),
+                },
+            ] {
+                let source = if venue {
+                    IdentityError::Venue(source)
+                } else {
+                    source.into()
+                };
+                assert_eq!(ReconciliationError::Identity(source).retryable(), venue);
+            }
+        }
+        assert!(!ReconciliationError::Binding("local provenance".to_owned()).retryable());
+    }
 
     #[test]
     fn idle_attempts_release_admitted_selections_and_running_ones_keep_theirs() {
