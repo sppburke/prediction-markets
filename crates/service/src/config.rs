@@ -572,10 +572,16 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "polygon_receipt_rpc_url",
     ]);
     let cfg: ServiceConfig = fig.merge(env).extract()?;
-    // Validate the base as Gamma requests extend it, so a local typo never reads as a venue rejection.
-    reqwest::Url::parse(&format!("{}/markets", cfg.gamma_base_url)).map_err(|error| {
-        ServiceConfigError::Invalid(format!("gamma_base_url must be a valid URL: {error}"))
-    })?;
+    // Validate the base and the request URL built from it, so a local typo never reads as a
+    // venue rejection.
+    for url in [
+        cfg.gamma_base_url.clone(),
+        format!("{}/markets", cfg.gamma_base_url),
+    ] {
+        reqwest::Url::parse(&url).map_err(|error| {
+            ServiceConfigError::Invalid(format!("gamma_base_url must be a valid URL: {error}"))
+        })?;
+    }
     // #530: the copy budget parameterizes a fail-closed admission rule; an absurd
     // value is a config error, not a posture. The owner permits copies through
     // 120 s while the ranker's latency shift stays at 2 s.
@@ -605,7 +611,7 @@ mod tests {
     fn malformed_gamma_base_url_is_rejected_at_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("svc.toml");
-        for base in ["://broken", "https://gamma-api.polymarket.com "] {
+        for base in ["://broken", "https://", "https://gamma-api.polymarket.com "] {
             std::fs::write(&path, format!("gamma_base_url = '{base}'\n")).unwrap();
             assert!(
                 load(Some(&path)).is_err(),

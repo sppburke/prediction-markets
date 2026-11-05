@@ -4333,12 +4333,12 @@ async fn venue_refusals_bad_envelopes_and_combo_conflicts_defer_only_their_walle
     let outcome = result.unwrap();
     assert_eq!(outcome.admitted, vec![healthy]);
     assert_eq!(outcome.deferred.len(), 3);
-    for (deferred, kind) in
-        outcome
-            .deferred
-            .iter()
-            .zip(["source.fatal", "activity.v2_envelope", "activity.aggregate"])
-    {
+    for (deferred, (wallet, kind)) in outcome.deferred.iter().zip([
+        (refused, "source.fatal"),
+        (malformed, "activity.v2_envelope"),
+        (combo, "activity.aggregate"),
+    ]) {
+        assert_eq!(deferred.wallet, wallet);
         assert_eq!(
             deferred.class,
             pe_service::position_seeder::FailureClass::WalletTransient

@@ -2354,18 +2354,14 @@ deployment actions described above; this procedure makes no trading or policy ch
     conversion-created holdings are reported with their `positions.missing_activity_mapping` evidence;
     ranks 3 and 27 must be live or excluded by an existing owner policy.
 
-    For #840 AC3, retain the same invocation's journal through the closing cutoff and the
-    receipt-bound `ac16-population.json` export: refresh venue deferrals appear as `anchor refresh
-    deferred` warnings (wallet, kind, error); admission warnings carry wallet/stage/kind while
-    `pe-service.watchlist-deferral` carries the detailed message; reconciliation retains `fixed-end
-    activity reconciliation will retry` (wallet, error). Query admission counts with
-    `jq '. as $p | [$p.deferrals[] | select(.received_at_ns >= $p.window_start * 1000000000 and .received_at_ns < $p.window_end * 1000000000) | .deferrals[] | {wallet,stage,kind,message}] | group_by([.stage,.wallet,.kind]) | map({stage:.[0].stage,wallet:.[0].wallet,kind:.[0].kind,count:length,messages:map(.message)|unique})' ac16-population.json`
-    (capture with the declared window so only its deferrals count);
-    for refresh/reconciliation use `jq -s '[.[] | .MESSAGE | fromjson | select(.message == "anchor refresh deferred" or .message == "fixed-end activity reconciliation will retry") | {stage:(if .message == "anchor refresh deferred" then "refresh" else "reconciliation" end),wallet,kind:(.kind // (if (.error | startswith("asset identity resolution:")) then "identity" else "activity_or_membership" end)),error}] | group_by([.stage,.wallet,.kind]) | map({stage:.[0].stage,wallet:.[0].wallet,kind:.[0].kind,count:length,errors:map(.error)|unique})' admission-journal.jsonl`.
-    Classify the retained messages/errors by venue versus local origin before reporting venue
-    counts; reconciliation distinguishes identity lookup errors from other retry causes. Report zero restarts and zero `critical owner exited` over the full
-    24-hour window. Recovery requires closing-cutoff authority: refresh needs an anchor installed
-    after that wallet's latest refusal, admission needs closing effective `live_wallets` membership,
+    For #840 AC3, count venue deferrals from step 10's invocation journal extract, which
+    `--since`/`--until` already bound to the exact window:
+    `jq -s '[.[] | .MESSAGE | fromjson | select(.message == "membership admission deferred" or .message == "anchor refresh deferred" or .message == "fixed-end activity reconciliation will retry") | {stage:(if .message == "anchor refresh deferred" then "refresh" elif .message == "membership admission deferred" then .stage else "reconciliation" end),wallet,kind:(.kind // (if (.error | startswith("asset identity resolution:")) then "identity" else "activity_or_membership" end)),error}] | group_by([.stage,.wallet,.kind]) | map({stage:.[0].stage,wallet:.[0].wallet,kind:.[0].kind,count:length,errors:map(.error // empty)|unique})' admission-journal.jsonl`.
+    Admission warnings omit the message; read it from the matching `pe-service.watchlist-deferral`
+    records in `ac16-population.json`. Classify every message or error by venue versus local origin
+    before reporting venue counts. Report zero restarts and zero `critical owner exited` over the
+    window. Recovery requires closing-cutoff authority: refresh needs an anchor installed after that
+    wallet's latest refusal, admission needs closing effective `live_wallets` membership,
     reconciliation needs disposition of the affected receipt-bound obligations. List still-deferred,
     terminally excluded and unavailable outcomes. Earlier anchors/membership, accepted-bracket logs
     and silence cannot prove recovery; zero refusals establishes availability only.
