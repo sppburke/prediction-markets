@@ -1168,6 +1168,7 @@ enum ControlCompletion {
 type BoundaryReply = Option<Result<(), DailyBoundaryError>>;
 
 struct RunningPoll {
+    identity: std::sync::Weak<AssetIdentityResolver>,
     source_receipts: pe_service::risk_inputs::SourceReceiptIndex,
     crash_boundary: Arc<Mutex<Option<pe_service::trade_poller::ReconciliationCrashBoundary>>>,
     health: pe_service::health::SharedHealth,
@@ -1375,6 +1376,31 @@ fn start_recorded_poller_with_membership(
     copy_budget_secs: u64,
     membership_reader: Option<(String, Arc<pe_source_polymarket_public::ReqwestFetcher>)>,
 ) -> (RunningPoll, Arc<PaperStateDb>) {
+    start_recorded_poller_with_identity(
+        dir,
+        wallets,
+        real_owner,
+        anchors,
+        boundary_anchor,
+        stop_after_completion,
+        copy_budget_secs,
+        membership_reader,
+        Arc::new(GammaFetcher),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_recorded_poller_with_identity(
+    dir: &tempfile::TempDir,
+    wallets: &[WalletAddress],
+    real_owner: bool,
+    anchors: bool,
+    boundary_anchor: Option<i64>,
+    stop_after_completion: Option<WalletAddress>,
+    copy_budget_secs: u64,
+    membership_reader: Option<(String, Arc<pe_source_polymarket_public::ReqwestFetcher>)>,
+    gamma: Arc<dyn ReconciliationFetcher>,
+) -> (RunningPoll, Arc<PaperStateDb>) {
     let paper_path = dir.path().join("paper.db");
     let restarting = paper_path.exists();
     let paper = Arc::new(PaperStateDb::open(&paper_path).unwrap());
@@ -1422,7 +1448,7 @@ fn start_recorded_poller_with_membership(
             .run(),
     );
     let identity = Arc::new(AssetIdentityResolver::new_runtime(
-        Arc::new(GammaFetcher),
+        gamma,
         BASE_URL.to_owned(),
         GAMMA_BATCH_SIZE,
         source.clone(),
@@ -1674,7 +1700,7 @@ fn start_recorded_poller_with_membership(
         },
         LiveWatchlist::new(membership),
         fetcher,
-        identity,
+        identity.clone(),
         source
             .clone()
             .with_append_ack_gate(append_ack_gate.clone(), append_ack_arrived.clone()),
@@ -1740,6 +1766,7 @@ fn start_recorded_poller_with_membership(
     }));
     (
         RunningPoll {
+            identity: Arc::downgrade(&identity),
             source_receipts: receipts,
             crash_boundary,
             health,
@@ -9435,4 +9462,231 @@ async fn v2_cursor_pages_are_recorded_in_acquisition_order() {
     }
     assert!(pages.windows(2).all(|pair| pair[0].seq < pair[1].seq));
     running.finish().await;
+}
+
+struct VenueIdentityFailure {
+    conflict: bool,
+    failing: bool,
+}
+impl ReconciliationFetcher for VenueIdentityFailure {
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.failing && !self.conflict && url.contains("clob_token_ids=asset-a") {
+                return Err(SourceError::Fatal {
+                    message: "HTTP 410".to_owned(),
+                });
+            }
+            if url.contains("condition_ids=0xcc") {
+                return Ok(
+                    serde_json::to_vec(&json!([{"conditionId":"0xcc", "clobTokenIds":
+                    [if self.failing {"asset-a"} else {"asset-c"}]}]))
+                    .unwrap(),
+                );
+            }
+            GammaFetcher.fetch(url).await
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn venue_identity_rejection_keeps_obligation_across_restart() {
+    assert_venue_identity_failure(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn venue_identity_conflict_keeps_obligation_across_restart() {
+    assert_venue_identity_failure(true).await;
+}
+
+async fn assert_venue_identity_failure(conflict: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let b = WalletAddress([0xbb; 20]);
+    let (mut running, paper) = start_recorded_poller_with_identity(
+        &dir,
+        &[wallet(), b],
+        false,
+        false,
+        None,
+        None,
+        120,
+        None,
+        Arc::new(VenueIdentityFailure {
+            conflict,
+            failing: true,
+        }),
+    );
+    paper.record_market_group("0xcc", "").unwrap();
+    for target in [wallet(), b] {
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(b"[]".to_vec())
+            .unwrap();
+        running.completed(target).await;
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+    }
+    running.round_completed().await;
+    let a_row = activity_row(
+        "TRADE",
+        "venue-identity-a",
+        MARKET_A,
+        "BUY",
+        "1",
+        "asset-a",
+        EPOCH,
+    );
+    let receipt = running.observe(a_row.clone()).await;
+    let a_request = running.requests.recv().await.unwrap();
+    let b_row = stream_row(b, "venue-identity-b", EPOCH);
+    running.clear_waits();
+    running.observe(b_row.clone()).await;
+    loop {
+        let waiting = running.waiting().await;
+        if waiting.obligations.len() == 2 {
+            break;
+        }
+    }
+    let mut rows = vec![a_row];
+    if conflict {
+        let mut anomaly = activity_row(
+            "SPLIT",
+            "venue-identity-conflict",
+            "0xcc",
+            "BUY",
+            "1",
+            "asset-c",
+            EPOCH,
+        );
+        anomaly["size"] = json!("4.212e-7");
+        rows.push(anomaly);
+    }
+    let page = serde_json::to_vec(&rows).unwrap();
+    a_request.respond.send(page.clone()).unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    assert_eq!(paper.cursor(&wallet()).unwrap(), Some(EPOCH - 10));
+    assert!(!paper.activity_observation_retired(receipt).unwrap());
+    let next = running.requests.recv().await;
+    assert!(
+        next.is_some(),
+        "venue identity failure terminated the poller owner"
+    );
+    let next = next.unwrap();
+    assert!(next.url.contains(&b.to_string()));
+    next.respond
+        .send(serde_json::to_vec(std::slice::from_ref(&b_row)).unwrap())
+        .unwrap();
+    running.completed(b).await;
+    assert_eq!(paper.decision_pending_history().unwrap().len(), 1);
+    let retry = running.requests.recv().await.unwrap();
+    assert!(retry.url.contains(&wallet().to_string()));
+    let commits = running.finish().await;
+    drop(retry);
+    assert_eq!(commits.len(), 1);
+    let rebuilt = pe_service::trade_poller::rebuild_reconciliation_obligations(
+        &dir.path().join("source.log"),
+        &paper,
+    )
+    .unwrap();
+    assert_eq!(rebuilt.len(), 1);
+    let (mut restarted, reopened) = start_recorded_poller_with_identity(
+        &dir,
+        &[wallet(), b],
+        false,
+        false,
+        None,
+        None,
+        120,
+        None,
+        Arc::new(VenueIdentityFailure {
+            conflict,
+            failing: false,
+        }),
+    );
+    for target in [wallet(), b] {
+        let request = restarted.requests.recv().await.unwrap();
+        assert!(request.url.contains(&target.to_string()));
+        request
+            .respond
+            .send(if target == wallet() {
+                page.clone()
+            } else {
+                serde_json::to_vec(std::slice::from_ref(&b_row)).unwrap()
+            })
+            .unwrap();
+        restarted.completed(target).await;
+    }
+    restarted.round_completed().await;
+    restarted.finish().await;
+    assert_eq!(
+        reopened
+            .decision_pending_history()
+            .unwrap()
+            .iter()
+            .filter(|decision| decision.wallet == b)
+            .count(),
+        1
+    );
+    assert!(reopened.activity_observation_retired(receipt).unwrap());
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            &reopened
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn local_identity_coordinator_failure_ends_reconciliation_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let (closed, rx) = SourceLogHandle::channel(1);
+    drop(rx);
+    running
+        .identity
+        .upgrade()
+        .unwrap()
+        .activate_runtime(closed)
+        .await;
+    let row = stream_row(wallet(), "local-identity", EPOCH);
+    let receipt = running.observe(row.clone()).await;
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[row]).unwrap())
+        .unwrap();
+    let result = (&mut running.poller).await.unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(pe_service::trade_poller::TradePollerOwnerError::Reconciliation(_))
+        ),
+        "{result:?}"
+    );
+    assert!(!paper.activity_observation_retired(receipt).unwrap());
+    assert!(paper.decision_pending_history().unwrap().is_empty());
+    drop(running.source);
+    drop(running.triggers);
+    drop(running.preparer);
+    running.ingest.await.unwrap();
+    running.control.await.unwrap();
 }

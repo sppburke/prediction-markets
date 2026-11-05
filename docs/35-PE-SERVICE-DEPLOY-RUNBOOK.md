@@ -2354,6 +2354,21 @@ deployment actions described above; this procedure makes no trading or policy ch
     conversion-created holdings are reported with their `positions.missing_activity_mapping` evidence;
     ranks 3 and 27 must be live or excluded by an existing owner policy.
 
+    For #840 AC3, copy the release artifact directory (`cp -a`), set `art` to the copy and re-derive
+    `invocation` and `restart_utc` from its `invocation.after` as in step 6. Rerun step 7's bound
+    block with `86400000000` in place of `7200000000`, then steps 8–10 (start step 8 before its
+    sampling begins), so every input ends 24 hours after listening. Count venue deferrals from that
+    journal extract:
+    `jq -s '[.[] | .MESSAGE | fromjson | select(.message == "membership admission deferred" or .message == "anchor refresh deferred" or .message == "fixed-end activity reconciliation will retry") | {stage:(if .message == "anchor refresh deferred" then "refresh" elif .message == "membership admission deferred" then .stage else "reconciliation" end),wallet,kind:(.kind // (if (.error | startswith("asset identity resolution:")) then "identity" else "activity_or_membership" end)),error}] | group_by([.stage,.wallet,.kind]) | map({stage:.[0].stage,wallet:.[0].wallet,kind:.[0].kind,count:length,errors:map(.error // empty)|unique})' "$art/admission-journal.jsonl"`.
+    Admission warnings omit the message; read it from the matching `pe-service.watchlist-deferral`
+    records in that capture's `ac16-population.json`. Classify every message or error by venue versus
+    local origin before reporting venue counts. Report zero restarts and zero `critical owner exited`
+    over the 24 hours. Recovery requires closing-cutoff authority: refresh needs an anchor installed
+    after that wallet's latest refusal, admission needs closing effective `live_wallets` membership,
+    reconciliation needs disposition of the affected receipt-bound obligations. List still-deferred,
+    terminally excluded and unavailable outcomes. Earlier anchors/membership, accepted-bracket logs
+    and silence cannot prove recovery; zero refusals establishes availability only.
+
     For each continuously eligible wallet, count ticks where its path ran first and started at least
     one bracket. N is the distinct eligible-wallet count across those path calls; k is their smallest
     positive started count. The wallet must start within ⌈N ÷ k⌉ such ticks. Report zero-start calls

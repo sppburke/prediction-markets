@@ -20,7 +20,7 @@ use pe_core_types::{
 use pe_event_log::Reader;
 use pe_paper_state::{AnchorInstallRecord, PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
-use pe_service::asset_identity::AssetIdentityResolver;
+use pe_service::asset_identity::{AssetIdentityResolver, IdentityError};
 use pe_service::bucket_commit::{BucketCommitEngine, BucketDecisionContext};
 use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::paper_recovery::{build_leader_ledger, replay_wallet_ledger};
@@ -114,7 +114,7 @@ impl PageFetcher for QueueFetcher {
         if url.contains("/activity?") && !url.contains("start=") {
             return Ok(b"[]".to_vec());
         }
-        data_api_v2::queued_fixture(
+        let response = data_api_v2::queued_fixture(
             url,
             &mut self
                 .responses
@@ -123,7 +123,14 @@ impl PageFetcher for QueueFetcher {
         )
         .ok_or_else(|| SourceError::Fatal {
             message: format!("no queued fixture for {url}"),
-        })
+        })?;
+        // A transport refusal is distinct from a complete but rejected JSON body.
+        if response == b"HTTP 410" {
+            return Err(SourceError::Fatal {
+                message: "HTTP 410".to_owned(),
+            });
+        }
+        Ok(response)
     }
 }
 
@@ -756,7 +763,7 @@ async fn split_merge_discovery_source_failure_is_identity_transient() {
     assert!(matches!(
         &error,
         CausalPositionError::Identity {
-            source: SourceError::Transient { .. },
+            source: IdentityError::Venue(SourceError::Transient { .. }),
             ..
         }
     ));
@@ -4298,32 +4305,110 @@ fn deferred_position_predicate_is_exact() {
 }
 
 #[tokio::test]
-async fn parse_and_fatal_fetch_errors_remain_boot_fatal() {
-    for (suffix, payload) in [(0x69, Some(b"{".to_vec())), (0x6a, None)] {
-        let wallet = wallet(suffix);
-        let (_dir, paper, mut engine) = fresh(&[wallet]);
-        let responses = payload.map_or_else(HashMap::new, |payload| {
-            HashMap::from([(activity_url(wallet), vec![payload])])
-        });
-        let error = validator(responses)
-            .validate_direct(&[wallet], &mut engine, &paper)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            CausalPositionError::Activity {
-                source: ActivityReadError::V2Envelope(_)
-                    | ActivityReadError::Parse(_)
-                    | ActivityReadError::Fetch {
-                        source: SourceError::Fatal { .. },
-                        ..
-                    },
-                ..
-            }
-        ));
-        assert!(!paper.is_wallet_fenced(&wallet).unwrap());
-        assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+async fn venue_refusals_bad_envelopes_and_combo_conflicts_defer_only_their_wallets() {
+    let healthy = wallet(0x61);
+    let refused = wallet(0x62);
+    let malformed = wallet(0x63);
+    let combo = wallet(0x64);
+    let (_dir, paper, engine) = fresh(&[]);
+    let mut responses = stable_responses(&[(healthy, 1, "1")]);
+    responses.insert(activity_url(refused), vec![b"HTTP 410".to_vec()]);
+    responses.insert(activity_url(malformed), vec![br#"{"data":[]}"#.to_vec()]);
+    let mut rows = vec![activity(combo, 1, "1", "0xcombo", 10); 2];
+    rows[1]["isCombo"] = json!(true);
+    responses.insert(
+        activity_url(combo),
+        vec![serde_json::to_vec(&rows).unwrap()],
+    );
+    let (tx, rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(rx, engine, paper.clone());
+    let preparer = AdmissionPreparer::with_validator(tx, paper.clone(), validator(responses));
+    let result = preparer
+        .prepare(&[refused, malformed, combo, healthy])
+        .await;
+    assert!(
+        result.is_ok(),
+        "venue failures must not abort admission: {result:?}"
+    );
+    let outcome = result.unwrap();
+    assert_eq!(outcome.admitted, vec![healthy]);
+    assert_eq!(outcome.deferred.len(), 3);
+    for (deferred, (wallet, kind)) in outcome.deferred.iter().zip([
+        (refused, "source.fatal"),
+        (malformed, "activity.v2_envelope"),
+        (combo, "activity.aggregate"),
+    ]) {
+        assert_eq!(deferred.wallet, wallet);
+        assert_eq!(
+            deferred.class,
+            pe_service::position_seeder::FailureClass::WalletTransient
+        );
+        assert_eq!(deferred.kind, kind);
+        assert!(paper.position_anchors(&deferred.wallet).unwrap().is_empty());
+        assert_eq!(paper.cursor(&deferred.wallet).unwrap(), None);
+        assert!(
+            paper
+                .activity_groups_after(&deferred.wallet, 0)
+                .unwrap()
+                .is_empty()
+        );
     }
+    assert_eq!(paper.position_anchors(&healthy).unwrap().len(), 1);
+    drop(preparer);
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn venue_refusals_and_complete_bad_envelopes_are_boot_deferred() {
+    let healthy = wallet(0x65);
+    let refused = wallet(0x66);
+    let malformed = wallet(0x67);
+    for include_healthy in [false, true] {
+        let (_dir, paper, mut engine) = fresh(&[]);
+        let mut responses = stable_responses(&[(healthy, 1, "1")]);
+        responses.insert(activity_url(refused), vec![b"HTTP 410".to_vec()]);
+        responses.insert(activity_url(malformed), vec![br#"{"data":[]}"#.to_vec()]);
+        let mut wallets = vec![refused, malformed];
+        if include_healthy {
+            wallets.push(healthy);
+        }
+        let result = validator(responses)
+            .validate_direct(&wallets, &mut engine, &paper)
+            .await;
+        assert!(
+            result.is_ok(),
+            "venue failures must be left for runtime admission: {result:?}"
+        );
+        let installs = result.unwrap();
+        assert_eq!(installs.len(), usize::from(include_healthy));
+        for wallet in [refused, malformed] {
+            assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+            assert!(!paper.wallet_history_complete(&wallet).unwrap());
+        }
+    }
+}
+
+#[tokio::test]
+async fn opaque_fatal_fetch_error_remains_boot_fatal() {
+    let wallet = wallet(0x6a);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    let responses = HashMap::new();
+    let error = validator(responses)
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CausalPositionError::Activity {
+            source: ActivityReadError::Fetch {
+                source: SourceError::Fatal { .. },
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -8306,7 +8391,14 @@ async fn reentry_attempt_logs_separate_baseline_and_stability_timing() {
         match failure {
             "none" => assert_eq!(outcomes.unwrap().accepted.len(), 1),
             "cancelled" => assert!(outcomes.is_err()),
-            _ => assert!(outcomes.unwrap().shared.is_some()),
+            _ => {
+                let outcomes = outcomes.unwrap();
+                assert_eq!(
+                    usize::from(outcomes.shared.is_some()) + outcomes.deferred.len(),
+                    1
+                );
+                assert!(outcomes.accepted.is_empty());
+            }
         }
         let bytes = bytes.lock().unwrap().clone();
         let logs = std::str::from_utf8(&bytes)
