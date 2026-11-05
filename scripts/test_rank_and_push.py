@@ -136,11 +136,12 @@ class RankAndPushScenario(unittest.TestCase):
             'echo "${PE_BOOTSTRAP_FETCH_RESOLUTIONS:-}" >> pe_bootstrap_env.log\n'
             'echo "${PE_BOOTSTRAP_PURGE_DECISION_CSV:-}" >> pe_bootstrap_purge_csv.log\n'
             'if [[ -f data/eval-results/rank_and_push.cycle ]]; then\n'
-            '  tr -d "\\n" < data/eval-results/rank_and_push.cycle >> pe_bootstrap_cycle.log\n'
+            '  cycle="$(tr -d "\\n" < data/eval-results/rank_and_push.cycle)"\n'
             'else\n'
-            '  printf missing >> pe_bootstrap_cycle.log\n'
+            '  cycle=missing\n'
             'fi\n'
-            'printf "\\n" >> pe_bootstrap_cycle.log\n'
+            # Fresh-lane children run concurrently: append each observation in one write.
+            'printf "%s\\n" "$cycle" >> pe_bootstrap_cycle.log\n'
             'if [[ -n "${STUB_WAIT_SAMPLE:-}" && "$1" == "$STUB_WAIT_SAMPLE" ]]; then\n'
             '  for _ in $(seq 300); do\n'
             '    for f in data/eval-results/cron-*/capacity_samples.jsonl; do [[ -s "$f" ]] && break 2; done\n'
@@ -560,6 +561,118 @@ Path('stage2_done').write_text('yes')
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 scope = shlex.split(self._bootstrap_lines("market-scope")[0])
                 self.assertEqual(scope[scope.index("--recurrences") + 1], ranking or "15m")
+
+
+    def test_refresh_crossing_utc_midnight_keeps_cycle_day_and_parameterized_today(self):
+        sys.path.insert(0, str(WRAPPER.parent))
+        from ranker_decay import window_bounds
+        real_date = shutil.which("date")
+        for production in (True, False):
+            for win_end, as_of in ((None, None), ("2026-02-28", None), (None, "2026-02-27")):
+                with self.subTest(production=production, win_end=win_end, as_of=as_of):
+                    self.tearDown(); self.setUp()
+                    if production:
+                        self._fresh_fixture()
+                        boot = self.root / "target/release/pe-bootstrap"
+                        boot.write_text(boot.read_text().replace(
+                            'sub="$1"',
+                            'if [[ "$1" == "winner-discovery" ]]; then touch crossed; fi\nsub="$1"', 1))
+                    else:
+                        rank = self.root / "scripts/rank_72hr_buyandhold.py"
+                        rank.write_text(rank.read_text().replace(
+                            "a = sys.argv[1:]\n",
+                            'a = sys.argv[1:]\nopen("crossed", "a").close()\n', 1))
+                    # _fresh_fixture installs its own date shim; replace it after setup.
+                    clock = self.root / "clock"; clock.mkdir(exist_ok=True)
+                    _write_exec(clock / "date", "#!/usr/bin/env bash\nday=2026-03-01\n"
+                                "[[ -f crossed ]] && day=2026-03-02\n"
+                                f'exec {real_date} -d "$day 23:59:00 UTC" "$@"\n')
+                    args = () if production else (
+                        "--out-dir", str(self.root / "parameterized"),
+                        "--skip-discovery", "--skip-backfill",
+                    )
+                    with (self.root / ".env").open("a") as handle:
+                        if win_end:
+                            handle.write(f"WIN_END={win_end}\n")
+                        if as_of:
+                            handle.write(f"AS_OF={as_of}\n")
+                    for attempt in range(2):
+                        before = len((self._log("pe_bootstrap.log") or "").splitlines())
+                        result = self._run(*args, exit_env={"STUB_EXIT_rank": "75" if attempt == 0 else "0"})
+                        self.assertEqual(result.returncode, 75 if attempt == 0 else 0,
+                                         result.stdout + result.stderr)
+                        self.assertTrue((self.root / "crossed").is_file(), "clock never crossed midnight")
+                        expected = win_end or ("2026-03-01" if production or attempt == 0 else "2026-03-02")
+                        rank = shlex.split(self._log("rank.log").splitlines()[-1])
+                        self.assertEqual(rank[rank.index("--win-end") + 1], expected)
+                        self.assertEqual(rank[rank.index("--as-of") + 1], as_of or expected)
+                        calls = [shlex.split(line) for line in self._log("pe_bootstrap.log").splitlines()[before:]]
+                        if production:
+                            for operation in ("winner-discovery", "market-scope"):
+                                self.assertTrue(any(call[0] == operation for call in calls), operation)
+                        else:
+                            # Both skips bypass refresh; ranking still acquires its market scope.
+                            self.assertEqual([call[0] for call in calls], ["market-scope"])
+                        for call in calls:
+                            if call[0] in ("winner-discovery", "market-scope"):
+                                self.assertEqual(call[call.index("--end-date-min") + 1],
+                                                 str(window_bounds(None, expected)[0] - 86_400))
+                    rerank = shlex.split(self._log("rerank.log"))
+                    self.assertEqual(rerank[rerank.index("--as-of") + 1], as_of or expected)
+
+
+    def test_fresh_lane_default_universe_window_scope_and_cycle_bindings(self):
+        self._fresh_fixture()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        discovery = self._bootstrap_lines("winner-discovery")
+        self.assertTrue(discovery, "fresh lane never invoked winner discovery")
+        for call in discovery:
+            self.assertIn("--defer-activation", shlex.split(call))
+        activation = self._bootstrap_lines("activate-next")
+        self.assertEqual(len(activation), 1)
+        self.assertIn("--batch-id", shlex.split(activation[0]))
+        self.assertIn("--audit-csv", shlex.split(activation[0]))
+
+        rank = self._log("rank.log")
+        self.assertIn("--universe-from-trades", rank)
+        self.assertNotIn("--universe ", rank)
+        rank_args = shlex.split(rank)
+        rerank_args = shlex.split(self._log("rerank.log"))
+        win_end = rank_args[rank_args.index("--win-end") + 1]
+        self.assertEqual(rank_args[rank_args.index("--as-of") + 1], win_end)
+        self.assertNotIn("--win-start", rank_args)
+
+        crons = list((self.root / "data" / "eval-results").glob("cron-*"))
+        self.assertEqual(len(crons), 1, f"expected one auto out-dir, got {crons}")
+        run_dir = str(crons[0].relative_to(self.root))
+        self.assertIn(f"RANK_AND_PUSH_RUN_DIR={run_dir}", result.stdout)
+        scope_file = str(Path(run_dir) / "market_scope.json")
+        sys.path.insert(0, str(WRAPPER.parent))
+        from ranker_decay import window_bounds
+        # Schema two binds the scope to the series certified in candidate coverage.
+        self.assertEqual(
+            [shlex.split(line) for line in self._bootstrap_lines("market-scope")],
+            [["market-scope", "--out", scope_file,
+              "--end-date-min", str(window_bounds(None, win_end)[0] - 86_400),
+              "--recurrences", "15m", "--series", "7:seven"]],
+        )
+        for args in (rank_args, rerank_args):
+            self.assertEqual(args[args.index("--market-scope") + 1], scope_file)
+
+        cycle_observations = (self._log("pe_bootstrap_cycle.log") or "").splitlines()
+        self.assertTrue(cycle_observations)
+        self.assertNotIn("missing", cycle_observations)
+        self.assertEqual(len(cycle_observations), len(self._log("pe_bootstrap.log").splitlines()))
+        self.assertTrue(
+            all(observation == run_dir for observation in cycle_observations),
+            f"cache mutation ran without the exact logical-cycle pointer: {cycle_observations}",
+        )
+        self.assertFalse(
+            (self.root / "data" / "eval-results" / "rank_and_push.cycle").exists(),
+            "successful cycle did not clear its logical-cycle pointer",
+        )
 
 
     def _df_stub(self, avail):

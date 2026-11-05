@@ -12,7 +12,7 @@ resolves — a high-conviction signal) is: *how long after a leader's trade can 
 actually see it?* That visibility lag sets the lowest reliable time-to-resolution (TTR)
 floor for the Winner-Follow 72h buy-and-hold cohort.
 
-Harness: `scripts/measure_activity_latency.py` (stdlib-only; re-runnable).
+Historical harness: `scripts/measure_activity_latency.py` (stdlib-only; retired in #842).
 
 The v1 `scripts/measure_activity_latency.py` harness was retired in #842. The
 measurements and methodology below are historical evidence; no replacement measurement
@@ -78,8 +78,8 @@ near resolution is governed separately by latency-shifted fill pricing in the ra
   separate question handled in the ranking.
 - Measured concurrently with a running `pe-bootstrap backfill` (~20 req/s from the same IP);
   the added ~2.3 req/s caused 0 errors. If anything this biases the latency *high*.
-- Re-run before trusting for a new regime: `python3 scripts/measure_activity_latency.py
-  --duration-secs 900`.
+- The measurements remain historical evidence; a new regime requires a new v2 measurement
+  because the v1 harness was retired in #842.
 
 
 ## Addendum (2026-08-25, issue #530): attributed websocket measurements
