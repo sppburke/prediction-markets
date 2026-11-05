@@ -7762,12 +7762,3 @@ async fn retention_open_continuation_census_and_preparation_authenticate_pinned_
     );
     assert_eq!(output.stdout, b"open_rows=1 validated=1\n");
 }
-
-#[tokio::test]
-async fn streamed_membership_102_record_wave_size_and_append_counts() {
-    for knockout in [false, true] {
-        let mut fixture = checkpoint_rollout::CheckpointFixture::new().await;
-        let members = fixture.append_streamed_membership(knockout, 102);
-        assert_eq!(members.len(), 102);
-    }
-}

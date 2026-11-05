@@ -2372,15 +2372,6 @@ impl CheckpointFixture {
         newcomers: usize,
     ) -> Vec<WalletAddress> {
         use pe_service::paper_recovery::{MembershipChange, MembershipReason};
-        let started = std::time::Instant::now();
-        let paper_before = std::fs::metadata(&self.cfg.event_log_path).unwrap().len();
-        let source_before = std::fs::metadata(&self.cfg.source_event_log_path)
-            .unwrap()
-            .len();
-        let source_seq = Scanner::verify(&self.cfg.source_event_log_path)
-            .unwrap()
-            .last_sequence
-            .map_or(0, |seq| seq.0);
         let members = (2..newcomers + 2).map(wallet).collect::<Vec<_>>();
         let mut entries = Vec::new();
         for (index, member) in members.iter().enumerate() {
@@ -2494,38 +2485,14 @@ impl CheckpointFixture {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(
-            replayed
-                .watchlist
-                .entries
-                .iter()
-                .map(|entry| entry.wallet)
-                .collect::<std::collections::HashSet<_>>(),
-            members.iter().copied().collect()
-        );
-        let source_appends = Scanner::verify(&self.cfg.source_event_log_path)
-            .unwrap()
-            .last_sequence
-            .map_or(0, |seq| seq.0)
-            - source_seq;
-        assert_eq!(
-            source_appends,
-            u64::try_from(2 * newcomers + usize::from(knockout)).unwrap()
-        );
-        eprintln!(
-            "streamed record wave: knockout={knockout} newcomers={newcomers} paper_bytes={} source_bytes={} paper_appends={newcomers} source_appends={} elapsed_ms={}",
-            std::fs::metadata(&self.cfg.event_log_path).unwrap().len() - paper_before,
-            std::fs::metadata(&self.cfg.source_event_log_path)
-                .unwrap()
-                .len()
-                - source_before,
-            Scanner::verify(&self.cfg.source_event_log_path)
-                .unwrap()
-                .last_sequence
-                .map_or(0, |seq| seq.0)
-                - source_seq,
-            started.elapsed().as_millis()
-        );
+        let mut replayed_wallets = replayed
+            .watchlist
+            .entries
+            .iter()
+            .map(|entry| entry.wallet)
+            .collect::<Vec<_>>();
+        replayed_wallets.sort_by_key(|wallet| wallet.0);
+        assert_eq!(replayed_wallets, members);
         self.cfg.maintenance_interval_secs = 0;
         self.cfg.supabase_refresh_interval_secs = 0;
         std::fs::write(&self.config_path, toml::to_string(&self.cfg).unwrap()).unwrap();

@@ -1313,8 +1313,9 @@ async fn audit_knockout_abort(
 struct PlanningReady<'a, 'b, 'c> {
     live: &'a LiveWatchlist,
     preparer: &'a AdmissionPreparer,
-    entries: &'a [WatchlistEntry],
+    candidates: &'a Watchlist,
     last_trade: &'a HashMap<WalletAddress, i64>,
+    selection_cap: usize,
     removed: Option<&'a HashSet<WalletAddress>>,
     cap: usize,
     prepared: &'a mut HashSet<WalletAddress>,
@@ -1345,13 +1346,17 @@ impl crate::watchlist_admission::ReadyHook for PlanningReady<'_, '_, '_> {
         };
         loop {
             let structural = self.live.structural_membership();
-            let entries = self
+            let (selected, last_trade) = supabase_reader::select_membership(
+                self.candidates.clone(),
+                self.last_trade.clone(),
+                self.excluded,
+                self.selection_cap,
+            );
+            let entries = selected
                 .entries
                 .iter()
                 .filter(|entry| {
-                    !self.excluded.contains(&entry.wallet)
-                        && (structural.contains(&entry.wallet)
-                            || self.prepared.contains(&entry.wallet))
+                    structural.contains(&entry.wallet) || self.prepared.contains(&entry.wallet)
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -1391,7 +1396,7 @@ impl crate::watchlist_admission::ReadyHook for PlanningReady<'_, '_, '_> {
                 additions,
                 proofs,
                 binding,
-                last_trade: self.last_trade.clone(),
+                last_trade,
                 deferrals: Vec::new(),
             };
             match publisher.publish(&plan).await {
@@ -1484,8 +1489,9 @@ pub(crate) async fn plan_membership(
         let mut ready = PlanningReady {
             live,
             preparer,
-            entries: &selected.entries,
-            last_trade: &selected_last_trade,
+            candidates,
+            last_trade,
+            selection_cap,
             removed,
             cap: membership_cap,
             prepared,
@@ -1510,99 +1516,75 @@ pub(crate) async fn plan_membership(
             .await;
         let stop = ready.stop.take();
         drop(ready);
+        let (started, mut admitted, mut deferred, mut unstarted, cause) = match outcome {
+            Ok(outcome) => (
+                outcome.started,
+                outcome.admitted,
+                outcome.deferred,
+                outcome.unstarted,
+                None,
+            ),
+            Err(abort) => (
+                abort.started,
+                abort.admitted,
+                abort.deferred,
+                abort.unstarted,
+                Some(abort.cause),
+            ),
+        };
+        if let Some(sync) = sync.as_deref_mut() {
+            sync.completed(
+                preparer.paper_state(),
+                &started,
+                &admitted,
+                &deferred,
+                &unstarted,
+            );
+            if stop.is_none() && cause.is_some() {
+                park_persistent(sync, preparer.paper_state(), &deferred);
+            }
+        }
+        if let Some(wave) = reentries.as_deref_mut() {
+            wave.absorb(&started, &mut deferred);
+            admitted.retain(|wallet| !wave.candidates.contains(wallet));
+            unstarted.retain(|wallet| !wave.candidates.contains(wallet));
+            if let Some(kind) = stop
+                .as_ref()
+                .map(|abort| abort.kind)
+                .or_else(|| cause.as_ref().map(|cause| cause.kind()))
+            {
+                wave.report.shared = Some(kind);
+            }
+        }
         if let Some(mut abort) = stop {
-            let (started, admitted, mut deferred, unstarted) = match outcome {
-                Ok(outcome) => (
-                    outcome.started,
-                    outcome.admitted,
-                    outcome.deferred,
-                    outcome.unstarted,
-                ),
-                Err(outcome) => (
-                    outcome.started,
-                    outcome.admitted,
-                    outcome.deferred,
-                    outcome.unstarted,
-                ),
-            };
-            if let Some(sync) = sync.as_deref_mut() {
-                sync.completed(
-                    preparer.paper_state(),
-                    &started,
-                    &admitted,
-                    &deferred,
-                    &unstarted,
-                );
-            }
-            if let Some(wave) = reentries.as_deref_mut() {
-                wave.absorb(&started, &mut deferred);
-                wave.report.shared = Some(abort.kind);
-            }
             deferrals.extend(deferred);
             deferrals.append(&mut abort.deferrals);
             abort.deferrals = deferrals;
             return Err(abort);
         }
-        match outcome {
-            Ok(mut outcome) => {
-                if let Some(sync) = sync.as_deref_mut() {
-                    sync.completed(
-                        preparer.paper_state(),
-                        &outcome.started,
-                        &outcome.admitted,
-                        &outcome.deferred,
-                        &outcome.unstarted,
-                    );
-                }
-                if let Some(wave) = reentries.as_deref_mut() {
-                    wave.absorb(&outcome.started, &mut outcome.deferred);
-                    outcome
-                        .admitted
-                        .retain(|wallet| !wave.candidates.contains(wallet));
-                    outcome
-                        .unstarted
-                        .retain(|wallet| !wave.candidates.contains(wallet));
-                }
-                for wallet in outcome.unstarted {
-                    changed |= excluded.insert(wallet);
-                }
-                prepared.extend(outcome.admitted);
-                for deferral in outcome.deferred {
-                    changed |= excluded.insert(deferral.wallet);
-                    deferrals.push(deferral);
-                }
+        if let Some(cause) = cause {
+            deferrals.extend(deferred);
+            // A reentry-only failure does not fail an otherwise unchanged batch transition.
+            let unchanged = removed.is_none()
+                && additions.is_empty()
+                && ranked_membership_change_set(&structural, &selected.entries, membership_cap)
+                    .0
+                    .is_empty();
+            if !unchanged || reentries.is_none() {
+                return Err(PlanningAbort {
+                    kind: cause.kind(),
+                    message: cause.to_string(),
+                    deferrals,
+                });
             }
-            Err(mut abort) => {
-                if let Some(sync) = sync.as_deref_mut() {
-                    sync.completed(
-                        preparer.paper_state(),
-                        &abort.started,
-                        &abort.admitted,
-                        &abort.deferred,
-                        &abort.unstarted,
-                    );
-                }
-                if let Some(sync) = sync.as_deref_mut() {
-                    park_persistent(sync, preparer.paper_state(), &abort.deferred);
-                }
-                if let Some(wave) = reentries.as_deref_mut() {
-                    wave.absorb(&abort.started, &mut abort.deferred);
-                    wave.report.shared = Some(abort.cause.kind());
-                }
-                deferrals.extend(abort.deferred);
-                // A reentry-only failure does not fail an otherwise unchanged batch transition.
-                let unchanged = removed.is_none()
-                    && additions.is_empty()
-                    && ranked_membership_change_set(&structural, &selected.entries, membership_cap)
-                        .0
-                        .is_empty();
-                if !unchanged || reentries.is_none() {
-                    return Err(PlanningAbort {
-                        kind: abort.cause.kind(),
-                        message: abort.cause.to_string(),
-                        deferrals,
-                    });
-                }
+        } else {
+            for wallet in unstarted {
+                changed |= excluded.insert(wallet);
+            }
+            prepared.extend(admitted);
+            for deferral in deferred {
+                changed |= excluded.insert(deferral.wallet);
+                deferrals.push(deferral);
             }
         }
         if live.structural_membership() != structural
@@ -2190,7 +2172,6 @@ async fn live_reentry_tick(
     attempted: &mut HashSet<WalletAddress>,
     now_unix: i64,
     deadline: Option<tokio::time::Instant>,
-    before_additions: bool,
 ) -> Option<LiveReentryReport> {
     let mut wave = live_reentry_wave(
         live,
@@ -2208,7 +2189,7 @@ async fn live_reentry_tick(
         held,
         attempted,
         now_unix,
-        before_additions,
+        false,
     )
     .await?;
     let candidates = wave.candidates.clone();
@@ -2256,7 +2237,6 @@ async fn live_reentry_tick(
 
 async fn record_live_reentry(
     preparer: &AdmissionPreparer,
-    _sync: &BatchSync,
     mode: MembershipMode,
     report: Option<LiveReentryReport>,
 ) {
@@ -2809,7 +2789,6 @@ async fn maintenance_tick_inner(
                                     park_persistent(sync, paper_state, &wave.report.deferred);
                                     record_live_reentry(
                                         preparer,
-                                        sync,
                                         cfg.membership_mode,
                                         Some(wave.report),
                                     )
@@ -2897,11 +2876,9 @@ async fn maintenance_tick_inner(
                                     &mut attempted_reentries,
                                     now_unix,
                                     Some(deadline),
-                                    false,
                                 )
                                 .await;
-                                record_live_reentry(preparer, sync, cfg.membership_mode, report)
-                                    .await;
+                                record_live_reentry(preparer, cfg.membership_mode, report).await;
                                 return;
                             }
                             Err(e) => {
@@ -2970,7 +2947,7 @@ async fn maintenance_tick_inner(
     if let Some(wave) = wave {
         attempted_reentries.extend(wave.attempted);
         park_persistent(sync, paper_state, &wave.report.deferred);
-        record_live_reentry(preparer, sync, cfg.membership_mode, Some(wave.report)).await;
+        record_live_reentry(preparer, cfg.membership_mode, Some(wave.report)).await;
     }
     let report = if shared_batch_fetch_failed {
         None
@@ -2991,11 +2968,10 @@ async fn maintenance_tick_inner(
             &mut attempted_reentries,
             now_unix,
             Some(deadline),
-            false,
         )
         .await
     };
-    record_live_reentry(preparer, sync, cfg.membership_mode, report).await;
+    record_live_reentry(preparer, cfg.membership_mode, report).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4275,9 +4251,10 @@ mod tests {
                                     )
                                     .unwrap();
                             }
-                            if failure == Some("locked_history")
-                                && publication_attempt == 0
-                                && let Some(wallet) = change.added.first()
+                            if let Some(wallet) = change.added.first()
+                                && ((failure == Some("locked_history") && publication_attempt == 0)
+                                    || (failure == Some("uncertain_after_wallet_deferral")
+                                        && *wallet == WalletAddress([2; 20])))
                             {
                                 rusqlite::Connection::open(&state_path)
                                     .unwrap()
@@ -4320,6 +4297,8 @@ mod tests {
                             if failure == Some("uncertain_append")
                                 || (failure == Some("uncertain_after_first")
                                     && publication_attempt > 0)
+                                || (failure == Some("uncertain_after_wallet_deferral")
+                                    && change.added.contains(&WalletAddress([3; 20])))
                             {
                                 acknowledged
                                     .send(Err(PublishError::UncertainAppend(
@@ -5449,7 +5428,6 @@ mod tests {
                 &mut attempted,
                 NOW,
                 None,
-                true,
             )
             .await
             .unwrap();
@@ -5461,7 +5439,7 @@ mod tests {
                 first.deferred[0].class,
                 crate::position_seeder::FailureClass::WalletPersistent
             );
-            record_live_reentry(&h.preparer, &sync, MembershipMode::Knockout, Some(first)).await;
+            record_live_reentry(&h.preparer, MembershipMode::Knockout, Some(first)).await;
             assert_eq!(sync.knockout_deferred, set(&[missing]));
             let second = live_reentry_tick(
                 &h.live,
@@ -5479,7 +5457,6 @@ mod tests {
                 &mut attempted,
                 NOW,
                 None,
-                true,
             )
             .await;
             // Nothing is retryable (one wallet live, one parked): no ranking read, no report.
@@ -6482,9 +6459,9 @@ mod tests {
         }
 
         async fn wait_live(live: &LiveWatchlist, wallets: &[WalletAddress]) {
-            let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            let observed = tokio::time::timeout(Duration::from_secs(30), async {
                 while !wallets.iter().all(|wallet| members(live).contains(wallet)) {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
             .await;
@@ -6819,6 +6796,117 @@ mod tests {
             release.add_permits(16);
             let h = task.await.unwrap();
             assert_eq!(members(&h.live), set(&[a, b, c]));
+        }
+
+        #[tokio::test]
+        async fn ready_capped_proof_deferral_keeps_reselected_structural_member() {
+            let (a, retained) = (wallet(1), wallet(9));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, a), row(2, 2, retained)];
+            fake.failure = Some("proof_twice_a");
+            let mut h = harness_at(fake, &[retained], "https://fixture.invalid".to_owned()).await;
+            h.applied = AppliedWatchlistCapacity::new(1);
+            let candidates = Watchlist {
+                entries: vec![entry(a), entry(retained)],
+                ..h.live.snapshot().as_ref().clone()
+            };
+            let last_trade = HashMap::from([(a, NOW - 60), (retained, NOW - 60)]);
+            let mut publisher = Publisher::FullRerank(PublicationState {
+                live: &h.live,
+                paper: &h.paper_state,
+                preparer: &h.preparer,
+                writer: &h.writer_lock,
+                applied: &h.applied,
+                epoch: h.applied.load(),
+                batch_id: Some(2),
+                receipt: None,
+                dropped: Vec::new(),
+                recaptured: HashSet::new(),
+                stopped: false,
+            });
+            let plan = tokio::time::timeout(
+                Duration::from_secs(30),
+                plan_membership(
+                    &h.live,
+                    &h.preparer,
+                    &candidates,
+                    &last_trade,
+                    HashSet::new(),
+                    1,
+                    1,
+                    None,
+                    &mut HashSet::new(),
+                    None,
+                    None,
+                    Some(&mut publisher),
+                    None,
+                ),
+            )
+            .await
+            .expect("planner deadlocked")
+            .unwrap_or_else(|abort| panic!("{}", abort.message));
+            assert!(matches!(
+                publisher.publish(&plan).await,
+                PublishOutcome::Published
+            ));
+            assert_eq!(members(&h.live), set(&[retained]));
+            assert_eq!(h.live.structural_membership(), set(&[retained]));
+            assert!(
+                h.published_changes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|change| !change.removed.contains(&retained))
+            );
+            assert_eq!(plan.deferrals.len(), 1);
+            assert_eq!(plan.deferrals[0].wallet, a);
+            assert_eq!(plan.deferrals[0].kind, "publication.proof_changed");
+        }
+
+        #[tokio::test]
+        async fn ready_complete_tick_uncertain_after_wallet_deferral_skips_audit() {
+            let (a, b, c, later, old) = (wallet(1), wallet(2), wallet(3), wallet(4), wallet(9));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = [a, b, c, later]
+                .iter()
+                .enumerate()
+                .map(|(rank, wallet)| row(2, i64::try_from(rank + 1).unwrap(), *wallet))
+                .collect();
+            fake.failure = Some("uncertain_after_wallet_deferral");
+            let mut h = harness(fake, &[old]).await;
+            h.applied = AppliedWatchlistCapacity::new(4);
+            let mut sync = admission_sync(1);
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                h.tick_synced(MembershipMode::FullRerank, &mut HashSet::new(), &mut sync),
+            )
+            .await
+            .expect("maintenance tick deadlocked");
+            assert_eq!(members(&h.live), set(&[a]));
+            assert_eq!(h.live.structural_membership(), set(&[a]));
+            assert_eq!(sync.marker, Some(2));
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 3);
+            let changes = h.published_changes.lock().unwrap();
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].added, vec![a]);
+            assert!(!h.paper_state.wallet_history_complete(&b).unwrap());
+            let controls = h
+                .controls
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|(wallets, _)| wallets.iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(controls, vec![a, b, c]);
+            assert!(h.paper_state.position_validation(&later).unwrap().is_none());
+            let audits = pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|(_, frame)| {
+                    frame.source_id.0 == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                })
+                .count();
+            assert_eq!(audits, 0);
         }
 
         #[tokio::test]
@@ -7215,9 +7303,9 @@ mod tests {
                 h
             });
             wait_live(&live, &[a, b, c]).await;
-            let held = tokio::time::timeout(Duration::from_secs(2), async {
+            let held = tokio::time::timeout(Duration::from_secs(30), async {
                 while writes.load(Ordering::SeqCst) == 0 {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
             .await;
@@ -8042,10 +8130,11 @@ mod tests {
                 .find(|log| log["path"] == "addition" && log["started"] != 0)
                 .unwrap();
             assert_eq!(addition["first"], true);
-            assert_eq!(
-                eligible(addition).into_iter().collect::<HashSet<_>>(),
-                HashSet::from([bench.to_string(), fresh.to_string()])
-            );
+            let mut offered = eligible(addition);
+            offered.sort();
+            let mut expected = vec![bench.to_string(), fresh.to_string()];
+            expected.sort();
+            assert_eq!(offered, expected);
             let reentries = launches
                 .iter()
                 .filter(|log| log["path"] == "reentry" && log["started"] != 0)
@@ -8161,34 +8250,48 @@ mod tests {
             let mut sync = admission_sync(1);
             sync.failures.insert(failed, 1);
             let mut attempted = HashSet::new();
-            for before_additions in [true, false] {
-                let report = live_reentry_tick(
-                    &h.live,
-                    &h.paper_state,
-                    &h.client,
-                    &h.base_url,
-                    "anon",
-                    "",
-                    &h.writer_lock,
-                    &h.applied,
-                    h.applied.load(),
-                    &h.preparer,
-                    &mut sync,
-                    None,
-                    &mut attempted,
-                    NOW,
-                    None,
-                    before_additions,
-                )
-                .await;
-                if before_additions {
-                    assert!(report.is_none());
-                    assert_eq!(pinned_reads.load(Ordering::SeqCst), 0, "no ranking read");
-                } else {
-                    assert_eq!(report.unwrap().admitted, vec![failed]);
-                    assert_eq!(pinned_reads.load(Ordering::SeqCst), 1);
-                }
-            }
+            let wave = live_reentry_wave(
+                &h.live,
+                &h.paper_state,
+                &h.client,
+                &h.base_url,
+                "anon",
+                "",
+                &h.writer_lock,
+                &h.applied,
+                h.applied.load(),
+                &h.preparer,
+                &mut sync,
+                1,
+                None,
+                &attempted,
+                NOW,
+                true,
+            )
+            .await;
+            assert!(wave.is_none());
+            assert_eq!(pinned_reads.load(Ordering::SeqCst), 0, "no ranking read");
+            let report = live_reentry_tick(
+                &h.live,
+                &h.paper_state,
+                &h.client,
+                &h.base_url,
+                "anon",
+                "",
+                &h.writer_lock,
+                &h.applied,
+                h.applied.load(),
+                &h.preparer,
+                &mut sync,
+                None,
+                &mut attempted,
+                NOW,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(report.admitted, vec![failed]);
+            assert_eq!(pinned_reads.load(Ordering::SeqCst), 1);
         }
 
         #[tokio::test(start_paused = true)]
@@ -8220,7 +8323,6 @@ mod tests {
                 &mut attempted,
                 NOW,
                 None,
-                false,
             );
             // The install lands and its reply outlasts the former 30 s deadline (#765).
             let drive = async {

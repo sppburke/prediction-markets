@@ -3,7 +3,7 @@
 //! Lane C owns the history/fence boundary here. Lane D extends the marked seam
 //! with the causal positions bracket; no sidecar or positions overlay is accepted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -1108,21 +1108,23 @@ impl AdmissionPreparer {
                 });
             }
             let mut running = futures::stream::FuturesUnordered::new();
+            let mut completed = VecDeque::new();
             let mut next = 0;
+            let mut launch_failed = false;
             let mut shared = None;
             let mut stopped = false;
             loop {
                 while running.len() < crate::position_seeder::BRACKET_CONCURRENCY
                     && next < eligible.len()
                     && !past_deadline()
-                    && shared.is_none()
-                    && !stopped
+                    && !launch_failed
                 {
                     let wallet = eligible[next];
                     next += 1;
                     started.push(wallet);
                     if let Err(cause) = launch.started(&mut attempt, wallet) {
-                        shared = Some(cause);
+                        shared.get_or_insert(cause);
+                        launch_failed = true;
                         break;
                     }
                     running.push(async move {
@@ -1138,7 +1140,11 @@ impl AdmissionPreparer {
                         (wallet, result, Instant::now())
                     });
                 }
-                let Some((wallet, result, completed_at)) = running.next().await else {
+                let result = match completed.pop_front() {
+                    Some(result) => Some(result),
+                    None => running.next().await,
+                };
+                let Some((wallet, result, completed_at)) = result else {
                     break;
                 };
                 let install = match result {
@@ -1160,19 +1166,26 @@ impl AdmissionPreparer {
                 if shared.is_some() || stopped {
                     continue;
                 }
-                let accepted = async {
+                let acceptance = async {
                     self.install_anchors(vec![install])
                         .await
                         .map_err(|error| ("anchor_install", error))?;
                     self.check_prerequisites(&[wallet])
-                        .map_err(|error| ("history", error))
-                }
-                .await;
-                match accepted {
-                    Ok(()) => {
-                        admitted.push(wallet);
-                        stopped = !ready_hook.ready(wallet).await;
+                        .map_err(|error| ("history", error))?;
+                    admitted.push(wallet);
+                    Ok(ready_hook.ready(wallet).await)
+                };
+                tokio::pin!(acceptance);
+                // Keep queued control sends and request timeouts progressing during publication.
+                let accepted = loop {
+                    tokio::select! {
+                        biased;
+                        accepted = &mut acceptance => break accepted,
+                        Some(result) = running.next() => completed.push_back(result),
                     }
+                };
+                match accepted {
+                    Ok(keep_going) => stopped = !keep_going,
                     Err((stage, error)) if error.class() != FailureClass::Shared => {
                         let mut deferral = Deferral::from_error(wallet, stage, &error);
                         deferral.completed_at = Some(Instant::now());
@@ -1194,6 +1207,7 @@ impl AdmissionPreparer {
                 });
             }
         } else {
+            let mut stopped = false;
             for wallet in eligible.iter().copied() {
                 if deadline.is_some_and(|end| Instant::now() >= end) {
                     // A zero-start call still idempotently seeds ranked cursors.
@@ -1218,6 +1232,9 @@ impl AdmissionPreparer {
                         cause,
                         deferred,
                     });
+                }
+                if stopped {
+                    continue;
                 }
                 match self.check_prerequisites(&[wallet]) {
                     Ok(()) => {}
@@ -1270,10 +1287,7 @@ impl AdmissionPreparer {
                     }
                 }
                 admitted.push(wallet);
-                if !ready_hook.ready(wallet).await {
-                    unstarted.extend(eligible.iter().skip(started.len()).copied());
-                    break;
-                }
+                stopped = !ready_hook.ready(wallet).await;
             }
         }
         Ok(AdmissionOutcome {

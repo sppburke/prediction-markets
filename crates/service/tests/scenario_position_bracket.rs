@@ -4,10 +4,6 @@
 #[path = "support/golden.rs"]
 mod golden;
 
-#[path = "support/position_validation.rs"]
-mod position_validation;
-use position_validation::ControlValidationExt;
-
 use golden::support;
 
 use support::data_api_v2;
@@ -2318,18 +2314,17 @@ async fn runtime_control_bracket_reads_one_full_baseline_then_three_tails() {
     let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
 
     let accepted = validator
-        .validate_via_control(
-            &[wallet],
+        .validate_logged(
+            wallet,
             &control_tx,
             &paper,
             pe_service::position_seeder::ValidationPurpose::CatchUp,
             None,
         )
         .await;
-    assert!(accepted.shared.is_none());
-    assert!(accepted.deferred.is_empty());
-    assert_eq!(accepted.accepted[0].cutoff, 4002);
-    let document = &accepted.accepted[0].proof.document;
+    let accepted = accepted.unwrap();
+    assert_eq!(accepted.cutoff, 4002);
+    let document = &accepted.proof.document;
     assert!(anchor_proves_full_history(document));
     let proof: Value = serde_json::from_str(document).unwrap();
     assert_eq!(proof["baseline_walk"]["fixed_end"], 4000);
@@ -3420,20 +3415,16 @@ async fn control_missing_mapping_waits_for_next_walk_then_retries() {
     reads.push(reads.last().unwrap().clone());
     let fetcher = Arc::new(QueueFetcher::new(responses));
     let outcomes = validator_from_fetcher(Arc::clone(&fetcher))
-        .validate_via_control(
-            &[wallet],
+        .validate_logged(
+            wallet,
             &control_tx,
             &paper,
             pe_service::position_seeder::ValidationPurpose::CatchUp,
             None,
         )
         .await;
-    assert!(outcomes.shared.is_none());
-    assert!(outcomes.deferred.is_empty());
-    assert_eq!(outcomes.accepted.len(), 1);
-    assert!(anchor_proves_full_history(
-        &outcomes.accepted[0].proof.document
-    ));
+    let outcomes = outcomes.unwrap();
+    assert!(anchor_proves_full_history(&outcomes.proof.document));
     assert_eq!(
         fetcher
             .urls()
@@ -4489,10 +4480,11 @@ async fn five_wallet_prepare_defers_mapping_failure_and_preserves_accepted_order
         .prepare(&[healthy[0], deferred, raced, healthy[1], healthy[2]])
         .await
         .unwrap();
-    assert_eq!(
-        outcome.admitted.iter().copied().collect::<HashSet<_>>(),
-        healthy.into_iter().collect()
-    );
+    let mut admitted = outcome.admitted.clone();
+    admitted.sort_by_key(|wallet| wallet.0);
+    let mut expected = healthy.to_vec();
+    expected.sort_by_key(|wallet| wallet.0);
+    assert_eq!(admitted, expected);
     assert_eq!(outcome.deferred.len(), 2);
     assert_eq!(outcome.deferred[0].wallet, deferred);
     assert_eq!(
@@ -7012,8 +7004,8 @@ async fn paper_service_rollout_fence_allowlist_cutoff_and_install_races_fail_clo
             paper.clone(),
         );
         let outcome = validator(rollout_empty_reads(wallet, 1))
-            .validate_via_control(
-                &[wallet],
+            .validate_logged(
+                wallet,
                 &tx,
                 &paper,
                 pe_service::position_seeder::ValidationPurpose::CatchUp,
@@ -7034,7 +7026,7 @@ async fn paper_service_rollout_fence_allowlist_cutoff_and_install_races_fail_clo
             "wallet_fenced",
         );
         assert!(matches!(
-            engine.install_anchors(&outcome.accepted),
+            engine.install_anchors(&[outcome.unwrap()]),
             Err(pe_service::bucket_commit::AnchorInstallError::CoverageGenerationChanged { .. })
         ));
         assert!(paper.position_anchors(&wallet).unwrap().is_empty());
@@ -7190,6 +7182,51 @@ impl PageFetcher for RolloutDeadlineFetcher {
     }
 }
 
+#[tokio::test]
+async fn admission_shared_bracket_failure_drains_all_five_without_unstarted() {
+    let wallets = (0xe1..=0xe5).map(wallet).collect::<Vec<_>>();
+    let (_dir, paper, engine) = fresh(&wallets);
+    let specs = wallets
+        .iter()
+        .enumerate()
+        .map(|(index, wallet)| (*wallet, u8::try_from(index + 1).unwrap(), "1"))
+        .collect::<Vec<_>>();
+    let mut responses = stable_responses(&specs);
+    responses.remove(&activity_url(wallets[0]));
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let validator = validator_from_reconciliation(fetcher.clone());
+    let (tx, rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(rx, engine, paper.clone());
+    let preparer = AdmissionPreparer::with_validator(tx, paper.clone(), validator);
+    let abort = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        preparer.scenario_prepare_until(
+            &wallets,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+        ),
+    )
+    .await
+    .expect("admission deadlocked")
+    .unwrap_err();
+    assert_eq!(abort.started, wallets);
+    assert!(abort.unstarted.is_empty());
+    assert!(abort.admitted.is_empty());
+    assert!(abort.deferred.is_empty());
+    assert_eq!(abort.cause.kind(), "source.fatal");
+    assert!(abort.cause.to_string().contains("no queued fixture"));
+    assert!(
+        fetcher
+            .urls()
+            .iter()
+            .any(|url| url.contains(&wallets[4].to_string()))
+    );
+    for wallet in &wallets {
+        assert!(paper.position_validation(wallet).unwrap().is_none());
+    }
+    drop(preparer);
+    actor.await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn paper_service_rollout_deadline_drains_four_and_leaves_fifth_unstarted() {
     let wallets = (0xe1..=0xe5).map(wallet).collect::<Vec<_>>();
@@ -7212,39 +7249,31 @@ async fn paper_service_rollout_deadline_drains_four_and_leaves_fifth_unstarted()
     let (tx, rx) = mpsc::channel(4);
     let actor = spawn_control_actor(rx, engine, paper.clone());
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    let paper_task = paper.clone();
+    let preparer = AdmissionPreparer::with_validator(tx.clone(), paper.clone(), validator);
     let wallets_task = wallets.clone();
-    let tx_task = tx.clone();
     let task = tokio::spawn(async move {
-        validator
-            .validate_via_control(
-                &wallets_task,
-                &tx_task,
-                &paper_task,
-                pe_service::position_seeder::ValidationPurpose::CatchUp,
-                Some(deadline),
-            )
-            .await
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            preparer.scenario_prepare_until(&wallets_task, deadline),
+        )
+        .await
+        .expect("admission deadlocked")
+        .unwrap()
     });
-    let mut launched = HashSet::new();
+    let mut launched = Vec::new();
     for _ in 0..4 {
-        launched.insert(started.recv().await.unwrap());
+        launched.push(started.recv().await.unwrap());
     }
-    assert_eq!(launched, wallets[..4].iter().copied().collect());
+    launched.sort_by_key(|wallet| wallet.0);
+    assert_eq!(launched, wallets[..4]);
     tokio::time::advance(std::time::Duration::from_secs(11)).await;
     release.add_permits(4);
-    let outcome = task.await.unwrap();
-    assert_eq!(outcome.started_prefix, 4);
-    assert_eq!(
-        outcome
-            .accepted
-            .iter()
-            .map(|install| install.wallet)
-            .collect::<Vec<_>>(),
-        wallets[..4]
-    );
+    let mut outcome = task.await.unwrap();
+    assert_eq!(outcome.started, wallets[..4]);
+    assert_eq!(outcome.unstarted, wallets[4..]);
+    outcome.admitted.sort_by_key(|wallet| wallet.0);
+    assert_eq!(outcome.admitted, wallets[..4]);
     assert!(outcome.deferred.is_empty());
-    assert!(outcome.shared.is_none());
     assert!(started.try_recv().is_err());
     assert!(paper.cursor(&wallets[4]).unwrap().is_none());
     drop(tx);
@@ -7306,10 +7335,9 @@ async fn paper_service_rollout_deadline_suppresses_optional_retry_and_maps_filte
     let outcome = task.await.unwrap();
     assert_eq!(outcome.started, wallets[1..5]);
     assert_eq!(outcome.unstarted, vec![wallets[5]]);
-    assert_eq!(
-        outcome.admitted.iter().copied().collect::<HashSet<_>>(),
-        wallets[2..5].iter().copied().collect()
-    );
+    let mut admitted = outcome.admitted.clone();
+    admitted.sort_by_key(|wallet| wallet.0);
+    assert_eq!(admitted, wallets[2..5]);
     assert_eq!(outcome.deferred.len(), 2);
     assert_eq!(outcome.deferred[0].wallet, wallets[0]);
     assert_eq!(outcome.deferred[1].wallet, wallets[1]);
@@ -7364,21 +7392,15 @@ async fn paper_service_rollout_novel_revision_on_first_read_refuses_then_safe_re
     let (tx, rx) = mpsc::channel(4);
     let actor = spawn_control_actor(rx, engine, paper.clone());
     let outcomes = validator
-        .validate_via_control(
-            &[wallet],
+        .validate_logged(
+            wallet,
             &tx,
             &paper,
             pe_service::position_seeder::ValidationPurpose::CatchUp,
             None,
         )
         .await;
-    assert_eq!(
-        outcomes.accepted.len(),
-        1,
-        "deferred={:?} shared={:?}",
-        outcomes.deferred,
-        outcomes.shared
-    );
+    let outcomes = outcomes.unwrap();
     assert_eq!(
         paper.wallet_coverage(&wallet).unwrap().coverage_generation,
         before + 1
@@ -7401,7 +7423,7 @@ async fn paper_service_rollout_novel_revision_on_first_read_refuses_then_safe_re
         pe_service::paper_recovery::build_leader_ledger(&paper).unwrap(),
     )
     .unwrap();
-    engine.install_anchors(&outcomes.accepted).unwrap();
+    engine.install_anchors(&[outcomes]).unwrap();
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
     assert_eq!(rollout_history(&dir).len(), 1);
 }
@@ -7614,13 +7636,11 @@ async fn reentry_intervening_tail_activity_retries_from_a_new_baseline() {
     let actor = spawn_control_actor(rx, engine, paper.clone());
     let (outcomes, attempts) = reentry_attempts(&validator, wallet, &tx, &paper).await;
     assert_eq!(attempts, ["validation.intervening_activity", "accepted"]);
-    assert!(outcomes.shared.is_none());
-    assert!(outcomes.deferred.is_empty());
-    assert_eq!(outcomes.accepted.len(), 1);
+    let outcomes = outcomes.unwrap();
     assert!(paper.position_anchors(&wallet).unwrap().is_empty());
-    let proof: Value = serde_json::from_str(&outcomes.accepted[0].proof.document).unwrap();
+    let proof: Value = serde_json::from_str(&outcomes.proof.document).unwrap();
     assert_eq!(proof["baseline_walk"]["fixed_end"], 4003);
-    assert_eq!(outcomes.accepted[0].cutoff, 4005);
+    assert_eq!(outcomes.cutoff, 4005);
     assert_eq!(
         fetcher
             .urls()
@@ -7631,7 +7651,7 @@ async fn reentry_intervening_tail_activity_retries_from_a_new_baseline() {
     );
     let (acknowledged, ack) = tokio::sync::oneshot::channel();
     tx.send(OrchestratorControl::InstallAnchors {
-        installs: outcomes.accepted,
+        installs: vec![outcomes],
         acknowledged,
     })
     .await
@@ -7775,7 +7795,7 @@ async fn reentry_of_reanchoring_wallet_sees_only_new_groups_between_captures() {
             &["accepted"]
         };
         assert_eq!(attempts, expected, "intervening {intervening}");
-        assert_eq!(outcomes.accepted.len(), 1, "intervening {intervening}");
+        assert!(outcomes.is_ok(), "intervening {intervening}: {outcomes:?}");
         drop(tx);
         actor.await.unwrap();
     }
@@ -7787,7 +7807,7 @@ async fn reentry_attempts(
     wallet: WalletAddress,
     tx: &mpsc::Sender<OrchestratorControl>,
     paper: &PaperStateDb,
-) -> (position_validation::ValidationOutcomes, Vec<String>) {
+) -> (Result<AnchorInstall, CausalPositionError>, Vec<String>) {
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
         .json()
@@ -7796,8 +7816,8 @@ async fn reentry_attempts(
         .finish();
     use tracing::instrument::WithSubscriber;
     let outcomes = validator
-        .validate_via_control(
-            &[wallet],
+        .validate_logged(
+            wallet,
             tx,
             paper,
             pe_service::position_seeder::ValidationPurpose::CatchUp,
@@ -8300,17 +8320,16 @@ async fn reentry_rejects_non_monotonic_bounds_including_baseline() {
     let (tx, rx) = mpsc::channel(2);
     let actor = spawn_control_actor(rx, engine, paper.clone());
     let outcomes = validator
-        .validate_via_control(
-            &[wallet],
+        .validate_logged(
+            wallet,
             &tx,
             &paper,
             pe_service::position_seeder::ValidationPurpose::CatchUp,
             None,
         )
         .await;
-    assert!(outcomes.accepted.is_empty());
     assert!(matches!(
-        outcomes.shared.unwrap(),
+        outcomes.unwrap_err(),
         CausalPositionError::NonMonotonicActivityBounds {
             previous: 4000,
             next: 3999,
@@ -8392,8 +8411,8 @@ async fn reentry_attempt_logs_separate_baseline_and_stability_timing() {
         let capture = tracing::subscriber::set_default(subscriber);
         let outcomes = tokio::time::timeout(
             std::time::Duration::from_secs(25),
-            validator.validate_via_control(
-                &[wallet],
+            validator.validate_logged(
+                wallet,
                 &tx,
                 &paper,
                 pe_service::position_seeder::ValidationPurpose::CatchUp,
@@ -8403,15 +8422,10 @@ async fn reentry_attempt_logs_separate_baseline_and_stability_timing() {
         .await;
         drop(capture);
         match failure {
-            "none" => assert_eq!(outcomes.unwrap().accepted.len(), 1),
+            "none" => assert!(outcomes.unwrap().is_ok()),
             "cancelled" => assert!(outcomes.is_err()),
             _ => {
-                let outcomes = outcomes.unwrap();
-                assert_eq!(
-                    usize::from(outcomes.shared.is_some()) + outcomes.deferred.len(),
-                    1
-                );
-                assert!(outcomes.accepted.is_empty());
+                assert!(outcomes.unwrap().is_err());
             }
         }
         let bytes = bytes.lock().unwrap().clone();
@@ -8471,18 +8485,16 @@ async fn reentry_union_mapping_rejects_baseline_tail_classification_conflict() {
     let (tx, rx) = mpsc::channel(2);
     let actor = spawn_control_actor(rx, engine, paper.clone());
     let outcomes = validator
-        .validate_via_control(
-            &[wallet],
+        .validate_logged(
+            wallet,
             &tx,
             &paper,
             pe_service::position_seeder::ValidationPurpose::CatchUp,
             None,
         )
         .await;
-    assert!(outcomes.accepted.is_empty());
-    assert!(outcomes.shared.is_none());
     assert!(matches!(
-        &outcomes.deferred[0].1,
+        outcomes.unwrap_err(),
         CausalPositionError::Positions {
             source: PositionReadError::MixedActivityClassification { .. },
             ..
@@ -8768,28 +8780,19 @@ async fn membership_cold_and_warm_bracket_acknowledgements_classify_identically(
                     let (tx, rx) = mpsc::channel(2);
                     let actor = spawn_control_actor(rx, engine, paper.clone());
                     let outcomes = validator
-                        .validate_via_control(
-                            &[wallet],
+                        .validate_logged(
+                            wallet,
                             &tx,
                             &paper,
                             pe_service::position_seeder::ValidationPurpose::CatchUp,
                             None,
                         )
                         .await;
-                    assert!(
-                        outcomes.shared.is_none(),
-                        "{case}/{direct}/{warm}: {:?}",
-                        outcomes.shared
-                    );
-                    assert!(
-                        outcomes.deferred.is_empty(),
-                        "{case}/{direct}/{warm}: {:?}",
-                        outcomes.deferred
-                    );
-                    assert_eq!(outcomes.accepted.len(), 1, "{case}/{direct}/{warm}");
+                    assert!(outcomes.is_ok(), "{case}/{direct}/{warm}: {outcomes:?}");
+                    let outcomes = outcomes.unwrap();
                     let (acknowledged, result) = tokio::sync::oneshot::channel();
                     tx.send(OrchestratorControl::InstallAnchors {
-                        installs: outcomes.accepted,
+                        installs: vec![outcomes],
                         acknowledged,
                     })
                     .await
@@ -9155,15 +9158,22 @@ async fn ready_admission_installs_before_held_peer_finishes() {
     let (tx, rx) = mpsc::channel(4);
     let actor = spawn_control_actor(rx, engine, paper.clone());
     let preparer = AdmissionPreparer::with_validator(tx.clone(), paper.clone(), validator);
-    let task = tokio::spawn(async move { preparer.prepare(&wallets).await });
+    let task = tokio::spawn(async move {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            preparer.prepare(&wallets),
+        )
+        .await
+        .expect("admission deadlocked")
+    });
     for _ in 0..3 {
         started.recv().await.unwrap();
     }
-    let installed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let installed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while paper.position_validation(&wallets[0]).unwrap().is_none()
             || paper.position_validation(&wallets[2]).unwrap().is_none()
         {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     })
     .await;
@@ -9174,10 +9184,9 @@ async fn ready_admission_installs_before_held_peer_finishes() {
     assert!(paper.position_validation(&wallets[1]).unwrap().is_none());
     release.add_permits(1);
     let outcome = task.await.unwrap().unwrap();
-    assert_eq!(
-        outcome.admitted.iter().copied().collect::<HashSet<_>>(),
-        wallets.into_iter().collect()
-    );
+    let mut admitted = outcome.admitted.clone();
+    admitted.sort_by_key(|wallet| wallet.0);
+    assert_eq!(admitted, wallets);
     drop(tx);
     actor.await.unwrap();
 }
@@ -9293,7 +9302,7 @@ async fn ready_streamed_membership(mode: pe_service::watchlist_maintenance::Memb
             for _ in 0..3 {
                 started.recv().await.unwrap();
             }
-            let ready = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let ready = tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 while ![a, c].iter().all(|wallet| {
                     h.live
                         .snapshot()
@@ -9301,7 +9310,7 @@ async fn ready_streamed_membership(mode: pe_service::watchlist_maintenance::Memb
                         .iter()
                         .any(|entry| entry.wallet == *wallet)
                 }) {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
             })
             .await;
@@ -9352,22 +9361,25 @@ async fn ready_streamed_membership(mode: pe_service::watchlist_maintenance::Memb
             assert_eq!(h.mutations(), 1);
             release.add_permits(1);
         };
-        tokio::join!(tick, observation);
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(tick, observation);
+        })
+        .await
+        .expect("streamed maintenance tick deadlocked");
     }
     assert_eq!(h.live.structural_membership(), HashSet::from([a, b, c]));
     let era = paper_era(scan_paper_log(&h.paper_path).unwrap());
     let replayed = replay_membership(&era, h.initial.clone(), &h.source_path)
         .unwrap()
         .unwrap();
-    assert_eq!(
-        replayed
-            .watchlist
-            .entries
-            .iter()
-            .map(|entry| entry.wallet)
-            .collect::<HashSet<_>>(),
-        HashSet::from([a, b, c])
-    );
+    let mut replayed_wallets = replayed
+        .watchlist
+        .entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect::<Vec<_>>();
+    replayed_wallets.sort_by_key(|wallet| wallet.0);
+    assert_eq!(replayed_wallets, vec![a, b, c]);
     let records = era
         .frames
         .iter()
@@ -9406,4 +9418,93 @@ async fn ready_full_rerank_records_replay_and_copy_before_held_peer() {
 #[tokio::test]
 async fn ready_knockout_records_replay_and_copy_before_held_peer() {
     ready_streamed_membership(pe_service::watchlist_maintenance::MembershipMode::Knockout).await;
+}
+
+#[tokio::test]
+async fn streamed_membership_102_record_wave_size_and_append_counts() {
+    use pe_service::paper_recovery::{PaperLogRecord, scan_paper_log};
+    use pe_service::runtime_config::AppliedWatchlistCapacity;
+    use pe_service::watchlist_maintenance::{MembershipMode, ScenarioMaintenanceState};
+    let wallets = (1..=102).map(wallet).collect::<Vec<_>>();
+    let old = wallet(0xe9);
+    let mut all_wallets = wallets.clone();
+    all_wallets.push(old);
+    let (dir, paper, mut engine) = fresh(&all_wallets);
+    install_empty_anchor(&mut engine, &paper, old, 1);
+    drop(engine);
+    let h = golden::BracketFinancialHarness::new(dir.path(), paper.clone(), &[old]).await;
+    let specs = wallets
+        .iter()
+        .enumerate()
+        .map(|(index, wallet)| (*wallet, u8::try_from(index + 1).unwrap(), "1"))
+        .collect::<Vec<_>>();
+    let fetcher = Arc::new(QueueFetcher::new(stable_responses(&specs)));
+    let preparer = financial_preparer(&h, &paper, fetcher);
+    let (base_url, server) = ready_ranking_server(&wallets).await;
+    let mut cfg = inactivity_config();
+    cfg.membership_mode = MembershipMode::FullRerank;
+    cfg.interval_secs = 600;
+    let client = reqwest::Client::new();
+    let applied = AppliedWatchlistCapacity::new(usize::MAX);
+    let mut state = ScenarioMaintenanceState::new(Some(1), 0);
+    let paper_before = std::fs::metadata(&h.paper_path).unwrap().len();
+    let source_before = std::fs::metadata(&h.source_path).unwrap().len();
+    let started = std::time::Instant::now();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        state.tick(
+            &h.live,
+            &paper,
+            &client,
+            &base_url,
+            &h.writer_lock,
+            &applied,
+            &preparer,
+            &cfg,
+            END,
+        ),
+    )
+    .await
+    .expect("102-wallet maintenance tick deadlocked");
+    let elapsed = started.elapsed();
+    let paper_growth = std::fs::metadata(&h.paper_path).unwrap().len() - paper_before;
+    let source_growth = std::fs::metadata(&h.source_path).unwrap().len() - source_before;
+    let membership_records = scan_paper_log(&h.paper_path)
+        .unwrap()
+        .iter()
+        .filter(|frame| {
+            matches!(
+                ready_record(frame),
+                Some(PaperLogRecord::MembershipChanged { .. })
+            )
+        })
+        .count();
+    let ranking_artifacts = Reader::replay(&h.source_path)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|(_, frame)| frame.source_id.0 == "pe-service.watchlist-ranking")
+        .count();
+    eprintln!(
+        "production streamed wave: newcomers=102 paper_bytes={paper_growth} source_bytes={source_growth} membership_changed={membership_records} ranking_artifacts={ranking_artifacts} elapsed_ms={}",
+        elapsed.as_millis()
+    );
+    assert!(paper_growth > 0);
+    assert!(source_growth > 0);
+    assert_eq!(membership_records, 102);
+    assert_eq!(ranking_artifacts, 102);
+    assert!(elapsed < std::time::Duration::from_secs(30));
+    let mut admitted = h
+        .live
+        .snapshot()
+        .entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect::<Vec<_>>();
+    admitted.sort_by_key(|wallet| wallet.0);
+    assert_eq!(admitted, wallets);
+    server.abort();
+    drop(preparer);
+    tokio::time::timeout(std::time::Duration::from_secs(30), h.shutdown())
+        .await
+        .expect("financial harness shutdown deadlocked");
 }

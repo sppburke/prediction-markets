@@ -4,10 +4,6 @@
 
 mod support;
 
-#[path = "support/position_validation.rs"]
-mod position_validation;
-use position_validation::ControlValidationExt;
-
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -7564,17 +7560,15 @@ async fn reconciled_frame_survives_routine_position_refresh_and_boot_anchor_walk
     )
     .with_clock(Arc::new(|| EPOCH + 10));
     let outcomes = validator
-        .validate_via_control(
-            &[wallet()],
+        .validate_logged(
+            wallet(),
             h.control.as_ref().unwrap(),
             &h.paper,
             pe_service::position_seeder::ValidationPurpose::RoutineRefresh { cutoff: 0 },
             None,
         )
         .await;
-    assert!(outcomes.shared.is_none(), "{:?}", outcomes.shared);
-    assert!(outcomes.deferred.is_empty(), "{:?}", outcomes.deferred);
-    assert_eq!(outcomes.accepted.len(), 1);
+    assert!(outcomes.is_ok(), "{outcomes:?}");
     h.stop().await;
     // This is the production boot path before it installs a source-receipt index.
     let mut engine =
