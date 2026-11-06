@@ -1053,10 +1053,12 @@ prefix, asserts agreement with the export, and repeats that check for the receiv
 Receipt selection is `[listening, window_end)`, whatever its trade-time delay or membership at
 trade time. Routing evidence continues through the capture cutoff: a queued receipt may route
 after `window_end`. Capture the journal for this invocation through that cutoff, retaining the
-journal timestamp and decoding `MESSAGE` as the service's **flattened** JSON event:
+journal timestamp and decoding `MESSAGE` as the service's **flattened** JSON event. Keep `--all`:
+without it, `journalctl -o json` prints messages over 4,096 bytes as `null`, and the parser below
+skips them:
 
 ```bash
-journalctl -u pe-service _SYSTEMD_INVOCATION_ID=<id> --since '<listening UTC>' --until '<capture-cutoff UTC>' -o json > journal.json
+journalctl -u pe-service _SYSTEMD_INVOCATION_ID=<id> --since '<listening UTC>' --until '<capture-cutoff UTC>' -o json --all > journal.json
 python3 - journal.json ignored.json <<'PY'
 import json, re, sys
 from decimal import Decimal

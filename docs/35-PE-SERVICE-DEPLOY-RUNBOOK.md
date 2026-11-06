@@ -2099,10 +2099,12 @@ declared outcomes; its command does not apply to the current tree:
 
 
 For AC-A, set `invocation`, `restart_utc`, and `window_end_utc` from the retained invocation and
-explicit UTC window; write the scoped journal before extracting it:
+explicit UTC window; write the scoped journal before extracting it. Every journal extract here uses
+`--all`: without it, `journalctl -o json` prints messages over 4,096 bytes as `null`, which stops
+`fromjson`:
 
 ```bash
-journalctl -u pe-service "_SYSTEMD_INVOCATION_ID=$invocation" --since "$restart_utc" --until "$window_end_utc" -o json > checkpoint-journal.jsonl
+journalctl -u pe-service "_SYSTEMD_INVOCATION_ID=$invocation" --since "$restart_utc" --until "$window_end_utc" -o json --all > checkpoint-journal.jsonl
 jq -ce '
   . as $journal | (.MESSAGE | fromjson) as $line |
   select($line.message == "source checkpoint published" or
@@ -2166,7 +2168,7 @@ deployment actions described above; this procedure makes no trading or policy ch
    ranking_read --csv -c "SELECT batch_id, rank, wallet_hex, last_trade_unix FROM ranking_entries WHERE batch_id = $baseline_batch AND survives IS TRUE ORDER BY rank" \
      > "$art/baseline-survivors.csv"
    cp -- "$status_path" "$art/status.baseline.json"
-   journalctl -u pe-service -n 1 --show-cursor -o json > "$art/journal.before.jsonl"
+   journalctl -u pe-service -n 1 --show-cursor -o json --all > "$art/journal.before.jsonl"
    systemctl show pe-service -p InvocationID -p ExecMainStartTimestamp > "$art/invocation.before"
    ```
 
@@ -2209,7 +2211,7 @@ deployment actions described above; this procedure makes no trading or policy ch
 
    ```bash
    startup_until_utc=$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')
-   journalctl -u pe-service "_SYSTEMD_INVOCATION_ID=$invocation" --since "$restart_utc" --until "$startup_until_utc" -o json > "$art/startup-journal.jsonl"
+   journalctl -u pe-service "_SYSTEMD_INVOCATION_ID=$invocation" --since "$restart_utc" --until "$startup_until_utc" -o json --all > "$art/startup-journal.jsonl"
    listening_unix_us=$(jq -ser '
      [.[] | . as $journal | (.MESSAGE | fromjson) as $line |
       select($line.message == "pe-service listening") | ($journal.__REALTIME_TIMESTAMP | tonumber)] |
@@ -2299,7 +2301,7 @@ deployment actions described above; this procedure makes no trading or policy ch
     decoding each entry's `MESSAGE` as a flattened service JSON event and retaining its timestamp:
 
     ```bash
-    journalctl -u pe-service "_SYSTEMD_INVOCATION_ID=$invocation" --since "$restart_utc" --until "$window_end_utc" -o json > "$art/admission-journal.jsonl"
+    journalctl -u pe-service "_SYSTEMD_INVOCATION_ID=$invocation" --since "$restart_utc" --until "$window_end_utc" -o json --all > "$art/admission-journal.jsonl"
     jq -ce '
       . as $journal | (.MESSAGE | fromjson) as $line |
       select($line.message == "maintenance admission budget completed" or
