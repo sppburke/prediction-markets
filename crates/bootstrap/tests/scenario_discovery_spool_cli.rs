@@ -85,6 +85,8 @@ fn collect(root: &Path, fixed: &Path, spool: &Path, enabled: bool) -> Value {
             "--defer-activation",
             "--collect-to",
             spool.to_str().unwrap(),
+            "--participant-audit",
+            spool.with_extension("audit.json").to_str().unwrap(),
             "--coverage-from",
             fixed.to_str().unwrap(),
             "--not-before",
@@ -423,4 +425,100 @@ fn discovery_spool_cli_opener_failure_precedes_recorded_participant_tempfail() {
     assert_eq!(out.status.code(), Some(1), "{}", logs(&out));
     assert!(logs(&out).contains("999"));
     assert_eq!(state(&side), before);
+}
+
+#[test]
+fn participant_audit_cli_consumes_values_and_checks_modes_after_config_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("cache.db");
+    old_candidate(&db);
+    let cases = [
+        vec!["winner-discovery", "--participant-audit"],
+        vec!["winner-discovery", "--participant-audit="],
+        vec!["winner-discovery", "--participant-audit", ""],
+        vec![
+            "winner-discovery",
+            "--participant-audit=a",
+            "--participant-audit=b",
+        ],
+        vec!["winner-discovery", "--out", "--participant-audit=a"],
+        vec![
+            "winner-discovery",
+            "--audit-csv",
+            "--participant-audit",
+            "a",
+        ],
+        vec![
+            "winner-discovery",
+            "--defer-activation",
+            "--apply-from=s",
+            "--participant-audit=a",
+        ],
+        vec!["pipeline-versions", "--participant-audit=a"],
+        vec!["events", "--participant-audit", "a"],
+    ];
+    for enabled in [false, true] {
+        for args in &cases {
+            let out = run(dir.path(), &db, args, enabled);
+            assert_eq!(out.status.code(), Some(1), "{args:?}: {}", logs(&out));
+            assert!(!logs(&out).contains("connection tuning applied"));
+        }
+    }
+    for args in [
+        vec!["winner-discovery"],
+        vec![
+            "winner-discovery",
+            "--defer-activation",
+            "--collect-to=s",
+            "--coverage-from=cache.db",
+            "--not-before=0",
+        ],
+    ] {
+        let out = run(dir.path(), &db, &args, true);
+        assert_eq!(out.status.code(), Some(1), "{}", logs(&out));
+        assert!(logs(&out).contains("requires --participant-audit"));
+        assert!(!dir.path().join("s").exists());
+    }
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "participant_lookback_secs = 0\n",
+    )
+    .unwrap();
+    for args in [
+        vec!["winner-discovery", "--participant-audit", "spaced.toml"],
+        vec![
+            "winner-discovery",
+            "--participant-audit=inline.toml",
+            "config.toml",
+        ],
+        vec![
+            "winner-discovery",
+            "--defer-activation",
+            "--collect-to=s",
+            "--coverage-from=cache.db",
+            "--not-before=0",
+            "--participant-audit=collector.json",
+        ],
+    ] {
+        let out = run(dir.path(), &db, &args, false);
+        assert_eq!(out.status.code(), Some(0), "{}", logs(&out));
+        assert!(logs(&out).contains("audit_sha256"));
+    }
+    for path in [
+        "spaced.toml",
+        "cache.db",
+        "cache.db-wal",
+        "cache.db-shm",
+        "cache.db-journal",
+        "cache.db.lock",
+    ] {
+        let out = run(
+            dir.path(),
+            &db,
+            &["winner-discovery", "--participant-audit", path],
+            true,
+        );
+        assert_eq!(out.status.code(), Some(1), "{path}: {}", logs(&out));
+        assert!(!logs(&out).contains("winner_discovery: datadash"));
+    }
 }

@@ -36,6 +36,13 @@ fn run_cli_with_env(
         .env("PE_BOOTSTRAP_OUTPUT", root.join("watchlist.json"))
         .env("PE_BOOTSTRAP_CACHE_PATH", cache_path)
         .env("PE_BOOTSTRAP_PURGE_ARCHIVE_ENABLED", "false");
+    if args.first() == Some(&"winner-discovery") {
+        static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        command
+            .arg("--participant-audit")
+            .arg(root.join(format!("participant-audit-{attempt}.json")));
+    }
     command.envs(extra_env.iter().copied()).output().unwrap()
 }
 

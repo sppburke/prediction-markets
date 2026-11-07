@@ -82,7 +82,11 @@ fn enabled_cli_failure_is_75_and_disabled_discovery_preserves_coverage() {
     ];
     let failed = run(
         dir.path(),
-        &args,
+        &[
+            args.as_slice(),
+            &["--participant-audit", "failed-audit.json"],
+        ]
+        .concat(),
         "invalid URL fails before network I/O",
         "5",
     );
@@ -249,11 +253,29 @@ fn discovery_retries_pages_and_finds_post_end_trades_before_advancing_coverage()
         "--end-date-min",
         "0",
     ];
-    let failed = run(dir.path(), &args, &base, "5");
+    let failed = run(
+        dir.path(),
+        &[
+            args.as_slice(),
+            &["--participant-audit", "failed-audit.json"],
+        ]
+        .concat(),
+        &base,
+        "5",
+    );
     assert_eq!(failed.status.code(), Some(75), "{failed:?}");
     assert_eq!(snapshot(dir.path()), initial);
     venue.lock().unwrap().mode = 1;
-    let retried = run(dir.path(), &args, &base, "5");
+    let retried = run(
+        dir.path(),
+        &[
+            args.as_slice(),
+            &["--participant-audit", "retried-audit.json"],
+        ]
+        .concat(),
+        &base,
+        "5",
+    );
     assert_eq!(retried.status.code(), Some(0), "{retried:?}");
     let first = snapshot(dir.path());
     assert_eq!(first.0, 1);
@@ -266,12 +288,41 @@ fn discovery_retries_pages_and_finds_post_end_trades_before_advancing_coverage()
         venue.closed = true;
         venue.trade_time = first_end;
     }
-    let invalid = run(dir.path(), &args, &base, "5");
+    let invalid = run(
+        dir.path(),
+        &[
+            args.as_slice(),
+            &["--participant-audit", "invalid-audit.json"],
+        ]
+        .concat(),
+        &base,
+        "5",
+    );
     assert_eq!(invalid.status.code(), Some(75), "{invalid:?}");
-    assert!(String::from_utf8_lossy(&invalid.stderr).contains("raw_sha256"));
+    let audit: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("invalid-audit.json")).unwrap())
+            .unwrap();
+    assert!(audit["pages"].as_array().unwrap().iter().any(|page| {
+        page["kind"] == "trades"
+            && page["raw_sha256"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64)
+    }));
+    assert!(
+        !String::from_utf8_lossy(&invalid.stderr).contains("winner_discovery: participant page")
+    );
     assert_eq!(snapshot(dir.path()), first);
     venue.lock().unwrap().mode = 3;
-    let later = run(dir.path(), &args, &base, "5");
+    let later = run(
+        dir.path(),
+        &[
+            args.as_slice(),
+            &["--participant-audit", "later-audit.json"],
+        ]
+        .concat(),
+        &base,
+        "5",
+    );
     assert_eq!(later.status.code(), Some(0), "{later:?}");
     let final_state = snapshot(dir.path());
     assert_eq!(final_state.0, 2);
@@ -345,6 +396,8 @@ fn discovery_refuses_changed_or_missing_covered_series_before_trades() {
             dir.path(),
             &[
                 "winner-discovery",
+                "--participant-audit",
+                "audit.json",
                 "--defer-activation",
                 "--end-date-min",
                 "0",

@@ -23385,6 +23385,11 @@ async fn real_wrapper_seeded_publication(supersession: bool, stage2_comparison: 
         let discovered = cli(
             &[
                 "winner-discovery",
+                "--participant-audit",
+                dir.path()
+                    .join("completion-participant-audit.json")
+                    .to_str()
+                    .unwrap(),
                 "--defer-activation",
                 "--end-date-min",
                 &floor,

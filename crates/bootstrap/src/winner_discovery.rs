@@ -20,7 +20,7 @@ use crate::error::BootstrapError;
 use crate::pile::ActivationPolicy;
 use crate::wallet_discovery::{
     CollectedSource, ParticipantDiscoveryCoverage, SourceDiscoveryResult, WalletDiscoverySource,
-    apply_source_discovery, collect_source_discovery,
+    apply_source_discovery, collect_source_discovery, preflight_participant_audit,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -42,8 +42,16 @@ pub struct WinnerDiscoveryReport {
 pub async fn run_winner_discovery(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
+    participant_audit: Option<&Path>,
 ) -> Result<WinnerDiscoveryReport, BootstrapError> {
-    run_winner_discovery_with_policy(config, cache, ActivationPolicy::Immediate, None).await
+    run_winner_discovery_with_policy(
+        config,
+        cache,
+        ActivationPolicy::Immediate,
+        None,
+        participant_audit,
+    )
+    .await
 }
 
 /// Winner discovery with an explicit activation policy. The full rank-and-push
@@ -53,12 +61,23 @@ pub async fn run_winner_discovery_with_policy(
     cache: &mut WalletCache,
     activation_policy: ActivationPolicy,
     market_floor: Option<i64>,
+    participant_audit: Option<&Path>,
 ) -> Result<WinnerDiscoveryReport, BootstrapError> {
+    preflight_participant_audit(config, &config.cache_path, None, participant_audit)?;
     run_winner_discovery_with_collector(
         cache,
         activation_policy,
         async |source, now, prior| {
-            collect_source_discovery(source, config, market_floor, now, prior).await
+            collect_source_discovery(
+                source,
+                config,
+                market_floor,
+                now,
+                prior,
+                participant_audit,
+                None,
+            )
+            .await
         },
         || time::OffsetDateTime::now_utc().unix_timestamp(),
     )
@@ -433,13 +452,14 @@ async fn wait_not_before(
 }
 
 /// Collect without a WalletCache opener or mutation lock. Only immutable local
-/// read failures abort without a spool; source errors are replayed by application.
+/// read and participant audit failures abort without a spool; source errors are replayed by application.
 pub async fn collect_winner_discovery(
     config: &BootstrapConfig,
     spool_path: &Path,
     coverage_from: &Path,
     not_before: i64,
     market_floor: Option<i64>,
+    participant_audit: Option<&Path>,
 ) -> Result<(), BootstrapError> {
     collect_winner_discovery_with_collector(
         config,
@@ -447,11 +467,21 @@ pub async fn collect_winner_discovery(
         coverage_from,
         not_before,
         market_floor,
-        async |source, now, prior| {
-            collect_source_discovery(source, config, market_floor, now, prior).await
+        async |source, now, prior, audit_error| {
+            collect_source_discovery(
+                source,
+                config,
+                market_floor,
+                now,
+                prior,
+                participant_audit,
+                Some(audit_error),
+            )
+            .await
         },
         || time::OffsetDateTime::now_utc().unix_timestamp(),
         async |duration| tokio::time::sleep(duration).await,
+        participant_audit,
     )
     .await
 }
@@ -467,10 +497,13 @@ async fn collect_winner_discovery_with_collector(
         WalletDiscoverySource,
         i64,
         &mut dyn FnMut() -> Result<Option<ParticipantDiscoveryCoverage>, BootstrapError>,
+        &mut Option<BootstrapError>,
     ) -> Result<CollectedSource, BootstrapError>,
     mut now: impl FnMut() -> i64,
     mut sleep: impl AsyncFnMut(std::time::Duration),
+    participant_audit: Option<&Path>,
 ) -> Result<(), BootstrapError> {
+    preflight_participant_audit(config, coverage_from, Some(spool_path), participant_audit)?;
     pe_event_log::run_blocking(|| {
         crate::cache_migration::require_discovery_spool_roles(coverage_from, spool_path)?;
         if spool_path.try_exists()? || std::fs::symlink_metadata(spool_path).is_ok() {
@@ -497,24 +530,30 @@ async fn collect_winner_discovery_with_collector(
             now()
         };
         let mut local_error = None;
-        let result = collect(source, now, &mut || {
-            let raw = pe_event_log::run_blocking(|| {
-                crate::cache_migration::discovery_immutable_coverage(coverage_from)
-            });
-            match raw {
-                Ok(raw) => {
-                    spool.coverage_read = true;
-                    spool.prior_coverage_raw = raw.clone();
-                    crate::cache::decode_participant_discovery_coverage(raw)
+        let mut audit_error = None;
+        let result = collect(
+            source,
+            now,
+            &mut || {
+                let raw = pe_event_log::run_blocking(|| {
+                    crate::cache_migration::discovery_immutable_coverage(coverage_from)
+                });
+                match raw {
+                    Ok(raw) => {
+                        spool.coverage_read = true;
+                        spool.prior_coverage_raw = raw.clone();
+                        crate::cache::decode_participant_discovery_coverage(raw)
+                    }
+                    Err(error) => {
+                        local_error = Some(error);
+                        Err(BootstrapError::Internal)
+                    }
                 }
-                Err(error) => {
-                    local_error = Some(error);
-                    Err(BootstrapError::Internal)
-                }
-            }
-        })
+            },
+            &mut audit_error,
+        )
         .await;
-        if let Some(error) = local_error {
+        if let Some(error) = local_error.or(audit_error) {
             return Err(error);
         }
         let outcome = match result {
@@ -629,6 +668,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
         let config = BootstrapConfig {
+            cache_path: dir.path().join("cache.db"),
             leaderboard_top_n: 0,
             leaderboard_base_url: Some("invalid URL must never be fetched".into()),
             datadash_api_url: None,
@@ -636,7 +676,9 @@ mod tests {
             participant_lookback_secs: 5,
             ..BootstrapConfig::default()
         };
-        let error = run_winner_discovery(&config, &mut cache).await.unwrap_err();
+        let error = run_winner_discovery(&config, &mut cache, Some(&dir.path().join("audit.json")))
+            .await
+            .unwrap_err();
         assert_eq!(error.exit_code(), 75);
         assert!(error.to_string().contains("failed:gamma"));
     }
@@ -667,9 +709,16 @@ mod tests {
             ..BootstrapConfig::default()
         };
         let path = dir.path().join("spool.json");
-        collect_winner_discovery(&config, &path, &candidate, 0, None)
-            .await
-            .unwrap();
+        collect_winner_discovery(
+            &config,
+            &path,
+            &candidate,
+            0,
+            None,
+            Some(&dir.path().join("audit.json")),
+        )
+        .await
+        .unwrap();
         let spool = read_discovery_spool(&config, &path, None).unwrap();
         assert!(!spool.coverage_read);
         assert_eq!(spool.outcomes.len(), 1);
@@ -724,11 +773,23 @@ mod tests {
             &candidate,
             NOW,
             Some(0),
-            async |source, now, prior| {
-                fixture_collect(source, &config, prior, "success", &mut calls, now, Some(0)).await
+            async |source, now, prior, audit_error| {
+                fixture_collect(
+                    source,
+                    &config,
+                    prior,
+                    "success",
+                    &mut calls,
+                    now,
+                    Some(0),
+                    Some(&dir.path().join("audit.json")),
+                    Some(audit_error),
+                )
+                .await
             },
             || NOW,
             async |_| panic!("fixed clock must not sleep"),
+            Some(&dir.path().join("audit.json")),
         )
         .await
         .unwrap();
@@ -755,6 +816,221 @@ mod tests {
                 .covered_through_unix,
             NOW
         );
+    }
+
+    #[tokio::test]
+    async fn audit_failure_keeps_earlier_datadash_commits_without_participant_effects() {
+        for policy in [ActivationPolicy::Immediate, ActivationPolicy::Deferred] {
+            let dir = tempfile::tempdir().unwrap();
+            let fixed = dir.path().join("cache.db");
+            let mut cache = WalletCache::open(&fixed).unwrap();
+            cache
+                .set_participant_discovery_coverage(&coverage())
+                .unwrap();
+            let config = fixture_config(&fixed);
+            let audit = dir.path().join("audit.json");
+            let temp = dir
+                .path()
+                .join(format!(".audit.json.{}.tmp", std::process::id()));
+            std::fs::write(&temp, b"abandoned evidence").unwrap();
+            let mut calls = Vec::new();
+            let error = run_winner_discovery_with_collector(
+                &mut cache,
+                policy,
+                async |source, now, prior| {
+                    fixture_collect(
+                        source,
+                        &config,
+                        prior,
+                        "success",
+                        &mut calls,
+                        now,
+                        Some(0),
+                        Some(&audit),
+                        None,
+                    )
+                    .await
+                },
+                || NOW,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.exit_code(), 1);
+            assert!(matches!(error, BootstrapError::Io(_)));
+            assert_eq!(calls, SOURCES);
+            assert_eq!(
+                cache.wallet_pile_size().unwrap(),
+                2,
+                "datadash committed before participants"
+            );
+            assert_eq!(
+                cache.active_wallet_count().unwrap(),
+                if policy == ActivationPolicy::Immediate {
+                    2
+                } else {
+                    0
+                }
+            );
+            assert_eq!(
+                cache.participant_discovery_coverage().unwrap(),
+                Some(coverage())
+            );
+            let participants: i64 = cache
+                .raw_conn_for_test()
+                .query_row(
+                    "SELECT COUNT(*) FROM wallets WHERE source_bits & 256 != 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(participants, 0);
+            assert!(!audit.exists());
+            assert_eq!(std::fs::read(temp).unwrap(), b"abandoned evidence");
+        }
+    }
+
+    #[tokio::test]
+    async fn collector_audit_preflight_precedes_every_source_and_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixed = dir.path().join("cache.db");
+        let cache = WalletCache::open(&fixed).unwrap();
+        cache
+            .raw_conn_for_test()
+            .execute_batch("PRAGMA user_version=2")
+            .unwrap();
+        drop(cache);
+        let config = fixture_config(&fixed);
+        let audit = dir.path().join("audit.json");
+        std::fs::write(&audit, b"keep audit").unwrap();
+        let spool = dir.path().join("spool.json");
+        for path in [
+            None,
+            Some(audit.as_path()),
+            Some(fixed.as_path()),
+            Some(spool.as_path()),
+        ] {
+            let error = collect_winner_discovery_with_collector(
+                &config,
+                &spool,
+                &fixed,
+                NOW,
+                Some(0),
+                async |_, _, _, _| panic!("no source may be reached"),
+                || panic!("no clock may be sampled"),
+                async |_| panic!("no wait"),
+                path,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.exit_code(), 1);
+            assert!(!spool.exists());
+        }
+        assert_eq!(std::fs::read(audit).unwrap(), b"keep audit");
+    }
+
+    #[tokio::test]
+    async fn collector_audit_precedes_spool_and_local_failures_bypass_recording() {
+        for case in [
+            "success",
+            "participant_75",
+            "audit_failure",
+            "occupied_audit",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let fixed = dir.path().join("cache.db");
+            let mut cache = WalletCache::open(&fixed).unwrap();
+            cache
+                .set_participant_discovery_coverage(&coverage())
+                .unwrap();
+            cache
+                .raw_conn_for_test()
+                .execute_batch("PRAGMA user_version=2")
+                .unwrap();
+            drop(cache);
+            let before = std::fs::read(&fixed).unwrap();
+            let config = fixture_config(&fixed);
+            let audit = dir.path().join("audit.json");
+            let spool = dir.path().join("spool.json");
+            let mut calls = Vec::new();
+            let result = collect_winner_discovery_with_collector(
+                &config,
+                &spool,
+                &fixed,
+                NOW,
+                Some(0),
+                async |source, now, prior, audit_error| {
+                    if source == WalletDiscoverySource::MarketParticipants {
+                        if case == "audit_failure" {
+                            std::fs::write(
+                                dir.path()
+                                    .join(format!(".audit.json.{}.tmp", std::process::id())),
+                                b"keep temp",
+                            )
+                            .unwrap();
+                        } else if case == "occupied_audit" {
+                            std::fs::write(&audit, b"keep target").unwrap();
+                        }
+                    }
+                    let result = fixture_collect(
+                        source,
+                        &config,
+                        prior,
+                        case,
+                        &mut calls,
+                        now,
+                        Some(0),
+                        Some(&audit),
+                        Some(audit_error),
+                    )
+                    .await;
+                    assert!(!spool.exists(), "collection has not yet written a spool");
+                    if source == WalletDiscoverySource::MarketParticipants
+                        && case != "audit_failure"
+                    {
+                        assert!(audit.exists(), "audit persisted before collection returned");
+                    }
+                    result
+                },
+                || NOW,
+                async |_| panic!("fixed clock"),
+                Some(&audit),
+            )
+            .await;
+            assert_eq!(
+                std::fs::read(&fixed).unwrap(),
+                before,
+                "collection has no cache effects"
+            );
+            if ["audit_failure", "occupied_audit"].contains(&case) {
+                assert_eq!(result.unwrap_err().exit_code(), 1);
+                assert!(!spool.exists());
+                if case == "occupied_audit" {
+                    assert_eq!(std::fs::read(&audit).unwrap(), b"keep target");
+                } else {
+                    assert!(!audit.exists());
+                }
+            } else {
+                result.unwrap();
+                let audit: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
+                assert_eq!(
+                    audit["record"]["status"],
+                    if case == "success" {
+                        "ok"
+                    } else {
+                        "failed:gamma"
+                    }
+                );
+                let spool = read_discovery_spool(&config, &spool, Some(0)).unwrap();
+                let mut cache = WalletCache::open(&fixed).unwrap();
+                let applied = apply_discovery_spool(spool, &mut cache);
+                if case == "success" {
+                    applied.unwrap();
+                } else {
+                    assert_eq!(applied.unwrap_err().exit_code(), 75);
+                }
+            }
+        }
     }
 
     fn wallet(n: u8) -> String {
@@ -796,6 +1072,7 @@ mod tests {
             Ok(FetchedPage { body: serde_json::to_vec(&json!({"data": [{"proxy_wallet": wallet(3), "timestamp": NOW - 1}, {"proxy_wallet": wallet(4), "timestamp": NOW - 2}], "pagination": {"limit":1000,"offset":0,"has_more":false,"next_cursor":null}})).unwrap(), observed_at_unix: NOW, received_at_unix: NOW, source_at_unix: Some(NOW) })
         }
     }
+    #[allow(clippy::too_many_arguments)]
     async fn fixture_collect(
         source: WalletDiscoverySource,
         config: &BootstrapConfig,
@@ -804,11 +1081,22 @@ mod tests {
         calls: &mut Vec<WalletDiscoverySource>,
         now: i64,
         market_floor: Option<i64>,
+        participant_audit: Option<&Path>,
+        audit_error: Option<&mut Option<BootstrapError>>,
     ) -> Result<CollectedSource, BootstrapError> {
         calls.push(source);
         match source {
             WalletDiscoverySource::Leaderboard => {
-                collect_source_discovery(source, config, market_floor, now, read_prior).await
+                collect_source_discovery(
+                    source,
+                    config,
+                    market_floor,
+                    now,
+                    read_prior,
+                    participant_audit,
+                    audit_error,
+                )
+                .await
             }
             WalletDiscoverySource::Datadash => {
                 if config.datadash_api_url.is_none() {
@@ -877,6 +1165,8 @@ mod tests {
                             digest: "fixture".into(),
                         })
                     },
+                    participant_audit,
+                    audit_error,
                 )
                 .await
             }
@@ -966,7 +1256,18 @@ mod tests {
             &mut plain,
             ActivationPolicy::Deferred,
             async |source, now, prior| {
-                fixture_collect(source, &config, prior, case, &mut plain_calls, now, Some(0)).await
+                fixture_collect(
+                    source,
+                    &config,
+                    prior,
+                    case,
+                    &mut plain_calls,
+                    now,
+                    Some(0),
+                    Some(&dir.path().join("plain-audit.json")),
+                    None,
+                )
+                .await
             },
             || NOW,
         )
@@ -986,11 +1287,23 @@ mod tests {
             &paths[1],
             NOW,
             Some(0),
-            async |source, now, prior| {
-                fixture_collect(source, &config, prior, case, &mut split_calls, now, Some(0)).await
+            async |source, now, prior, audit_error| {
+                fixture_collect(
+                    source,
+                    &config,
+                    prior,
+                    case,
+                    &mut split_calls,
+                    now,
+                    Some(0),
+                    Some(&dir.path().join("audit.json")),
+                    Some(audit_error),
+                )
+                .await
             },
             || NOW,
             async |_| panic!("fixed clock must not sleep"),
+            Some(&dir.path().join("audit.json")),
         )
         .await
         .unwrap();
@@ -1245,9 +1558,16 @@ mod tests {
         };
         let listing = list();
         let spool = dir.path().join("spool.json");
-        collect_winner_discovery(&disabled_config(&fixed), &spool, &fixed, i64::MAX, None)
-            .await
-            .unwrap();
+        collect_winner_discovery(
+            &disabled_config(&fixed),
+            &spool,
+            &fixed,
+            i64::MAX,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read(&fixed).unwrap(), before);
         assert_eq!(
             std::fs::metadata(&fixed).unwrap().modified().unwrap(),
@@ -1258,9 +1578,16 @@ mod tests {
         let mut enabled = disabled_config(&fixed);
         enabled.participant_lookback_secs = 100;
         enabled.gamma_base_url = "invalid URL fails before network".into();
-        collect_winner_discovery(&enabled, &spool, &fixed, 0, None)
-            .await
-            .unwrap();
+        collect_winner_discovery(
+            &enabled,
+            &spool,
+            &fixed,
+            0,
+            None,
+            Some(&dir.path().join("audit.json")),
+        )
+        .await
+        .unwrap();
         let collected: DiscoverySpool =
             serde_json::from_slice(&std::fs::read(&spool).unwrap()).unwrap();
         assert!(collected.coverage_read);
@@ -1270,14 +1597,22 @@ mod tests {
             modified
         );
         std::fs::remove_file(&spool).unwrap();
+        std::fs::remove_file(dir.path().join("audit.json")).unwrap();
         assert_eq!(list(), listing);
         let conn = rusqlite::Connection::open(&fixed).unwrap();
         conn.execute_batch("PRAGMA user_version=1").unwrap();
         drop(conn);
         assert!(
-            collect_winner_discovery(&fixture_config(&fixed), &spool, &fixed, 0, None)
-                .await
-                .is_err()
+            collect_winner_discovery(
+                &fixture_config(&fixed),
+                &spool,
+                &fixed,
+                0,
+                None,
+                Some(&dir.path().join("audit.json")),
+            )
+            .await
+            .is_err()
         );
         assert!(!spool.exists());
     }
@@ -1312,9 +1647,16 @@ mod tests {
             existing.clone(),
         ] {
             assert!(
-                collect_winner_discovery(&config, &file, &fixed, 0, None)
-                    .await
-                    .is_err(),
+                collect_winner_discovery(
+                    &config,
+                    &file,
+                    &fixed,
+                    0,
+                    None,
+                    Some(&dir.path().join("audit.json")),
+                )
+                .await
+                .is_err(),
                 "{}",
                 file.display()
             );
@@ -1327,9 +1669,16 @@ mod tests {
             .join(format!(".temp_collision.json.{}.tmp", std::process::id()));
         std::fs::hard_link(&fixed, temp).unwrap();
         assert!(
-            collect_winner_discovery(&config, &spool, &fixed, 0, None)
-                .await
-                .is_err()
+            collect_winner_discovery(
+                &config,
+                &spool,
+                &fixed,
+                0,
+                None,
+                Some(&dir.path().join("audit.json")),
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -1368,11 +1717,18 @@ mod tests {
         config.gamma_base_url = "invalid URL fails before network".into();
         let spool = dir.path().join("spool.json");
         assert!(
-            collect_winner_discovery(&config, &spool, &fixed, 0, None)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("malformed")
+            collect_winner_discovery(
+                &config,
+                &spool,
+                &fixed,
+                0,
+                None,
+                Some(&dir.path().join("audit.json")),
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("malformed")
         );
         assert!(!spool.exists());
     }
@@ -1499,7 +1855,7 @@ mod tests {
                     &candidate,
                     NOW,
                     market_floor,
-                    async |source, now, read_prior| {
+                    async |source, now, read_prior, audit_error| {
                         fixture_collect(
                             source,
                             &config,
@@ -1508,11 +1864,14 @@ mod tests {
                             &mut calls,
                             now,
                             market_floor,
+                            Some(&dir.path().join("audit.json")),
+                            Some(audit_error),
                         )
                         .await
                     },
                     || NOW,
                     async |_| panic!("fixed clock must not sleep"),
+                    Some(&dir.path().join("audit.json")),
                 )
                 .await
                 .unwrap();
@@ -1672,14 +2031,26 @@ mod tests {
             &fixed,
             NOW + 120,
             None,
-            async |source, now, prior| {
-                fixture_collect(source, &config, prior, "success", &mut calls, now, None).await
+            async |source, now, prior, audit_error| {
+                fixture_collect(
+                    source,
+                    &config,
+                    prior,
+                    "success",
+                    &mut calls,
+                    now,
+                    None,
+                    Some(&dir.path().join("audit.json")),
+                    Some(audit_error),
+                )
+                .await
             },
             || clock.get(),
             async |duration| {
                 waits.set(waits.get() + 1);
                 clock.set(clock.get() + i64::try_from(duration.as_secs()).unwrap());
             },
+            Some(&dir.path().join("audit.json")),
         )
         .await
         .unwrap();
@@ -1772,9 +2143,16 @@ with sqlite3.connect(':memory:') as c:
             config.participant_lookback_secs = 100;
             config.gamma_base_url = "invalid URL fails before network".into();
             let spool = dir.path().join("spool.json");
-            collect_winner_discovery(&config, &spool, &fixed, 0, None)
-                .await
-                .unwrap();
+            collect_winner_discovery(
+                &config,
+                &spool,
+                &fixed,
+                0,
+                None,
+                Some(&dir.path().join("audit.json")),
+            )
+            .await
+            .unwrap();
             let collected: DiscoverySpool =
                 serde_json::from_slice(&std::fs::read(&spool).unwrap()).unwrap();
             assert!(collected.coverage_read);

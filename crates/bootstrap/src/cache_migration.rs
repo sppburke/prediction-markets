@@ -5186,6 +5186,57 @@ pub(crate) fn require_discovery_spool_roles(
     require_distinct_files(&roles)
 }
 
+/// Refuse audit aliases and occupied targets before any discovery request.
+pub(crate) fn require_participant_audit_roles(
+    cache: &Path,
+    spool: Option<&Path>,
+    audit: &Path,
+) -> Result<(), BootstrapError> {
+    require_absent_participant_audit(audit)?;
+    let temp = atomic_write_temp_path(audit);
+    let lock = lock_target_path(cache)?;
+    // SQLite sidecars follow the physical cache; cleanup also uses its spelling.
+    let physical = std::fs::canonicalize(cache)?;
+    let mut sidecars = Vec::new();
+    for base in [cache, physical.as_path()] {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let path = sidecar_path(base, suffix);
+            let intended = canonical_intended_path(&path)?;
+            if sidecars.iter().all(|(seen, _)| *seen != intended) {
+                sidecars.push((intended, path));
+            }
+        }
+    }
+    let mut roles = vec![
+        ("discovery cache", cache),
+        ("participant audit", audit),
+        ("participant audit temporary file", temp.as_path()),
+        ("cache mutation lock", lock.as_path()),
+    ];
+    roles.extend(
+        sidecars
+            .iter()
+            .map(|(_, path)| ("cache sidecar", path.as_path())),
+    );
+    let spool_temp = spool.map(atomic_write_temp_path);
+    if let (Some(spool), Some(spool_temp)) = (spool, spool_temp.as_deref()) {
+        roles.push(("discovery spool", spool));
+        roles.push(("discovery spool temporary file", spool_temp));
+    }
+    require_distinct_files(&roles)
+}
+
+pub(crate) fn require_absent_participant_audit(path: &Path) -> Result<(), BootstrapError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => invalid(format!(
+            "participant audit {} is already occupied",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Refuse marker aliases and occupied paths before the cache mutation lock or open.
 pub fn require_ready_file_roles(
     cache: &Path,

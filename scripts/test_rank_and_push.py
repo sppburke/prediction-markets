@@ -2183,6 +2183,13 @@ Path('stage2_done').write_text('yes')
             "now = int(time.time())\n"
             "sub, db = a[0], opt('--db')\n"
             "if sub == 'winner-discovery':\n"
+            "    if '--apply-from' in a:\n"
+            "        assert '--participant-audit' not in a, 'apply must not collect an audit'\n"
+            "    else:\n"
+            "        assert opt('--participant-audit'), 'collecting invocation needs an audit path'\n"
+            "        if not opt('--collect-to') and os.environ.get('STUB_DISCOVERY_AUDIT_FAIL') == '1': raise SystemExit(1)\n"
+            "        with Path(opt('--participant-audit')).open('x') as audit: json.dump({'version': 1, 'attempt': a}, audit)\n"
+            "        if not opt('--collect-to') and os.environ.get('STUB_DISCOVERY_ORDINARY_EXIT'): raise SystemExit(int(os.environ['STUB_DISCOVERY_ORDINARY_EXIT']))\n"
             "    if opt('--collect-to'):\n"
             "        Path(opt('--collect-to')).write_text(json.dumps({'collector': os.getpid()}))\n"
             "        raise SystemExit(int(os.environ.get('STUB_DISCOVERY_COLLECT_EXIT', '0')))\n"
@@ -2921,10 +2928,26 @@ if mode == 'block':
 if mode == 'orphan':
     with open('discovery-release.pipe') as pipe: pipe.read()
 code = int(os.environ.get('STUB_DISCOVERY_COLLECT_EXIT', '0'))
+with Path(a[a.index('--participant-audit') + 1]).open('x') as audit: json.dump({'version': 1, 'attempt': a}, audit)
 if not code: out.write_text(json.dumps({'collector': os.getpid()}))
 Path('discovery_finished').write_text(str(os.getpid()))
 raise SystemExit(code)
 """)
+
+    def _assert_discovery_audits(self, calls):
+        paths = []
+        for call in calls:
+            if "--apply-from" in call:
+                self.assertNotIn("--participant-audit", call)
+                continue
+            self.assertEqual(call.count("--participant-audit"), 1)
+            path = self.root / call[call.index("--participant-audit") + 1]
+            self.assertTrue(path.name.startswith("participant_audit."), path)
+            self.assertTrue(path.is_file(), path)
+            self.assertEqual(json.loads(path.read_text())["version"], 1)
+            paths.append(path)
+        self.assertEqual(len(set(paths)), len(paths), "every collecting attempt has a fresh audit")
+        return paths
 
     def test_discovery_spool_overlaps_staging_and_applies_after_probe_before_activation(self):
         self._prepare_incremental_fixture(two_file=True)
@@ -2946,6 +2969,7 @@ raise SystemExit(code)
         self.assertLess(at("--apply-from"), at("[activate-next] running:"))
         calls = self._discovery_calls()
         self.assertEqual(len(calls), 2)
+        self._assert_discovery_audits(calls)
         spool = calls[0][calls[0].index("--collect-to") + 1]
         self.assertEqual(calls[1][calls[1].index("--apply-from") + 1], spool)
         for lock in ("loop.lock", "data/eval-results/.rank_and_push.lock"):
@@ -2959,6 +2983,7 @@ raise SystemExit(code)
                 result = self._run(exit_env={"STUB_DISCOVERY_COLLECT_EXIT":str(collect_code),"STUB_DISCOVERY_APPLY_EXIT":str(apply_code)})
                 self.assertEqual(result.returncode,expected,result.stdout + result.stderr)
                 calls=self._discovery_calls()
+                self._assert_discovery_audits(calls)
                 self.assertEqual(sum("--collect-to" not in call and "--apply-from" not in call for call in calls),int(ordinary))
                 self.assertIn(f"collector exited {collect_code}",result.stdout)
                 if apply_code==77 and not collect_code: self.assertIn("apply exited 77",result.stdout)
@@ -3022,6 +3047,7 @@ raise SystemExit(code)
         self.assertIn('--collect-to',calls[0]);self.assertIn('--apply-from',calls[1])
         self.assertNotIn('--collect-to',calls[2]);self.assertNotIn('--apply-from',calls[2])
         self.assertIn('apply exited 77',result.stdout)
+        self._assert_discovery_audits(calls)
 
     def test_discovery_spool_retry_existing_candidate_is_serial(self):
         self._prepare_incremental_fixture(two_file=True)
@@ -3033,6 +3059,37 @@ raise SystemExit(code)
         calls=self._discovery_calls()[before:]
         self.assertEqual(len(calls),1)
         self.assertNotIn("--collect-to",calls[0]);self.assertNotIn("--apply-from",calls[0])
+
+    def test_discovery_audit_serial_retry_preserves_earlier_attempts(self):
+        self._prepare_incremental_fixture(two_file=True)
+        stopped = self._run(exit_env={"STUB_DISCOVERY_COLLECT_EXIT": "1", "STUB_DISCOVERY_ORDINARY_EXIT": "75"})
+        self.assertEqual(stopped.returncode, 75, stopped.stdout + stopped.stderr)
+        self.assertNotIn("activate-next", self._bootstrap_ops())
+        earlier = {path: path.read_bytes() for path in self._assert_discovery_audits(self._discovery_calls())}
+        self.assertEqual(len(earlier), 2, "collector and ordinary fallback each retain evidence")
+        before = len(self._discovery_calls())
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 2, resumed.stdout + resumed.stderr)
+        calls = self._discovery_calls()
+        self.assertEqual(len(calls[before:]), 1)
+        self.assertNotIn("--collect-to", calls[-1])
+        self._assert_discovery_audits(calls)
+        for path, data in earlier.items(): self.assertEqual(path.read_bytes(), data)
+
+    def test_discovery_audit_ordinary_failure_stops_before_activation(self):
+        self._prepare_incremental_fixture(two_file=True)
+        result = self._run(exit_env={"STUB_DISCOVERY_COLLECT_EXIT": "1", "STUB_DISCOVERY_AUDIT_FAIL": "1"})
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        calls = self._discovery_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--collect-to", calls[0])
+        self.assertNotIn("--collect-to", calls[1])
+        self.assertNotIn("--apply-from", calls[1])
+        old = self._assert_discovery_audits(calls[:1])[0]
+        attempted = self.root / calls[1][calls[1].index("--participant-audit") + 1]
+        self.assertNotEqual(old, attempted)
+        self.assertFalse(attempted.exists())
+        self.assertNotIn("activate-next", self._bootstrap_ops())
 
     def test_discovery_spool_orphan_finishing_last_cannot_supply_new_attempt(self):
         import fcntl
