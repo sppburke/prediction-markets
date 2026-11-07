@@ -165,8 +165,28 @@ pub async fn run_market_scope(
     pinned: Option<&[ScopeSeries]>,
 ) -> Result<MarketScope, BootstrapError> {
     let scope = recent_market_scope(config, end_date_min_unix, recurrences, pinned).await?;
+    write_market_scope(out, scope)
+}
+
+/// The stage's ranking list must hold markets: an empty scope fails before anything is written.
+fn write_market_scope(out: &Path, scope: MarketScope) -> Result<MarketScope, BootstrapError> {
+    require_markets(&scope)?;
     crate::cache_migration::atomic_write_json(out, &scope)?;
     Ok(scope)
+}
+
+/// A sweep reports what Gamma lists, even no market; a caller that needs markets fails closed here.
+pub(crate) fn require_markets(scope: &MarketScope) -> Result<(), BootstrapError> {
+    if scope.condition_ids.is_empty() {
+        return Err(no_markets());
+    }
+    Ok(())
+}
+
+pub(crate) fn no_markets() -> BootstrapError {
+    BootstrapError::Gamma {
+        message: "market-scope: the requested series list no markets".to_owned(),
+    }
 }
 
 /// Sweep recent markets with page provenance, without writing a file.
@@ -341,12 +361,6 @@ async fn sweep_market_scope<F: ScopeFetcher + Sync>(
             "market-scope: series walked"
         );
     }
-    if condition_ids.is_empty() {
-        return Err(BootstrapError::Gamma {
-            message: "market-scope: the requested series list no markets".to_owned(),
-        });
-    }
-
     let condition_ids: Vec<String> = condition_ids.into_iter().collect();
     let digest = format!("{:x}", Sha256::digest(condition_ids.join("\n").as_bytes()));
     Ok(MarketScope {
@@ -1130,10 +1144,70 @@ mod tests {
             sweep(no_series).await.unwrap_err(),
             sweep(bad_row).await.unwrap_err(),
             sweep(bad_id).await.unwrap_err(),
-            sweep(no_labels).await.unwrap_err(),
+            require_markets(&sweep(no_labels).await.unwrap()).unwrap_err(),
         ] {
             assert_eq!(error.exit_code(), 1, "{error}");
         }
+    }
+
+    /// A newly listed series with no events yet sweeps to an empty scope that keeps its pages; only a caller
+    /// that needs markets (the market-scope stage, discovery's covered sweep) turns that into exit 1.
+    #[tokio::test]
+    async fn empty_series_sweep_keeps_its_pages_and_only_require_markets_fails() {
+        let serve = |url: &str, _| {
+            let body = if url == series_url(0) {
+                json!([{"id": "13005", "slug": "polyv2-soak-btc-up-or-down-15m", "recurrence": "15m"}])
+            } else if url == events_url(BASE, "13005", FLOOR_ISO, None).unwrap() {
+                json!({"events": [], "next_cursor": null})
+            } else {
+                panic!("unexpected URL {url}");
+            };
+            Ok(serde_json::to_vec(&body).unwrap())
+        };
+        let scope = sweep(serve).await.unwrap();
+        assert!(scope.condition_ids.is_empty());
+        assert_eq!(scope.count, 0);
+        assert_eq!(scope.digest, format!("{:x}", Sha256::digest(b"")));
+        assert_eq!(
+            scope.series,
+            vec![ScopeSeries {
+                id: "13005".into(),
+                slug: Some("polyv2-soak-btc-up-or-down-15m".into()),
+            }]
+        );
+        assert_eq!(
+            scope.pages.len(),
+            2,
+            "the listing page and the empty events page"
+        );
+        let error = require_markets(&scope).unwrap_err();
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(error.to_string(), no_markets().to_string());
+
+        // The market-scope stage refuses it before writing: no new file, and an existing one is untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.json");
+        assert_eq!(
+            write_market_scope(&fresh, scope.clone())
+                .unwrap_err()
+                .exit_code(),
+            1
+        );
+        assert!(!fresh.exists());
+        let existing = dir.path().join("market_scope.json");
+        std::fs::write(&existing, b"prior scope").unwrap();
+        assert_eq!(
+            write_market_scope(&existing, scope.clone())
+                .unwrap_err()
+                .exit_code(),
+            1
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), b"prior scope");
+        let mut listed = scope;
+        listed.condition_ids = vec![condition(1)];
+        write_market_scope(&existing, listed.clone()).unwrap();
+        let written: Value = serde_json::from_slice(&std::fs::read(&existing).unwrap()).unwrap();
+        assert_eq!(written["condition_ids"], json!(listed.condition_ids));
     }
 
     #[tokio::test]

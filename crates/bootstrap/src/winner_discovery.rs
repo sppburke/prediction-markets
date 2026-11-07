@@ -647,7 +647,7 @@ mod tests {
         ParticipantDiscoveryCoverage, ParticipantScope, collect_participants,
     };
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     const NOW: i64 = 1_800_057_600; // UTC midnight: the not-before test crosses it.
 
@@ -843,9 +843,24 @@ mod tests {
                                 message: "fixture failure".into(),
                             });
                         }
-                        Ok((coverage().scope.series.unwrap(), Vec::new()))
+                        let mut listed = coverage().scope.series.unwrap();
+                        if case == "empty_addition" {
+                            listed.push(ScopeSeries {
+                                id: "13005".into(),
+                                slug: Some("polyv2-soak-btc-up-or-down-15m".into()),
+                            });
+                        }
+                        Ok((listed, Vec::new()))
                     },
                     |lo, series| async move {
+                        // A newly listed series without markets, or a covered sweep that comes back empty.
+                        let empty = case == "empty_covered"
+                            || (case == "empty_addition" && series.iter().all(|s| s.id == "13005"));
+                        let condition_ids = if empty {
+                            vec![]
+                        } else {
+                            vec![format!("0x{:064x}", 1)]
+                        };
                         Ok(MarketScope {
                             version: 1,
                             source_id: "fixture",
@@ -857,8 +872,8 @@ mod tests {
                             completed_at_unix: NOW,
                             series,
                             pages: vec![],
-                            condition_ids: vec![format!("0x{:064x}", 1)],
-                            count: 1,
+                            count: u64::try_from(condition_ids.len()).unwrap(),
+                            condition_ids,
                             digest: "fixture".into(),
                         })
                     },
@@ -1112,6 +1127,28 @@ mod tests {
             assert_eq!(plain_calls, vec![SOURCES[0]]);
             assert_eq!(split_calls, plain_calls);
         }
+        if case == "empty_addition" || case == "empty_covered" {
+            let ids: BTreeSet<String> = plain
+                .participant_discovery_coverage()
+                .unwrap()
+                .unwrap()
+                .scope
+                .series
+                .unwrap()
+                .into_iter()
+                .map(|series| series.id)
+                .collect();
+            let expected: &[&str] = if case == "empty_addition" {
+                &["13005", "7"]
+            } else {
+                &["7"]
+            };
+            assert_eq!(
+                ids,
+                expected.iter().map(|id| (*id).to_owned()).collect(),
+                "coverage {case}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1126,6 +1163,13 @@ mod tests {
     #[tokio::test]
     async fn discovery_spool_participant_failure_preserves_earlier_commits() {
         parity("participant_75", 75, &[128, 128]).await;
+    }
+    /// 2026-11-06: newly listed series with no markets join the coverage through the spool as in-process; an empty
+    /// covered sweep still fails the participant source with exit 75 and leaves the coverage alone.
+    #[tokio::test]
+    async fn discovery_spool_accepts_an_empty_addition_and_fails_an_empty_covered_sweep() {
+        parity("empty_addition", 0, &[128, 128, 256]).await;
+        parity("empty_covered", 75, &[128, 128]).await;
     }
     #[tokio::test]
     async fn discovery_spool_leaderboard_terminal_stops_requests_and_skips_binding() {
