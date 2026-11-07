@@ -1128,6 +1128,7 @@ mod tests {
                     crate::wallet_discovery::WalletDiscoverySource::MarketParticipants,
                     &cfg,
                     &mut cache,
+                    None,
                 ))
                 .unwrap();
             assert_eq!(result.status, "disabled");

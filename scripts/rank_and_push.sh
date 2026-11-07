@@ -868,10 +868,15 @@ start_market_scope() {
   SCOPE_PID=$!
 }
 
+participant_audit_path() {
+  echo "$OUT_DIR/participant_audit.$$.$(date -u +%Y%m%dT%H%M%S%NZ).json"
+}
+
 start_winner_discovery() {
   DISCOVERY_SPOOL="$OUT_DIR/discovery_spool.$$.$(date -u +%Y%m%dT%H%M%S%NZ).json"
   local -a command=("$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation
     --collect-to "$DISCOVERY_SPOOL" --coverage-from "$FIXED_DB"
+    --participant-audit "$(participant_audit_path)"
     --not-before "$((RANK_WINDOW_END_UNIX + FILL_WINDOW_SECS))"
     "${DISCOVERY_SCOPE_ARGS[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}")
   echo "   [winner-discovery] collecting beside cache-stage: ${command[*]}"
@@ -1053,7 +1058,7 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
       fi
       if [[ "$ordinary_discovery" == "1" ]]; then
         run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation \
-          "${DISCOVERY_SCOPE_ARGS[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+          --participant-audit "$(participant_audit_path)" "${DISCOVERY_SCOPE_ARGS[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
       fi
     else
       echo "FATAL: unexpected activation batch probe output: $batch_recorded" >&2; exit 2

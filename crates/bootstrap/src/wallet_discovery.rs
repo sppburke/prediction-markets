@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::path::Path;
 use std::time::Duration;
 
 use futures::{StreamExt, stream};
@@ -220,8 +221,17 @@ pub async fn run_source_discovery(
     source: WalletDiscoverySource,
     config: &BootstrapConfig,
     cache: &mut WalletCache,
+    participant_audit: Option<&Path>,
 ) -> Result<SourceDiscoveryResult, BootstrapError> {
-    run_source_discovery_with_policy(source, config, cache, ActivationPolicy::Immediate, None).await
+    run_source_discovery_with_policy(
+        source,
+        config,
+        cache,
+        ActivationPolicy::Immediate,
+        None,
+        participant_audit,
+    )
+    .await
 }
 
 /// Source discovery with an explicit activation policy. The rank-and-push
@@ -232,11 +242,21 @@ pub async fn run_source_discovery_with_policy(
     cache: &mut WalletCache,
     activation_policy: ActivationPolicy,
     market_floor: Option<i64>,
+    participant_audit: Option<&Path>,
 ) -> Result<SourceDiscoveryResult, BootstrapError> {
+    if source == WalletDiscoverySource::MarketParticipants || participant_audit.is_some() {
+        preflight_participant_audit(config, &config.cache_path, None, participant_audit)?;
+    }
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    let collected = collect_source_discovery(source, config, market_floor, now, || {
-        pe_event_log::run_blocking(|| cache.participant_discovery_coverage())
-    })
+    let collected = collect_source_discovery(
+        source,
+        config,
+        market_floor,
+        now,
+        || pe_event_log::run_blocking(|| cache.participant_discovery_coverage()),
+        participant_audit,
+        None,
+    )
     .await?;
     let disabled = source == WalletDiscoverySource::MarketParticipants
         && matches!(collected, CollectedSource::Disabled);
@@ -262,12 +282,41 @@ pub(crate) enum CollectedSource {
     Disabled,
 }
 
+pub(crate) fn preflight_participant_audit(
+    config: &BootstrapConfig,
+    cache: &Path,
+    spool: Option<&Path>,
+    participant_audit: Option<&Path>,
+) -> Result<(), BootstrapError> {
+    require_participant_audit(config, participant_audit)?;
+    if let Some(path) = participant_audit {
+        pe_event_log::run_blocking(|| {
+            crate::cache_migration::require_participant_audit_roles(cache, spool, path)
+        })?;
+    }
+    Ok(())
+}
+
+fn require_participant_audit(
+    config: &BootstrapConfig,
+    participant_audit: Option<&Path>,
+) -> Result<(), BootstrapError> {
+    if config.participant_lookback_secs > 0 && participant_audit.is_none() {
+        return Err(BootstrapError::Invalid {
+            message: "enabled participant discovery requires --participant-audit".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) async fn collect_source_discovery(
     source: WalletDiscoverySource,
     config: &BootstrapConfig,
     market_floor: Option<i64>,
     now: i64,
     prior: impl FnOnce() -> Result<Option<ParticipantDiscoveryCoverage>, BootstrapError>,
+    participant_audit: Option<&Path>,
+    audit_error: Option<&mut Option<BootstrapError>>,
 ) -> Result<CollectedSource, BootstrapError> {
     match source {
         WalletDiscoverySource::Leaderboard => {
@@ -327,6 +376,8 @@ pub(crate) async fn collect_source_discovery(
                     )
                     .await
                 },
+                participant_audit,
+                audit_error,
             )
             .await
         }
@@ -384,6 +435,7 @@ struct ParticipantRecord {
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn run_participant_discovery<F, L, S, Listed, Swept>(
     config: &BootstrapConfig,
     cache: &mut WalletCache,
@@ -392,6 +444,7 @@ async fn run_participant_discovery<F, L, S, Listed, Swept>(
     make_fetcher: impl FnOnce() -> Result<F, BootstrapError>,
     list: L,
     sweep: S,
+    participant_audit: Option<&Path>,
 ) -> Result<SourceDiscoveryResult, BootstrapError>
 where
     F: ScopeFetcher + Sync,
@@ -407,6 +460,8 @@ where
         make_fetcher,
         list,
         sweep,
+        participant_audit,
+        None,
     )
     .await?;
     let disabled = matches!(collected, CollectedSource::Disabled);
@@ -417,6 +472,7 @@ where
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn collect_participants<F, L, S, Listed, Swept>(
     config: &BootstrapConfig,
     read_prior: impl FnOnce() -> Result<Option<ParticipantDiscoveryCoverage>, BootstrapError>,
@@ -424,6 +480,8 @@ pub(crate) async fn collect_participants<F, L, S, Listed, Swept>(
     make_fetcher: impl FnOnce() -> Result<F, BootstrapError>,
     list: L,
     mut sweep: S,
+    participant_audit: Option<&Path>,
+    audit_error: Option<&mut Option<BootstrapError>>,
 ) -> Result<CollectedSource, BootstrapError>
 where
     F: ScopeFetcher + Sync,
@@ -432,6 +490,7 @@ where
     S: FnMut(i64, Vec<ScopeSeries>) -> Swept,
     Swept: Future<Output = Result<MarketScope, BootstrapError>>,
 {
+    require_participant_audit(config, participant_audit)?;
     let recurrences = canonical_recurrences(&config.market_recurrences)?;
     let prior = if config.participant_lookback_secs == 0 {
         None
@@ -574,8 +633,8 @@ where
         }
     };
     record.wallet_count = wallets.len();
-    // One summary line plus one line per page and chunk: the whole record measured 179 KB, past journald's
-    // 48 KB LineMax. Each trades page URL lists its condition ids; the scope digest covers them all.
+    // Persist the retained evidence before application; keep the journal to one summary.
+    // Each trades page URL lists its condition ids; the scope digest covers them all.
     let scope = record.market_scope.as_ref();
     let summary = serde_json::json!({
         "source_id": record.source_id,
@@ -602,16 +661,38 @@ where
         "trades_pages": record.trades_pages.len(),
         "chunks": record.chunks.len(),
     });
-    tracing::info!(record = %summary, "winner_discovery: participants");
-    for chunk in &record.chunks {
-        tracing::info!(chunk = %serde_json::to_string(chunk)?, "winner_discovery: participant chunk");
-    }
-    for page in scope
-        .into_iter()
-        .flat_map(|s| &s.pages)
-        .chain(&record.trades_pages)
-    {
-        tracing::info!(page = %serde_json::to_string(page)?, "winner_discovery: participant page");
+    if let Some(path) = participant_audit {
+        let persisted = pe_event_log::run_blocking(|| {
+            crate::cache_migration::require_absent_participant_audit(path)?;
+            // Serialized from the retained records directly: a Value tree of every page would
+            // multiply the transient memory of a ~25 MB record.
+            let audit = ParticipantAudit {
+                version: 1,
+                record: &summary,
+                chunks: &record.chunks,
+                pages: scope
+                    .into_iter()
+                    .flat_map(|s| &s.pages)
+                    .chain(&record.trades_pages)
+                    .collect(),
+            };
+            crate::cache_migration::atomic_write_json(path, &audit)?;
+            let bytes = std::fs::read(path)?;
+            Ok::<_, BootstrapError>((format!("{:x}", Sha256::digest(&bytes)), bytes.len()))
+        });
+        let (sha256, bytes) = persisted.map_err(|error| {
+            // Collection must not turn a local audit failure into a terminal spool outcome.
+            if let Some(local_error) = audit_error {
+                *local_error = Some(error);
+                BootstrapError::Internal
+            } else {
+                error
+            }
+        })?;
+        tracing::info!(record = %summary, audit_path = %path.display(), audit_sha256 = %sha256,
+            audit_bytes = bytes, "winner_discovery: participants");
+    } else {
+        tracing::info!(record = %summary, "winner_discovery: participants");
     }
     if record.status == "disabled" {
         return Ok(CollectedSource::Disabled);
@@ -667,6 +748,15 @@ fn participant_failure(reason: &'static str, error: &impl std::fmt::Display) -> 
 
 pub(crate) fn valid_participant_window(lo: i64, now: i64) -> bool {
     lo >= 0 && lo < now && lo >= now.saturating_sub(PARTICIPANT_WINDOW_SECS)
+}
+
+/// Format version 1 of the participant audit file (`docs/_GLOSSARY.md` `participant_audit`).
+#[derive(Serialize)]
+struct ParticipantAudit<'a> {
+    version: u32,
+    record: &'a serde_json::Value,
+    chunks: &'a [ParticipantChunk],
+    pages: Vec<&'a ScopePage>,
 }
 
 #[derive(Serialize)]
@@ -850,9 +940,14 @@ mod tests {
             participant_lookback_secs: 5,
             ..BootstrapConfig::default()
         };
-        let result = run_source_discovery(WalletDiscoverySource::Leaderboard, &config, &mut cache)
-            .await
-            .unwrap();
+        let result = run_source_discovery(
+            WalletDiscoverySource::Leaderboard,
+            &config,
+            &mut cache,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!((result.unique_wallets, result.activated), (0, 0));
         assert_eq!(cache.wallet_pile_size().unwrap(), 0);
         let fetcher = fetcher(|_: &str| {
@@ -869,6 +964,7 @@ mod tests {
             || Ok(fetcher),
             listing,
             |_, _| async { Ok(scope(1)) },
+            Some(&audit_path(&_dir)),
         )
         .await
         .unwrap();
@@ -893,7 +989,7 @@ mod tests {
             ..BootstrapConfig::default()
         };
 
-        let r = run_source_discovery(WalletDiscoverySource::Datadash, &config, &mut cache)
+        let r = run_source_discovery(WalletDiscoverySource::Datadash, &config, &mut cache, None)
             .await
             .unwrap();
         assert_eq!(r.unique_wallets, 0);
@@ -988,6 +1084,219 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
         (dir, cache)
+    }
+
+    fn audit_path(dir: &TempDir) -> std::path::PathBuf {
+        (0..)
+            .map(|n| dir.path().join(format!("audit-{n}.json")))
+            .find(|path| !path.exists())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn participants_missing_audit_fails_before_reading_or_fetching() {
+        let (_dir, mut cache) = tmp_cache();
+        let error = run_participant_discovery(
+            &config(5),
+            &mut cache,
+            ActivationPolicy::Immediate,
+            NOW,
+            || Ok(fetcher(|_: &str| panic!("no trades"))),
+            || async { panic!("no listing") },
+            |_, _| async { panic!("no sweep") },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.to_string().contains("requires --participant-audit"));
+        assert_eq!(cache.wallet_pile_size().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn participants_disabled_audit_is_optional_and_journal_metadata_matches() {
+        for supplied in [false, true] {
+            let (dir, mut cache) = tmp_cache();
+            let path = dir.path().join("disabled.json");
+            let log = AuditLog::default();
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_writer(move || writer.clone())
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let r = run_participant_discovery(
+                &config(0),
+                &mut cache,
+                ActivationPolicy::Immediate,
+                NOW,
+                || Ok(fetcher(|_: &str| panic!("no trades"))),
+                || async { panic!("no listing") },
+                |_, _| async { panic!("no sweep") },
+                supplied.then_some(path.as_path()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(r.status, "disabled");
+            assert_eq!(cache.participant_discovery_coverage().unwrap(), None);
+            assert_eq!(path.exists(), supplied);
+            let bytes = log.0.lock().unwrap();
+            let lines: Vec<Value> = std::str::from_utf8(&bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let events: Vec<_> = lines
+                .iter()
+                .filter(|line| line["fields"]["message"] == "winner_discovery: participants")
+                .collect();
+            assert_eq!(events.len(), 1);
+            let fields = &events[0]["fields"];
+            let summary: Value = serde_json::from_str(fields["record"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                summary,
+                json!({"source_id": PARTICIPANT_SOURCE_ID, "schema_version": 2,
+                "parser_version": 2, "window_start_unix": NOW, "window_end_unix": NOW,
+                "status": "disabled", "wallet_count": 0, "scope": null,
+                "gamma_pages": 0, "trades_pages": 0, "chunks": 0})
+            );
+            if supplied {
+                let bytes = std::fs::read(&path).unwrap();
+                let audit: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    audit,
+                    json!({"version": 1, "record": summary, "chunks": [], "pages": []})
+                );
+                assert_eq!(
+                    fields["audit_sha256"],
+                    format!("{:x}", Sha256::digest(&bytes))
+                );
+                assert_eq!(fields["audit_bytes"], bytes.len());
+            } else {
+                for key in ["audit_path", "audit_sha256", "audit_bytes"] {
+                    assert!(fields.get(key).is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn participant_audit_preflight_protects_spelled_and_physical_roles_before_sources() {
+        let (dir, mut cache) = tmp_cache();
+        let physical = dir.path().join("cache.db");
+        let spelled = dir.path().join("alias.db");
+        std::os::unix::fs::symlink(&physical, &spelled).unwrap();
+        let spool = dir.path().join("spool.json");
+        let temp = |path: &Path| {
+            path.parent().unwrap().join(format!(
+                ".{}.{}.tmp",
+                path.file_name().unwrap().to_str().unwrap(),
+                std::process::id()
+            ))
+        };
+        let audit = dir.path().join("audit.json");
+        let occupied = dir.path().join("occupied");
+        std::fs::write(&occupied, b"preserve").unwrap();
+        let symlink = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("absent"), &symlink).unwrap();
+        let hardlink = dir.path().join("hardlink");
+        std::fs::hard_link(&physical, &hardlink).unwrap();
+        let before = std::fs::read(&physical).unwrap();
+        let mut cases = vec![
+            physical.clone(),
+            spelled.clone(),
+            occupied.clone(),
+            symlink.clone(),
+            hardlink,
+            crate::lock::lock_path_for(&spelled),
+            spool.clone(),
+            temp(&spool),
+        ];
+        for base in [&physical, &spelled] {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                cases.push(std::path::PathBuf::from(format!(
+                    "{}{suffix}",
+                    base.display()
+                )));
+            }
+        }
+        // A temporary audit file must not alias a protected role, even with an absent final audit.
+        std::fs::hard_link(&physical, temp(&audit)).unwrap();
+        cases.push(audit.clone());
+        for path in cases {
+            let cfg = BootstrapConfig {
+                cache_path: spelled.clone(),
+                leaderboard_top_n: 0,
+                datadash_api_url: Some("invalid URL must never be used".into()),
+                ..config(5)
+            };
+            // Foreground preflight runs before even the enabled datadash source.
+            if path != spool && path != temp(&spool) {
+                let log = AuditLog::default();
+                let writer = log.clone();
+                let _guard = tracing::subscriber::set_default(
+                    tracing_subscriber::fmt()
+                        .with_writer(move || writer.clone())
+                        .finish(),
+                );
+                let error = crate::winner_discovery::run_winner_discovery_with_policy(
+                    &cfg,
+                    &mut cache,
+                    ActivationPolicy::Deferred,
+                    None,
+                    Some(&path),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.exit_code(), 1, "{}: {error}", path.display());
+                assert!(!matches!(error, BootstrapError::TransientSource { .. }));
+                let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+                assert!(
+                    !logs.contains("datadash source failed"),
+                    "no datadash acquisition: {logs}"
+                );
+                assert!(
+                    !logs.contains("participant collection stopped"),
+                    "no Gamma acquisition: {logs}"
+                );
+            }
+            let error =
+                preflight_participant_audit(&cfg, &spelled, Some(&spool), Some(&path)).unwrap_err();
+            assert_eq!(error.exit_code(), 1, "{}: {error}", path.display());
+            assert_eq!(std::fs::read(&physical).unwrap(), before);
+        }
+        // The spool's temporary file may alias the audit or its temporary file.
+        std::fs::remove_file(temp(&audit)).unwrap();
+        let cfg = BootstrapConfig {
+            cache_path: spelled.clone(),
+            ..config(5)
+        };
+        assert_eq!(
+            preflight_participant_audit(&cfg, &spelled, Some(&temp(&audit)), Some(&audit))
+                .unwrap_err()
+                .exit_code(),
+            1
+        );
+        std::os::unix::fs::symlink(temp(&audit), temp(&spool)).unwrap();
+        let cfg = BootstrapConfig {
+            cache_path: spelled.clone(),
+            ..config(5)
+        };
+        assert_eq!(
+            preflight_participant_audit(&cfg, &spelled, Some(&spool), Some(&audit))
+                .unwrap_err()
+                .exit_code(),
+            1
+        );
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"preserve");
+        assert!(
+            std::fs::symlink_metadata(&symlink)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&physical).unwrap(), before);
+        assert!(!spool.exists() && !audit.exists());
     }
 
     #[tokio::test]
@@ -1208,6 +1517,7 @@ mod tests {
                 || Ok(fetcher),
                 listing,
                 |_, _| async { Ok(scope(1)) },
+                Some(&audit_path(&_dir)),
             )
             .await
             .unwrap_err();
@@ -1234,6 +1544,7 @@ mod tests {
             || Ok(fetcher(|_: &str| panic!("guarded trades"))),
             || async { panic!("guarded listing") },
             |_, _| async { panic!("guarded sweep") },
+            Some(&audit_path(&_dir)),
         )
         .await
         .unwrap_err();
@@ -1330,6 +1641,7 @@ mod tests {
                     message: "fixture outage".into(),
                 })
             },
+            Some(&audit_path(&_dir)),
         )
         .await
         .unwrap_err();
@@ -1355,6 +1667,7 @@ mod tests {
             },
             listing,
             |_, _| async { panic!("disabled must not fetch Gamma") },
+            Some(&audit_path(&_dir)),
         )
         .await
         .unwrap();
@@ -1377,6 +1690,7 @@ mod tests {
             || Ok(fetcher),
             listing,
             |_, _| async { Ok(scope(1)) },
+            Some(&audit_path(&_dir)),
         )
         .await
         .unwrap();
@@ -1412,6 +1726,7 @@ mod tests {
                 || Ok(fetcher),
                 listing,
                 |_, _| async { Ok(scope(21)) },
+                Some(&audit_path(&_dir)),
             )
             .await
             .unwrap_err();
@@ -1514,6 +1829,7 @@ mod tests {
                 || Ok(fetcher),
                 listing,
                 |_, _| async { Ok(scope(1)) },
+                Some(&audit_path(&_dir)),
             )
             .await
             .unwrap();
@@ -1550,6 +1866,7 @@ mod tests {
             || Ok(fetcher),
             listing,
             |_, _| async { Ok(scope(1)) },
+            Some(&audit_path(&dir)),
         )
         .await
         .unwrap_err();
@@ -1574,8 +1891,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn participants_audit_is_a_versioned_summary_plus_one_line_per_page() {
+    async fn participants_audit_is_versioned_with_one_journal_summary() {
         let (_dir, mut cache) = tmp_cache();
+        let audit_path = _dir.path().join("audit.json");
         let log = AuditLog::default();
         let writer = log.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -1614,9 +1932,13 @@ mod tests {
                 let gamma = gamma.clone();
                 async { Ok(gamma) }
             },
+            Some(&audit_path),
         )
         .await
         .unwrap();
+        let audit_bytes = std::fs::read(&audit_path).unwrap();
+        let audit: Value = serde_json::from_slice(&audit_bytes).unwrap();
+        assert_eq!(audit["version"], 1);
         let bytes = log.0.lock().unwrap();
         let lines: Vec<Value> = std::str::from_utf8(&bytes)
             .unwrap()
@@ -1632,7 +1954,24 @@ mod tests {
         };
         let records = field("winner_discovery: participants", "record");
         assert_eq!(records.len(), 1);
-        let record = &records[0];
+        assert!(field("winner_discovery: participant chunk", "chunk").is_empty());
+        assert!(field("winner_discovery: participant page", "page").is_empty());
+        let event = &lines
+            .iter()
+            .find(|line| line["fields"]["message"] == "winner_discovery: participants")
+            .unwrap()["fields"];
+        assert_eq!(event["audit_path"], audit_path.to_str().unwrap());
+        assert_eq!(
+            event["audit_sha256"],
+            format!("{:x}", Sha256::digest(&audit_bytes))
+        );
+        assert_eq!(event["audit_bytes"], audit_bytes.len());
+        assert_eq!(
+            event["record"],
+            serde_json::to_string(&audit["record"]).unwrap()
+        );
+        assert_eq!(audit["record"], records[0]);
+        let record = &audit["record"];
         assert_eq!(record["source_id"], PARTICIPANT_SOURCE_ID);
         assert_eq!(record["schema_version"], 2);
         assert_eq!(record["parser_version"], 2);
@@ -1641,7 +1980,7 @@ mod tests {
         assert_eq!(record["status"], "ok");
         assert_eq!(record["wallet_count"], 1);
         assert_eq!(record["chunks"], 1);
-        let chunks = field("winner_discovery: participant chunk", "chunk");
+        let chunks = audit["chunks"].as_array().unwrap().clone();
         assert_eq!(
             chunks,
             [
@@ -1671,11 +2010,11 @@ mod tests {
             ),
             (json!(1), json!(1))
         );
-        let pages = field("winner_discovery: participant page", "page");
+        let pages = audit["pages"].as_array().unwrap();
         assert_eq!(
             pages.len(),
             2,
-            "every Gamma and trades page gets its own line"
+            "Gamma pages precede trades pages in the file"
         );
         assert_eq!(pages[0], gamma_page);
         assert_eq!(pages[1]["kind"], "trades");
@@ -1694,6 +2033,7 @@ mod tests {
     #[tokio::test]
     async fn participants_empty_addition_keeps_its_gamma_page_in_the_audit() {
         let (_dir, mut cache) = tmp_cache();
+        let audit_path = _dir.path().join("audit.json");
         cache
             .set_participant_discovery_coverage(&coverage(10, 100, 20))
             .unwrap();
@@ -1754,9 +2094,13 @@ mod tests {
                 };
                 async { Ok(scope) }
             },
+            Some(&audit_path),
         )
         .await
         .unwrap();
+        let audit_bytes = std::fs::read(&audit_path).unwrap();
+        let audit: Value = serde_json::from_slice(&audit_bytes).unwrap();
+        assert_eq!(audit["version"], 1);
         let bytes = log.0.lock().unwrap();
         let lines: Vec<Value> = std::str::from_utf8(&bytes)
             .unwrap()
@@ -1772,7 +2116,8 @@ mod tests {
         };
         let records = field("winner_discovery: participants", "record");
         assert_eq!(records.len(), 1);
-        let record = &records[0];
+        assert_eq!(audit["record"], records[0]);
+        let record = &audit["record"];
         assert_eq!(record["status"], "ok");
         assert_eq!(record["wallet_count"], 1);
         assert_eq!(record["gamma_pages"], 2);
@@ -1784,7 +2129,7 @@ mod tests {
             .map(|series| series["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, ["13005", "2"]);
-        let pages = field("winner_discovery: participant page", "page");
+        let pages = audit["pages"].as_array().unwrap();
         assert_eq!(pages.len(), 3, "two Gamma pages, then one trades page");
         assert_eq!(pages[0]["ordinal"], 0);
         assert_eq!(pages[1], empty_page);
@@ -1796,6 +2141,7 @@ mod tests {
     #[tokio::test]
     async fn participants_empty_first_discovery_fails_with_contiguous_audit_pages() {
         let (_dir, mut cache) = tmp_cache();
+        let audit_path = _dir.path().join("audit.json");
         let log = AuditLog::default();
         let writer = log.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -1837,12 +2183,16 @@ mod tests {
                 let scope = empty_scope.clone();
                 async { Ok(scope) }
             },
+            Some(&audit_path),
         )
         .await
         .unwrap_err();
         assert_eq!(error.exit_code(), 75);
         assert!(error.to_string().contains("failed:gamma"), "{error}");
         assert_eq!(cache.participant_discovery_coverage().unwrap(), None);
+        let audit_bytes = std::fs::read(&audit_path).unwrap();
+        let audit: Value = serde_json::from_slice(&audit_bytes).unwrap();
+        assert_eq!(audit["version"], 1);
         let bytes = log.0.lock().unwrap();
         let lines: Vec<Value> = std::str::from_utf8(&bytes)
             .unwrap()
@@ -1858,12 +2208,13 @@ mod tests {
         };
         let records = field("winner_discovery: participants", "record");
         assert_eq!(records.len(), 1);
-        let record = &records[0];
+        assert_eq!(audit["record"], records[0]);
+        let record = &audit["record"];
         assert_eq!(record["status"], "failed:gamma");
         assert_eq!(record["scope"]["count"], 0);
         assert_eq!(record["scope"]["digest"], json!(empty_digest));
         assert_eq!(record["gamma_pages"], 2);
-        let pages = field("winner_discovery: participant page", "page");
+        let pages = audit["pages"].as_array().unwrap();
         let ordinals: Vec<u64> = pages
             .iter()
             .map(|page| page["ordinal"].as_u64().unwrap())
@@ -1897,6 +2248,7 @@ mod tests {
             || Ok(fetcher),
             listing,
             |_, _| async { Ok(scope(1)) },
+            Some(&audit_path(&_dir)),
         )
         .await
         .unwrap_err();
@@ -1918,7 +2270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn participants_invalid_wallet_refuses_the_chunk_and_logs_its_hash() {
+    async fn participants_invalid_wallet_refuses_the_chunk_and_audits_its_hash() {
         for invalid in [
             json!({"timestamp": 100}),
             json!({"proxy_wallet": null, "timestamp": 100}),
@@ -1930,14 +2282,7 @@ mod tests {
             let (_dir, mut cache) = tmp_cache();
             let prior = coverage(50, 90, 20);
             cache.set_participant_discovery_coverage(&prior).unwrap();
-            let log = AuditLog::default();
-            let writer = log.clone();
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::fmt()
-                    .with_ansi(false)
-                    .with_writer(move || writer.clone())
-                    .finish(),
-            );
+            let audit_path = _dir.path().join("invalid-audit.json");
             let body = envelope(
                 json!([{"proxy_wallet": wallet(1), "timestamp": 100}, invalid]),
                 None,
@@ -1951,17 +2296,17 @@ mod tests {
                 || Ok(fetcher(|_: &str| Ok(body.clone()))),
                 listing,
                 |_, _| async { Ok(scope(1)) },
+                Some(&audit_path),
             )
             .await
             .unwrap_err();
             assert_eq!(error.exit_code(), 75);
             assert_eq!(cache.wallet_pile_size().unwrap(), 0);
             assert_eq!(cache.participant_discovery_coverage().unwrap(), Some(prior));
-            assert!(
-                String::from_utf8(log.0.lock().unwrap().clone())
-                    .unwrap()
-                    .contains(&hash)
-            );
+            let audit: Value =
+                serde_json::from_slice(&std::fs::read(&audit_path).unwrap()).unwrap();
+            assert_eq!(audit["record"]["status"], "incomplete:proxy-wallet");
+            assert_eq!(audit["pages"][0]["raw_sha256"], hash);
         }
     }
 
@@ -2017,6 +2362,7 @@ mod tests {
                 assert_eq!(lo, 100);
                 Ok(scope(1))
             },
+            Some(&audit_path(&_dir)),
         )
         .await
         .unwrap_err();
@@ -2045,6 +2391,7 @@ mod tests {
                 assert_eq!(lo, 100);
                 Ok(scope(1))
             },
+            Some(&audit_path(&_dir)),
         )
         .await
         .unwrap_err();
@@ -2066,6 +2413,7 @@ mod tests {
                 assert_eq!(lo, 100);
                 Ok(scope(1))
             },
+            Some(&audit_path(&_dir)),
         )
         .await
         .unwrap();
@@ -2087,6 +2435,7 @@ mod tests {
                 scope.end_date_min_unix = 20;
                 Ok(scope)
             },
+            Some(&audit_path(&_dir)),
         )
         .await
         .unwrap();
@@ -2109,6 +2458,7 @@ mod tests {
             || Ok(fetcher(|_: &str| panic!("disabled fetch"))),
             listing,
             |_, _| async { panic!("disabled scope") },
+            Some(&audit_path(&_dir)),
         )
         .await
         .unwrap();
@@ -2128,7 +2478,8 @@ mod tests {
                 NOW,
                 || Ok(fetcher(|_: &str| panic!("bad coverage trades"))),
                 listing,
-                |_, _| async { panic!("bad coverage scope") }
+                |_, _| async { panic!("bad coverage scope") },
+                Some(&audit_path(&_dir)),
             )
             .await
             .is_err()
@@ -2145,7 +2496,8 @@ mod tests {
                 NOW,
                 || Ok(fetcher(|_: &str| panic!("bad query trades"))),
                 listing,
-                |_, _| async { panic!("bad query scope") }
+                |_, _| async { panic!("bad query scope") },
+                Some(&audit_path(&_dir)),
             )
             .await
             .is_err()
@@ -2173,6 +2525,7 @@ mod tests {
                 scope.series = subset;
                 Ok(scope)
             },
+            Some(&audit_path(&_dir)),
         )
         .await
         .unwrap();
@@ -2239,6 +2592,7 @@ mod tests {
                     scope.end_date_min_unix = 20;
                     async { Ok(scope) }
                 },
+                Some(&audit_path(&_dir)),
             )
             .await
             .unwrap();
@@ -2340,6 +2694,7 @@ mod tests {
                     let scope = swept(subset, &empty);
                     async { Ok(scope) }
                 },
+                Some(&audit_path(&_dir)),
             )
             .await;
             match case {
@@ -2382,6 +2737,7 @@ mod tests {
                             let scope = swept(subset, &["13005"]);
                             async { Ok(scope) }
                         },
+                        Some(&audit_path(&_dir)),
                     )
                     .await
                     .unwrap();
@@ -2446,6 +2802,7 @@ mod tests {
                 ))
             },
             |_, _| async { panic!("old addition must not sweep") },
+            Some(&audit_path(&_dir)),
         )
         .await
         .unwrap_err();
@@ -2542,6 +2899,7 @@ mod tests {
                 scope.end_date_min_unix = 20;
                 Ok(scope)
             },
+            Some(&audit_path(&dir)),
         )
         .await
         .unwrap();
@@ -2663,6 +3021,7 @@ mod tests {
                 },
                 listing,
                 |_, _| async { Ok(scope(1)) },
+                Some(&audit_path(&_dir)),
             )
             .await
             .unwrap();

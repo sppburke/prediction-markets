@@ -55,6 +55,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let participant_audit = match parse_participant_audit(&args, &discovery_mode) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!(error = %error, "winner-discovery: invalid participant audit");
+            std::process::exit(1);
+        }
+    };
     // Infra marks are permanent (#826). The removed command must not fall through to the
     // positional-config default below, which would run `all` on the configured cache.
     if first_arg == Some("clear-infra-exclusion") {
@@ -191,6 +198,7 @@ async fn main() {
                 "--coverage-from",
                 "--not-before",
                 "--apply-from",
+                "--participant-audit",
             ]
             .contains(&a)
                 && i + 1 < rest.len()
@@ -440,11 +448,17 @@ async fn main() {
         let consumed_discovery_mode = flag_values.iter().any(|value| {
             matches!(
                 value.split('=').next(),
-                Some("--collect-to" | "--coverage-from" | "--not-before" | "--apply-from")
+                Some(
+                    "--collect-to"
+                        | "--coverage-from"
+                        | "--not-before"
+                        | "--apply-from"
+                        | "--participant-audit"
+                )
             )
         });
-        if !matches!(discovery_mode, DiscoveryMode::Plain)
-            && (!defer_activation || consumed_discovery_mode)
+        if consumed_discovery_mode
+            || (!matches!(discovery_mode, DiscoveryMode::Plain) && !defer_activation)
         {
             tracing::error!(
                 "winner-discovery: invalid mode: spool mode flags and --defer-activation must be parsed as flags"
@@ -979,6 +993,17 @@ async fn main() {
             None
         };
 
+        if sub == "winner-discovery"
+            && let Err(error) = require_participant_audit_arg(
+                &discovery_mode,
+                bootstrap_config.participant_lookback_secs,
+                participant_audit.as_deref(),
+            )
+        {
+            tracing::error!(error = %error, "winner-discovery: invalid participant audit");
+            std::process::exit(1);
+        }
+
         match discovery_mode {
             DiscoveryMode::Collect {
                 spool,
@@ -991,6 +1016,7 @@ async fn main() {
                     &coverage_from,
                     not_before,
                     end_date_min_arg,
+                    participant_audit.as_deref(),
                 )
                 .await;
                 let exit = match result {
@@ -1222,6 +1248,7 @@ async fn main() {
                         pile::ActivationPolicy::Immediate
                     },
                     end_date_min_arg,
+                    participant_audit.as_deref(),
                 )
                 .await,
             ),
@@ -1662,6 +1689,58 @@ fn parse_discovery_mode(args: &[String]) -> Result<DiscoveryMode, BootstrapError
     })
 }
 
+fn parse_participant_audit(
+    args: &[String],
+    mode: &DiscoveryMode,
+) -> Result<Option<std::path::PathBuf>, BootstrapError> {
+    let mut path = None;
+    let mut i = 1;
+    while i < args.len() {
+        let (name, inline) = args[i]
+            .split_once('=')
+            .map_or((args[i].as_str(), None), |(name, value)| {
+                (name, Some(value))
+            });
+        if name == "--participant-audit" {
+            if args.get(1).map(String::as_str) != Some("winner-discovery")
+                || matches!(mode, DiscoveryMode::Apply { .. })
+            {
+                return Err(BootstrapError::Invalid {
+                    message: "--participant-audit requires collecting winner-discovery".to_owned(),
+                });
+            }
+            let value = match inline {
+                Some(value) => value,
+                None => {
+                    i += 1;
+                    args.get(i).map(String::as_str).unwrap_or_default()
+                }
+            };
+            if value.is_empty() || value.starts_with("--") || path.is_some() {
+                return Err(BootstrapError::Invalid {
+                    message: "--participant-audit requires one nonempty value".to_owned(),
+                });
+            }
+            path = Some(value.into());
+        }
+        i += 1;
+    }
+    Ok(path)
+}
+
+fn require_participant_audit_arg(
+    mode: &DiscoveryMode,
+    lookback: u64,
+    path: Option<&std::path::Path>,
+) -> Result<(), BootstrapError> {
+    if !matches!(mode, DiscoveryMode::Apply { .. }) && lookback > 0 && path.is_none() {
+        return Err(BootstrapError::Invalid {
+            message: "enabled participant discovery requires --participant-audit".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn winner_discovery_exit(
     result: Result<winner_discovery::WinnerDiscoveryReport, BootstrapError>,
 ) -> i32 {
@@ -1687,9 +1766,92 @@ fn winner_discovery_exit(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::resolutions_error_exit_code;
     use pe_bootstrap::error::BootstrapError;
+
+    fn discovery_args(args: &[&str]) -> Vec<String> {
+        std::iter::once("pe-bootstrap")
+            .chain(args.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn participant_audit_argument_matrix() {
+        use super::{
+            DiscoveryMode, parse_discovery_mode, parse_participant_audit,
+            require_participant_audit_arg,
+        };
+        for args in [
+            vec!["winner-discovery", "--participant-audit", "audit.json"],
+            vec![
+                "winner-discovery",
+                "--participant-audit=audit.json",
+                "bootstrap.toml",
+            ],
+            vec![
+                "winner-discovery",
+                "--defer-activation",
+                "--collect-to=s",
+                "--coverage-from=c",
+                "--not-before=0",
+                "--participant-audit=audit.json",
+            ],
+        ] {
+            let args = discovery_args(&args);
+            let mode = parse_discovery_mode(&args).unwrap();
+            let path = parse_participant_audit(&args, &mode).unwrap().unwrap();
+            assert_eq!(path, std::path::Path::new("audit.json"));
+            assert!(require_participant_audit_arg(&mode, 1, Some(&path)).is_ok());
+            assert!(require_participant_audit_arg(&mode, 0, Some(&path)).is_ok());
+            assert!(require_participant_audit_arg(&mode, 1, None).is_err());
+            assert!(require_participant_audit_arg(&mode, 0, None).is_ok());
+        }
+        for args in [
+            vec!["winner-discovery", "--participant-audit"],
+            vec!["winner-discovery", "--participant-audit="],
+            vec!["winner-discovery", "--participant-audit", ""],
+            vec![
+                "winner-discovery",
+                "--participant-audit",
+                "--defer-activation",
+            ],
+            vec![
+                "winner-discovery",
+                "--participant-audit=a",
+                "--participant-audit=b",
+            ],
+            vec![
+                "winner-discovery",
+                "--participant-audit",
+                "a",
+                "--participant-audit=b",
+            ],
+            vec![
+                "winner-discovery",
+                "--defer-activation",
+                "--apply-from=s",
+                "--participant-audit=a",
+            ],
+            vec!["events", "--participant-audit=a"],
+            vec!["pipeline-versions", "--participant-audit", "a"],
+            vec!["bootstrap.toml", "--participant-audit=a"],
+        ] {
+            let args = discovery_args(&args);
+            let mode = parse_discovery_mode(&args).unwrap();
+            assert!(parse_participant_audit(&args, &mode).is_err(), "{args:?}");
+        }
+        let apply = DiscoveryMode::Apply { spool: "s".into() };
+        assert!(require_participant_audit_arg(&apply, 1, None).is_ok());
+        let plain = parse_discovery_mode(&discovery_args(&[
+            "winner-discovery",
+            "--participant-audit=a",
+        ]))
+        .unwrap();
+        assert!(matches!(plain, DiscoveryMode::Plain));
+    }
 
     #[test]
     fn resolutions_tempfail_covers_audit_incomplete_and_transient_source() {

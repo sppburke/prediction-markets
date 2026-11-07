@@ -42,7 +42,8 @@ cargo build --release -p pe-bootstrap
 
 # Standalone discovery preserves legacy immediate activation:
 PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db \
-  ./target/release/pe-bootstrap winner-discovery
+  ./target/release/pe-bootstrap winner-discovery \
+    --participant-audit "data/participant_audit.$$.$(date -u +%Y%m%dT%H%M%S%NZ).json"
 ```
 
 Do not add `--defer-activation` to an ad-hoc command unless the same operation
@@ -78,6 +79,7 @@ and prior are both absent starts collection immediately before `cache-stage`:
 
 ```bash
 pe-bootstrap winner-discovery --defer-activation --collect-to "$SPOOL" \
+  --participant-audit "$OUT_DIR/participant_audit.$$.$(date -u +%Y%m%dT%H%M%S%NZ).json" \
   --coverage-from "$FIXED_DB" --not-before "$((RANK_WINDOW_END_UNIX + FILL_WINDOW_SECS))" \
   --end-date-min "$FLOOR" --recurrences "$RECURRENCES" [bootstrap.toml]
 PE_BOOTSTRAP_CACHE_PATH="$SIDE" pe-bootstrap winner-discovery --defer-activation \
@@ -86,12 +88,13 @@ PE_BOOTSTRAP_CACHE_PATH="$SIDE" pe-bootstrap winner-discovery --defer-activation
 
 Collector flags are required together; apply forbids them. Both modes require
 `--defer-activation`, and no other subcommand accepts these flags. Collection uses the same
-fetchers, limits, retries and evidence lines. It writes only its attempt's spool and atomic-write
-temporary file; it takes no cache lock or writable opener. It refuses an existing spool, any
+fetchers, limits and retries. It writes its attempt's participant audit, spool and atomic-write
+temporary files; it takes no cache lock or writable opener. It refuses an existing spool, any
 spool/temp alias of the fixed cache, sidecars or lock, and a fixed schema other than two before
 requests. Only the reached, enabled participant arm waits for `--not-before`, samples its clock
 and reads raw coverage immutably (ignoring WAL). Decode/validation failures are recorded source
-outcomes; local read errors exit nonzero without a spool. Exit zero means a complete spool was written.
+outcomes; local coverage-read and audit errors exit nonzero without a spool. Exit zero means a
+complete spool was written.
 
 Apply validates the version, settings, source prefix, coverage flag and wallet/count/coverage
 records and roles before taking the candidate lock. Under that lock it compares raw coverage
@@ -107,16 +110,18 @@ spool. Collector nonzero or apply 77 runs ordinary discovery; every other apply 
 stage status mapping (including participant 75). A staging failure stops/reaps collection and keeps
 staging's status. Existing candidates, prior-backed attempts and bulk-root resumes retain their
 ordinary flow. Each eligible attempt chooses a new spool; completed spools and abandoned temporary
-files remain evidence and are never used by another attempt.
+files remain evidence and are never used by another attempt. Each collecting invocation, including
+ordinary fallback and serial retries, also gets a fresh participant-audit path; apply gets none.
 
 Evidence includes `[winner-discovery] collecting beside cache-stage: <command>`, the stage start/end,
 `[winner-discovery] joining the collector started beside cache-stage`,
 `[winner-discovery] collector exited <status>`, and the ordinary apply/fallback start/end lines.
-Collector and apply log `winner-discovery: spool` with path and SHA-256. Participant summary, chunk
-and page evidence remains in collection; datadash soft failure and source completion lines occur
-at apply. On the first installed eligible cycle, measure overlap, join wait and critical-path saving
-from these journal lines; this rollout measurement is not a test claim. Earlier collection can
-advance coverage less far than serial discovery; the next cycle's canonical overlap prevents a gap.
+Collector and apply log `winner-discovery: spool` with path and SHA-256. Collection writes participant
+chunk/page evidence to the audit and logs one summary with its path, SHA-256 and byte length;
+datadash soft failure and source completion lines occur at apply. On the first installed eligible
+cycle, measure overlap, join wait and critical-path saving from these journal lines; this rollout
+measurement is not a test claim. Earlier collection can advance coverage less far than serial
+discovery; the next cycle's canonical overlap prevents a gap.
 
 ## Retired leaderboard acquisition (#842)
 
@@ -152,12 +157,12 @@ every positive fill. Bounds, window guard, concurrency and request spacing are c
 
 Valid `proxy_wallet` addresses are canonicalized to lowercase and deduplicated before tagging with
 `SRC_MARKET_PARTICIPANT`. A row without a valid wallet makes the chunk incomplete; its page hash
-is logged, and no participant from that run is upserted. Preferred activation eligibility is the
-same as datadash, including already-known inactive wallets. Under the owner's 2026-10-31 decisions,
-participant upserts lift `proven_loser` tombstones, while infra marks are permanent (#826): `infra`
-tombstones stay blocked, a live `is_infra` flag is kept, and the four exchange contracts stay blocked
-(`docs/37` §6). Each skipped infra-tombstoned participant is logged by wallet and counted. Normal history acquisition,
-eligibility, ranking and sizing still apply.
+is retained in the participant audit, and no participant from that run is upserted. Preferred
+activation eligibility is the same as datadash, including already-known inactive wallets. Under the
+owner's 2026-10-31 decisions, participant upserts lift `proven_loser` tombstones, while infra marks
+are permanent (#826): `infra` tombstones stay blocked, a live `is_infra` flag is kept, and the four
+exchange contracts stay blocked (`docs/37` §6). Each skipped infra-tombstoned participant is logged
+by wallet and counted. Normal history acquisition, eligibility, ranking and sizing still apply.
 
 Completed coverage lives in the dedicated `meta` key
 [`participant_discovery_coverage`](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap), including on
@@ -174,16 +179,38 @@ lock, participant upserts commit before coverage, so interruption between commit
 idempotent upsert without advancing coverage past an uncommitted wallet. Disabled or failed
 collection leaves coverage unchanged.
 
-Each run logs one summary `record` under `winner_discovery: participants`: source id
+Collecting discovery requires `--participant-audit PATH` (or `--participant-audit=PATH`) when
+lookback is positive. Lookback zero allows omission; a supplied path writes a `disabled` audit.
+Apply forbids the flag. Missing, empty or duplicate values and use by other subcommands exit 1.
+Before any source request, preflight refuses an existing target or symlink and aliases of the
+protected cache (foreground cache or collector `coverage-from`), its spelled and physical SQLite
+sidecars, mutation lock, collector spool or either atomic-write temporary file. Refusal exits 1,
+not spool-refusal 77. Paths name files in existing directories.
+
+At the participant emission boundary, collection atomically writes and syncs one JSON document:
+`{"version":1,"record":<summary>,"chunks":[...],"pages":[...]}`. The summary retains source id
 `polymarket-data-api-trades`, schema/parser versions, frozen window, wallet count, status, the
 Gamma scope's own source ID, version, schema/parser versions, digest, count and series, and page
-counts. Each chunk also logs its lower bound, newest and oldest timestamps, page count and
-stop reason (`terminal` or `threshold`). Every page of a completed Gamma sweep and every
-`/v2/trades` page fetched then gets its own `page` line under `winner_discovery: participant page`
-(URL, raw sha256, rows, observed, received and source times, plus request and returned cursors).
-The Gamma sweep is all-or-nothing, like `market-scope`: failure logs
-`failed:gamma`, records no Gamma pages and writes no participant wallet. Each line stays under
-journald's `LineMax`; a trades URL lists its condition ids and the scope digest covers the list.
+counts. Chunks retain lower bound, newest/oldest timestamps, page count and stop reason
+(`terminal` or `threshold`). Pages retain URL, raw sha256, rows, observed/received/source times
+and request/returned cursors, in Gamma sweep then trades order; ordinals are per stream.
+The counts match the retained arrays. Each trades URL lists its condition ids; the scope digest
+covers the list. One `winner_discovery: participants` journal event keeps the summary `record`
+and adds `audit_path`, `audit_sha256` and `audit_bytes` from a file readback. No chunk/page journal
+events are emitted. Disabled collection without a path keeps only its disabled summary.
+
+Failed/incomplete attempts that reach this boundary also write their audit before returning
+`TransientSource`. A prior-coverage read error or any earlier failure/interruption has no audit
+persistence guarantee. A failed Gamma sweep transfers none of that sweep's pages; buffered trades
+stop at the first error. These retention boundaries are unchanged.
+
+Audit serialization, write, sync or digest-readback failure is a local fatal error: foreground
+exits 1 before participant upserts, activation or coverage; collector exits nonzero before any
+spool, so the wrapper falls back with a fresh audit path. Earlier foreground source commits
+(datadash) and cache-opener migrations remain. A source failure still writes a recorded collector
+outcome and spool, exits 0 in collection and returns 75 on apply. Completed audits and abandoned
+temporary files remain cycle evidence; later attempts never reuse their paths.
+
 Statuses:
 
 - `ok`: collection completed; counts are included in both CLI discovery summaries.
@@ -241,8 +268,8 @@ cycle can skip discovery, so one invocation's log is insufficient.
 
 ## Operational notes
 
-- **No direct auto-deploy to live.** Discovery writes only to the local SQLite
-  cache. A discovered wallet reaches the live set only after the ranking pipeline
+- **No direct auto-deploy to live.** Discovery writes only local cache and audit/spool files.
+  A discovered wallet reaches the live set only after the ranking pipeline
   publishes it to Supabase `latest_ranking` and the service admits it (maintenance-tick
   backfill in knockout mode; the next batch swap in `full_rerank`) — never directly
   from discovery.

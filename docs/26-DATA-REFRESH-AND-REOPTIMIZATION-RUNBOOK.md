@@ -925,6 +925,7 @@ pe-bootstrap cache-migrate-v2 --db "$SIDE" --manifest "$CACHE_BUILD_MANIFEST"   
 # Skipped on a retried cycle whose candidate already records $BATCH in wallet_activation_batches
 # (rank_cycle_manifest.py activation-batch; an unreadable probe exits 2) (#788):
 pe-bootstrap winner-discovery --db "$SIDE" --defer-activation \
+  --participant-audit "$RUN_DIR/participant_audit.$$.$(date -u +%Y%m%dT%H%M%S%NZ).json" \
   --recurrences "$RECURRENCES" --end-date-min "$FLOOR"
 pe-bootstrap activate-next --db "$SIDE" --batch-id "$BATCH" --audit-csv "$AUDIT"
 pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N"
@@ -2116,10 +2117,12 @@ settings and run:
 
 ```bash
 pe-bootstrap winner-discovery --db <side> --defer-activation \
+  --participant-audit "$RUN_DIR/participant_audit.$$.$(date -u +%Y%m%dT%H%M%S%NZ).json" \
   --recurrences <cycle-recurrences> --end-date-min <cycle-floor>
 ```
 
-Record its interval, floor, pages and status; retry the same command on temporary failure.
+Record its interval, floor, pages and status from the audit; on temporary failure rerun the command
+with a newly generated audit path in the cycle folder (`RUN_DIR`). Never reuse an earlier path.
 A participant hold needs activation, not another discovery read. Preview the full cohort and
 recheck capacity, then use a command-scoped `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=<count>` with
 `activate-next --db <side> --batch-id <cycle>-complete --audit-csv <audit>`. Use `-complete-2`,
