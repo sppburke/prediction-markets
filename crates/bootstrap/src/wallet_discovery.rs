@@ -546,19 +546,20 @@ where
                 .await?,
             );
         }
+        if let Some(scope) = &mut record.market_scope {
+            scope.series.sort_by(|a, b| a.id.cmp(&b.id));
+            for (ordinal, page) in scope.pages.iter_mut().enumerate() {
+                page.ordinal = u64::try_from(ordinal).map_err(|_| "failed:page-count")?;
+            }
+        }
         // No covered series and only empty additions (a first discovery): an answer with no market is a Gamma failure.
+        // Checked after renumbering, so the failed record's audit keeps contiguous page ordinals.
         if record
             .market_scope
             .as_ref()
             .is_none_or(|scope| scope.condition_ids.is_empty())
         {
             return Err(participant_failure("failed:gamma", &no_markets()));
-        }
-        if let Some(scope) = &mut record.market_scope {
-            scope.series.sort_by(|a, b| a.id.cmp(&b.id));
-            for (ordinal, page) in scope.pages.iter_mut().enumerate() {
-                page.ordinal = u64::try_from(ordinal).map_err(|_| "failed:page-count")?;
-            }
         }
         record.status = "ok";
         Ok(wallets.into_iter().collect())
@@ -1788,6 +1789,88 @@ mod tests {
         assert_eq!(pages[0]["ordinal"], 0);
         assert_eq!(pages[1], empty_page);
         assert_eq!(pages[2]["kind"], "trades");
+    }
+
+    /// A first discovery whose every listed series is empty fails `failed:gamma`, and its audit still lists the
+    /// catalog and sweep pages with contiguous ordinals, count 0 and the empty set's digest.
+    #[tokio::test]
+    async fn participants_empty_first_discovery_fails_with_contiguous_audit_pages() {
+        let (_dir, mut cache) = tmp_cache();
+        let log = AuditLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let page = |kind: &'static str, series: Option<&str>| ScopePage {
+            ordinal: 0,
+            kind,
+            series_id: series.map(str::to_owned),
+            url: format!("http://gamma.test/{kind}"),
+            request_cursor: None,
+            returned_next_cursor: None,
+            raw_sha256: format!("{:x}", Sha256::digest(kind.as_bytes())),
+            rows: 0,
+            observed_at_unix: 110,
+            received_at_unix: 111,
+            source_at_unix: Some(109),
+        };
+        let soak = ScopeSeries {
+            id: "13005".into(),
+            slug: Some("polyv2-soak-btc-up-or-down-15m".into()),
+        };
+        let empty_digest = format!("{:x}", Sha256::digest(b""));
+        let mut empty_scope = scope(0);
+        empty_scope.series = vec![soak.clone()];
+        empty_scope.digest = empty_digest.clone();
+        empty_scope.pages.push(page("events", Some("13005")));
+        let listing_page = page("series", None);
+        let error = run_participant_discovery(
+            &config(5),
+            &mut cache,
+            ActivationPolicy::Deferred,
+            200,
+            || Ok(fetcher(|_: &str| panic!("an empty answer reads no trades"))),
+            || async { Ok((vec![soak.clone()], vec![listing_page.clone()])) },
+            |_, _| {
+                let scope = empty_scope.clone();
+                async { Ok(scope) }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 75);
+        assert!(error.to_string().contains("failed:gamma"), "{error}");
+        assert_eq!(cache.participant_discovery_coverage().unwrap(), None);
+        let bytes = log.0.lock().unwrap();
+        let lines: Vec<Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect();
+        let field = |message: &str, key: &str| -> Vec<Value> {
+            lines
+                .iter()
+                .filter(|line| line["fields"]["message"] == message)
+                .map(|line| serde_json::from_str(line["fields"][key].as_str().unwrap()).unwrap())
+                .collect()
+        };
+        let records = field("winner_discovery: participants", "record");
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["status"], "failed:gamma");
+        assert_eq!(record["scope"]["count"], 0);
+        assert_eq!(record["scope"]["digest"], json!(empty_digest));
+        assert_eq!(record["gamma_pages"], 2);
+        let pages = field("winner_discovery: participant page", "page");
+        let ordinals: Vec<u64> = pages
+            .iter()
+            .map(|page| page["ordinal"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ordinals, [0, 1], "catalog page, then the empty sweep page");
+        assert_eq!(pages[0]["kind"], "series");
+        assert_eq!(pages[1]["series_id"], "13005");
     }
 
     #[tokio::test]
