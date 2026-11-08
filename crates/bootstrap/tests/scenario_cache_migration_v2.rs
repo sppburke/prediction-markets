@@ -14543,7 +14543,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         .iter()
         .filter_map(|market| market["condition_id"].as_str())
         .filter(|id| id.len() == 66)
-        .map(|id| serde_json::json!({"series":[{"id":"7","recurrence":"15m"}],"markets":[{"conditionId":id}]}))
+        .map(|id| serde_json::json!({"series":[{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"}],"markets":[{"conditionId":id}]}))
         .collect::<Vec<_>>();
     let activity_rows = Arc::new(Mutex::new(rows));
     let venue = FixtureVenue::start(
@@ -23069,8 +23069,8 @@ async fn real_wrapper_seeded_publication(supersession: bool, stage2_comparison: 
         .iter()
         .filter_map(|market| market["condition_id"].as_str())
         .filter(|id| id.len() == 66)
-        .map(|id| serde_json::json!({"series":[{"id":"7","recurrence":"15m"}],"markets":[{"conditionId":id}]}))
-        .chain([serde_json::json!({"series":[{"id":"8","recurrence":"5m"}],
+        .map(|id| serde_json::json!({"series":[{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"}],"markets":[{"conditionId":id}]}))
+        .chain([serde_json::json!({"series":[{"id":"8","slug":"btc-up-or-down-5m","recurrence":"5m"}],
             "markets":[{"conditionId":format!("0x{:064x}", 0x5)}]})])
         .collect::<Vec<_>>();
     let activity_rows = Arc::new(Mutex::new(rows));

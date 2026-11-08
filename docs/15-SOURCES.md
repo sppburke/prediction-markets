@@ -492,7 +492,7 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 
 ## Public sources
 
-- **Series listing and covered set. Last checked: 2026-11-03; re-verify by 2027-01-02.**
+- **Series listing and covered set. Last checked: 2026-11-08; re-verify by 2027-01-07.**
   The official [listing](https://docs.polymarket.com/api-reference/series/list-series) and
   [by-id](https://docs.polymarket.com/api-reference/series/get-series-by-id) references expose
   series ids, slugs and recurrences. The approved 11/3 source pass's paged listing returned
@@ -501,7 +501,11 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
   every listed series of the configured recurrences, reading covered series by id and additions
   back to the coverage start. Schema-two ranking reads that explicit covered set by id; it
   has no configured series pin. A missing, renamed or changed-recurrence covered series fails
-  temporarily rather than shrinking scope. Recurrences and coverage are canonical in
+  temporarily rather than shrinking scope. The one policy exception is gate F's slug rule (#871,
+  [`ranker_market_scope`](_GLOSSARY.md#ranker-market-scope)): a series whose slug starts with
+  `polyv2` or is unusable (the OpenAPI declares `Series.slug` nullable) is excluded and recorded,
+  and each kept series' keyset events must embed a passing slug in their first series.
+  Recurrences and coverage are canonical in
   [_GLOSSARY.md](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap).
   The recorded 10/28 fee reads across the 18 `15m`/`5m` series found `feeType` `crypto_fees_v2`
   with `feeSchedule` `{"exponent":1,"rate":0.07,"takerOnly":true,"rebateRate":0.2}`, equal to
@@ -575,6 +579,15 @@ Treat as research inspiration; not a production decision input unless an authori
 
 ## Last research pass
 
+- 2026-11-08 (ranker scope, #871): re-read the official `gamma-openapi.yaml` (`Series.slug`
+  `type: string, nullable: true`) and re-ran the full `/series?exclude_events=true` listing
+  (06:01–06:02Z: 52 pages, 2,582 series, every slug a non-blank string; 38 `polyv2` slugs, 10 of
+  them `15m`; 20 `15m` series = ten production + ten soak). `/series/13011` named
+  `polyv2-soak-xrp-up-or-down-15m`; `/events/keyset` for soak series 13011 and 13005 held 0 events.
+  Every production series' whole keyset chain from the ranker's floor (2026-05-11T00:00Z,
+  06:19:53–06:46:40Z: 1,336 pages, 133,408 events) embedded the walked id, recurrence `15m` and the
+  catalog slug in each event's first series: no event lacked a usable slug. Raw replies, the census
+  and the walk are in `/mnt/data/pm-815-limits-evidence/polyv2-ranker-20261108/`.
 - 2026-11-08 (test-series exclusion, #869): the official Gamma OpenAPI declares `Series.slug` a
   nullable string. Admission-shaped `/markets?condition_ids=…&include_tag=true` replies carry
   `events[0].series[0]` as `{id, slug, title, recurrence}`: the open soak market

@@ -324,9 +324,13 @@ impl DiscoverySpool {
                                 .ok_or_else(|| refused("invalid participant lookback"))?;
                             let addition_lo =
                                 matching.map_or(lo, |prior| lo.min(prior.covered_from_unix));
-                            let covered = matching
-                                .and_then(|prior| prior.scope.series.as_deref())
-                                .unwrap_or_default();
+                            // The prior's series that gate F's slug rule keeps (#871), exactly as
+                            // collect_participants partitions them; its policy drops leave coverage.
+                            let (covered, _) = crate::market_scope::partition_series(
+                                matching
+                                    .and_then(|prior| prior.scope.series.clone())
+                                    .unwrap_or_default(),
+                            );
                             let has_additions = c
                                 .coverage
                                 .scope
@@ -362,17 +366,13 @@ impl DiscoverySpool {
                             if c.coverage.covered_from_unix != addition_lo
                                 || c.coverage.covered_through_unix != through
                                 || c.coverage.market_floor_unix != expected_floor
-                                || matching
-                                    .and_then(|prior| prior.scope.series.as_ref())
-                                    .is_some_and(|series| {
-                                        series.iter().any(|old| {
-                                            !c.coverage
-                                                .scope
-                                                .series
-                                                .as_ref()
-                                                .is_some_and(|new| new.contains(old))
-                                        })
-                                    })
+                                || covered.iter().any(|old| {
+                                    !c.coverage
+                                        .scope
+                                        .series
+                                        .as_ref()
+                                        .is_some_and(|new| new.contains(old))
+                                })
                             {
                                 return Err(refused(
                                     "participant coverage differs from collection window, floor or prior series",
@@ -380,6 +380,10 @@ impl DiscoverySpool {
                             }
                             if c.coverage.scope.recurrences != recurrences
                                 || c.coverage.scope.series.is_none()
+                                || c.coverage.scope.series.iter().flatten().any(|series| {
+                                    crate::market_scope::series_exclusion(series.slug.as_deref())
+                                        .is_some()
+                                })
                                 || c.wallets.iter().any(|wallet| {
                                     pe_core_types::WalletAddress::from_hex(wallet).is_err()
                                 })
@@ -1134,8 +1138,8 @@ mod tests {
                         let mut listed = coverage().scope.series.unwrap();
                         if case == "empty_addition" {
                             listed.push(ScopeSeries {
-                                id: "13005".into(),
-                                slug: Some("polyv2-soak-btc-up-or-down-15m".into()),
+                                id: "13100".into(),
+                                slug: Some("newcoin-up-or-down-15m".into()),
                             });
                         }
                         Ok((listed, Vec::new()))
@@ -1143,7 +1147,7 @@ mod tests {
                     |lo, series| async move {
                         // A newly listed series without markets, or a covered sweep that comes back empty.
                         let empty = case == "empty_covered"
-                            || (case == "empty_addition" && series.iter().all(|s| s.id == "13005"));
+                            || (case == "empty_addition" && series.iter().all(|s| s.id == "13100"));
                         let condition_ids = if empty {
                             vec![]
                         } else {
@@ -1159,6 +1163,7 @@ mod tests {
                             started_at_unix: NOW,
                             completed_at_unix: NOW,
                             series,
+                            excluded_series: Vec::new(),
                             pages: vec![],
                             count: u64::try_from(condition_ids.len()).unwrap(),
                             condition_ids,
@@ -1452,7 +1457,7 @@ mod tests {
                 .map(|series| series.id)
                 .collect();
             let expected: &[&str] = if case == "empty_addition" {
-                &["13005", "7"]
+                &["13100", "7"]
             } else {
                 &["7"]
             };
@@ -1829,10 +1834,23 @@ mod tests {
                 let mut cache = WalletCache::open(&candidate).unwrap();
                 let mut prior = coverage();
                 prior.market_floor_unix = prior_floor;
-                prior.scope.series.as_mut().unwrap().push(ScopeSeries {
-                    id: "8".into(),
-                    slug: Some("eight".into()),
-                });
+                // A covered test series (#871) leaves the collected coverage; apply accepts exactly that drop.
+                let mut prior_series = prior.scope.series.clone().unwrap();
+                prior_series.extend([
+                    ScopeSeries {
+                        id: "8".into(),
+                        slug: Some("eight".into()),
+                    },
+                    ScopeSeries {
+                        id: "13005".into(),
+                        slug: Some("polyv2-soak-btc-up-or-down-15m".into()),
+                    },
+                ]);
+                prior.scope = crate::wallet_discovery::ParticipantScope::new(
+                    &prior.scope.recurrences,
+                    Some(&prior_series),
+                )
+                .unwrap();
                 match prior_kind {
                     "legacy" => prior.scope.series = None,
                     "other_recurrences" => prior.scope.recurrences = vec!["5m".into()],
@@ -1906,6 +1924,29 @@ mod tests {
                     let mut renamed = data.coverage.clone();
                     renamed.scope.series.as_mut().unwrap()[0].slug = Some("renamed".into());
                     invalid.push(renamed);
+                    assert!(
+                        !data
+                            .coverage
+                            .scope
+                            .series
+                            .as_ref()
+                            .unwrap()
+                            .iter()
+                            .any(|series| series.id == "13005"),
+                        "the honest collection dropped the covered test series"
+                    );
+                    let mut readded = data.coverage.clone();
+                    let mut series = readded.scope.series.clone().unwrap();
+                    series.push(ScopeSeries {
+                        id: "13005".into(),
+                        slug: Some("polyv2-soak-btc-up-or-down-15m".into()),
+                    });
+                    readded.scope = crate::wallet_discovery::ParticipantScope::new(
+                        &readded.scope.recurrences,
+                        Some(&series),
+                    )
+                    .unwrap();
+                    invalid.push(readded);
                 }
                 for coverage in invalid {
                     // Every counterexample decodes and passes the coverage type's own validation.

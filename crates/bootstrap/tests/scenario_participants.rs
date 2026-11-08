@@ -183,7 +183,9 @@ fn serve(venue: Arc<Mutex<Venue>>) -> String {
                     Some("recurrence") => {
                         (200, json!({"id":"7", "slug":"seven", "recurrence":"daily"}))
                     }
-                    None => (200, json!({"id":"7", "slug":"seven", "recurrence":"15m"})),
+                    None | Some("embedded") => {
+                        (200, json!({"id":"7", "slug":"seven", "recurrence":"15m"}))
+                    }
                     _ => unreachable!(),
                 }
             } else if request.starts_with("GET /events/keyset?") {
@@ -196,9 +198,15 @@ fn serve(venue: Arc<Mutex<Venue>>) -> String {
                 {
                     (200, json!({"events":[]}))
                 } else {
+                    // #871: the embedded series is what gate F reads; a test slug there fails the walk.
+                    let slug = if venue.series_failure == Some("embedded") {
+                        "polyv2-soak-btc-up-or-down-15m"
+                    } else {
+                        "seven"
+                    };
                     (
                         200,
-                        json!({"events":[{"series":[{"id":"7", "recurrence":"15m"}], "markets":[{"conditionId":CONDITION, "endDate":"1970-01-02T00:00:00Z", "closed":venue.closed}]}], "next_cursor":"last"}),
+                        json!({"events":[{"series":[{"id":"7", "slug":slug, "recurrence":"15m"}], "markets":[{"conditionId":CONDITION, "endDate":"1970-01-02T00:00:00Z", "closed":venue.closed}]}], "next_cursor":"last"}),
                     )
                 }
             } else if request.starts_with("GET /v2/trades?") {
@@ -374,7 +382,7 @@ fn discovery_retries_pages_and_finds_post_end_trades_before_advancing_coverage()
 
 #[test]
 fn discovery_refuses_changed_or_missing_covered_series_before_trades() {
-    for failure in ["gone", "renamed", "recurrence"] {
+    for failure in ["gone", "renamed", "recurrence", "embedded"] {
         let dir = TempDir::new().unwrap();
         drop(WalletCache::open(&dir.path().join("cache.db")).unwrap());
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -415,7 +423,111 @@ fn discovery_refuses_changed_or_missing_covered_series_before_trades() {
                 .iter()
                 .any(|request| request.starts_with("GET /v2/trades"))
         );
+        let audit: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("audit.json")).unwrap()).unwrap();
+        assert_eq!(audit["record"]["status"], "failed:gamma", "{failure}");
     }
+}
+
+/// A schema-two candidate, built as the spool CLI scenario builds one (the collector requires schema two).
+fn schema_two_candidate(path: &Path) {
+    let mut cache = WalletCache::open(path).unwrap();
+    cache
+        .upsert_wallets_bulk(&[(WALLET.to_owned(), 16, false, None, None, None, 0)])
+        .unwrap();
+    cache.begin_or_resume_clob_payout_walk_v2(100).unwrap();
+    cache
+        .raw_conn_for_test()
+        .execute_batch(
+            "PRAGMA user_version=2; ALTER TABLE clob_payout_evidence_v2 DROP COLUMN neg_risk;",
+        )
+        .unwrap();
+}
+
+fn participant_state(db: &Path) -> (i64, Option<String>) {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    (
+        conn.query_row("SELECT COUNT(*) FROM wallets", [], |row| row.get(0))
+            .unwrap(),
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = 'participant_discovery_coverage'",
+            [],
+            |row| row.get(0),
+        )
+        .ok(),
+    )
+}
+
+/// #871 FAIL: a kept series' event embedding a test-series slug lets split collection exit nonzero (the wrapper
+/// would then run ordinary discovery) or record anything but terminal 75, its audit loses `failed:gamma`, or apply
+/// returns anything but 75 or changes participant state.
+#[test]
+fn split_collection_records_an_embedded_test_slug_as_terminal_75() {
+    let dir = TempDir::new().unwrap();
+    let fixed = dir.path().join("fixed.db");
+    schema_two_candidate(&fixed);
+    let candidate = dir.path().join("cache.db");
+    std::fs::copy(&fixed, &candidate).unwrap();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let venue = Arc::new(Mutex::new(Venue {
+        mode: 3,
+        trade_time: now,
+        series_failure: Some("embedded"),
+        ..Venue::default()
+    }));
+    let base = serve(Arc::clone(&venue));
+    let spool = dir.path().join("spool.json");
+    let collected = run(
+        dir.path(),
+        &[
+            "winner-discovery",
+            "--defer-activation",
+            "--collect-to",
+            spool.to_str().unwrap(),
+            "--participant-audit",
+            "audit.json",
+            "--coverage-from",
+            fixed.to_str().unwrap(),
+            "--not-before",
+            "0",
+            "--end-date-min",
+            "0",
+        ],
+        &base,
+        "5",
+    );
+    assert_eq!(collected.status.code(), Some(0), "{collected:?}");
+    let value: Value = serde_json::from_slice(&std::fs::read(&spool).unwrap()).unwrap();
+    assert_eq!(value["outcomes"][2]["result"]["exit_code"], 75, "{value}");
+    let audit: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("audit.json")).unwrap()).unwrap();
+    assert_eq!(audit["record"]["status"], "failed:gamma");
+    assert!(
+        !venue
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| request.starts_with("GET /v2/trades"))
+    );
+    let before = participant_state(&candidate);
+    let applied = run(
+        dir.path(),
+        &[
+            "winner-discovery",
+            "--defer-activation",
+            "--apply-from",
+            spool.to_str().unwrap(),
+            "--end-date-min",
+            "0",
+        ],
+        &base,
+        "5",
+    );
+    assert_eq!(applied.status.code(), Some(75), "{applied:?}");
+    assert_eq!(participant_state(&candidate), before);
 }
 
 #[test]

@@ -30,7 +30,7 @@ fn start_server(events_series_id: &'static str) -> String {
                 r#"{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"}"#.to_owned()
             } else if request.starts_with("GET /events/keyset?series_id=7&") {
                 format!(
-                    r#"{{"events":[{{"series":[{{"id":"{events_series_id}","recurrence":"15m"}}],"markets":[{{"conditionId":"{CONDITION}"}}]}}]}}"#
+                    r#"{{"events":[{{"series":[{{"id":"{events_series_id}","slug":"btc-up-or-down-15m","recurrence":"15m"}}],"markets":[{{"conditionId":"{CONDITION}"}}]}}]}}"#
                 )
             } else {
                 panic!("unexpected request {request}");

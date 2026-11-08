@@ -1,10 +1,11 @@
 //! Gamma market scope for the ranker and participant discovery (#784, #800).
 //!
-//! This command lists every Gamma series, keeps those with a requested recurrence,
-//! walks each one's events through the documented `/events/keyset` endpoint back
-//! to an end-date floor, and writes the markets' condition ids with every page's hash, cursor
-//! chain and times. Any surprise in a reply fails the command (exit 1); exhausted transient
-//! fetches exit 75 so the loop supervisor retries the retained cycle. Nothing touches the cache.
+//! This command lists every Gamma series, keeps those with a requested recurrence and gate F's
+//! usable non-test slug (#871), walks each one's events through the documented `/events/keyset`
+//! endpoint back to an end-date floor, and writes the markets' condition ids with every page's
+//! hash, cursor chain and times. Any surprise in a reply fails the command (exit 1); exhausted
+//! transient fetches exit 75 so the loop supervisor retries the retained cycle. Nothing touches
+//! the cache.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -13,7 +14,8 @@ use std::time::Duration;
 use pe_core_types::RawHttpAttempt;
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
-    FIFTEEN_MINUTE_RECURRENCE, HttpRequestContext, ReqwestFetcher, event_series_recurrence,
+    FIFTEEN_MINUTE_RECURRENCE, HttpRequestContext, POLYMARKET_TEST_SERIES_SLUG_PREFIX,
+    ReqwestFetcher, event_series_recurrence,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -102,6 +104,67 @@ pub struct ScopeSeries {
     pub slug: Option<String>,
 }
 
+/// Why a series of a requested recurrence stays out of the scope: gate F's slug rule (#869, #871).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExclusionReason {
+    /// The slug starts with Polymarket's test-series prefix.
+    TestSeries,
+    /// The slug is absent, null, not a string or blank.
+    NoSlug,
+}
+
+/// A requested-recurrence series the scope excludes, with the slug it was judged by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExcludedSeries {
+    pub id: String,
+    pub slug: Option<String>,
+    pub reason: ExclusionReason,
+}
+
+/// Gate F's series rule after its recurrence check: a usable slug outside Polymarket's test namespace. A blank slug
+/// identifies nothing, as in admission's read (`str::trim`).
+pub(crate) fn series_exclusion(slug: Option<&str>) -> Option<ExclusionReason> {
+    match slug.filter(|slug| !slug.trim().is_empty()) {
+        None => Some(ExclusionReason::NoSlug),
+        Some(slug) if slug.starts_with(POLYMARKET_TEST_SERIES_SLUG_PREFIX) => {
+            Some(ExclusionReason::TestSeries)
+        }
+        Some(_) => None,
+    }
+}
+
+/// Split series into those the scope keeps and those gate F's slug rule excludes, preserving order.
+pub(crate) fn partition_series(
+    series: impl IntoIterator<Item = ScopeSeries>,
+) -> (Vec<ScopeSeries>, Vec<ExcludedSeries>) {
+    let mut kept = Vec::new();
+    let mut excluded = Vec::new();
+    for listed in series {
+        match series_exclusion(listed.slug.as_deref()) {
+            None => kept.push(listed),
+            Some(reason) => excluded.push(ExcludedSeries {
+                id: listed.id,
+                slug: listed.slug,
+                reason,
+            }),
+        }
+    }
+    (kept, excluded)
+}
+
+/// Order exclusions by numeric series id (ids are decimal) and warn for each series without a usable slug: it
+/// could hide a would-be production series, which pe-service also refuses (`series_slug:none`).
+pub(crate) fn settle_exclusions(excluded: &mut [ExcludedSeries]) {
+    excluded.sort_by_key(|series| (series.id.parse::<u64>().ok(), series.id.clone()));
+    for series in excluded.iter() {
+        if series.reason == ExclusionReason::NoSlug {
+            warn!(series = %series.id, slug = ?series.slug,
+                "market scope: series of a requested recurrence has no usable slug; excluded");
+        }
+    }
+}
+
 /// One fetched page's provenance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ScopePage {
@@ -130,6 +193,9 @@ pub struct MarketScope {
     pub started_at_unix: i64,
     pub completed_at_unix: i64,
     pub series: Vec<ScopeSeries>,
+    /// Requested-recurrence series that gate F's slug rule keeps out (#871); omitted when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excluded_series: Vec<ExcludedSeries>,
     pub pages: Vec<ScopePage>,
     pub condition_ids: Vec<String>,
     pub count: u64,
@@ -261,7 +327,8 @@ pub fn parse_pinned_series(text: &str) -> Result<Vec<ScopeSeries>, BootstrapErro
 }
 
 /// List the requested series (or read exactly the pinned ones by id), then walk each one's events
-/// ending at or after the floor.
+/// ending at or after the floor. Gate F's slug rule excludes series after the listing and before any
+/// by-id read, so an excluded series is never read or walked; the scope records each exclusion.
 async fn sweep_market_scope<F: ScopeFetcher + Sync>(
     fetcher: &F,
     base_url: &str,
@@ -279,20 +346,27 @@ async fn sweep_market_scope<F: ScopeFetcher + Sync>(
             message: format!("market-scope: unusable --end-date-min {end_date_min_unix}"),
         })?;
     let mut pages = Vec::new();
-    let series = match pinned {
+    let (series, mut excluded_series) = match pinned {
         Some(pinned) => {
-            pinned_series(
+            let (kept, excluded) = partition_series(pinned.iter().cloned());
+            let read = pinned_series(
                 fetcher,
                 base_url,
-                pinned,
+                &kept,
                 &recurrences,
                 retry_base,
                 &mut pages,
             )
-            .await?
+            .await?;
+            (read.into_values().collect::<Vec<_>>(), excluded)
         }
-        None => list_series(fetcher, base_url, &recurrences, retry_base, &mut pages).await?,
+        None => partition_series(
+            list_series(fetcher, base_url, &recurrences, retry_base, &mut pages)
+                .await?
+                .into_values(),
+        ),
     };
+    settle_exclusions(&mut excluded_series);
     if series.is_empty() {
         return Err(BootstrapError::Gamma {
             message: "market-scope: Gamma lists no requested series".to_owned(),
@@ -300,7 +374,7 @@ async fn sweep_market_scope<F: ScopeFetcher + Sync>(
     }
 
     let mut condition_ids = BTreeSet::new();
-    for listed_series in series.values() {
+    for listed_series in &series {
         let mut cursor: Option<String> = None;
         let mut seen = HashSet::new();
         let mut walked = 0usize;
@@ -372,7 +446,8 @@ async fn sweep_market_scope<F: ScopeFetcher + Sync>(
         end_date_min_unix,
         started_at_unix,
         completed_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
-        series: series.into_values().collect(),
+        series,
+        excluded_series,
         pages,
         count: u64::try_from(condition_ids.len()).map_err(|_| BootstrapError::Internal)?,
         condition_ids,
@@ -483,7 +558,10 @@ async fn list_series<F: ScopeFetcher + Sync>(
     })
 }
 
-/// Label one event's markets after proving it belongs to a requested, walked series.
+/// Label one event's markets after proving it belongs to a requested, walked series whose embedded
+/// slug passes gate F's rule. Gate F reads exactly this first embedded series, so a disagreement with
+/// the kept series fails the walk temporarily (exit 75), as a changed by-id slug does, rather than
+/// stopping the loop or silently shrinking the scope.
 fn collect_event(
     url: &str,
     series_id: &str,
@@ -509,6 +587,19 @@ fn collect_event(
             url,
             "event's first series does not have a requested recurrence",
         );
+    }
+    let embedded_slug = first_series
+        .and_then(|series| series.get("slug"))
+        .and_then(Value::as_str);
+    if let Some(reason) = series_exclusion(embedded_slug) {
+        return Err(BootstrapError::TransientSource {
+            source_name: "gamma-events",
+            message: format!(
+                "market-scope {url}: event {} of series {series_id} embeds a series slug {embedded_slug:?} \
+                 that gate F refuses ({reason:?})",
+                event.get("id").unwrap_or(&Value::Null)
+            ),
+        });
     }
     let markets = event
         .get("markets")
@@ -694,10 +785,11 @@ mod tests {
         format!("0x{}", format!("{n:02x}").repeat(32))
     }
 
+    /// One keyset event whose first embedded series carries a usable production slug, as Gamma serves it.
     fn event(series_id: &str, recurrence: &str, markets: &[String]) -> Value {
         json!({
             "id": "e",
-            "series": [{"id": series_id, "recurrence": recurrence}],
+            "series": [{"id": series_id, "slug": format!("series-{series_id}"), "recurrence": recurrence}],
             "markets": markets.iter().map(|id| json!({"conditionId": id})).collect::<Vec<_>>(),
         })
     }
@@ -976,7 +1068,7 @@ mod tests {
                 r#"[{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"}]"#.to_owned()
             } else {
                 format!(
-                    r#"{{"events":[{{"series":[{{"id":"7","recurrence":"15m"}}],"markets":[{{"conditionId":"{}"}}]}}]}}"#,
+                    r#"{{"events":[{{"series":[{{"id":"7","slug":"btc-up-or-down-15m","recurrence":"15m"}}],"markets":[{{"conditionId":"{}"}}]}}]}}"#,
                     condition(0xab)
                 )
             };
@@ -993,6 +1085,14 @@ mod tests {
             std::fs::read(out).unwrap(),
             include_bytes!("../tests/fixtures/market_scope_15m.json")
         );
+        // A scope with no exclusions writes no `excluded_series` key, so earlier files and readers stay compatible.
+        assert!(
+            !serde_json::to_value(&scope)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("excluded_series")
+        );
     }
 
     #[test]
@@ -1006,9 +1106,9 @@ mod tests {
                 let calls = fetcher(|url: &str, _| {
                     let value = if url.contains("/series?") {
                         json!([
-                            {"id": "2", "recurrence": "15m"},
-                            {"id": "3", "recurrence": "5m"},
-                            {"id": "4", "recurrence": "daily"}
+                            {"id": "2", "slug": "btc-up-or-down-15m", "recurrence": "15m"},
+                            {"id": "3", "slug": "btc-up-or-down-5m", "recurrence": "5m"},
+                            {"id": "4", "slug": "btc-up-or-down-daily", "recurrence": "daily"}
                         ])
                     } else if url.contains("series_id=2&") {
                         json!({"events": [event("2", "15m", &[condition(2)])]})
@@ -1094,7 +1194,7 @@ mod tests {
             ),
             (
                 "no markets",
-                json!({"events": [{"series": [{"id": "2", "recurrence": "15m"}]}]}),
+                json!({"events": [{"series": [{"id": "2", "slug": "btc-up-or-down-15m", "recurrence": "15m"}]}]}),
             ),
             ("no series", json!({"events": [{"markets": []}]})),
             ("array reply", json!([event("2", "15m", &[condition(1)])])),
@@ -1156,8 +1256,8 @@ mod tests {
     async fn empty_series_sweep_keeps_its_pages_and_only_require_markets_fails() {
         let serve = |url: &str, _| {
             let body = if url == series_url(0) {
-                json!([{"id": "13005", "slug": "polyv2-soak-btc-up-or-down-15m", "recurrence": "15m"}])
-            } else if url == events_url(BASE, "13005", FLOOR_ISO, None).unwrap() {
+                json!([{"id": "13100", "slug": "newcoin-up-or-down-15m", "recurrence": "15m"}])
+            } else if url == events_url(BASE, "13100", FLOOR_ISO, None).unwrap() {
                 json!({"events": [], "next_cursor": null})
             } else {
                 panic!("unexpected URL {url}");
@@ -1171,8 +1271,8 @@ mod tests {
         assert_eq!(
             scope.series,
             vec![ScopeSeries {
-                id: "13005".into(),
-                slug: Some("polyv2-soak-btc-up-or-down-15m".into()),
+                id: "13100".into(),
+                slug: Some("newcoin-up-or-down-15m".into()),
             }]
         );
         assert_eq!(
@@ -1220,7 +1320,10 @@ mod tests {
 
         let endless = |url: &str, call: usize| {
             if url.contains("/series") {
-                return Ok(serde_json::to_vec(&json!([{"id": "2", "recurrence": "15m"}])).unwrap());
+                return Ok(serde_json::to_vec(
+                    &json!([{"id": "2", "slug": "btc-up-or-down-15m", "recurrence": "15m"}]),
+                )
+                .unwrap());
             }
             Ok(
                 serde_json::to_vec(&json!({"events": [event("2", "15m", &[condition(1)])],
@@ -1247,7 +1350,10 @@ mod tests {
 
         let repeating = |url: &str, _| {
             if url.contains("/series") {
-                return Ok(serde_json::to_vec(&json!([{"id": "2", "recurrence": "15m"}])).unwrap());
+                return Ok(serde_json::to_vec(
+                    &json!([{"id": "2", "slug": "btc-up-or-down-15m", "recurrence": "15m"}]),
+                )
+                .unwrap());
             }
             Ok(serde_json::to_vec(&json!({"events": [], "next_cursor": "same"})).unwrap())
         };
@@ -1310,5 +1416,242 @@ mod tests {
             })
         };
         assert_eq!(sweep(fatal).await.unwrap_err().exit_code(), 1);
+    }
+
+    /// Captures JSON log lines for assertions on warnings.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogCapture {
+        fn lines(&self) -> Vec<Value> {
+            let bytes = self.0.lock().unwrap();
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect()
+        }
+    }
+
+    fn excluded(id: &str, slug: Option<&str>, reason: ExclusionReason) -> ExcludedSeries {
+        ExcludedSeries {
+            id: id.into(),
+            slug: slug.map(str::to_owned),
+            reason,
+        }
+    }
+
+    /// Gate F's slug rule (#871): a usable slug outside Polymarket's test namespace is kept; a test slug, or an
+    /// absent, null, non-string or blank one (admission's `str::trim` rule), is excluded.
+    #[test]
+    fn series_exclusion_mirrors_gate_f() {
+        for (slug, expected) in [
+            (Some("btc-up-or-down-15m"), None),
+            (
+                Some("polyv2-soak-xrp-up-or-down-15m"),
+                Some(ExclusionReason::TestSeries),
+            ),
+            (Some("polyv2bkbsl"), Some(ExclusionReason::TestSeries)),
+            (None, Some(ExclusionReason::NoSlug)),
+            (Some(""), Some(ExclusionReason::NoSlug)),
+            (Some("  "), Some(ExclusionReason::NoSlug)),
+        ] {
+            assert_eq!(series_exclusion(slug), expected, "{slug:?}");
+        }
+        let (kept, dropped) = partition_series([
+            ScopeSeries {
+                id: "13005".into(),
+                slug: Some("polyv2-soak-btc-up-or-down-15m".into()),
+            },
+            ScopeSeries {
+                id: "10192".into(),
+                slug: Some("btc-up-or-down-15m".into()),
+            },
+            ScopeSeries {
+                id: "9".into(),
+                slug: None,
+            },
+        ]);
+        assert_eq!(
+            kept,
+            [ScopeSeries {
+                id: "10192".into(),
+                slug: Some("btc-up-or-down-15m".into()),
+            }]
+        );
+        assert_eq!(
+            dropped,
+            [
+                excluded(
+                    "13005",
+                    Some("polyv2-soak-btc-up-or-down-15m"),
+                    ExclusionReason::TestSeries
+                ),
+                excluded("9", None, ExclusionReason::NoSlug),
+            ]
+        );
+    }
+
+    /// FAIL: a listed test or slugless series of a requested recurrence is read, walked or left unrecorded, a row of
+    /// another recurrence is recorded (recurrence comes first, as in gate F), or no warning names the slugless one.
+    #[tokio::test]
+    async fn listing_excludes_test_and_slugless_series_without_reading_them() {
+        let log = LogCapture::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let scope = sweep(|url: &str, _| {
+            let body = if url == series_url(0) {
+                json!([
+                    {"id": "2", "slug": "btc-up-or-down-15m", "recurrence": "15m"},
+                    {"id": "13005", "slug": "polyv2-soak-btc-up-or-down-15m", "recurrence": "15m"},
+                    {"id": "14", "slug": null, "recurrence": "15m"},
+                    {"id": "15", "slug": 15, "recurrence": "15m"},
+                    {"id": "16", "slug": "  ", "recurrence": "15m"},
+                    {"id": "13006", "slug": "polyv2-soak-btc-up-or-down-5m", "recurrence": "5m"}
+                ])
+            } else if url == events_url(BASE, "2", FLOOR_ISO, None).unwrap() {
+                json!({"events": [event("2", "15m", &[condition(1)])]})
+            } else {
+                panic!("an excluded series must not be read or walked: {url}");
+            };
+            Ok(serde_json::to_vec(&body).unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            scope.series,
+            [ScopeSeries {
+                id: "2".into(),
+                slug: Some("btc-up-or-down-15m".into()),
+            }]
+        );
+        assert_eq!(
+            scope.excluded_series,
+            [
+                excluded("14", None, ExclusionReason::NoSlug),
+                excluded("15", None, ExclusionReason::NoSlug),
+                excluded("16", Some("  "), ExclusionReason::NoSlug),
+                excluded(
+                    "13005",
+                    Some("polyv2-soak-btc-up-or-down-15m"),
+                    ExclusionReason::TestSeries
+                ),
+            ]
+        );
+        assert_eq!(scope.condition_ids, [condition(1)]);
+        let written = serde_json::to_value(&scope).unwrap();
+        assert_eq!(written["excluded_series"][3]["reason"], "test_series");
+        assert_eq!(written["excluded_series"][0]["reason"], "no_slug");
+        let warned: Vec<String> = log
+            .lines()
+            .into_iter()
+            .filter(|line| line["level"] == "WARN")
+            .map(|line| line["fields"]["series"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(warned, ["14", "15", "16"]);
+    }
+
+    /// FAIL: a pinned test series is read by id or walked, its exclusion is not recorded, the written file breaks the
+    /// reader's one-read-per-series rule, or an all-test pin produces a scope.
+    #[tokio::test]
+    async fn pinned_test_series_are_recorded_and_never_read() {
+        let (scope, calls) = sweep_pinned(
+            |url: &str, call| {
+                assert!(
+                    !url.contains("13005"),
+                    "an excluded pinned series must not be read or walked: {url}"
+                );
+                serve_pinned(url, call)
+            },
+            "13005:polyv2-soak-btc-up-or-down-15m,2:btc-up-or-down-15m",
+        )
+        .await;
+        let scope = scope.unwrap();
+        assert_eq!(
+            scope.series,
+            [ScopeSeries {
+                id: "2".into(),
+                slug: Some("btc-up-or-down-15m".into()),
+            }]
+        );
+        assert_eq!(
+            scope.excluded_series,
+            [excluded(
+                "13005",
+                Some("polyv2-soak-btc-up-or-down-15m"),
+                ExclusionReason::TestSeries
+            )]
+        );
+        let reads: Vec<&str> = scope
+            .pages
+            .iter()
+            .filter(|page| page.kind == "series")
+            .map(|page| page.url.as_str())
+            .collect();
+        assert_eq!(reads, [format!("{BASE}/series/2")]);
+        assert_eq!(calls, 3, "one by-id read and series 2's two keyset pages");
+
+        let (all_test, calls) = sweep_pinned(
+            |url: &str, _| panic!("an all-test pin must not fetch: {url}"),
+            "13005:polyv2-soak-btc-up-or-down-15m",
+        )
+        .await;
+        assert_eq!(all_test.unwrap_err().exit_code(), 1);
+        assert_eq!(calls, 0);
+    }
+
+    /// FAIL: a kept series' event whose first embedded series carries a test or unusable slug is recorded, or fails any
+    /// way other than a temporary failure (exit 75) that names the event; a production embedded slug fails the walk.
+    #[tokio::test]
+    async fn embedded_test_or_unusable_slug_fails_the_walk_temporarily() {
+        let first_events = events_url(BASE, "2", FLOOR_ISO, None).unwrap();
+        for embedded in [
+            json!({"id": "2", "recurrence": "15m"}),
+            json!({"id": "2", "recurrence": "15m", "slug": null}),
+            json!({"id": "2", "recurrence": "15m", "slug": 15}),
+            json!({"id": "2", "recurrence": "15m", "slug": ""}),
+            json!({"id": "2", "recurrence": "15m", "slug": "  "}),
+            json!({"id": "2", "recurrence": "15m", "slug": "polyv2-soak-btc-up-or-down-15m"}),
+            json!({"id": "2", "recurrence": "15m", "slug": "polyv2bkbsl"}),
+        ] {
+            let first_events = first_events.clone();
+            let reply = json!({"events": [{"id": "e9", "series": [embedded.clone()],
+                                           "markets": [{"conditionId": condition(1)}]}]});
+            let error = sweep(move |url: &str, call| {
+                if url == first_events {
+                    Ok(serde_json::to_vec(&reply).unwrap())
+                } else {
+                    serve_ok(url, call)
+                }
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(error.exit_code(), 75, "{embedded}: {error}");
+            assert!(
+                matches!(error, BootstrapError::TransientSource { .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains("\"e9\""), "{error}");
+        }
+        let healthy = sweep(serve_ok).await.unwrap();
+        assert_eq!(
+            healthy.condition_ids,
+            [condition(1), condition(2), condition(3)]
+        );
     }
 }
