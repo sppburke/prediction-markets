@@ -10474,6 +10474,7 @@ mod tests {
         let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
         for events in [
             r#"[{"series":[{"recurrence":"15m"}]}]"#,
+            r#"[{"series":[{"recurrence":"15m","slug":"polyv2-soak-xrp-up-or-down-15m"}]}]"#,
             r#"[{"volume":1e400}]"#,
             deep.as_str(),
         ] {

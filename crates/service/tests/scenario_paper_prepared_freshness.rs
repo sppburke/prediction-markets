@@ -4630,14 +4630,43 @@ async fn sibling_group_yes_is_skipped_before_staging() {
 
 #[tokio::test]
 async fn only_fifteen_minute_series_is_copied() {
-    for (recurrence, refusal) in [
-        (Some("15m"), None),
-        (Some("5m"), Some("series_recurrence:5m")),
-        (None, Some("series_recurrence:none")),
+    let logs = CensusLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .flatten_event(true)
+        .without_time()
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let production = Some("btc-up-or-down-15m");
+    let soak = Some("polyv2-soak-xrp-up-or-down-15m");
+    let mut soak_refusal = None;
+    for (recurrence, slug, refusal) in [
+        (Some("15m"), production, None),
+        (Some("5m"), production, Some("series_recurrence:5m")),
+        (None, production, Some("series_recurrence:none")),
+        (
+            Some("15m"),
+            soak,
+            Some("series_slug:polyv2-soak-xrp-up-or-down-15m"),
+        ),
+        (
+            Some("15m"),
+            Some("polyv2bkbsl"),
+            Some("series_slug:polyv2bkbsl"),
+        ),
+        (Some("15m"), None, Some("series_slug:none")),
+        // Recurrence is checked first.
+        (Some("5m"), soak, Some("series_recurrence:5m")),
     ] {
         let mut h = Harness::new().await;
         let mut recorded = h.record(1).await;
         recorded.admission.market.series_recurrence = recurrence.map(str::to_owned);
+        recorded.admission.market.series_slug = slug.map(str::to_owned);
+        if recurrence == Some("15m") && slug == soak {
+            soak_refusal = Some(recorded.clone());
+        }
         h.freeze(&recorded, true).await;
         h.set_continuation_version(&recorded, 7);
         h.attempt(&recorded, at());
@@ -4666,45 +4695,81 @@ async fn only_fifteen_minute_series_is_copied() {
             .unwrap();
         assert_eq!(seeds, copied);
     }
+    // The test-series refusal's journal line joins it to its decision and its recorded Gamma frame.
+    let recorded = soak_refusal.unwrap();
+    let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let refusals: Vec<serde_json::Value> = captured
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| {
+            line["message"] == "signal did not produce order"
+                && line["reason"] == "series_slug"
+                && line["value"] == "polyv2-soak-xrp-up-or-down-15m"
+        })
+        .collect();
+    assert_eq!(refusals.len(), 1, "{captured}");
+    let gamma = &recorded.admission.receipts.gamma;
+    assert_eq!(
+        refusals[0]["market"],
+        recorded.admission.market.condition_id.0.as_str()
+    );
+    assert_eq!(refusals[0]["trade"], recorded.id.0.as_str());
+    assert_eq!(refusals[0]["gamma_seq"], gamma.sequence.0);
+    assert_eq!(
+        refusals[0]["gamma_hash"],
+        gamma.this_hash.to_string().as_str()
+    );
 }
 
 #[tokio::test]
 async fn staged_decision_keeps_admission_when_series_is_not_fifteen_minutes() {
-    let mut h = Harness::new().await;
-    let held = h.record(1).await;
-    h.freeze(&held, true).await;
-    h.set_continuation_version(&held, 7);
-    h.attempt(&held, at());
-    h.start(true);
-    h.barrier().await;
-    h.stop().await;
-    let second = h.record(2).await;
-    h.freeze(&second, true).await;
-    h.set_continuation_version(&second, 7);
-    h.arm();
-    h.attempt(&second, at() + time::Duration::seconds(1));
-    *h.prices.gate.market.lock().unwrap() = Some(held.admission.market.condition_id.0.clone());
-    h.prices.gate.blocked.store(true, Ordering::SeqCst);
-    h.start(true);
-    h.prices.gate.started.notified().await;
-    h.stop().await;
-    assert_eq!(h.terminal(&second).state, DecisionPendingState::Open);
-    let seed = h.paper.pending_dispatch_seeds().unwrap().remove(0);
-    let mut resumed = second.clone();
-    resumed.admission.market.series_recurrence = Some("5m".to_owned());
-    h.prices.gate.blocked.store(false, Ordering::SeqCst);
-    h.attempt(&resumed, at() + time::Duration::seconds(1));
-    h.start(true);
-    h.barrier().await;
-    h.stop().await;
-    let terminal = h.terminal(&second);
-    assert_eq!(terminal.terminal_disposition.as_deref(), Some("fill"));
-    let replay = replay_decision_pending(&terminal).unwrap();
-    assert_eq!(
-        replay.post_boundary.body.terminal.dispatch_id.as_deref(),
-        Some(seed.dispatch_id.as_str())
-    );
-    assert_eq!(h.prepared_count(), 2);
+    // A staged decision skips gate F on either condition: a resumed admission whose series no
+    // longer recurs every 15 minutes, or one that names a Polymarket test series.
+    for (recurrence, slug) in [
+        ("5m", "btc-up-or-down-15m"),
+        ("15m", "polyv2-soak-xrp-up-or-down-15m"),
+    ] {
+        let mut h = Harness::new().await;
+        let held = h.record(1).await;
+        h.freeze(&held, true).await;
+        h.set_continuation_version(&held, 7);
+        h.attempt(&held, at());
+        h.start(true);
+        h.barrier().await;
+        h.stop().await;
+        let second = h.record(2).await;
+        h.freeze(&second, true).await;
+        h.set_continuation_version(&second, 7);
+        h.arm();
+        h.attempt(&second, at() + time::Duration::seconds(1));
+        *h.prices.gate.market.lock().unwrap() = Some(held.admission.market.condition_id.0.clone());
+        h.prices.gate.blocked.store(true, Ordering::SeqCst);
+        h.start(true);
+        h.prices.gate.started.notified().await;
+        h.stop().await;
+        assert_eq!(h.terminal(&second).state, DecisionPendingState::Open);
+        let seed = h.paper.pending_dispatch_seeds().unwrap().remove(0);
+        let mut resumed = second.clone();
+        resumed.admission.market.series_recurrence = Some(recurrence.to_owned());
+        resumed.admission.market.series_slug = Some(slug.to_owned());
+        h.prices.gate.blocked.store(false, Ordering::SeqCst);
+        h.attempt(&resumed, at() + time::Duration::seconds(1));
+        h.start(true);
+        h.barrier().await;
+        h.stop().await;
+        let terminal = h.terminal(&second);
+        assert_eq!(
+            terminal.terminal_disposition.as_deref(),
+            Some("fill"),
+            "{slug}"
+        );
+        let replay = replay_decision_pending(&terminal).unwrap();
+        assert_eq!(
+            replay.post_boundary.body.terminal.dispatch_id.as_deref(),
+            Some(seed.dispatch_id.as_str())
+        );
+        assert_eq!(h.prepared_count(), 2);
+    }
 }
 
 #[tokio::test]

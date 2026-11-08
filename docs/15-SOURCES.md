@@ -482,11 +482,11 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://clob.polymarket.com/prices-history?market={tokenId} | 2026-09-01 | 2026-10-31 |
 | https://clob.polymarket.com/prices-history?market={tokenId}&startTs={start}&endTs={cutoff}&fidelity=1 | 2026-09-18 | 2026-11-17 |
 | https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-10-13 | 2026-12-12 |
-| https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-10-15 | 2026-12-14 |
-| https://docs.polymarket.com/api-spec/gamma-openapi.yaml (`Market.events`, `Event.series`, `Series.recurrence`) | 2026-10-15 | 2026-12-14 |
-| https://gamma-api.polymarket.com/series?exclude_events=true&limit=50&offset={k} (discover additions to the covered set) | 2026-11-03 | 2027-01-02 |
-| https://gamma-api.polymarket.com/series/{id} (read each covered series by id; verify its slug and recurrence for discovery and ranking) | 2026-11-03 | 2027-01-02 |
-| https://gamma-api.polymarket.com/events/keyset?series_id={id}&end_date_min={iso}&limit=100&after_cursor={cursor} (documented in gamma-openapi.yaml) | 2026-10-15 | 2026-12-14 |
+| https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-11-08 | 2027-01-07 |
+| https://docs.polymarket.com/api-spec/gamma-openapi.yaml (`Market.events`, `Event.series`, `Series.recurrence`, `Series.slug`) | 2026-11-08 | 2027-01-07 |
+| https://gamma-api.polymarket.com/series?exclude_events=true&limit=50&offset={k} (discover additions to the covered set) | 2026-11-08 | 2027-01-07 |
+| https://gamma-api.polymarket.com/series/{id} (read each covered series by id; verify its slug and recurrence for discovery and ranking) | 2026-11-08 | 2027-01-07 |
+| https://gamma-api.polymarket.com/events/keyset?series_id={id}&end_date_min={iso}&limit=100&after_cursor={cursor} (documented in gamma-openapi.yaml) | 2026-11-08 | 2027-01-07 |
 | https://gamma-api.polymarket.com/markets?clob_token_ids={token}&closed=true | 2026-09-02 | 2026-11-01 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 
@@ -575,6 +575,24 @@ Treat as research inspiration; not a production decision input unless an authori
 
 ## Last research pass
 
+- 2026-11-08 (test-series exclusion, #869): the official Gamma OpenAPI declares `Series.slug` a
+  nullable string. Admission-shaped `/markets?condition_ids=…&include_tag=true` replies carry
+  `events[0].series[0]` as `{id, slug, title, recurrence}`: the open soak market
+  `0x01bea569…000000` (00:16Z) named `polyv2-soak-xrp-up-or-down-15m` (id 13011, "PolyV2 Soak —
+  XRP Up or Down 15m", `15m`) and omitted `negRisk`, which admission requires, as did a closed soak
+  reply; an open production BTC market (06:02Z) named `btc-up-or-down-15m` (id 10192) with
+  `negRisk` present. The full `/series?exclude_events=true` listing (2026-11-07 23:40Z, re-run
+  2026-11-08 06:02Z) held 2,582 series, every slug a non-blank string. 20 recur `15m`: ten
+  production `{bnb,btc,doge,eth,gold,hype,silver,sol,xrp,zec}-up-or-down-15m` and ten
+  `polyv2-soak-…-up-or-down-15m`. Exactly 38 slugs start with `polyv2` (35 "PolyV2 Soak — …" and
+  three daily "PolyV2 … Canary": `polyv2-nba`, `polyv2-weather`, `polyv2bkbsl`), and no other slug
+  contains it; six other test-looking names (`testsetset`, `testtest`, `testtesttest`,
+  `testtesttesttest`, `mustafa-test`, `gaytest`) do not recur every 15 minutes. No other marker
+  separates soak from production: `restricted` is true on 1,037 series, including production sol,
+  xrp, gold and silver 15m; tags and `version` `v2` are shared; the condition-id shape ending in 30
+  zero hex digits is undocumented. `/events/keyset?series_id=…` returned 0 events for all ten soak
+  series at 00:15Z, against 100 for production BTC. The prefix rule is an inference from this
+  listing, not a venue guarantee; a paged listing can omit series (2026-10-15 entry).
 - 2026-10-27 (ordinary-live go-live, #808): re-read the official
   [Wallets and Authentication](https://docs.polymarket.com/trading/wallets-auth) page (unchanged
   since 2026-10-26) and [Onchain Position Data](https://docs.polymarket.com/resources/onchain-position-data).

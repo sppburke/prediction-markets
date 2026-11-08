@@ -24,7 +24,9 @@ use pe_kelly_sizer::{KellyInput, size_contracts};
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb, PendingTerminalEvidence};
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{EquityInputs, RiskSnapshot, TradingMode, current_equity};
-use pe_source_polymarket_public::{FIFTEEN_MINUTE_RECURRENCE, PageFetcher};
+use pe_source_polymarket_public::{
+    FIFTEEN_MINUTE_RECURRENCE, POLYMARKET_TEST_SERIES_SLUG_PREFIX, PageFetcher,
+};
 use pe_strategy_winner_follow::{ExecutionMode, SizingMode, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
 use pe_venue_polymarket::{BuySizing, LadderError, LadderPlan, ladder_is_stale, plan_sized_buy};
@@ -3878,19 +3880,29 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             return;
         }
 
-        // Gate F (docs/19): copy only markets whose Gamma series recurs every 15 minutes.
-        if !already_staged
-            && admission.market.series_recurrence.as_deref() != Some(FIFTEEN_MINUTE_RECURRENCE)
+        // Gate F (docs/19): copy only markets whose Gamma series recurs every 15 minutes and has a
+        // usable slug outside Polymarket's `polyv2` test series.
+        let market = &admission.market;
+        let refusal = if market.series_recurrence.as_deref() != Some(FIFTEEN_MINUTE_RECURRENCE) {
+            Some(("series_recurrence", market.series_recurrence.as_deref()))
+        } else if market
+            .series_slug
+            .as_deref()
+            .is_none_or(|slug| slug.starts_with(POLYMARKET_TEST_SERIES_SLUG_PREFIX))
         {
-            let recurrence = admission
-                .market
-                .series_recurrence
-                .as_deref()
-                .unwrap_or("none");
+            Some(("series_slug", market.series_slug.as_deref()))
+        } else {
+            None
+        };
+        if !already_staged && let Some((reason, value)) = refusal {
+            let value = value.unwrap_or("none");
             info!(
-                reason = "series_recurrence",
+                reason,
                 market = %signal.market_id,
-                recurrence,
+                value,
+                trade = %trade.source_trade_id,
+                gamma_seq = admission.receipts.gamma.sequence.0,
+                gamma_hash = %admission.receipts.gamma.this_hash,
                 "signal did not produce order",
             );
             drop(early_book);
@@ -3898,7 +3910,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 &trade,
                 &leader_row,
                 None,
-                &format!("series_recurrence:{recurrence}"),
+                &format!("{reason}:{value}"),
                 &rb,
                 Some(&signal.market_id),
                 decision_evidence.as_ref(),
@@ -5292,6 +5304,7 @@ mod tests {
                     neg_risk: false,
                     neg_risk_market_id: None,
                     series_recurrence: Some("15m".to_owned()),
+                    series_slug: Some("btc-up-or-down-15m".to_owned()),
                     minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
                     minimum_order_size: ShareAmount::from_whole(5).unwrap(),
                     scheduled_end_unix: None,
@@ -5507,11 +5520,19 @@ mod tests {
 
         #[tokio::test(start_paused = true)]
         async fn admission_and_gate_refusals_drop_stalled_book_immediately() {
-            for (admission_failure, recurrence, reason) in [
-                (true, "15m", "market_admission_unavailable"),
-                (false, "15m", "market resolution time unknown"),
-                // Gate F refuses before gate C would.
-                (false, "5m", "series_recurrence:5m"),
+            let production = "btc-up-or-down-15m";
+            let soak = "polyv2-soak-xrp-up-or-down-15m";
+            for (admission_failure, recurrence, slug, reason) in [
+                (true, "15m", production, "market_admission_unavailable"),
+                (false, "15m", production, "market resolution time unknown"),
+                // Gate F refuses before gate C would, on either condition.
+                (false, "5m", production, "series_recurrence:5m"),
+                (
+                    false,
+                    "15m",
+                    soak,
+                    "series_slug:polyv2-soak-xrp-up-or-down-15m",
+                ),
             ] {
                 let mut harness = Harness::new(TradeProvenance::ActivityWs, true, true);
                 if admission_failure {
@@ -5524,6 +5545,7 @@ mod tests {
                     let market = &mut harness.hooks.admission_artifacts.lock().unwrap()[0].market;
                     market.scheduled_end_unix = None;
                     market.series_recurrence = Some(recurrence.to_owned());
+                    market.series_slug = Some(slug.to_owned());
                 }
                 let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
                 assert!(futures::poll!(&mut decision).is_pending());
@@ -8084,6 +8106,7 @@ mod tests {
                 neg_risk: false,
                 neg_risk_market_id: None,
                 series_recurrence: Some("15m".to_owned()),
+                series_slug: Some("btc-up-or-down-15m".to_owned()),
                 minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
                 minimum_order_size: ShareAmount::from_whole(5).unwrap(),
                 scheduled_end_unix: Some(86400),
