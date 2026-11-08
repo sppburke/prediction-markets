@@ -198,7 +198,7 @@ fn serve(venue: Arc<Mutex<Venue>>) -> String {
                 } else {
                     (
                         200,
-                        json!({"events":[{"series":[{"id":"7", "recurrence":"15m"}], "markets":[{"conditionId":CONDITION, "endDate":"1970-01-02T00:00:00Z", "closed":venue.closed}]}], "next_cursor":"last"}),
+                        json!({"events":[{"series":[{"id":"7", "slug":"seven", "recurrence":"15m"}], "markets":[{"conditionId":CONDITION, "endDate":"1970-01-02T00:00:00Z", "closed":venue.closed}]}], "next_cursor":"last"}),
                     )
                 }
             } else if request.starts_with("GET /v2/trades?") {

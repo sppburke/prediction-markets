@@ -26,8 +26,9 @@ use crate::datadash_discovery::{
 };
 use crate::error::BootstrapError;
 use crate::market_scope::{
-    MarketScope, ScopeFetcher, ScopePage, ScopeSeries, canonical_recurrences, list_market_series,
-    no_markets, recent_market_scope, require_markets,
+    ExcludedSeries, MarketScope, ScopeFetcher, ScopePage, ScopeSeries, canonical_recurrences,
+    list_market_series, no_markets, partition_series, recent_market_scope, require_markets,
+    settle_exclusions,
 };
 use crate::pile::{self, ActivationPolicy, SRC_MARKET_PARTICIPANT};
 
@@ -428,6 +429,10 @@ struct ParticipantRecord {
     window_start_unix: Option<i64>,
     window_end_unix: i64,
     market_scope: Option<MarketScope>,
+    /// Gate F's slug exclusions once classification ran (#871): covered drops and listing exclusions.
+    excluded_series: Option<Vec<ExcludedSeries>>,
+    /// The completed listing, kept so an attempt that fails before any sweep still retains its Gamma provenance.
+    listing_pages: Vec<ScopePage>,
     trades_pages: Vec<ScopePage>,
     chunks: Vec<ParticipantChunk>,
     wallet_count: usize,
@@ -514,6 +519,8 @@ where
         window_start_unix: lo,
         window_end_unix: now,
         market_scope: None,
+        excluded_series: None,
+        listing_pages: Vec::new(),
         trades_pages: Vec::new(),
         chunks: Vec::new(),
         wallet_count: 0,
@@ -530,9 +537,25 @@ where
         let (listed, listing_pages) = list()
             .await
             .map_err(|error| participant_failure("failed:gamma", &error))?;
-        let covered = matching
-            .and_then(|prior| prior.scope.series.clone())
-            .unwrap_or_default();
+        record.listing_pages.clone_from(&listing_pages);
+        // Gate F's slug rule (#871): covered series are judged by their recorded slugs, listed ones by their
+        // current slugs. A listed exclusion of a series that stays covered is not recorded: its by-id read applies
+        // the rename rule instead.
+        let (covered, mut excluded) = partition_series(
+            matching
+                .and_then(|prior| prior.scope.series.clone())
+                .unwrap_or_default(),
+        );
+        let (listed, listed_excluded) = partition_series(listed);
+        for series in listed_excluded {
+            if !covered.iter().any(|kept| kept.id == series.id)
+                && !excluded.iter().any(|dropped| dropped.id == series.id)
+            {
+                excluded.push(series);
+            }
+        }
+        settle_exclusions(&mut excluded);
+        record.excluded_series = Some(excluded);
         let additions: Vec<_> = listed
             .into_iter()
             .filter(|series| !covered.iter().any(|old| old.id == series.id))
@@ -636,6 +659,9 @@ where
     // Persist the retained evidence before application; keep the journal to one summary.
     // Each trades page URL lists its condition ids; the scope digest covers them all.
     let scope = record.market_scope.as_ref();
+    // An attempt that failed before any sweep completed still keeps its completed listing (#871), so every
+    // recorded exclusion has page provenance; a combined scope already starts with that listing.
+    let gamma_pages: &[ScopePage] = scope.map_or(&record.listing_pages, |s| &s.pages);
     let summary = serde_json::json!({
         "source_id": record.source_id,
         "schema_version": record.schema_version,
@@ -657,7 +683,8 @@ where
             "count": s.count,
             "digest": s.digest,
         })),
-        "gamma_pages": scope.map_or(0, |s| s.pages.len()),
+        "excluded_series": record.excluded_series,
+        "gamma_pages": gamma_pages.len(),
         "trades_pages": record.trades_pages.len(),
         "chunks": record.chunks.len(),
     });
@@ -670,11 +697,7 @@ where
                 version: 1,
                 record: &summary,
                 chunks: &record.chunks,
-                pages: scope
-                    .into_iter()
-                    .flat_map(|s| &s.pages)
-                    .chain(&record.trades_pages)
-                    .collect(),
+                pages: gamma_pages.iter().chain(&record.trades_pages).collect(),
             };
             crate::cache_migration::atomic_write_json(path, &audit)?;
             let bytes = std::fs::read(path)?;
@@ -1056,6 +1079,7 @@ mod tests {
                 id: "2".into(),
                 slug: Some("two".into()),
             }],
+            excluded_series: Vec::new(),
             pages: Vec::new(),
             condition_ids: (0..markets).map(|n| format!("0x{n:064x}")).collect(),
             count: u64::try_from(markets).unwrap(),
@@ -1158,7 +1182,7 @@ mod tests {
                 json!({"source_id": PARTICIPANT_SOURCE_ID, "schema_version": 2,
                 "parser_version": 2, "window_start_unix": NOW, "window_end_unix": NOW,
                 "status": "disabled", "wallet_count": 0, "scope": null,
-                "gamma_pages": 0, "trades_pages": 0, "chunks": 0})
+                "excluded_series": null, "gamma_pages": 0, "trades_pages": 0, "chunks": 0})
             );
             if supplied {
                 let bytes = std::fs::read(&path).unwrap();
@@ -2057,21 +2081,21 @@ mod tests {
             received_at_unix: 111,
             source_at_unix: Some(109),
         };
-        let soak = ScopeSeries {
-            id: "13005".into(),
-            slug: Some("polyv2-soak-btc-up-or-down-15m".into()),
+        let newcoin = ScopeSeries {
+            id: "13100".into(),
+            slug: Some("newcoin-up-or-down-15m".into()),
         };
         let mut covered_scope = scope(1);
         covered_scope.pages.push(page("2", 1, b"covered page"));
         let mut empty_scope = scope(0);
-        empty_scope.series = vec![soak.clone()];
+        empty_scope.series = vec![newcoin.clone()];
         empty_scope
             .pages
-            .push(page("13005", 0, br#"{"events":[],"next_cursor":null}"#));
+            .push(page("13100", 0, br#"{"events":[],"next_cursor":null}"#));
         let mut empty_page = serde_json::to_value(&empty_scope.pages[0]).unwrap();
         empty_page["ordinal"] = json!(1);
         let mut listed = scope(1).series;
-        listed.push(soak.clone());
+        listed.push(newcoin.clone());
         run_participant_discovery(
             &config(5),
             &mut cache,
@@ -2087,7 +2111,7 @@ mod tests {
             },
             || async { Ok((listed.clone(), Vec::new())) },
             |_, subset| {
-                let scope = if subset == [soak.clone()] {
+                let scope = if subset == [newcoin.clone()] {
                     empty_scope.clone()
                 } else {
                     covered_scope.clone()
@@ -2128,7 +2152,7 @@ mod tests {
             .iter()
             .map(|series| series["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, ["13005", "2"]);
+        assert_eq!(ids, ["13100", "2"]);
         let pages = audit["pages"].as_array().unwrap();
         assert_eq!(pages.len(), 3, "two Gamma pages, then one trades page");
         assert_eq!(pages[0]["ordinal"], 0);
@@ -2162,15 +2186,15 @@ mod tests {
             received_at_unix: 111,
             source_at_unix: Some(109),
         };
-        let soak = ScopeSeries {
-            id: "13005".into(),
-            slug: Some("polyv2-soak-btc-up-or-down-15m".into()),
+        let newcoin = ScopeSeries {
+            id: "13100".into(),
+            slug: Some("newcoin-up-or-down-15m".into()),
         };
         let empty_digest = format!("{:x}", Sha256::digest(b""));
         let mut empty_scope = scope(0);
-        empty_scope.series = vec![soak.clone()];
+        empty_scope.series = vec![newcoin.clone()];
         empty_scope.digest = empty_digest.clone();
-        empty_scope.pages.push(page("events", Some("13005")));
+        empty_scope.pages.push(page("events", Some("13100")));
         let listing_page = page("series", None);
         let error = run_participant_discovery(
             &config(5),
@@ -2178,7 +2202,7 @@ mod tests {
             ActivationPolicy::Deferred,
             200,
             || Ok(fetcher(|_: &str| panic!("an empty answer reads no trades"))),
-            || async { Ok((vec![soak.clone()], vec![listing_page.clone()])) },
+            || async { Ok((vec![newcoin.clone()], vec![listing_page.clone()])) },
             |_, _| {
                 let scope = empty_scope.clone();
                 async { Ok(scope) }
@@ -2221,7 +2245,287 @@ mod tests {
             .collect();
         assert_eq!(ordinals, [0, 1], "catalog page, then the empty sweep page");
         assert_eq!(pages[0]["kind"], "series");
-        assert_eq!(pages[1]["series_id"], "13005");
+        assert_eq!(pages[1]["series_id"], "13100");
+    }
+
+    fn polyv2_series(id: &str) -> ScopeSeries {
+        ScopeSeries {
+            id: id.into(),
+            slug: Some(format!("polyv2-soak-{id}-up-or-down-15m")),
+        }
+    }
+
+    fn production_series(id: &str) -> ScopeSeries {
+        ScopeSeries {
+            id: id.into(),
+            slug: Some(format!("series-{id}")),
+        }
+    }
+
+    fn coverage_of(series: &[ScopeSeries]) -> ParticipantDiscoveryCoverage {
+        ParticipantDiscoveryCoverage {
+            version: 1,
+            scope: ParticipantScope::new(&["15m".into()], Some(series)).unwrap(),
+            market_floor_unix: 20,
+            covered_from_unix: 10,
+            covered_through_unix: 100,
+        }
+    }
+
+    /// Runs one discovery over `listed` with the cache's prior coverage, sweeping a covered subset to one market and
+    /// any other subset to none; returns the result, the swept subsets (ids), the audit record and the WARN series.
+    async fn discover_with_listing(
+        cache: &mut WalletCache,
+        audit_path: &Path,
+        listed: Vec<ScopeSeries>,
+        listing_pages: Vec<ScopePage>,
+        fail_first_sweep: bool,
+    ) -> (
+        Result<SourceDiscoveryResult, BootstrapError>,
+        Vec<Vec<String>>,
+        Value,
+        Vec<String>,
+    ) {
+        let log = AuditLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let swept = Arc::new(Mutex::new(Vec::new()));
+        let record_swept = swept.clone();
+        let result = run_participant_discovery(
+            &config(5),
+            cache,
+            ActivationPolicy::Deferred,
+            NOW,
+            || {
+                Ok(fetcher(|_: &str| {
+                    Ok(envelope(
+                        json!([{"proxy_wallet": wallet(1), "timestamp": 100}]),
+                        None,
+                    ))
+                }))
+            },
+            || async { Ok((listed, listing_pages)) },
+            move |_, subset| {
+                let first = record_swept.lock().unwrap().is_empty();
+                record_swept.lock().unwrap().push(
+                    subset
+                        .iter()
+                        .map(|series| series.id.clone())
+                        .collect::<Vec<_>>(),
+                );
+                let covered = subset.iter().all(|series| series.id != "13100");
+                let mut swept_scope = scope(usize::from(covered));
+                swept_scope.series = subset;
+                async move {
+                    if fail_first_sweep && first {
+                        return Err(BootstrapError::Gamma {
+                            message: "fixture by-id failure".into(),
+                        });
+                    }
+                    Ok(swept_scope)
+                }
+            },
+            Some(audit_path),
+        )
+        .await;
+        let audit: Value = serde_json::from_slice(&std::fs::read(audit_path).unwrap()).unwrap();
+        let bytes = log.0.lock().unwrap();
+        let warned = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|line| line["level"] == "WARN" && line["fields"]["series"].is_string())
+            .map(|line| line["fields"]["series"].as_str().unwrap().to_owned())
+            .collect();
+        let swept = swept.lock().unwrap().clone();
+        (result, swept, audit, warned)
+    }
+
+    /// #871 FAIL: a covered test series stays covered or is swept, a listed test or slugless series joins the coverage
+    /// or is swept, an exclusion is missing from the audit or listed twice, the slugless one is not warned about, or a
+    /// newly listed non-test series stops joining (#866).
+    #[tokio::test]
+    async fn participants_drop_test_series_from_coverage_and_record_each_exclusion() {
+        let (_dir, mut cache) = tmp_cache();
+        let audit_path = _dir.path().join("audit.json");
+        let (two, three, soak) = (
+            production_series("2"),
+            production_series("3"),
+            polyv2_series("13005"),
+        );
+        let newcoin = ScopeSeries {
+            id: "13100".into(),
+            slug: Some("newcoin-up-or-down-15m".into()),
+        };
+        let slugless = ScopeSeries {
+            id: "14".into(),
+            slug: None,
+        };
+        cache
+            .set_participant_discovery_coverage(&coverage_of(&[
+                two.clone(),
+                three.clone(),
+                soak.clone(),
+            ]))
+            .unwrap();
+        let (result, swept, audit, warned) = discover_with_listing(
+            &mut cache,
+            &audit_path,
+            vec![
+                two.clone(),
+                three.clone(),
+                soak.clone(),
+                slugless,
+                newcoin.clone(),
+            ],
+            Vec::new(),
+            false,
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(swept, [vec!["2", "3"], vec!["13100"]]);
+        let stored = cache.participant_discovery_coverage().unwrap().unwrap();
+        assert_eq!(
+            stored.scope.series.unwrap(),
+            [newcoin, two, three],
+            "the test series left the coverage; the new series joined it"
+        );
+        assert_eq!(
+            stored.covered_from_unix, 10,
+            "the addition read back to covered_from"
+        );
+        let record = &audit["record"];
+        assert_eq!(record["status"], "ok");
+        assert_eq!(
+            record["excluded_series"],
+            json!([
+                {"id": "14", "slug": null, "reason": "no_slug"},
+                {"id": "13005", "slug": "polyv2-soak-13005-up-or-down-15m", "reason": "test_series"}
+            ])
+        );
+        assert_eq!(warned, ["14"]);
+    }
+
+    /// #871: a covered test series whose current listing slug is a production slug returns as an addition read back to
+    /// `covered_from`; a kept covered series whose current listing slug turned test stays covered (its by-id read then
+    /// applies the rename rule) and is not recorded as excluded.
+    #[tokio::test]
+    async fn participants_judge_covered_series_by_recorded_and_listed_series_by_current_slugs() {
+        let (_dir, mut cache) = tmp_cache();
+        let audit_path = _dir.path().join("audit.json");
+        cache
+            .set_participant_discovery_coverage(&coverage_of(&[
+                production_series("2"),
+                polyv2_series("13005"),
+            ]))
+            .unwrap();
+        let renamed_out = production_series("13005");
+        let (result, swept, audit, _) = discover_with_listing(
+            &mut cache,
+            &audit_path,
+            vec![polyv2_series("2"), renamed_out.clone()],
+            Vec::new(),
+            false,
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(
+            swept,
+            [vec!["2"], vec!["13005"]],
+            "covered 2, then the addition"
+        );
+        let stored = cache.participant_discovery_coverage().unwrap().unwrap();
+        assert_eq!(
+            stored.scope.series.unwrap(),
+            [renamed_out, production_series("2")]
+        );
+        assert_eq!(stored.covered_from_unix, 10);
+        assert_eq!(
+            audit["record"]["excluded_series"],
+            json!([{"id": "13005", "slug": "polyv2-soak-13005-up-or-down-15m", "reason": "test_series"}]),
+            "only the recorded test entry; listed 2 stays covered"
+        );
+    }
+
+    /// #871 FAIL: an attempt that completed classification but swept nothing writes an audit without its exclusions or
+    /// its listing pages, or changes wallets or coverage.
+    #[tokio::test]
+    async fn participants_failed_attempts_keep_exclusions_and_listing_pages() {
+        let listing_page = |offset: u64| ScopePage {
+            ordinal: offset,
+            kind: "series",
+            series_id: None,
+            url: format!("http://gamma.test/series?exclude_events=true&limit=50&offset={offset}"),
+            request_cursor: None,
+            returned_next_cursor: None,
+            raw_sha256: format!("{:x}", Sha256::digest(offset.to_string().as_bytes())),
+            rows: 1,
+            observed_at_unix: 110,
+            received_at_unix: 111,
+            source_at_unix: Some(109),
+        };
+        for case in ["all excluded", "first sweep fails"] {
+            let (_dir, mut cache) = tmp_cache();
+            let audit_path = _dir.path().join("audit.json");
+            let listed = if case == "all excluded" {
+                vec![
+                    polyv2_series("13005"),
+                    ScopeSeries {
+                        id: "14".into(),
+                        slug: Some("  ".into()),
+                    },
+                ]
+            } else {
+                cache
+                    .set_participant_discovery_coverage(&coverage_of(&[production_series("2")]))
+                    .unwrap();
+                vec![production_series("2"), polyv2_series("13005")]
+            };
+            let prior = cache.participant_discovery_coverage().unwrap();
+            let (result, swept, audit, _) = discover_with_listing(
+                &mut cache,
+                &audit_path,
+                listed,
+                vec![listing_page(0), listing_page(1)],
+                case == "first sweep fails",
+            )
+            .await;
+            let error = result.unwrap_err();
+            assert_eq!(error.exit_code(), 75, "{case}: {error}");
+            assert_eq!(
+                cache.participant_discovery_coverage().unwrap(),
+                prior,
+                "{case}"
+            );
+            let record = &audit["record"];
+            assert_eq!(record["status"], "failed:gamma", "{case}");
+            assert_eq!(record["scope"], Value::Null, "{case}");
+            let excluded: Vec<&str> = record["excluded_series"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|series| series["id"].as_str().unwrap())
+                .collect();
+            if case == "all excluded" {
+                assert!(swept.is_empty());
+                assert_eq!(excluded, ["14", "13005"]);
+            } else {
+                assert_eq!(swept, [vec!["2"]]);
+                assert_eq!(excluded, ["13005"]);
+            }
+            assert_eq!(record["gamma_pages"], 2, "{case}");
+            let ordinals: Vec<u64> = audit["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|page| page["ordinal"].as_u64().unwrap())
+                .collect();
+            assert_eq!(ordinals, [0, 1], "{case}: the completed listing, in order");
+        }
     }
 
     #[tokio::test]
@@ -2650,12 +2954,12 @@ mod tests {
         )
         .unwrap();
         covered.sort_by(|a, b| a.id.cmp(&b.id));
-        let soak = ScopeSeries {
-            id: "13005".into(),
-            slug: Some("polyv2-soak-btc-up-or-down-15m".into()),
+        let newcoin = ScopeSeries {
+            id: "13100".into(),
+            slug: Some("newcoin-up-or-down-15m".into()),
         };
         let mut listed = covered.clone();
-        listed.push(soak.clone());
+        listed.push(newcoin.clone());
         let all_ids: Vec<String> = listed.iter().map(|series| series.id.clone()).collect();
         for case in ["empty addition", "empty covered", "first discovery"] {
             let (_dir, mut cache) = tmp_cache();
@@ -2665,9 +2969,9 @@ mod tests {
                 cache.set_participant_discovery_coverage(&prior).unwrap();
             }
             let (listing, empty): (Vec<ScopeSeries>, Vec<&str>) = match case {
-                "empty addition" => (listed.clone(), vec!["13005"]),
+                "empty addition" => (listed.clone(), vec!["13100"]),
                 "empty covered" => (listed.clone(), all_ids.iter().map(String::as_str).collect()),
-                _ => (vec![soak.clone()], vec!["13005"]),
+                _ => (vec![newcoin.clone()], vec!["13100"]),
             };
             let sweeps = std::cell::RefCell::new(Vec::new());
             let result = run_participant_discovery(
@@ -2679,7 +2983,7 @@ mod tests {
                     Ok(fetcher(|url: &str| {
                         assert_ne!(
                             query(url)["condition"],
-                            format!("0x{:064x}", 13005),
+                            format!("0x{:064x}", 13100),
                             "an empty series reads no trades"
                         );
                         Ok(envelope(
@@ -2706,7 +3010,7 @@ mod tests {
                     );
                     assert_eq!(
                         *sweeps.borrow(),
-                        vec![(95, covered.clone()), (10, vec![soak.clone()])]
+                        vec![(95, covered.clone()), (10, vec![newcoin.clone()])]
                     );
                     let mut expected = prior.clone();
                     expected.covered_through_unix = 200;
@@ -2734,7 +3038,7 @@ mod tests {
                         || async { Ok((listed.clone(), Vec::new())) },
                         |lo, subset| {
                             next.borrow_mut().push((lo, subset.clone()));
-                            let scope = swept(subset, &["13005"]);
+                            let scope = swept(subset, &["13100"]);
                             async { Ok(scope) }
                         },
                         Some(&audit_path(&_dir)),

@@ -145,6 +145,14 @@ Discovery retains covered series by id and adds every listed series of those rec
 ranking's `market-scope --series` then reads that explicit coverage set by id. A listing
 omission cannot drop a covered series; a missing, renamed or changed-recurrence by-id reply
 fails temporarily without changing coverage. `winner-discovery --series` is rejected.
+Gate F's slug rule (#869, #871; [`ranker_market_scope`](_GLOSSARY.md#ranker-market-scope)) is
+the one exception: a covered series whose recorded slug starts with `polyv2` or is unusable
+(absent, null, non-string or blank) leaves the set at the next discovery, a listed one (judged
+by its current slug) never joins it, and neither is swept. A covered series that stays covered
+keeps the rename rule even when its current listing slug fails. The apply check partitions the
+prior set the same way, accepts exactly that drop, and refuses (77) a collected set holding an
+excluded series. Each kept series' events must embed a passing slug in their first series, or
+the sweep fails `failed:gamma` (exit 75).
 Every in-scope market is read over the whole discovery interval, regardless of its end date or
 open status. Trades after a market's end,
 and an old market trading between runs then closing, remain discoverable. Future markets can be
@@ -190,7 +198,8 @@ not spool-refusal 77. Paths name files in existing directories.
 At the participant emission boundary, collection atomically writes and syncs one JSON document:
 `{"version":1,"record":<summary>,"chunks":[...],"pages":[...]}`. The summary retains source id
 `polymarket-data-api-trades`, schema/parser versions, frozen window, wallet count, status, the
-Gamma scope's own source ID, version, schema/parser versions, digest, count and series, and page
+Gamma scope's own source ID, version, schema/parser versions, digest, count and series, the
+top-level `excluded_series` (`{id, slug, reason}`, once classification ran; null before), and page
 counts. Chunks retain lower bound, newest/oldest timestamps, page count and stop reason
 (`terminal` or `threshold`). Pages retain URL, raw sha256, rows, observed/received/source times
 and request/returned cursors, in Gamma sweep then trades order; ordinals are per stream.
@@ -202,7 +211,9 @@ events are emitted. Disabled collection without a path keeps only its disabled s
 Failed/incomplete attempts that reach this boundary also write their audit before returning
 `TransientSource`. A prior-coverage read error or any earlier failure/interruption has no audit
 persistence guarantee. A failed Gamma sweep transfers none of that sweep's pages; buffered trades
-stop at the first error. These retention boundaries are unchanged.
+stop at the first error. These retention boundaries are unchanged. An attempt that fails after
+classification but before any sweep completes still writes its completed catalog listing as its
+Gamma pages, so every recorded exclusion keeps its page provenance (#871).
 
 Audit serialization, write, sync or digest-readback failure is a local fatal error: foreground
 exits 1 before participant upserts, activation or coverage; collector exits nonzero before any

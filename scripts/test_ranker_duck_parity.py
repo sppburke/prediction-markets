@@ -2195,6 +2195,19 @@ class MarketScopeLoad(unittest.TestCase):
                 with self.assertRaises(ranker_duck.MarketScopeError):
                     self.load(value)
 
+    def test_recorded_exclusions_validate_in_both_modes(self):
+        """#871: `excluded_series` names test or slugless series the scope never read or walked; the reader ignores it,
+        and an excluded pinned series has no by-id read."""
+        excluded = [{"id": "14", "slug": None, "reason": "no_slug"},
+                    {"id": "13005", "slug": "polyv2-soak-btc-up-or-down-15m", "reason": "test_series"}]
+        for mode, value in (("listing", self.two_series()), ("pinned", self.pinned())):
+            with self.subTest(mode=mode):
+                value["excluded_series"] = excluded
+                ids, summary = self.load(value)
+                self.assertEqual(ids, frozenset({"0xa", "0xb"}))
+                self.assertEqual(summary["count"], 2)
+                self.assertNotIn("13005", {page["series_id"] for page in value["pages"]})
+
     def test_known_recurrence_lists_are_accepted(self):
         for recurrence in ("15m", "5m", "15m,5m"):
             with self.subTest(recurrence=recurrence):

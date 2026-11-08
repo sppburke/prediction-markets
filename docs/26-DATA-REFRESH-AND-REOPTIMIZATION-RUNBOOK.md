@@ -973,7 +973,8 @@ ranking lists its markets after refresh. A cycle crossing midnight keeps its cre
 window. Reports state the actual activity, discovery, `as_of` and publication clocks: a long
 cycle has no promised publication delay, and research retains its own recorded-`as_of` checks.
 Participant discovery uses the ranking recurrences and floor, both trade roles, and persisted
-interval coverage (`docs/27`). Schema-two ranking reads the explicit covered series set by id;
+interval coverage (`docs/27`). Schema-two ranking reads the explicit covered series set by id,
+which never holds a series excluded by gate F's slug rule (`ranker_market_scope`, #871);
 `participant-series` refuses absent, malformed or null-set coverage. Schema-one ranking keeps
 listing the catalog.
 
@@ -1936,8 +1937,9 @@ Each cycle records the recurrence settings and research link directory in
 `rank_market_series` key stays recorded and is inert. The cache keeps complete histories,
 read and certified as in the old loop; it differs only in which wallets it holds. Discovery
 keeps the covered series and adds every listed series of the configured recurrences, reading
-additions back to the coverage start. Ranking uses that coverage set by id, so a catalog
-omission cannot shrink it. A new series changes the November research's frozen list and
+additions back to the coverage start, except series excluded by gate F's slug rule
+(`ranker_market_scope`, #871), which leave the set. Ranking uses that coverage set by id, so a
+catalog omission cannot shrink it. A new series changes the November research's frozen list and
 requires a recorded owner decision before its merger can accept that cycle (`RANKING-PROTOCOL.md`).
 Admitting 5-minute participants is a capacity decision: tens of thousands of wallets trade those markets each month,
 many with long histories. Measure their certified sizes in the old cache first.
@@ -2021,7 +2023,8 @@ below; a recorded batch of zero stays unchanged and cannot waive participant/cov
 3. Install and verify this release in the old checkout by "Forge release deployment" above while
    both loops are inactive (the pause helper sees every ranker process), and give its `.env` the
    same `PE_RANK_MARKET_RECURRENCES` as the new loop. Its coverage must keep the covered series
-   set before a revert can publish. Keep its flag `stop`.
+   set (less any series gate F's slug rule excludes, `ranker_market_scope`) before a revert can
+   publish. Keep its flag `stop`.
 4. Capacity: proceed only if free bytes ≥ 3 × S + the old loop's last payout tables, spool and
    exports + the operator reserve (`_GLOSSARY.md` `rank_capacity_operator_reserve_gb`), S being the seeds'
    certified complete-history size. These are estimates; the first cycle's samples record the actual first
