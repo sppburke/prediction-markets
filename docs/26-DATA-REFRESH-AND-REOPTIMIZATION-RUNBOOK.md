@@ -973,9 +973,11 @@ ranking lists its markets after refresh. A cycle crossing midnight keeps its cre
 window. Reports state the actual activity, discovery, `as_of` and publication clocks: a long
 cycle has no promised publication delay, and research retains its own recorded-`as_of` checks.
 Participant discovery uses the ranking recurrences and floor, both trade roles, and persisted
-interval coverage (`docs/27`). Schema-two ranking reads the explicit covered series set by id,
-which never holds a series excluded by gate F's slug rule (`ranker_market_scope`, #871);
-`participant-series` refuses absent, malformed or null-set coverage. Schema-one ranking keeps
+interval coverage (`docs/27`). Schema-two ranking reads the explicit covered series set by id.
+After a successful discovery that set holds no series excluded by gate F's slug rule
+(`ranker_market_scope`, #871); a resumed pre-release candidate or an import can still list one,
+and `market-scope` skips it before any read and records it. `participant-series` refuses absent,
+malformed or null-set coverage. Schema-one ranking keeps
 listing the catalog.
 
 Admission preserves activity rows, receipts, manifests and cumulative drops, clears the derived
