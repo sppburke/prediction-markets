@@ -23,6 +23,9 @@ pub struct LiveMarketEvidence {
     pub neg_risk_market_id: Option<String>,
     /// Gamma `events[0].series[0].recurrence` (for example `15m`); absent or malformed is `None`.
     pub series_recurrence: Option<String>,
+    /// Gamma `events[0].series[0].slug`, the series identity gate F checks for test series; absent,
+    /// malformed or blank is `None`.
+    pub series_slug: Option<String>,
     pub minimum_tick_size: Price,
     pub minimum_order_size: ShareAmount,
     pub scheduled_end_unix: Option<i64>,
@@ -222,12 +225,14 @@ fn validate_market(
         .try_into()
         .map_err(|_| LiveMarketError::MissingMapping)?;
     let scheduled_end_unix = clob.end_date_iso.as_deref().and_then(parse_clob_end_date);
+    let (series_recurrence, series_slug) = first_series(gamma_raw, expected_condition);
     Ok(LiveMarketEvidence {
         condition_id: expected_condition.clone(),
         ordered_outcome_token_ids,
         neg_risk: gamma_neg_risk,
         neg_risk_market_id: clob.neg_risk_market_id,
-        series_recurrence: series_recurrence(gamma_raw, expected_condition),
+        series_recurrence,
+        series_slug,
         minimum_tick_size: gamma_tick,
         minimum_order_size: gamma_minimum,
         scheduled_end_unix,
@@ -241,6 +246,10 @@ fn validate_market(
 /// The Gamma series recurrence copied by gate F (#782) and scored by the ranker (#784).
 pub const FIFTEEN_MINUTE_RECURRENCE: &str = "15m";
 
+/// Slug prefix of Polymarket's test series ("PolyV2 Soak …", "PolyV2 … Canary"), which gate F never
+/// copies (#869).
+pub const POLYMARKET_TEST_SERIES_SLUG_PREFIX: &str = "polyv2";
+
 /// A Gamma event's recurrence: its first series' `recurrence` string, `None` for any other shape.
 pub fn event_series_recurrence(event: &Value) -> Option<&str> {
     event
@@ -251,15 +260,30 @@ pub fn event_series_recurrence(event: &Value) -> Option<&str> {
         .as_str()
 }
 
-/// Best-effort second read: replay re-runs the validators on every recorded reply, so any surprise
-/// here yields `None` (no copy) and never a new admission or replay failure.
-fn series_recurrence(gamma_raw: &[u8], condition: &PolymarketConditionId) -> Option<String> {
-    let rows: Vec<Value> = serde_json::from_slice(gamma_raw).ok()?;
-    let row = rows
+/// Best-effort second read of the market's first event's first series, as `(recurrence, slug)`:
+/// replay re-runs the validators on every recorded reply, so any surprise here yields `None` (no
+/// copy) and never a new admission or replay failure. A blank slug identifies nothing.
+fn first_series(
+    gamma_raw: &[u8],
+    condition: &PolymarketConditionId,
+) -> (Option<String>, Option<String>) {
+    let Ok(rows) = serde_json::from_slice::<Vec<Value>>(gamma_raw) else {
+        return (None, None);
+    };
+    let Some(event) = rows
         .iter()
-        .find(|row| row.get("conditionId").and_then(Value::as_str) == Some(condition.0.as_str()))?;
-    let event = row.get("events")?.as_array()?.first()?;
-    event_series_recurrence(event).map(str::to_owned)
+        .find(|row| row.get("conditionId").and_then(Value::as_str) == Some(condition.0.as_str()))
+        .and_then(|row| row.get("events")?.as_array()?.first())
+    else {
+        return (None, None);
+    };
+    let slug = event
+        .get("series")
+        .and_then(Value::as_array)
+        .and_then(|series| series.first()?.get("slug")?.as_str())
+        .filter(|slug| !slug.trim().is_empty())
+        .map(str::to_owned);
+    (event_series_recurrence(event).map(str::to_owned), slug)
 }
 
 fn validate_state(
@@ -412,22 +436,50 @@ mod tests {
     fn series_recurrence_is_carried_and_never_refuses() {
         let evidence = validate(&gamma(false), &clob(false)).unwrap();
         assert_eq!(evidence.series_recurrence, None);
+        assert_eq!(evidence.series_slug, None);
         let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
         let clob = serde_json::to_vec(&clob(false)).unwrap();
-        for (events, expected) in [
-            (r#"[{"series":[{"recurrence":"15m"}]}]"#, Some("15m")),
-            (r#"[{"series":[{"recurrence":"5m"}]}]"#, Some("5m")),
-            ("null", None),
-            (r#"{"series":[]}"#, None),
-            (r#"{"0":{"series":[{"recurrence":"15m"}]}}"#, None),
-            (r#"[{"series":{"0":{"recurrence":"15m"}}}]"#, None),
-            (r#"[{"series":null}]"#, None),
-            (r#"[{"series":[{"recurrence":15}]}]"#, None),
+        let soak = Some("polyv2-soak-xrp-up-or-down-15m");
+        for (events, recurrence, slug) in [
+            (r#"[{"series":[{"recurrence":"15m"}]}]"#, Some("15m"), None),
+            (r#"[{"series":[{"recurrence":"5m"}]}]"#, Some("5m"), None),
             (
-                r#"[{"series":[{"recurrence":"15m","volume":1e400}]}]"#,
+                r#"[{"series":[{"recurrence":"15m","slug":"polyv2-soak-xrp-up-or-down-15m"}]}]"#,
+                Some("15m"),
+                soak,
+            ),
+            (
+                r#"[{"series":[{"recurrence":"15m","slug":null}]}]"#,
+                Some("15m"),
                 None,
             ),
-            (deep.as_str(), None),
+            (
+                r#"[{"series":[{"recurrence":"15m","slug":15}]}]"#,
+                Some("15m"),
+                None,
+            ),
+            (
+                r#"[{"series":[{"recurrence":"15m","slug":""}]}]"#,
+                Some("15m"),
+                None,
+            ),
+            (
+                r#"[{"series":[{"recurrence":"15m","slug":"  "}]}]"#,
+                Some("15m"),
+                None,
+            ),
+            ("null", None, None),
+            (r#"{"series":[]}"#, None, None),
+            (r#"{"0":{"series":[{"recurrence":"15m"}]}}"#, None, None),
+            (r#"[{"series":{"0":{"recurrence":"15m"}}}]"#, None, None),
+            (r#"[{"series":null}]"#, None, None),
+            (r#"[{"series":[{"recurrence":15}]}]"#, None, None),
+            (
+                r#"[{"series":[{"recurrence":"15m","slug":"btc-up-or-down-15m","volume":1e400}]}]"#,
+                None,
+                None,
+            ),
+            (deep.as_str(), None, None),
         ] {
             let mut gamma = gamma(false);
             gamma[0]["events"] = json!("EVENTS");
@@ -436,7 +488,12 @@ mod tests {
                 .replace("\"EVENTS\"", events);
             for validator in [validate_live_market, validate_paper_market] {
                 let evidence = validator(gamma.as_bytes(), &clob, &condition(), 1_000, 30).unwrap();
-                assert_eq!(evidence.series_recurrence.as_deref(), expected, "{events}");
+                assert_eq!(
+                    evidence.series_recurrence.as_deref(),
+                    recurrence,
+                    "{events}"
+                );
+                assert_eq!(evidence.series_slug.as_deref(), slug, "{events}");
             }
         }
     }
