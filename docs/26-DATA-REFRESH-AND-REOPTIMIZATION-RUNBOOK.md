@@ -1157,7 +1157,14 @@ Each full history-proof walk (head to root, in activity admission or collection,
 finalize, measurement or manifest verification) emits one INFO `activity history proof
 loaded` event with `caller` (`activity_admission`, `activity_collection`, `finalize`,
 `measurement`, `manifest_verification` or `other`), `head_generation`, `generations`
-(receipt sets verified), `receipts` and integer `elapsed_ms`. A legacy transition's
+(receipt sets verified), `receipts` and integer `elapsed_ms`. It also reports
+`read_ahead` (`done`, `cancelled` or `unavailable`), `read_ahead_error` only when
+unavailable, and `read_ahead_budget_bytes` when runtime page-size discovery succeeds.
+The budget covers configured reader caches, chunk buffers and conservative retained
+SQLite overflow cursor indexes; connection, statement, thread and identity-hint
+overhead are additional. Private read-only connections warm committed receipt pages;
+returned helper failures disable advice without changing verification. Every helper
+is joined before return, including on verifier failure. A legacy transition's
 record-chain checks stop at already verified generations and keep their own `activity
 record chain verified` event. Activity collection emits one INFO
 `activity history proof reused` decision with `reused`. Admission's history walk

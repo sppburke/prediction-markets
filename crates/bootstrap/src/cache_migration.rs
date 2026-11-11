@@ -57,6 +57,11 @@ mod aggregate_scan;
 mod digests;
 mod incremental;
 #[cfg(feature = "scenario")]
+pub use incremental::history_read_ahead::{
+    HistoryReadAheadAction, HistoryReadAheadEvent, Point as HistoryReadAheadPoint,
+    Resource as HistoryReadAheadResource, set_history_read_ahead_hook_for_test,
+};
+#[cfg(feature = "scenario")]
 mod measurement;
 mod projection_digest;
 mod projection_v3;
@@ -2842,6 +2847,17 @@ pub async fn populate_activity_fresh_v2_on_connection_for_test(
         carry,
     )
     .await
+}
+
+/// Run a full walk on a scenario-owned connection.
+#[cfg(feature = "scenario")]
+pub fn load_history_proof_for_test(
+    connection: &Connection,
+    generation: u64,
+) -> Result<(), BootstrapError> {
+    let identity = generation_identity(connection, generation)?.ok_or(BootstrapError::Internal)?;
+    incremental::HistoryProof::load(connection, &identity, HistoryProofCaller::Other)?;
+    Ok(())
 }
 
 /// Compare every collection/history field after real admission with a fresh walk.
