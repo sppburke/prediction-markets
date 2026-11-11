@@ -26933,7 +26933,7 @@ async fn history_read_ahead_differential_clean_damaged_and_committed_wal_collect
                     event["read_ahead"],
                     if disabled { "unavailable" } else { "done" }
                 );
-                assert_eq!(event["read_ahead_budget_bytes"], 64_222_464_u64);
+                assert_eq!(event["read_ahead_budget_bytes"], 67_340_736_u64);
                 assert_eq!(event.get("read_ahead_error").is_some(), disabled);
             }
             let checkpoint: (i64, i64, i64) = keeper
@@ -27070,69 +27070,96 @@ async fn history_read_ahead_verifier_completion_cancels_unfinished_readers_befor
         HistoryReadAheadAction as Action, HistoryReadAheadEvent as Event,
         HistoryReadAheadPoint as Point, set_history_read_ahead_hook_for_test,
     };
-    let dir = TempDir::new().unwrap();
-    let (side, source) = history_v3_legacy_seed(
-        &dir,
-        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
-    )
-    .await;
-    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
-        .await
-        .unwrap();
-    let before = history_read_ahead_state(&side);
-    let sync = Arc::new((
-        Mutex::new((false, false, 0_usize)),
-        std::sync::Condvar::new(),
-    ));
-    let observed = Arc::clone(&sync);
-    set_history_read_ahead_hook_for_test(Some(Arc::new(move |event| {
-        let mut state = observed.0.lock().unwrap();
-        match event {
-            Event::Acquire { .. } => state.2 += 1,
-            Event::Release { .. } => state.2 -= 1,
-            Event::Point {
-                point: Point::Chunk { .. },
-                ..
-            } => {
-                state.0 = true;
-                observed.1.notify_all();
-                drop(observed.1.wait_while(state, |state| !state.1).unwrap());
-            }
-            Event::Point {
-                point: Point::Verifier,
-                ..
-            } => {
-                drop(observed.1.wait_while(state, |state| !state.0).unwrap());
-            }
-            Event::Point {
-                point: Point::Stopping,
-                ..
-            } => {
-                state.1 = true;
-                observed.1.notify_all();
-            }
-            _ => {}
+    for damage in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let (side, source) = history_v3_legacy_seed(
+            &dir,
+            vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+        )
+        .await;
+        history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+            .await
+            .unwrap();
+        if damage {
+            history_v3_damage_connection(&side).execute(
+                "UPDATE activity_wallet_coverage_staging_v2 SET source_row_count = source_row_count + 1 WHERE generation = 1", []).unwrap();
         }
-        Action::Continue
-    })));
-    let _hook = HistoryReadAheadHook;
-    let (log, _log_guard) = history_reuse_log();
-    pe_bootstrap::cache_migration::load_history_proof_for_test(
-        &Connection::open(&side).unwrap(),
-        2,
-    )
-    .unwrap();
-    assert_eq!(sync.0.lock().unwrap().2, 0);
-    let loaded = collection_766_events(&log, "activity history proof loaded");
-    assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0]["read_ahead"], "cancelled");
-    assert!(loaded[0].get("read_ahead_error").is_none());
-    let checkpoint: (i64, i64, i64) = Connection::open(&side)
-        .unwrap()
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })
-        .unwrap();
-    assert_eq!(checkpoint, (0, 0, 0));
-    assert_eq!(history_read_ahead_state(&side), before);
+        let before = history_read_ahead_state(&side);
+        // Today's walk, with read-ahead disabled, gives the expected result and first error.
+        let baseline = {
+            let (_hook, _) = history_read_ahead_hook(true, None);
+            pe_bootstrap::cache_migration::load_history_proof_for_test(
+                &Connection::open(&side).unwrap(),
+                2,
+            )
+            .map_err(|error| error.to_string())
+        };
+        if damage {
+            assert!(
+                baseline
+                    .as_ref()
+                    .unwrap_err()
+                    .contains("historical receipt-set commitment mismatch")
+            );
+        } else {
+            assert!(baseline.is_ok(), "{baseline:?}");
+        }
+        // Readers stay mid-chunk until the verifier has returned (or failed) and stopped them.
+        let sync = Arc::new((
+            Mutex::new((false, false, 0_usize)),
+            std::sync::Condvar::new(),
+        ));
+        let observed = Arc::clone(&sync);
+        set_history_read_ahead_hook_for_test(Some(Arc::new(move |event| {
+            let mut state = observed.0.lock().unwrap();
+            match event {
+                Event::Acquire { .. } => state.2 += 1,
+                Event::Release { .. } => state.2 -= 1,
+                Event::Point {
+                    point: Point::Chunk { .. },
+                    ..
+                } => {
+                    state.0 = true;
+                    observed.1.notify_all();
+                    drop(observed.1.wait_while(state, |state| !state.1).unwrap());
+                }
+                Event::Point {
+                    point: Point::Verifier,
+                    ..
+                } => {
+                    drop(observed.1.wait_while(state, |state| !state.0).unwrap());
+                }
+                Event::Point {
+                    point: Point::Stopping,
+                    ..
+                } => {
+                    state.1 = true;
+                    observed.1.notify_all();
+                }
+                _ => {}
+            }
+            Action::Continue
+        })));
+        let _hook = HistoryReadAheadHook;
+        let (log, _log_guard) = history_reuse_log();
+        let result = pe_bootstrap::cache_migration::load_history_proof_for_test(
+            &Connection::open(&side).unwrap(),
+            2,
+        )
+        .map_err(|error| error.to_string());
+        assert_eq!(result, baseline, "damage={damage}");
+        assert_eq!(sync.0.lock().unwrap().2, 0);
+        let loaded = collection_766_events(&log, "activity history proof loaded");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0]["read_ahead"], "cancelled");
+        assert!(loaded[0].get("read_ahead_error").is_none());
+        let checkpoint: (i64, i64, i64) = Connection::open(&side)
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(checkpoint, (0, 0, 0));
+        assert_eq!(history_read_ahead_state(&side), before);
+    }
 }

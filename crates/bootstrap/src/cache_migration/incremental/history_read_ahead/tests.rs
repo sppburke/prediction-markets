@@ -133,8 +133,10 @@ fn checkpoint(connection: &Connection) {
 
 #[test]
 fn history_read_ahead_budget_accounts_for_retained_overflow_cursors() {
-    assert_eq!(budget(4096).unwrap(), 64_222_464);
-    assert_eq!(budget(8192).unwrap(), 40_750_464);
+    // The largest reservation leaves 3,841 usable bytes of a 4 KiB page, and 480 of 512.
+    assert_eq!(budget(4096).unwrap(), 67_340_736);
+    assert_eq!(budget(8192).unwrap(), 41_504_256);
+    assert_eq!(budget(512).unwrap(), 420_662_976);
     assert!(budget(0).is_err());
     assert!(budget(4095).is_err());
 }

@@ -114,12 +114,15 @@ impl Drop for StopOnDrop<'_> {
 }
 
 // SQLite's accessPayload allocates nOvfl * 2 * sizeof(Pgno) per cursor, retained
-// across blob_reopen. MAX_LENGTH bounds the whole row, not each JSON column.
+// across blob_reopen. MAX_LENGTH bounds the whole row, not each JSON column. An
+// overflow page holds usable size - 4 bytes; up to 255 reserved bytes per page
+// shrink the usable size, never below 480, so assume the largest reservation.
 fn budget(page_size: u64) -> Result<u64, String> {
     if !(512..=65_536).contains(&page_size) || !page_size.is_power_of_two() {
         return Err(format!("invalid read-ahead page_size {page_size}"));
     }
-    let cursor = 1_000_000_000_u64.div_ceil(page_size - 4) * 2 * 4;
+    let usable = page_size.saturating_sub(255).max(480);
+    let cursor = 1_000_000_000_u64.div_ceil(usable - 4) * 2 * 4;
     Ok(
         u64::try_from(HISTORY_READ_AHEAD_CONNECTIONS).map_err(|e| e.to_string())?
             * (HISTORY_READ_AHEAD_CACHE_KIB * 1024
