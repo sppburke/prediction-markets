@@ -67,8 +67,8 @@ pub use seed::{SeedPlan, SeededCacheReport, require_init_roles};
 mod walk_prefetch;
 use digests::{JsonArrayDigest, ReceiptSetDigest};
 use incremental::{
-    CollectionProof, commit_incremental_wallet, generation_identity, manifest_link,
-    record_completed_manifest,
+    CollectionProof, HistoryProofCaller, HistoryProofCarry, HistoryReuseRefusal,
+    commit_incremental_wallet, generation_identity, manifest_link, record_completed_manifest,
 };
 
 use crate::cache::{
@@ -277,6 +277,76 @@ fn verify_history_write_guards(connection: &Connection) -> Result<(), BootstrapE
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "scenario")]
+thread_local! {
+    static HISTORY_ELIGIBILITY_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make the next admission's optional eligibility query fail on this scenario thread.
+#[cfg(feature = "scenario")]
+pub fn fail_history_reuse_eligibility_for_test() {
+    HISTORY_ELIGIBILITY_ERROR.with(|fail| fail.set(true));
+}
+
+fn history_reuse_eligibility(connection: &Connection) -> Option<HistoryReuseRefusal> {
+    check_history_reuse_eligibility(connection)
+        .unwrap_or(Some(HistoryReuseRefusal::EligibilityUnavailable))
+}
+
+fn check_history_reuse_eligibility(
+    connection: &Connection,
+) -> Result<Option<HistoryReuseRefusal>, BootstrapError> {
+    #[cfg(feature = "scenario")]
+    if HISTORY_ELIGIBILITY_ERROR.with(|fail| fail.replace(false)) {
+        connection.prepare("SELECT FROM pe_injected_eligibility_error")?;
+    }
+    let carried = seed::has_seed_drops(connection)?.then_some(&seed::SEED_DROPS_TABLE);
+    let mut expected = BTreeMap::new();
+    for table in HISTORY_GUARDED_TABLES.iter().chain(carried) {
+        for operation in ["INSERT", "UPDATE", "DELETE"] {
+            expected.insert(
+                format!("pe_history_{table}_{}", operation.to_ascii_lowercase()),
+                history_trigger_sql(table, operation),
+            );
+        }
+    }
+    let actual = connection
+        .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger'")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let temp_triggers: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_temp_schema WHERE type = 'trigger')",
+        [],
+        |row| row.get(0),
+    )?;
+    if actual != expected || temp_triggers {
+        return Ok(Some(HistoryReuseRefusal::UnexpectedTrigger));
+    }
+    let mut tables = connection.prepare(
+        "SELECT name, 'main' FROM sqlite_schema WHERE type = 'table'
+         UNION ALL SELECT name, 'temp' FROM sqlite_temp_schema WHERE type = 'table'",
+    )?;
+    let mut tables = tables.query([])?;
+    let mut keys =
+        connection.prepare("SELECT on_update, on_delete FROM pragma_foreign_key_list(?1, ?2)")?;
+    while let Some(table) = tables.next()? {
+        let name: String = table.get(0)?;
+        let schema: String = table.get(1)?;
+        let mut actions = keys.query(params![name, schema])?;
+        while let Some(action) = actions.next()? {
+            for column in [0, 1] {
+                let action: String = action.get(column)?;
+                if matches!(action.as_str(), "CASCADE" | "SET NULL" | "SET DEFAULT") {
+                    return Ok(Some(HistoryReuseRefusal::ReferentialAction));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 // Checked once per stable proof, using the phase's authoritative commitment.
@@ -1204,6 +1274,7 @@ pub async fn populate_activity_v2(
         None,
         completed_at_unix,
         None.into(),
+        None,
     )
     .await
 }
@@ -1265,7 +1336,7 @@ pub async fn populate_activity_fresh_v2_with_clock(
     WalletCache::apply_connection_tuning(&connection, &tuning)?;
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
     ensure_lane_a_v2_schema(&connection)?;
-    let record = begin_or_resume_fresh_collection(
+    let (record, carry) = begin_or_resume_fresh_collection(
         &mut connection,
         generation,
         full_read_wallets,
@@ -1287,6 +1358,7 @@ pub async fn populate_activity_fresh_v2_with_clock(
         FULL_HISTORY_START_EXCLUSIVE,
         completed_at_unix,
         wallet_budget.into(),
+        carry,
     )
     .await
 }
@@ -1348,7 +1420,7 @@ pub async fn populate_activity_bulk_root_v2_with_clock(
     }
     let already_sealed =
         version == CACHE_SCHEMA_VERSION_V2 && stored_activity_manifest(&connection, 1)?.is_some();
-    let record = begin_or_resume_fresh_collection(
+    let (record, _) = begin_or_resume_fresh_collection(
         &mut connection,
         1,
         &[],
@@ -1370,6 +1442,7 @@ pub async fn populate_activity_bulk_root_v2_with_clock(
         FULL_HISTORY_START_EXCLUSIVE,
         completed_at_unix,
         wallet_budget.into(),
+        None,
     )
     .await?;
     if already_sealed {
@@ -1474,7 +1547,7 @@ fn begin_or_resume_fresh_collection(
     bulk_root: bool,
     settled_end: impl FnOnce() -> Result<i64, BootstrapError>,
     started_at_unix: i64,
-) -> Result<FreshCollectionIdentity, BootstrapError> {
+) -> Result<(FreshCollectionIdentity, Option<HistoryProofCarry>), BootstrapError> {
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let _authorization = authorize_history_writes(&transaction)?;
@@ -1482,6 +1555,11 @@ fn begin_or_resume_fresh_collection(
     let format_three = recorded
         .as_ref()
         .is_some_and(|record| record.history_format_three());
+    let eligibility = if format_three && !bulk_root {
+        history_reuse_eligibility(&transaction)
+    } else {
+        Some(HistoryReuseRefusal::NoCarry)
+    };
     let collection_proof = if format_three {
         CollectionProof::load(
             &transaction,
@@ -1489,10 +1567,16 @@ fn begin_or_resume_fresh_collection(
                 .as_ref()
                 .ok_or(BootstrapError::Internal)?
                 .generation,
+            HistoryProofCaller::ActivityAdmission,
+            None,
         )?
     } else {
         None
     };
+    let carry = collection_proof
+        .as_ref()
+        .filter(|_| !bulk_root)
+        .and_then(|proof| proof.carry(eligibility));
     if bulk_root {
         let version: i64 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -1545,7 +1629,7 @@ fn begin_or_resume_fresh_collection(
                 return invalid("resume cannot change the frozen full-read selection".to_owned());
             }
         }
-        return Ok(record.clone());
+        return Ok((record.clone(), carry));
     }
     let generation_i64 = to_i64(generation, "fresh activity generation")?;
     let mut known = recorded
@@ -1789,7 +1873,7 @@ fn begin_or_resume_fresh_collection(
     transaction.execute("DELETE FROM ranker_entries_v2", [])?;
     drop(_authorization);
     transaction.commit()?;
-    Ok(record)
+    Ok((record, carry))
 }
 
 fn fresh_collection_record(
@@ -2286,6 +2370,10 @@ impl ActivityWalk<'_> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the optional admission proof stays with the collector's connection"
+)]
 async fn collect_activity_v2(
     mut connection: Connection,
     fetcher: &dyn ReconciliationFetcher,
@@ -2294,6 +2382,7 @@ async fn collect_activity_v2(
     history_start_exclusive: Option<i64>,
     completed_at_unix: i64,
     limits: ActivityCollectionLimits,
+    carry: Option<HistoryProofCarry>,
 ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
     let ActivityIdentity {
         generation,
@@ -2304,7 +2393,12 @@ async fn collect_activity_v2(
     let (generation, fixed_end_unix) = (*generation, *fixed_end_unix);
     let began = Instant::now();
     let run_started_at_unix = OffsetDateTime::now_utc().unix_timestamp();
-    let proof = CollectionProof::load(&connection, generation)?;
+    let proof = CollectionProof::load(
+        &connection,
+        generation,
+        HistoryProofCaller::ActivityCollection,
+        carry,
+    )?;
     if let Some(manifest) = completed_activity_manifest(
         &connection,
         generation,
@@ -2712,6 +2806,72 @@ async fn collect_activity_v2(
 /// Resume the collector on a scenario-owned connection, allowing SQL tracing
 /// to schedule external commits at exact read/write boundaries without sleeps.
 #[cfg(feature = "scenario")]
+pub async fn populate_activity_fresh_v2_on_connection_for_test(
+    mut connection: Connection,
+    fetcher: &dyn ReconciliationFetcher,
+    base_url: &str,
+    generation: u64,
+    full_read_wallets: &[String],
+    fixed_end_unix: i64,
+    completed_at_unix: i64,
+) -> Result<ActivityCoverageManifestV2, BootstrapError> {
+    require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
+    ensure_lane_a_v2_schema(&connection)?;
+    let (record, carry) = begin_or_resume_fresh_collection(
+        &mut connection,
+        generation,
+        full_read_wallets,
+        false,
+        || Ok(fixed_end_unix),
+        completed_at_unix,
+    )?;
+    let identity = ActivityIdentity {
+        generation: record.generation,
+        reference_sha256: record.digest,
+        fixed_end_unix: record.fixed_end_unix,
+        wallets: record.wallets,
+    };
+    collect_activity_v2(
+        connection,
+        fetcher,
+        base_url,
+        &identity,
+        FULL_HISTORY_START_EXCLUSIVE,
+        completed_at_unix,
+        None.into(),
+        carry,
+    )
+    .await
+}
+
+/// Compare every collection/history field after real admission with a fresh walk.
+#[cfg(feature = "scenario")]
+pub fn history_reuse_proof_matches_for_test(
+    connection: &mut Connection,
+    generation: u64,
+    full_read_wallets: &[String],
+    fixed_end_unix: i64,
+) -> Result<bool, BootstrapError> {
+    let (_, carry) = begin_or_resume_fresh_collection(
+        connection,
+        generation,
+        full_read_wallets,
+        false,
+        || Ok(fixed_end_unix),
+        fixed_end_unix,
+    )?;
+    let reused = CollectionProof::load(
+        connection,
+        generation,
+        HistoryProofCaller::ActivityCollection,
+        carry,
+    )?;
+    let fresh = CollectionProof::load(connection, generation, HistoryProofCaller::Other, None)?;
+    Ok(reused == fresh)
+}
+
+/// Resume without admission or a carried history proof.
+#[cfg(feature = "scenario")]
 pub async fn collect_activity_v2_for_test(
     connection: Connection,
     fetcher: &dyn ReconciliationFetcher,
@@ -2751,6 +2911,7 @@ pub async fn collect_activity_v2_with_limits_for_test(
             wallet_budget,
             held_rows,
         },
+        None,
     )
     .await
 }
@@ -2765,7 +2926,8 @@ pub fn commit_activity_batch_for_test(
     aggregates: Vec<ActivityAggregate>,
 ) -> Result<(), BootstrapError> {
     let generation = activity_identity(connection)?.generation;
-    let proof = CollectionProof::load(connection, generation)?.ok_or(BootstrapError::Internal)?;
+    let proof = CollectionProof::load(connection, generation, HistoryProofCaller::Other, None)?
+        .ok_or(BootstrapError::Internal)?;
     let source_row_count = aggregates.iter().try_fold(0, |count, aggregate| {
         checked_activity_count(count, aggregate.row_count)
     })?;
@@ -4034,7 +4196,12 @@ fn verify_activity_manifest_with(
         let proof = if let Some(proof) = proof {
             Some(proof)
         } else {
-            loaded = CollectionProof::load(connection, manifest.generation)?;
+            loaded = CollectionProof::load(
+                connection,
+                manifest.generation,
+                HistoryProofCaller::ManifestVerification,
+                None,
+            )?;
             loaded.as_ref()
         };
         validate_activity_staging_with(
@@ -8016,4 +8183,42 @@ mod ever_infra_tests {
 #[cfg(feature = "scenario")]
 pub fn measure_classifier_v6_sample(cache_path: &Path) -> Result<Value, BootstrapError> {
     measurement::run(cache_path)
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "a broken fixture must fail its test")]
+mod history_reuse_tests {
+    use super::*;
+
+    #[test]
+    fn history_reuse_eligibility_requires_exact_guards_including_seed_drops() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(V2_SCHEMA).unwrap();
+        create_history_v3(&connection).unwrap();
+        assert!(history_reuse_eligibility(&connection).is_none());
+        connection.execute_batch(
+            "CREATE TABLE activity_seed_drops_v3 (wallet_hex TEXT PRIMARY KEY, scope_drops_json TEXT NOT NULL)",
+        ).unwrap();
+        assert!(matches!(
+            history_reuse_eligibility(&connection),
+            Some(HistoryReuseRefusal::UnexpectedTrigger)
+        ));
+        for operation in ["INSERT", "UPDATE", "DELETE"] {
+            connection
+                .execute_batch(&history_trigger_sql(seed::SEED_DROPS_TABLE, operation))
+                .unwrap();
+        }
+        assert!(history_reuse_eligibility(&connection).is_none());
+        connection
+            .execute_batch(
+                "DROP TRIGGER pe_history_activity_seed_drops_v3_update;
+             CREATE TRIGGER pe_history_activity_seed_drops_v3_update
+             BEFORE UPDATE ON activity_seed_drops_v3 BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+        assert!(matches!(
+            history_reuse_eligibility(&connection),
+            Some(HistoryReuseRefusal::UnexpectedTrigger)
+        ));
+    }
 }

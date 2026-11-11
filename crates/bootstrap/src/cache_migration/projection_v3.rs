@@ -1388,8 +1388,13 @@ fn finalize_with_shape(
     let authorization = authorize_history_writes(&transaction)?;
     let identity = fresh_collection_record(&transaction)?.ok_or(BootstrapError::Internal)?;
     let classifier_version = identity.classifier_version()?;
-    let proof = CollectionProof::load(&transaction, identity.generation)?
-        .ok_or(BootstrapError::Internal)?;
+    let proof = CollectionProof::load(
+        &transaction,
+        identity.generation,
+        HistoryProofCaller::Finalize,
+        None,
+    )?
+    .ok_or(BootstrapError::Internal)?;
     let manifest = completed_activity_manifest(
         &transaction,
         identity.generation,

@@ -45,7 +45,8 @@ pub(super) fn run(cache_path: &Path) -> Result<Value, BootstrapError> {
         to_u64(count, "projection count")?,
     )?;
     let payout = BoundPayouts::read(&transaction)?;
-    let proof = incremental::HistoryProof::load(&transaction, &identity)?;
+    let proof =
+        incremental::HistoryProof::load(&transaction, &identity, HistoryProofCaller::Measurement)?;
     let quality = ReconstructionQuality::new(100).map_err(|error| BootstrapError::Invalid {
         message: error.to_string(),
     })?;

@@ -1153,6 +1153,21 @@ durations; none establishes a total freshness bound. `cache-finalize-v2` logs on
 committed one; `export_verification` when bound to an export; `commit_checkpoint_sync`; and
 `cache_hash` and `stage_record` when it writes a stage record.
 
+Each full history-proof walk (head to root, in activity admission or collection, a
+finalize, measurement or manifest verification) emits one INFO `activity history proof
+loaded` event with `caller` (`activity_admission`, `activity_collection`, `finalize`,
+`measurement`, `manifest_verification` or `other`), `head_generation`, `generations`
+(receipt sets verified), `receipts` and integer `elapsed_ms`. A legacy transition's
+record-chain checks stop at already verified generations and keep their own `activity
+record chain verified` event. Activity collection emits one INFO
+`activity history proof reused` decision with `reused`. Admission's history walk
+can be reused on the same connection for a resume or immediate successor when
+schema eligibility and `data_version` prove equivalence. When `reused = false`,
+`reason` is `no_carry`, `eligibility_unavailable`, `unexpected_trigger`,
+`referential_action`, `data_version_changed` or `generation_relation`, and collection
+falls back to the full walk. All other collection-time proof checks still run;
+finalizers and callers without a carry retain their own full walks.
+
 Install and roll back through the [release procedure](#forge-release-deployment-and-rollback).
 Resume the same cycle with its fixed/prior/candidate paths, committed WAL, identities, receipts,
 configuration and prepared request intact. A release that preserves parser/classifier versions
