@@ -499,7 +499,78 @@ pub(super) fn record_completed_manifest(
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum HistoryProofCaller {
+    ActivityAdmission,
+    ActivityCollection,
+    Finalize,
+    #[cfg(feature = "scenario")]
+    Measurement,
+    ManifestVerification,
+    #[cfg(any(test, feature = "scenario"))]
+    Other,
+}
+
+impl HistoryProofCaller {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ActivityAdmission => "activity_admission",
+            Self::ActivityCollection => "activity_collection",
+            Self::Finalize => "finalize",
+            #[cfg(feature = "scenario")]
+            Self::Measurement => "measurement",
+            Self::ManifestVerification => "manifest_verification",
+            #[cfg(any(test, feature = "scenario"))]
+            Self::Other => "other",
+        }
+    }
+
+    fn log_reuse(self, refusal: Option<HistoryReuseRefusal>) {
+        if self == Self::ActivityCollection {
+            match refusal {
+                None => tracing::info!(reused = true, "activity history proof reused"),
+                Some(reason) => tracing::info!(
+                    reused = false,
+                    reason = reason.as_str(),
+                    "activity history proof reused"
+                ),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum HistoryReuseRefusal {
+    NoCarry,
+    EligibilityUnavailable,
+    UnexpectedTrigger,
+    ReferentialAction,
+    DataVersionChanged,
+    GenerationRelation,
+}
+
+impl HistoryReuseRefusal {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCarry => "no_carry",
+            Self::EligibilityUnavailable => "eligibility_unavailable",
+            Self::UnexpectedTrigger => "unexpected_trigger",
+            Self::ReferentialAction => "referential_action",
+            Self::DataVersionChanged => "data_version_changed",
+            Self::GenerationRelation => "generation_relation",
+        }
+    }
+}
+
+pub(super) struct HistoryProofCarry {
+    history: Arc<HistoryProof>,
+    head_generation: u64,
+    data_version: i64,
+    refusal: Option<HistoryReuseRefusal>,
+}
+
 #[derive(Clone)]
+#[cfg_attr(any(test, feature = "scenario"), derive(Debug, PartialEq, Eq))]
 pub(super) struct CollectionProof {
     pub(super) identity: FreshCollectionIdentity,
     pub(super) bulk_root: bool,
@@ -515,16 +586,20 @@ impl CollectionProof {
     pub(super) fn load(
         connection: &Connection,
         generation: u64,
+        caller: HistoryProofCaller,
+        carry: Option<HistoryProofCarry>,
     ) -> Result<Option<Self>, BootstrapError> {
         // The collector loads outside a transaction. Bracket every proof read
         // so an external commit cannot become the baseline for stale fields.
         let data_version: i64 =
             connection.pragma_query_value(None, "data_version", |row| row.get(0))?;
         let Some(identity) = generation_identity(connection, generation)? else {
+            caller.log_reuse(Some(HistoryReuseRefusal::NoCarry));
             return Ok(None);
         };
         if identity.version == 1 {
             reject_bulk_root(connection)?;
+            caller.log_reuse(Some(HistoryReuseRefusal::NoCarry));
             return Ok(None);
         }
         let bulk_root = connection
@@ -536,8 +611,32 @@ impl CollectionProof {
             large_certified_wallets = connection.prepare(
                 "SELECT wallet_hex FROM activity_wallet_history_v3 WHERE source_row_count >= 5500",
             )?.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<_, _>>()?;
-            Some(Arc::new(HistoryProof::load(connection, &identity)?))
+            let reused = if bulk_root {
+                Err(HistoryReuseRefusal::NoCarry)
+            } else if let Some(carry) = carry {
+                if let Some(reason) = carry.refusal {
+                    Err(reason)
+                } else if data_version != carry.data_version {
+                    Err(HistoryReuseRefusal::DataVersionChanged)
+                } else if carry.head_generation == identity.generation {
+                    Ok(carry.history)
+                } else if Some(carry.head_generation) == identity.base_generation {
+                    Ok(Arc::new(
+                        Arc::unwrap_or_clone(carry.history).extend(connection, &identity)?,
+                    ))
+                } else {
+                    Err(HistoryReuseRefusal::GenerationRelation)
+                }
+            } else {
+                Err(HistoryReuseRefusal::NoCarry)
+            };
+            caller.log_reuse(reused.as_ref().err().copied());
+            Some(match reused {
+                Ok(history) => history,
+                Err(_) => Arc::new(HistoryProof::load(connection, &identity, caller)?),
+            })
         } else {
+            caller.log_reuse(Some(HistoryReuseRefusal::NoCarry));
             None
         };
         if bulk_root {
@@ -595,6 +694,15 @@ impl CollectionProof {
             large_certified_wallets,
             infra,
         }))
+    }
+
+    pub(super) fn carry(&self, refusal: Option<HistoryReuseRefusal>) -> Option<HistoryProofCarry> {
+        self.history.as_ref().map(|history| HistoryProofCarry {
+            history: Arc::clone(history),
+            head_generation: self.identity.generation,
+            data_version: self.data_version,
+            refusal,
+        })
     }
 
     pub(super) fn verify_unchanged(&self, connection: &Connection) -> Result<(), BootstrapError> {
@@ -1044,21 +1152,41 @@ fn verify_historical_receipts_with(
 }
 
 #[derive(Clone)]
+#[cfg_attr(any(test, feature = "scenario"), derive(Debug, PartialEq, Eq))]
 pub(super) struct HistoryProof {
     records: BTreeMap<u64, (FreshCollectionIdentity, Option<ActivityCoverageManifestV2>)>,
     links: BTreeMap<u64, String>,
     continuations: BTreeMap<String, (ActivityReadMode, i64)>,
+    head_continuations: BTreeMap<String, (ActivityReadMode, i64)>,
     anomaly_wallets: BTreeSet<String>,
     unarchived_generations: BTreeSet<u64>,
     complete_chain: bool,
+}
+
+#[derive(Default)]
+struct HistoryLoadCounts {
+    generations: u64,
+    receipts: u64,
 }
 
 impl HistoryProof {
     pub(super) fn load(
         connection: &Connection,
         head: &FreshCollectionIdentity,
+        caller: HistoryProofCaller,
     ) -> Result<Self, BootstrapError> {
-        Self::load_until(connection, head, |_| false)
+        let began = Instant::now();
+        let mut counts = HistoryLoadCounts::default();
+        let result = Self::load_until_counted(connection, head, |_| false, &mut counts);
+        tracing::info!(
+            caller = caller.as_str(),
+            head_generation = head.generation,
+            generations = counts.generations,
+            receipts = counts.receipts,
+            elapsed_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "activity history proof loaded"
+        );
+        result
     }
 
     /// Walks `head`'s chain toward its root, stopping at the first predecessor
@@ -1069,9 +1197,24 @@ impl HistoryProof {
         head: &FreshCollectionIdentity,
         verified: impl Fn(u64) -> bool,
     ) -> Result<Self, BootstrapError> {
+        Self::load_until_counted(
+            connection,
+            head,
+            verified,
+            &mut HistoryLoadCounts::default(),
+        )
+    }
+
+    fn load_until_counted(
+        connection: &Connection,
+        head: &FreshCollectionIdentity,
+        verified: impl Fn(u64) -> bool,
+        counts: &mut HistoryLoadCounts,
+    ) -> Result<Self, BootstrapError> {
         let mut records = BTreeMap::new();
         let mut links = BTreeMap::new();
         let mut continuations = BTreeMap::new();
+        let mut head_continuations = BTreeMap::new();
         let mut anomaly_wallets = BTreeSet::new();
         let mut unarchived_generations = BTreeSet::new();
         let mut identity = head.clone();
@@ -1081,6 +1224,7 @@ impl HistoryProof {
                 links.insert(identity.generation, manifest_link(manifest, &identity)?);
                 verify_archived_identity(connection, identity.generation, &identity, true)?;
                 verify_historical_receipts_with(connection, manifest, &identity, |receipt| {
+                    counts.receipts += 1;
                     if identity.version == 5
                         && receipt.pages.iter().any(|page| !page.anomalies.is_empty())
                     {
@@ -1091,7 +1235,13 @@ impl HistoryProof {
                     {
                         continuations.insert(receipt.wallet_hex.clone(), continuation);
                     }
+                    if identity.generation == head.generation
+                        && let Some(continuation) = receipt.continuation()
+                    {
+                        head_continuations.insert(receipt.wallet_hex.clone(), continuation);
+                    }
                 })?;
+                counts.generations += 1;
             } else {
                 unarchived_generations.insert(identity.generation);
             }
@@ -1122,10 +1272,34 @@ impl HistoryProof {
             records,
             links,
             continuations,
+            head_continuations,
             anomaly_wallets,
             unarchived_generations,
             complete_chain,
         })
+    }
+
+    fn extend(
+        mut self,
+        connection: &Connection,
+        head: &FreshCollectionIdentity,
+    ) -> Result<Self, BootstrapError> {
+        let base = head.base_generation.ok_or(BootstrapError::Internal)?;
+        let prior = self.identity(base).ok_or(BootstrapError::Internal)?;
+        let manifest = self.manifest(base).ok_or_else(|| BootstrapError::Invalid {
+            message: "history chain manifest missing".to_owned(),
+        })?;
+        if Some(manifest_link(manifest, prior)?) != head.base_manifest_sha256
+            || Some(prior.fixed_end_unix) != head.start_exclusive
+        {
+            return invalid("history chain manifest commitment mismatch".to_owned());
+        }
+        verify_archived_identity(connection, base, prior, true)?;
+        self.records.insert(head.generation, (head.clone(), None));
+        self.unarchived_generations.insert(head.generation);
+        // A successor continues from its base's receipts, not that base's predecessor.
+        self.continuations = std::mem::take(&mut self.head_continuations);
+        Ok(self)
     }
 
     /// Both aggregate commitments and anomalies use these replacement rules.
@@ -2822,9 +2996,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_reuse_unrelated_generation_keeps_full_walk_and_refusal() {
+        let (connection, _) = anomaly_history(false, false).await;
+        connection.execute_batch(HISTORY_V3_SCHEMA).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE wallets (wallet_hex TEXT, is_infra INTEGER);
+             CREATE TABLE purged_wallets (wallet_hex TEXT, reason TEXT);",
+            )
+            .unwrap();
+        let proof = CollectionProof::load(&connection, 1, HistoryProofCaller::Other, None)
+            .unwrap()
+            .unwrap();
+        let fresh = CollectionProof::load(&connection, 3, HistoryProofCaller::Other, None).unwrap();
+        let fallback =
+            CollectionProof::load(&connection, 3, HistoryProofCaller::Other, proof.carry(None))
+                .unwrap();
+        assert_eq!(fallback, fresh);
+        connection.execute(
+            "UPDATE activity_wallet_coverage_staging_v2 SET source_row_count = source_row_count + 1 WHERE generation = 1",
+            [],
+        ).unwrap();
+        let error =
+            CollectionProof::load(&connection, 3, HistoryProofCaller::Other, proof.carry(None))
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("historical receipt-set commitment mismatch")
+        );
+    }
+
+    #[tokio::test]
     async fn anomaly_free_wallet_skips_archived_receipt_reads() {
         let (connection, head) = anomaly_history(false, false).await;
-        let proof = HistoryProof::load(&connection, &head).unwrap();
+        let proof = HistoryProof::load(&connection, &head, HistoryProofCaller::Other).unwrap();
         assert!(proof.anomaly_wallets.is_empty());
         // Damage after loading isolates the effective walk from initial authentication.
         connection
@@ -2855,7 +3061,7 @@ mod tests {
     #[tokio::test]
     async fn unarchived_head_anomaly_is_in_the_effective_set() {
         let (connection, head) = anomaly_history(false, true).await;
-        let proof = HistoryProof::load(&connection, &head).unwrap();
+        let proof = HistoryProof::load(&connection, &head, HistoryProofCaller::Other).unwrap();
         let wallet = &head.wallets[0];
         assert!(proof.anomaly_wallets.is_empty());
         assert!(
@@ -2876,7 +3082,7 @@ mod tests {
     #[tokio::test]
     async fn archived_anomaly_keeps_the_walk_and_full_replacement_rules() {
         let (connection, head) = anomaly_history(true, false).await;
-        let proof = HistoryProof::load(&connection, &head).unwrap();
+        let proof = HistoryProof::load(&connection, &head, HistoryProofCaller::Other).unwrap();
         let wallet = &head.wallets[0];
         assert!(proof.anomaly_wallets.contains(wallet));
         assert_eq!(

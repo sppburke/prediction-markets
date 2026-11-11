@@ -17596,6 +17596,505 @@ async fn history_v3_incremental_probe_ignores_provenance_but_excludes_same_walle
 }
 
 #[tokio::test]
+async fn history_reuse_extra_trigger_keeps_admission_damage_refusal() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "admission-trigger.db", &[]);
+    let source = DatasetFetcher {
+        rows: vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    history_v3_damage_connection(&side)
+        .execute_batch(
+            "CREATE TRIGGER damage_history AFTER UPDATE ON cache_v2_migration_state
+             BEGIN UPDATE activity_wallet_coverage_staging_v2
+             SET source_row_count = source_row_count + 1 WHERE generation = 1; END;",
+        )
+        .unwrap();
+    source.calls.lock().unwrap().clear();
+    let (log, _guard) = history_reuse_log();
+    let error = history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("historical receipt-set commitment mismatch"),
+        "{error}"
+    );
+    assert!(source.calls.lock().unwrap().is_empty());
+    assert_eq!(generation_rows(&side, 2), 0);
+    assert_eq!(receipt(&side, 2, WALLET), None);
+    assert_eq!(fresh_record(&side)["generation"], 2);
+    assert_history_reuse_decision(&log, Some("unexpected_trigger"));
+    let loaded = collection_766_events(&log, "activity history proof loaded");
+    assert_eq!(loaded.len(), 2, "{loaded:?}");
+    assert_eq!(loaded[0]["caller"], "activity_admission");
+    assert_eq!(loaded[1]["caller"], "activity_collection");
+}
+
+fn history_reuse_log() -> (CheckLog, tracing::subscriber::DefaultGuard) {
+    let log = CheckLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (log, guard)
+}
+
+fn assert_history_reuse_decision(log: &CheckLog, reason: Option<&str>) {
+    let events = collection_766_events(log, "activity history proof reused");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["reused"], reason.is_none());
+    match reason {
+        Some(reason) => assert_eq!(events[0]["reason"], reason),
+        None => assert!(events[0].get("reason").is_none()),
+    }
+    for event in String::from_utf8(log.0.lock().unwrap().clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| {
+            matches!(
+                event["fields"]["message"].as_str(),
+                Some("activity history proof loaded" | "activity history proof reused")
+            )
+        })
+    {
+        assert_eq!(event["level"], "INFO");
+    }
+}
+
+#[tokio::test]
+async fn history_reuse_successor_and_resume_load_once_with_foreign_keys_enabled() {
+    for resume in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "reuse.db", &[]);
+        let source = DatasetFetcher {
+            rows: vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+            ..Default::default()
+        };
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        let connection = Connection::open(&side).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(
+            count(
+                &side,
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('clob_payout_evidence_v2')"
+            ) > 0
+        );
+        if resume {
+            pe_bootstrap::cache_migration::populate_activity_fresh_v2_on_connection_for_test(
+                connection,
+                &HistoryV3StopFetcher,
+                "https://data.example",
+                2,
+                &[],
+                FRESH_END + 1,
+                FRESH_END + 2,
+            )
+            .await
+            .unwrap_err();
+        }
+        let (log, _guard) = history_reuse_log();
+        history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+            .await
+            .unwrap();
+        assert_history_reuse_decision(&log, None);
+        let loaded = collection_766_events(&log, "activity history proof loaded");
+        assert_eq!(loaded.len(), 1, "{loaded:?}");
+        assert_eq!(loaded[0]["caller"], "activity_admission");
+        assert_eq!(loaded[0]["head_generation"], if resume { 2 } else { 1 });
+        assert_eq!(loaded[0]["generations"], 1);
+        assert_eq!(loaded[0]["receipts"], 1);
+        assert!(loaded[0]["elapsed_ms"].as_u64().is_some());
+    }
+}
+
+#[tokio::test]
+async fn history_reuse_referential_actions_and_eligibility_error_fall_back() {
+    for action in [
+        "ON DELETE CASCADE",
+        "ON UPDATE SET NULL",
+        "ON DELETE SET DEFAULT",
+        "error",
+        "temp_trigger",
+    ] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "fallback.db", &[]);
+        let source = DatasetFetcher::default();
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        let connection = Connection::open(&side).unwrap();
+        let reason = if action == "error" {
+            pe_bootstrap::cache_migration::fail_history_reuse_eligibility_for_test();
+            "eligibility_unavailable"
+        } else if action == "temp_trigger" {
+            connection.execute_batch(
+                "CREATE TEMP TRIGGER extra_temp AFTER UPDATE ON main.cache_v2_migration_state BEGIN SELECT 1; END;"
+            ).unwrap();
+            "unexpected_trigger"
+        } else {
+            connection.execute_batch(&format!(
+                "CREATE TABLE action_key (entry TEXT REFERENCES ranker_entries_v2(source_trade_id) {action})"
+            )).unwrap();
+            "referential_action"
+        };
+        let (log, _guard) = history_reuse_log();
+        pe_bootstrap::cache_migration::populate_activity_fresh_v2_on_connection_for_test(
+            connection,
+            &source,
+            "https://data.example",
+            2,
+            &[],
+            FRESH_END + 1,
+            FRESH_END + 2,
+        )
+        .await
+        .unwrap();
+        assert_history_reuse_decision(&log, Some(reason));
+        let loaded = collection_766_events(&log, "activity history proof loaded");
+        assert_eq!(loaded.len(), 2, "{action}: {loaded:?}");
+        assert_eq!(loaded[0]["caller"], "activity_admission");
+        assert_eq!(loaded[0]["head_generation"], 1);
+        assert_eq!(loaded[1]["caller"], "activity_collection");
+        assert_eq!(loaded[1]["head_generation"], 2);
+        for event in loaded {
+            assert_eq!(event["generations"], 1);
+            assert_eq!(event["receipts"], 1);
+            assert!(event["elapsed_ms"].as_u64().is_some());
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_reuse_external_commit_before_opening_read_falls_back() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "before-opening.db", &[]);
+    let source = DatasetFetcher::default();
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    let connection = trace_collection_interleaving(
+        &side,
+        "PRAGMA data_version",
+        2,
+        "UPDATE activity_coverage_manifests_v2 SET completed_at_unix = completed_at_unix + 1 WHERE generation = 1",
+    );
+    let (log, _guard) = history_reuse_log();
+    let error = pe_bootstrap::cache_migration::populate_activity_fresh_v2_on_connection_for_test(
+        connection,
+        &source,
+        "https://data.example",
+        2,
+        &[],
+        FRESH_END + 1,
+        FRESH_END + 2,
+    )
+    .await
+    .unwrap_err();
+    assert_collection_interleaving_committed();
+    assert_history_reuse_decision(&log, Some("data_version_changed"));
+    assert_eq!(
+        collection_766_events(&log, "activity history proof loaded").len(),
+        2
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("history chain manifest commitment mismatch"),
+        "{error}"
+    );
+    assert_eq!(generation_rows(&side, 2), 0);
+    assert_eq!(receipt(&side, 2, WALLET), None);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_coverage_manifests_v2 WHERE generation = 2"
+        ),
+        0
+    );
+}
+
+#[tokio::test]
+async fn history_reuse_external_commit_after_selection_refuses_successor_and_resume() {
+    for resume in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "reuse-race.db", &[]);
+        let source = DatasetFetcher {
+            rows: vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+            ..Default::default()
+        };
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        if resume {
+            pe_bootstrap::cache_migration::populate_activity_fresh_v2_on_connection_for_test(
+                Connection::open(&side).unwrap(),
+                &HistoryV3StopFetcher,
+                "https://data.example",
+                2,
+                &[],
+                FRESH_END + 1,
+                FRESH_END + 2,
+            )
+            .await
+            .unwrap_err();
+        }
+        source.calls.lock().unwrap().clear();
+        let connection = trace_collection_interleaving(
+            &side,
+            "SELECT MAX(generation) FROM activity_coverage_manifests_v2 WHERE generation < 2",
+            usize::from(resume),
+            "UPDATE activity_coverage_manifests_v2 SET completed_at_unix = completed_at_unix + 1 WHERE generation = 1",
+        );
+        let (log, _guard) = history_reuse_log();
+        let error =
+            pe_bootstrap::cache_migration::populate_activity_fresh_v2_on_connection_for_test(
+                connection,
+                &source,
+                "https://data.example",
+                2,
+                &[],
+                FRESH_END + 1,
+                FRESH_END + 2,
+            )
+            .await
+            .unwrap_err();
+        assert_collection_interleaving_committed();
+        assert_history_reuse_decision(&log, None);
+        assert_eq!(
+            collection_766_events(&log, "activity history proof loaded").len(),
+            1
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("collection changed externally while loading proof"),
+            "{error}"
+        );
+        assert!(source.calls.lock().unwrap().is_empty());
+        assert_eq!(generation_rows(&side, 2), 0);
+        assert_eq!(receipt(&side, 2, WALLET), None);
+        assert_eq!(
+            count(
+                &side,
+                "SELECT COUNT(*) FROM activity_coverage_manifests_v2 WHERE generation = 2"
+            ),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn history_reuse_without_carry_keeps_full_walk_for_root_and_non_cycle_callers() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "no-carry.db", &[]);
+    let source = DatasetFetcher::default();
+    let (log, guard) = history_reuse_log();
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    assert_history_reuse_decision(&log, Some("no_carry"));
+    let loaded = collection_766_events(&log, "activity history proof loaded");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0]["caller"], "activity_collection");
+    assert_eq!(loaded[0]["head_generation"], 1);
+    assert_eq!(loaded[0]["generations"], 0);
+    assert_eq!(loaded[0]["receipts"], 0);
+    drop(guard);
+    let (log, _guard) = history_reuse_log();
+    pe_bootstrap::cache_migration::collect_activity_v2_for_test(
+        Connection::open(&side).unwrap(),
+        &source,
+        "https://data.example",
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap();
+    assert_history_reuse_decision(&log, Some("no_carry"));
+    let loaded = collection_766_events(&log, "activity history proof loaded");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0]["generations"], 1);
+    assert_eq!(loaded[0]["receipts"], 1);
+}
+
+fn assert_history_reuse_matches(
+    side: &std::path::Path,
+    generation: u64,
+    end: i64,
+    repairs: &[String],
+) {
+    let (log, _guard) = history_reuse_log();
+    assert!(
+        pe_bootstrap::cache_migration::history_reuse_proof_matches_for_test(
+            &mut Connection::open(side).unwrap(),
+            generation,
+            repairs,
+            end,
+        )
+        .unwrap(),
+        "generation {generation}"
+    );
+    assert_history_reuse_decision(&log, None);
+}
+
+#[tokio::test]
+async fn history_reuse_legacy_and_bulk_roots_do_not_carry() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "legacy-no-carry.db", &[]);
+    history_v3_freeze_legacy_root(&side, &[WALLET]);
+    let source = DatasetFetcher::default();
+    let (log, guard) = history_reuse_log();
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    assert_history_reuse_decision(&log, Some("no_carry"));
+    assert!(collection_766_events(&log, "activity history proof loaded").is_empty());
+    drop(guard);
+
+    let fixture = BulkRootFixture::new();
+    fixture.admit().await;
+    for sealed in [false, true] {
+        let (log, _guard) = history_reuse_log();
+        fixture.collect(&source).await.unwrap();
+        assert_history_reuse_decision(&log, Some("no_carry"));
+        let loaded = collection_766_events(&log, "activity history proof loaded");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0]["caller"], "activity_admission");
+        assert_eq!(loaded[1]["caller"], "activity_collection");
+        for event in loaded {
+            assert_eq!(event["head_generation"], 1);
+            assert_eq!(event["generations"], u64::from(sealed));
+            assert_eq!(event["receipts"], if sealed { 2 } else { 0 });
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn history_reuse_proof_equality_for_partial_no_progress_completion_and_repair() {
+    for version in [4, 5] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "proof-equality.db", &[]);
+        let mut rows = collection_rows(WALLET, 12_000);
+        if version == 5 {
+            rows.push(forge_822_anomaly(0, FRESH_END - 19_999));
+        }
+        collection_admit(&side, 1, FRESH_END, &[]).await;
+        if version == 4 {
+            freeze_identity_four(&side);
+        }
+        for generation in 1..=7 {
+            let end = FRESH_END + i64::try_from(generation).unwrap() - 1;
+            let repairs = if generation == 6 {
+                vec![WALLET.to_owned()]
+            } else {
+                Vec::new()
+            };
+            if generation > 1 {
+                // Extension uses the completed head's own continuation snapshot.
+                assert_history_reuse_matches(&side, generation, end, &repairs);
+                if version == 4 {
+                    freeze_identity_four(&side);
+                }
+            }
+            // Resume keeps the base-relative snapshot, including no-progress reads.
+            assert_history_reuse_matches(&side, generation, end, &repairs);
+            let mut source = CollectionDataset::new(rows.clone(), 1);
+            if matches!(generation, 3 | 4) {
+                source.failures.insert(1, 0);
+            }
+            collection_run(
+                &side,
+                &source,
+                end,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                (generation <= 4).then_some(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+            let receipt = collection_proof(&side, generation, WALLET);
+            if generation <= 2 {
+                assert_eq!(receipt["acquisition"]["disposition"], "excluded");
+                assert!(receipt["acquisition"]["fixed_end_unix"].as_i64().unwrap() < end);
+                assert!(
+                    receipt["acquisition"]["fetched_source_row_count"]
+                        .as_u64()
+                        .unwrap()
+                        > 0
+                );
+            } else if generation <= 4 {
+                assert_eq!(
+                    receipt["acquisition"]["aggregation_status"],
+                    "not_attempted"
+                );
+            } else {
+                assert_eq!(receipt["acquisition"]["disposition"], "complete");
+            }
+            if generation == 6 {
+                assert_eq!(receipt["acquisition"]["mode"], "full");
+                assert_eq!(
+                    fresh_record(&side)["repair_wallets"],
+                    serde_json::json!([WALLET])
+                );
+            }
+            dataset_payouts(&side, &rows).await;
+            finalize_cache_v2_unbound(&side, None, end + 1).unwrap();
+            if generation >= 5 {
+                assert!(
+                    count(
+                        &side,
+                        "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE source_row_count >= 5500"
+                    ) > 0
+                );
+            }
+            // Also compare resumes of completed/finalized heads with nonempty certificates.
+            assert_history_reuse_matches(&side, generation, end, &repairs);
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_reuse_proof_equality_with_anomalies_and_an_excluded_wallet() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "excluded-equality.db", &[WALLET_B]);
+    let mut excluded = history_v3_bad_row(FRESH_END);
+    excluded["proxyWallet"] = WALLET_B.into();
+    let source = DatasetFetcher {
+        rows: vec![forge_822_anomaly(0, FRESH_END - 1), excluded],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        collection_proof(&side, 1, WALLET_B)["acquisition"]["disposition"],
+        "excluded"
+    );
+    for generation in 2..=3 {
+        let end = FRESH_END + i64::try_from(generation).unwrap();
+        assert_history_reuse_matches(&side, generation, end, &[]);
+        assert_history_reuse_matches(&side, generation, end, &[]);
+        history_v3_collect(&side, &source, generation, end, &[])
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn history_v3_record_chain_damage_is_refused_before_fetch() {
     let dir = TempDir::new().unwrap();
     let (side, source) = history_v3_legacy_seed(
