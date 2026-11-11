@@ -29,11 +29,12 @@ ignore = [
     # (uninitialized page-cache memory when a database is opened with a crafted -wal of another
     # page size). The advisory exposes only a process that opens a database file, with its -wal,
     # that a less trusted party could have written; the crates that link it (pe-bootstrap,
-    # pe-service, pe-paper-state, pe-crypto-shadow) open only databases their own processes
-    # create on hosts we operate. The fix is libsqlite3-sys 0.39 through rusqlite 0.41, a
-    # breaking upgrade that changes the SQLite engine of the production services, so it ships
-    # as its own change with its own qualification. The [bans] entries keep every other
-    # affected version out. Will resolve when rusqlite moves to 0.41 or later.
+    # pe-service, pe-paper-state, pe-crypto-shadow) open only databases this workspace's own
+    # processes create on hosts we operate, or copies and backups of them. The fix is
+    # libsqlite3-sys 0.39 through rusqlite 0.41, a breaking upgrade that changes the SQLite engine
+    # of the production services, so it ships as its own change with its own qualification. The
+    # [bans] entries keep every other affected version out. Will resolve when rusqlite moves to
+    # 0.41 or later.
     "RUSTSEC-2026-0459",
 ]
 
@@ -73,7 +74,8 @@ deny = [
     { name = "crypto-bigint", version = "<0.5.5" },
     { name = "crypto-bigint", version = ">0.5.5, <0.7.6" },
     # RUSTSEC-2026-0459 is ignored above only for libsqlite3-sys 0.37.0, which rusqlite 0.39
-    # requires; these keep the advisory's other affected versions (everything below 0.39.0) out.
+    # requires; these keep the advisory's other affected versions (0.6.0 to 0.38.2) out. The
+    # lower entry also covers the unaffected pre-0.6.0 releases, which bundle no SQLite.
     { name = "libsqlite3-sys", version = "<0.37.0" },
     { name = "libsqlite3-sys", version = ">0.37.0, <0.39.0" },
 ]
