@@ -2,6 +2,8 @@
 
 use super::*;
 
+pub(super) mod history_read_ahead;
+
 #[derive(Debug, Clone)]
 pub(super) struct HistoryCertificate {
     pub(super) wallet_hex: String,
@@ -1177,12 +1179,23 @@ impl HistoryProof {
     ) -> Result<Self, BootstrapError> {
         let began = Instant::now();
         let mut counts = HistoryLoadCounts::default();
-        let result = Self::load_until_counted(connection, head, |_| false, &mut counts);
+        let (result, read_ahead) = history_read_ahead::run(connection, head, |progress| {
+            Self::load_until_counted(
+                connection,
+                head,
+                |_| false,
+                &mut counts,
+                || progress.advance(),
+            )
+        });
         tracing::info!(
             caller = caller.as_str(),
             head_generation = head.generation,
             generations = counts.generations,
             receipts = counts.receipts,
+            read_ahead = read_ahead.outcome.status(),
+            read_ahead_error = read_ahead.outcome.error(),
+            read_ahead_budget_bytes = read_ahead.budget_bytes,
             elapsed_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
             "activity history proof loaded"
         );
@@ -1202,6 +1215,7 @@ impl HistoryProof {
             head,
             verified,
             &mut HistoryLoadCounts::default(),
+            || {},
         )
     }
 
@@ -1210,6 +1224,7 @@ impl HistoryProof {
         head: &FreshCollectionIdentity,
         verified: impl Fn(u64) -> bool,
         counts: &mut HistoryLoadCounts,
+        mut advance: impl FnMut(),
     ) -> Result<Self, BootstrapError> {
         let mut records = BTreeMap::new();
         let mut links = BTreeMap::new();
@@ -1246,6 +1261,7 @@ impl HistoryProof {
                 unarchived_generations.insert(identity.generation);
             }
             records.insert(identity.generation, (identity.clone(), manifest));
+            advance();
             let Some(base) = identity.base_generation else {
                 break true;
             };

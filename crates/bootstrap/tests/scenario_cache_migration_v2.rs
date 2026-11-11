@@ -26711,3 +26711,428 @@ async fn stage2_ready_marker_write_failure_stops_before_hash() {
         ],
     );
 }
+
+#[derive(Default)]
+struct HistoryReadAheadObservation {
+    rss_baseline_kib: Option<u64>,
+    rss_peak_kib: Option<u64>,
+    rss_sampling: bool,
+    injected: bool,
+    spawned: usize,
+    finished: usize,
+    chunks: usize,
+    live: usize,
+}
+
+struct HistoryReadAheadHook;
+
+impl Drop for HistoryReadAheadHook {
+    fn drop(&mut self) {
+        pe_bootstrap::cache_migration::set_history_read_ahead_hook_for_test(None);
+    }
+}
+
+fn history_read_ahead_rss_kib() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn history_read_ahead_hook(
+    disabled: bool,
+    failure: Option<(pe_bootstrap::cache_migration::HistoryReadAheadPoint, bool)>,
+) -> (
+    HistoryReadAheadHook,
+    Arc<(Mutex<HistoryReadAheadObservation>, std::sync::Condvar)>,
+) {
+    use pe_bootstrap::cache_migration::{
+        HistoryReadAheadAction as Action, HistoryReadAheadEvent as Event,
+        HistoryReadAheadPoint as Point, set_history_read_ahead_hook_for_test,
+    };
+    let observation = Arc::new((
+        Mutex::new(HistoryReadAheadObservation::default()),
+        std::sync::Condvar::new(),
+    ));
+    let observed = Arc::clone(&observation);
+    set_history_read_ahead_hook_for_test(Some(Arc::new(move |event| {
+        let mut state = observed.0.lock().unwrap();
+        if matches!(
+            event,
+            Event::Point {
+                point: Point::Setup,
+                ..
+            }
+        ) {
+            state.rss_baseline_kib = history_read_ahead_rss_kib();
+            state.rss_peak_kib = state.rss_baseline_kib;
+            state.rss_sampling = true;
+        }
+        if state.rss_sampling
+            && let Some(rss) = history_read_ahead_rss_kib()
+        {
+            state.rss_peak_kib = Some(state.rss_peak_kib.unwrap_or(0).max(rss));
+        }
+        match event {
+            Event::Acquire { .. } => state.live += 1,
+            Event::Release { .. } => state.live -= 1,
+            Event::Point { worker, point } => {
+                if disabled && matches!(point, Point::Setup) {
+                    return Action::Fail(rusqlite::Error::InvalidQuery);
+                }
+                if let Some((injected, all)) = failure
+                    && (all || !state.injected)
+                    && (!matches!(point, Point::Spawn) || all || worker == 1)
+                    && std::mem::discriminant(&injected) == std::mem::discriminant(&point)
+                {
+                    state.injected = true;
+                    return Action::Fail(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(if matches!(injected, Point::Step) {
+                            rusqlite::ffi::SQLITE_BUSY
+                        } else {
+                            rusqlite::ffi::SQLITE_ERROR
+                        }),
+                        Some(format!("injected {injected:?}")),
+                    ));
+                }
+                match point {
+                    Point::Spawn => state.spawned += 1,
+                    Point::Chunk { .. } => state.chunks += 1,
+                    Point::Finished => {
+                        state.finished += 1;
+                        observed.1.notify_all();
+                    }
+                    Point::Verifier => {
+                        // All spawned workers finish before the real verifier is released.
+                        // A spawn failure has no worker and has already cancelled advice.
+                        if !matches!(failure, Some((Point::Spawn, _))) {
+                            state = observed
+                                .1
+                                .wait_while(state, |state| state.finished < state.spawned)
+                                .unwrap();
+                            if failure.is_none() {
+                                assert!(state.chunks > 0);
+                            }
+                        }
+                        // Stop sampling before the verifier allocates receipts/proofs.
+                        if let (Some(baseline), Some(peak)) =
+                            (state.rss_baseline_kib, state.rss_peak_kib)
+                        {
+                            eprintln!(
+                                "isolated hint-and-readers RSS: baseline_kib={baseline}, sampled_peak_kib={peak}, delta_kib={}",
+                                peak.saturating_sub(baseline)
+                            );
+                        }
+                        state.rss_sampling = false;
+                        state.spawned = 0;
+                        state.finished = 0;
+                        state.chunks = 0;
+                        state.injected = false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Action::Continue
+    })));
+    (HistoryReadAheadHook, observation)
+}
+
+fn history_read_ahead_state(
+    side: &std::path::Path,
+) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+    let connection = Connection::open(side).unwrap();
+    let tables = connection
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let mut rows = query_values(
+                side,
+                &format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")),
+            );
+            rows.sort_by_key(|row| format!("{row:?}"));
+            (table, rows)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn history_read_ahead_differential_clean_damaged_and_committed_wal_collection() {
+    for damage in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let (seed, source) = history_v3_legacy_seed(
+            &dir,
+            vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+        )
+        .await;
+        history_v3_collect(&seed, &source, 2, FRESH_END + 1, &[])
+            .await
+            .unwrap();
+        history_v3_collect(&seed, &source, 3, FRESH_END + 2, &[])
+            .await
+            .unwrap();
+        let mut results = Vec::new();
+        for disabled in [true, false] {
+            // Copy the same recorded receipts, including their transport timestamps.
+            // Resume completed generation three so no new transport clock is sampled.
+            let side = dir.path().join(format!("trial-{disabled}.db"));
+            Connection::open(&seed)
+                .unwrap()
+                .execute("VACUUM INTO ?1", [side.to_str().unwrap()])
+                .unwrap();
+            let keeper = history_v3_damage_connection(&side);
+            keeper
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0")
+                .unwrap();
+            if damage {
+                keeper.execute_batch(
+                    "UPDATE activity_wallet_coverage_staging_v2 SET source_row_count = source_row_count + 1 WHERE generation = 2;
+                     UPDATE activity_wallet_coverage_staging_v2 SET page_evidence_json = 'damaged' WHERE generation = 1;").unwrap();
+            } else {
+                keeper.execute("UPDATE activity_wallet_coverage_staging_v2 SET page_evidence_json = page_evidence_json || ' ' WHERE generation = 2", []).unwrap();
+            }
+            assert!(
+                std::fs::metadata(side.with_extension("db-wal"))
+                    .unwrap()
+                    .len()
+                    > 32
+            );
+            source.calls.lock().unwrap().clear();
+            let (log, _log_guard) = history_reuse_log();
+            let (_hook, observation) = history_read_ahead_hook(disabled, None);
+            let result = history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+                .await
+                .map(|manifest| serde_json::to_value(manifest).unwrap())
+                .map_err(|error| error.to_string());
+            if damage {
+                assert!(
+                    result
+                        .as_ref()
+                        .unwrap_err()
+                        .contains("historical receipt-set commitment mismatch")
+                );
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+            }
+            assert!(source.calls.lock().unwrap().is_empty());
+            assert_eq!(observation.0.lock().unwrap().live, 0);
+            let loaded = collection_766_events(&log, "activity history proof loaded");
+            assert!(!loaded.is_empty());
+            for event in loaded {
+                assert_eq!(
+                    event["read_ahead"],
+                    if disabled { "unavailable" } else { "done" }
+                );
+                assert_eq!(event["read_ahead_budget_bytes"], 64_222_464_u64);
+                assert_eq!(event.get("read_ahead_error").is_some(), disabled);
+            }
+            let checkpoint: (i64, i64, i64) = keeper
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            assert_eq!(checkpoint, (0, 0, 0));
+            results.push((
+                result,
+                source.calls.lock().unwrap().clone(),
+                history_read_ahead_state(&side),
+            ));
+        }
+        assert_eq!(results[0], results[1]);
+    }
+}
+
+#[tokio::test]
+async fn history_read_ahead_failures_preserve_first_error_source_calls_and_committed_state() {
+    use pe_bootstrap::cache_migration::HistoryReadAheadPoint as Point;
+    for damage in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let (seed, source) = history_v3_legacy_seed(
+            &dir,
+            vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+        )
+        .await;
+        history_v3_collect(&seed, &source, 2, FRESH_END + 1, &[])
+            .await
+            .unwrap();
+        let mut baseline = None;
+        for (trial, failure) in [
+            None,
+            Some(Point::Spawn),
+            Some(Point::Open),
+            Some(Point::Prepare),
+            Some(Point::Step),
+            Some(Point::Blob),
+            Some(Point::Chunk { bytes: 0 }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for all in [false, true] {
+                let side = dir.path().join(format!("trial-{trial}-{all}.db"));
+                Connection::open(&seed)
+                    .unwrap()
+                    .execute("VACUUM INTO ?1", [side.to_str().unwrap()])
+                    .unwrap();
+                if damage {
+                    history_v3_damage_connection(&side).execute(
+                        "UPDATE activity_wallet_coverage_staging_v2 SET source_row_count = source_row_count + 1 WHERE generation = 1", []).unwrap();
+                }
+                source.calls.lock().unwrap().clear();
+                let (log, _log_guard) = history_reuse_log();
+                let (_hook, observation) =
+                    history_read_ahead_hook(failure.is_none(), failure.map(|point| (point, all)));
+                let result = history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+                    .await
+                    .map(|manifest| serde_json::to_value(manifest).unwrap())
+                    .map_err(|error| error.to_string());
+                assert_eq!(observation.0.lock().unwrap().live, 0);
+                let events = collection_766_events(&log, "activity history proof loaded");
+                assert!(!events.is_empty());
+                for event in events {
+                    assert_eq!(event["read_ahead"], "unavailable", "{failure:?}: {event:?}");
+                    assert!(event["read_ahead_error"].is_string());
+                }
+                let observed = (
+                    result,
+                    source.calls.lock().unwrap().clone(),
+                    history_read_ahead_state(&side),
+                );
+                if let Some(baseline) = &baseline {
+                    assert_eq!(&observed, baseline, "{failure:?}, all={all}");
+                } else {
+                    baseline = Some(observed);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_read_ahead_begin_immediate_keeps_uncommitted_data_private_and_releases_wal() {
+    let dir = TempDir::new().unwrap();
+    let (side, source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    let connection = history_v3_damage_connection(&side);
+    let before = history_read_ahead_state(&side);
+    for damage in [false, true] {
+        let mut results = Vec::new();
+        for disabled in [true, false] {
+            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            if damage {
+                connection.execute("UPDATE activity_wallet_coverage_staging_v2 SET page_evidence_json = 'uncommitted damage' WHERE generation = 1", []).unwrap();
+            }
+            let (log, _log_guard) = history_reuse_log();
+            let (_hook, observation) = history_read_ahead_hook(disabled, None);
+            let result = pe_bootstrap::cache_migration::load_history_proof_for_test(&connection, 2)
+                .map_err(|error| error.to_string());
+            assert_eq!(result.is_err(), damage);
+            assert_eq!(observation.0.lock().unwrap().live, 0);
+            let loaded = collection_766_events(&log, "activity history proof loaded");
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(
+                loaded[0]["read_ahead"],
+                if disabled { "unavailable" } else { "done" }
+            );
+            connection.execute_batch("ROLLBACK").unwrap();
+            let checkpoint: (i64, i64, i64) = connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            assert_eq!(checkpoint, (0, 0, 0));
+            assert_eq!(history_read_ahead_state(&side), before);
+            results.push(result);
+        }
+        assert_eq!(results[0], results[1]);
+    }
+}
+
+#[tokio::test]
+async fn history_read_ahead_verifier_completion_cancels_unfinished_readers_before_return() {
+    use pe_bootstrap::cache_migration::{
+        HistoryReadAheadAction as Action, HistoryReadAheadEvent as Event,
+        HistoryReadAheadPoint as Point, set_history_read_ahead_hook_for_test,
+    };
+    let dir = TempDir::new().unwrap();
+    let (side, source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    let before = history_read_ahead_state(&side);
+    let sync = Arc::new((
+        Mutex::new((false, false, 0_usize)),
+        std::sync::Condvar::new(),
+    ));
+    let observed = Arc::clone(&sync);
+    set_history_read_ahead_hook_for_test(Some(Arc::new(move |event| {
+        let mut state = observed.0.lock().unwrap();
+        match event {
+            Event::Acquire { .. } => state.2 += 1,
+            Event::Release { .. } => state.2 -= 1,
+            Event::Point {
+                point: Point::Chunk { .. },
+                ..
+            } => {
+                state.0 = true;
+                observed.1.notify_all();
+                drop(observed.1.wait_while(state, |state| !state.1).unwrap());
+            }
+            Event::Point {
+                point: Point::Verifier,
+                ..
+            } => {
+                drop(observed.1.wait_while(state, |state| !state.0).unwrap());
+            }
+            Event::Point {
+                point: Point::Stopping,
+                ..
+            } => {
+                state.1 = true;
+                observed.1.notify_all();
+            }
+            _ => {}
+        }
+        Action::Continue
+    })));
+    let _hook = HistoryReadAheadHook;
+    let (log, _log_guard) = history_reuse_log();
+    pe_bootstrap::cache_migration::load_history_proof_for_test(
+        &Connection::open(&side).unwrap(),
+        2,
+    )
+    .unwrap();
+    assert_eq!(sync.0.lock().unwrap().2, 0);
+    let loaded = collection_766_events(&log, "activity history proof loaded");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0]["read_ahead"], "cancelled");
+    assert!(loaded[0].get("read_ahead_error").is_none());
+    let checkpoint: (i64, i64, i64) = Connection::open(&side)
+        .unwrap()
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(checkpoint, (0, 0, 0));
+    assert_eq!(history_read_ahead_state(&side), before);
+}
