@@ -88,17 +88,14 @@ fn run_fixture_sweep() -> (WalletCache, TempDir) {
 
     let mut responses: HashMap<String, Vec<u8>> = HashMap::new();
     responses.insert(
-        format!("{BASE}/events?limit=500&offset=0"),
+        format!("{BASE}/events?limit=50&offset=0"),
         br#"[{"id": 491919, "slug": "btc-event", "markets": [
             {"conditionId": "0xaa", "clobTokenIds": "[\"111\",\"222\"]"},
             {"conditionId": "0xbb", "clobTokenIds": "[\"333\",\"444\"]"}
         ]}]"#
             .to_vec(),
     );
-    responses.insert(
-        format!("{BASE}/events?limit=500&offset=500"),
-        b"[]".to_vec(),
-    );
+    responses.insert(format!("{BASE}/events?limit=50&offset=50"), b"[]".to_vec());
 
     let fetcher = GammaEventsFetcher::new(BASE.to_owned(), FixtureFetcher::new(responses));
     let rt = tokio::runtime::Builder::new_current_thread()

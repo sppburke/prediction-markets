@@ -42,9 +42,9 @@ use crate::error::BootstrapError;
 /// `source_cursor` key holding the next `/events` page offset to fetch.
 pub(crate) const EVENTS_CURSOR_KEY: &str = "gamma_events_sweep_offset";
 
-/// Events fetched per `/events` page. Gamma caps the page size; 500 is the
-/// observed maximum that returns reliably.
-const EVENTS_PAGE_LIMIT: u64 = 500;
+/// Events fetched per `/events` page. Gamma serves pages above 50 gzip-compressed only
+/// (HTTP 406 `gzip_required` since 2026-11-12, `docs/15-SOURCES.md`) and our client sends none.
+const EVENTS_PAGE_LIMIT: u64 = 50;
 
 /// Walk-level retries for one Gamma `/events` page after the shared HTTP
 /// fetcher's own fast retries are exhausted.
@@ -483,8 +483,8 @@ mod tests {
         assert_eq!(
             events.fetcher.urls(),
             vec![
-                "https://gamma.test/events?limit=500&offset=500",
-                "https://gamma.test/events?limit=500&offset=500"
+                "https://gamma.test/events?limit=50&offset=500",
+                "https://gamma.test/events?limit=50&offset=500"
             ]
         );
         assert_eq!(
