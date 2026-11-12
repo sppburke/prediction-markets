@@ -32,8 +32,9 @@ const SCOPE_MIN_INTERVAL_MS: u64 = 500;
 /// `/series` returns at most 50 rows per page whatever `limit` asks for (probed 2026-10-15).
 const SERIES_PAGE_LIMIT: usize = 50;
 const SERIES_MAX_PAGES: usize = 200;
-/// `/events/keyset` documents `limit` at most 100.
-const EVENTS_PAGE_LIMIT: usize = 100;
+/// `/events/keyset` documents `limit` at most 100, but Gamma serves pages above 50 gzip-compressed
+/// only (HTTP 406 `gzip_required` since 2026-11-12, `docs/15-SOURCES.md`) and our client sends none.
+const EVENTS_PAGE_LIMIT: usize = 50;
 const EVENTS_MAX_PAGES_PER_SERIES: usize = 2_000;
 /// Page-level retries after the fetcher's own, as in the `/events` sweep (`events.rs`).
 const PAGE_MAX_RETRIES: u32 = 5;

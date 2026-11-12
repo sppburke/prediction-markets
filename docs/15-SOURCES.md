@@ -486,7 +486,7 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/api-spec/gamma-openapi.yaml (`Market.events`, `Event.series`, `Series.recurrence`, `Series.slug`) | 2026-11-08 | 2027-01-07 |
 | https://gamma-api.polymarket.com/series?exclude_events=true&limit=50&offset={k} (discover additions to the covered set) | 2026-11-08 | 2027-01-07 |
 | https://gamma-api.polymarket.com/series/{id} (read each covered series by id; verify its slug and recurrence for discovery and ranking) | 2026-11-08 | 2027-01-07 |
-| https://gamma-api.polymarket.com/events/keyset?series_id={id}&end_date_min={iso}&limit=100&after_cursor={cursor} (documented in gamma-openapi.yaml) | 2026-11-08 | 2027-01-07 |
+| https://gamma-api.polymarket.com/events/keyset?series_id={id}&end_date_min={iso}&limit=50&after_cursor={cursor} (documented in gamma-openapi.yaml; pages above 50 are gzip-only) | 2026-11-12 | 2027-01-11 |
 | https://gamma-api.polymarket.com/markets?clob_token_ids={token}&closed=true | 2026-09-02 | 2026-11-01 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 
@@ -578,6 +578,14 @@ Treat as research inspiration; not a production decision input unless an authori
 | https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
+
+- 2026-11-12 (Gamma page size, #877): Gamma now refuses `/events` and `/events/keyset` pages whose `limit`
+  is above 50 unless the request sends `Accept-Encoding: gzip`: `HTTP 406 {"error":"gzip_required","hint":"send the
+  header Accept-Encoding: gzip. /events and /events/keyset pages with limit above 50 are served compressed only."}`.
+  Probes about 09:50 CT from the development box and Forge: keyset `limit=100` 406, the same with gzip 200, `limit=50`
+  200; `/events?limit=100` 406; `/events` at the default size and `/markets?limit=500` 200. The ranker had walked
+  every scope series at `limit=100` until 04:04 CT that day. pe-bootstrap pages both endpoints at 50, because the
+  workspace HTTP client does not negotiate gzip.
 
 - 2026-11-08 (ranker scope, #871): re-read the official `gamma-openapi.yaml` (`Series.slug`
   `type: string, nullable: true`) and re-ran the full `/series?exclude_events=true` listing
