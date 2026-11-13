@@ -1387,12 +1387,16 @@ Run it while the old unit serves, again in full after the stop under the deploy 
 every resume before the swap, each into its own `<stage>` file. It must exit 0: every readable
 recorded book reports a tick absent or equal to its record's tick, and the live journal is
 header-only (the kit does not scan live records). Otherwise restart the old binary and do not swap.
-After the final census and before the start, record the baseline once; a resume keeps it:
+After the final census and before the start, record the baseline once; a resume keeps it, and a
+failed capture stops the deploy before the start:
 
 ```bash
-[ -e "$art/tick-t0.json" ] || {
-  python3 -I "$art/tick_audit.py" capture <generation-dir> > "$art/tick-t0.json.new" &&
-  chmod a-w "$art/tick-t0.json.new" && mv -T "$art/tick-t0.json.new" "$art/tick-t0.json"; }
+if [ ! -e "$art/tick-t0.json" ]; then
+  t0=$(mktemp "$art/tick-t0.XXXXXX") \
+    && python3 -I "$art/tick_audit.py" capture <generation-dir> > "$t0" \
+    && mv -T "$t0" "$art/tick-t0.json" || { echo 'tick capture failed: do not start'; exit 1; }
+fi
+chmod a-w "$art/tick-t0.json"
 ```
 
 Each day for three days after the start, run

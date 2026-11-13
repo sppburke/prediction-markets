@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr as _;
+use std::sync::Arc;
 use std::time::Duration;
 
 use pe_core_types::{Price, ReceivedAt, SourceId, SourceTimestamp};
@@ -325,6 +326,7 @@ pub struct ReqwestClobBookFetcher {
     timeout: Duration,
     rate_gate: RateGate,
     source_log: Option<SourceLogHandle>,
+    clock: Option<Arc<dyn Fn() -> time::OffsetDateTime + Send + Sync>>,
 }
 
 impl ReqwestClobBookFetcher {
@@ -337,6 +339,7 @@ impl ReqwestClobBookFetcher {
             timeout: Duration::from_secs(CLOB_REQUEST_TIMEOUT_SECS),
             rate_gate: RateGate::default(),
             source_log: None,
+            clock: None,
         }
     }
 
@@ -352,6 +355,17 @@ impl ReqwestClobBookFetcher {
     #[must_use]
     pub fn with_base_url(mut self, base_url: String) -> Self {
         self.base_url = base_url;
+        self
+    }
+
+    /// Fixed receipt and fetch clock for deterministic live scenarios.
+    #[cfg(any(test, feature = "scenario"))]
+    #[must_use]
+    pub fn with_clock(
+        mut self,
+        clock: Arc<dyn Fn() -> time::OffsetDateTime + Send + Sync>,
+    ) -> Self {
+        self.clock = Some(clock);
         self
     }
 }
@@ -376,7 +390,10 @@ impl ClobBookFetcher for ReqwestClobBookFetcher {
             .bytes()
             .await
             .map_err(|e| ClobBookError::Request(e.to_string()))?;
-        let received_at = time::OffsetDateTime::now_utc();
+        let received_at = self
+            .clock
+            .as_ref()
+            .map_or_else(time::OffsetDateTime::now_utc, |clock| clock());
         let source_receipt = if let Some(source_log) = &self.source_log {
             Some(
                 source_log
@@ -399,7 +416,10 @@ impl ClobBookFetcher for ReqwestClobBookFetcher {
             return Err(ClobBookError::Status(status.as_u16()));
         }
         let mut book = parse_requested_book(&body, condition_id, token_id)?;
-        book.fetched_at_ms = now_unix_ms();
+        book.fetched_at_ms = self
+            .clock
+            .as_ref()
+            .map_or_else(now_unix_ms, |clock| unix_ms(clock()));
         book.source_receipt = source_receipt;
         Ok(book)
     }
@@ -417,7 +437,11 @@ fn parse_requested_book(
 
 /// Current Unix time in milliseconds (`0` before the epoch — unreachable on a live host).
 pub(crate) fn now_unix_ms() -> u64 {
-    u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
+    unix_ms(time::OffsetDateTime::now_utc())
+}
+
+fn unix_ms(at: time::OffsetDateTime) -> u64 {
+    u64::try_from(at.unix_timestamp_nanos() / 1_000_000).unwrap_or(0)
 }
 
 /// Deterministic [`ClobBookFetcher`] returning pre-loaded books keyed by token

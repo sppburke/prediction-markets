@@ -2443,6 +2443,8 @@ async fn process_target(
     observation: &ObservationEvidence,
     now: OffsetDateTime,
 ) -> Result<PassControl, FanoutError> {
+    // The pass reads time only from the fanout clock, the wall clock outside tests.
+    let clock = Arc::clone(&state.clock);
     if pending_control_history(state, target)?.iter().any(|audit| {
         audit.outcome == pe_execution_core::live_journal::LiveTargetControlOutcome::NotArmed
     }) {
@@ -2506,12 +2508,7 @@ async fn process_target(
     let credentials = match credentials_for_target(state, target).await {
         CredentialLoad::Ready(credentials) => credentials,
         CredentialLoad::Changed => {
-            terminalize(
-                state,
-                target,
-                "credential_version_changed",
-                OffsetDateTime::now_utc(),
-            )?;
+            terminalize(state, target, "credential_version_changed", clock())?;
             return Ok(PassControl::Continue);
         }
         CredentialLoad::Transient(reason) => {
@@ -2533,7 +2530,7 @@ async fn process_target(
     };
 
     let condition_id = PolymarketConditionId(signal.market_id.0.0.clone());
-    let admission_started_at = OffsetDateTime::now_utc();
+    let admission_started_at = clock();
     let mut admission = match state
         .admission
         .build(&condition_id, admission_started_at)
@@ -2545,12 +2542,7 @@ async fn process_target(
             return Ok(PassControl::StopSeed);
         }
         Err(error) => {
-            terminalize(
-                state,
-                target,
-                admission_terminal_reason(&error),
-                OffsetDateTime::now_utc(),
-            )?;
+            terminalize(state, target, admission_terminal_reason(&error), clock())?;
             return Ok(PassControl::Continue);
         }
     };
@@ -2562,12 +2554,7 @@ async fn process_target(
     {
         Some(token) => token,
         None => {
-            terminalize(
-                state,
-                target,
-                "outcome_not_binary",
-                OffsetDateTime::now_utc(),
-            )?;
+            terminalize(state, target, "outcome_not_binary", clock())?;
             return Ok(PassControl::Continue);
         }
     };
@@ -2613,26 +2600,21 @@ async fn process_target(
         warn!(account_id = %target.account_id, "recorded /book receipt missing; seed paused");
         return Ok(PassControl::StopSeed);
     };
-    let now_ms = unix_ms(OffsetDateTime::now_utc());
+    let now_ms = unix_ms(clock());
     if pe_venue_polymarket::ladder_is_stale(now_ms, book.fetched_at_ms) {
         return Ok(PassControl::StopSeed);
     }
     let Some(ladder) = book.ladder() else {
-        terminalize(state, target, "ladder_invalid", OffsetDateTime::now_utc())?;
+        terminalize(state, target, "ladder_invalid", clock())?;
         return Ok(PassControl::Continue);
     };
     let Some(best_ask) = ladder.first().map(|ask| ask.price) else {
-        terminalize(state, target, "ladder_empty", OffsetDateTime::now_utc())?;
+        terminalize(state, target, "ladder_empty", clock())?;
         return Ok(PassControl::Continue);
     };
     // The order is planned, signed and journaled on the walked book's tick (#881).
     let Some(order_tick) = book.order_tick(admission.market.minimum_tick_size) else {
-        terminalize(
-            state,
-            target,
-            "book_tick_inconsistent",
-            OffsetDateTime::now_utc(),
-        )?;
+        terminalize(state, target, "book_tick_inconsistent", clock())?;
         return Ok(PassControl::Continue);
     };
     admission.market.minimum_tick_size = order_tick;
@@ -2647,7 +2629,7 @@ async fn process_target(
     let sizing = match settings.sizing_mode(runtime.sizing_mode) {
         Ok(sizing) => sizing,
         Err(reason) => {
-            terminalize(state, target, reason, OffsetDateTime::now_utc())?;
+            terminalize(state, target, reason, clock())?;
             return Ok(PassControl::Continue);
         }
     };
@@ -2690,7 +2672,7 @@ async fn process_target(
             state,
             target,
             winner_follow_terminal_reason(&error),
-            OffsetDateTime::now_utc(),
+            clock(),
         )?;
         return Ok(PassControl::Continue);
     }
@@ -2699,12 +2681,7 @@ async fn process_target(
     let (minimum_price, maximum_price) = match (minimum_price, maximum_price) {
         (Ok(minimum), Ok(maximum)) => (minimum, maximum),
         _ => {
-            terminalize(
-                state,
-                target,
-                "live_price_band_invalid",
-                OffsetDateTime::now_utc(),
-            )?;
+            terminalize(state, target, "live_price_band_invalid", clock())?;
             return Ok(PassControl::Continue);
         }
     };
@@ -2767,12 +2744,7 @@ async fn process_target(
     ) {
         Ok(plan) => plan,
         Err(error) => {
-            terminalize(
-                state,
-                target,
-                ladder_terminal_reason(&error),
-                OffsetDateTime::now_utc(),
-            )?;
+            terminalize(state, target, ladder_terminal_reason(&error), clock())?;
             return Ok(PassControl::Continue);
         }
     };
@@ -2891,7 +2863,7 @@ async fn process_target(
             state,
             target,
             winner_follow_terminal_reason(&decline),
-            OffsetDateTime::now_utc(),
+            clock(),
         )?;
         return Ok(PassControl::Continue);
     }
@@ -2920,7 +2892,7 @@ async fn process_target(
         ladder: plan.clone(),
         economic,
     };
-    let prepare_check_at = OffsetDateTime::now_utc();
+    let prepare_check_at = clock();
     let prepare_price_expired =
         risk_price_expired(state, &request.economic.risk, prepare_check_at)?;
     if risk_day_changed(&request.economic.risk, prepare_check_at) || prepare_price_expired {
@@ -2967,13 +2939,13 @@ async fn process_target(
                 state,
                 target,
                 winner_follow_terminal_reason(&decline),
-                OffsetDateTime::now_utc(),
+                clock(),
             )?;
             return Ok(PassControl::Continue);
         }
         request.economic.risk = refreshed;
     }
-    let final_prepare_check_at = OffsetDateTime::now_utc();
+    let final_prepare_check_at = clock();
     let final_prepare_price_expired =
         risk_price_expired(state, &request.economic.risk, final_prepare_check_at)?;
     if risk_day_changed(&request.economic.risk, final_prepare_check_at)
@@ -2992,11 +2964,7 @@ async fn process_target(
         return Ok(PassControl::StopSeed);
     }
     match executor
-        .prepare_with_observed_account_and_clock(
-            request,
-            account_state.clone(),
-            OffsetDateTime::now_utc,
-        )
+        .prepare_with_observed_account_and_clock(request, account_state.clone(), || clock())
         .await?
     {
         LivePrepareResult::Terminal(outcome) => {
@@ -3004,7 +2972,7 @@ async fn process_target(
                 return Ok(PassControl::StopSeed);
             }
             let transition = outcome_transition(&outcome);
-            persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
+            persist_outcome(state, target, &outcome, clock())?;
             Ok(if transition.freeze {
                 PassControl::FreezePass
             } else {
@@ -3024,13 +2992,13 @@ async fn process_target(
             {
                 let outcome = executor.terminalize_prepared(
                     prepared,
-                    OffsetDateTime::now_utc(),
+                    clock(),
                     pe_execution_core::LiveOrderPreparationFailure::PrePostMarkUnavailable,
                 )?;
-                persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
+                persist_outcome(state, target, &outcome, clock())?;
                 return Ok(PassControl::StopSeed);
             }
-            let post_check_at = OffsetDateTime::now_utc();
+            let post_check_at = clock();
             if prepared_ladder_is_stale(state, prepared.audit(), post_check_at)? {
                 let outcome = executor.terminalize_prepared(
                     prepared,
@@ -3059,10 +3027,10 @@ async fn process_target(
                 {
                     let outcome = executor.terminalize_prepared(
                         prepared,
-                        OffsetDateTime::now_utc(),
+                        clock(),
                         pe_execution_core::LiveOrderPreparationFailure::PrePostMarkUnavailable,
                     )?;
-                    persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
+                    persist_outcome(state, target, &outcome, clock())?;
                     return Ok(PassControl::StopSeed);
                 }
                 let refreshed = live_risk_audit(
@@ -3083,14 +3051,13 @@ async fn process_target(
                 } else {
                     pe_execution_core::LiveOrderPreparationFailure::PrePostRiskDayChanged
                 };
-                let outcome =
-                    executor.terminalize_prepared(prepared, OffsetDateTime::now_utc(), failure)?;
-                persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
+                let outcome = executor.terminalize_prepared(prepared, clock(), failure)?;
+                persist_outcome(state, target, &outcome, clock())?;
                 return Ok(PassControl::StopSeed);
             }
             // The short guard orders control publication against the final check and durable
             // submitted transition. It is released before any venue network call.
-            let final_at = OffsetDateTime::now_utc();
+            let final_at = clock();
             let (control, submitted) = state.config.live_accounts.with_publication(|| {
                 let latest = state.config.live_accounts.snapshot();
                 let latest_account = latest
@@ -3127,19 +3094,14 @@ async fn process_target(
                 persist_outcome(state, target, &outcome, final_at)?;
                 return Ok(PassControl::Continue);
             }
-            let outcome = post_prepared_target(
-                state,
-                target,
-                &executor,
-                prepared,
-                copy_deadline,
-                OffsetDateTime::now_utc,
-            )
-            .await?;
+            let outcome =
+                post_prepared_target(state, target, &executor, prepared, copy_deadline, || {
+                    clock()
+                })
+                .await?;
             let transition = outcome_transition(&outcome);
             if matches!(outcome, LiveOrderOutcome::Matched { .. }) {
-                reconcile_account_projection(state, &account.account_id, OffsetDateTime::now_utc())
-                    .await;
+                reconcile_account_projection(state, &account.account_id, clock()).await;
             }
             Ok(if transition.freeze {
                 PassControl::FreezePass
@@ -21052,7 +21014,8 @@ mod tests {
         state.config.book_fetcher = Arc::new(
             ReqwestClobBookFetcher::new(state.config.http.clone())
                 .with_base_url(base)
-                .with_source_log(state.config.source_log.clone()),
+                .with_source_log(state.config.source_log.clone())
+                .with_clock(Arc::new(move || now)),
         );
         let mut runtime = state.config.runtime_config.snapshot().as_ref().clone();
         runtime.per_trade_cap = pe_strategy_winner_follow::PerTradeCap::Unlimited;
@@ -21250,7 +21213,8 @@ mod tests {
             state.config.book_fetcher = Arc::new(
                 ReqwestClobBookFetcher::new(state.config.http.clone())
                     .with_base_url(base)
-                    .with_source_log(state.config.source_log.clone()),
+                    .with_source_log(state.config.source_log.clone())
+                    .with_clock(Arc::new(move || now)),
             );
             let mut runtime = state.config.runtime_config.snapshot().as_ref().clone();
             runtime.per_trade_cap = pe_strategy_winner_follow::PerTradeCap::Unlimited;
