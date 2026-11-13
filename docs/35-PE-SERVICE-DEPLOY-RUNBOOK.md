@@ -1373,6 +1373,44 @@ SQL apply.
    changes to their recorded reason. Record unobserved cases explicitly; preserve all evidence and
    fix forward once the boundary exists.
 
+**#881 tick-refinement update.** An ordinary in-era update with one restart through the locked swap
+below: no configuration, schema, Supabase or Forge change, and no new financial-semantic,
+continuation or economic version. Re-run `scripts/probe_activity_ws.py` before deploying, and copy
+the deploy kit's read-only auditor `tick_audit.py` into `$art` once step 3 creates it. The unchanged
+versions rest on its census of every recorded `/book` tick:
+
+```bash
+python3 -I "$art/tick_audit.py" census <generation-dir> <live-journal> > "$art/tick-census.<stage>.jsonl"
+```
+
+Run it while the old unit serves, again in full after the stop under the deploy lock, and again on
+every resume before the swap, each into its own `<stage>` file. It must exit 0: every readable
+recorded book reports a tick absent or equal to its record's tick, and the live journal is
+header-only (the kit does not scan live records). Otherwise restart the old binary and do not swap.
+After the final census and before the start, record the baseline once; a resume keeps it, and a
+failed capture stops the deploy before the start:
+
+```bash
+if [ ! -e "$art/tick-t0.json" ]; then
+  t0=$(mktemp "$art/tick-t0.XXXXXX") \
+    && python3 -I "$art/tick_audit.py" capture <generation-dir> > "$t0" \
+    && mv -T "$t0" "$art/tick-t0.json" || { echo 'tick capture failed: do not start'; exit 1; }
+fi
+chmod a-w "$art/tick-t0.json"
+```
+
+Each day for three days after the start, run
+`python3 -I "$art/tick_audit.py" verify <generation-dir> <live-journal> "$art/tick-t0.json"` and keep
+its output: exit 0 passes, 1 is a failing record, 2 an operational error (including any live
+record) and 3 incomplete evidence. A fourth argument, the service's journal lines since the start,
+lists refusals as unproven coverage; they never pass or fail the check. The rollback boundary is
+the first record that depends on the [tick rule](_GLOSSARY.md#market-admission-tick):
+a paper economic record admitted from disagreeing sources or planned on a changed book tick, which an
+older binary's source-backed replay rejects inside a selected qualification seal, or such an
+ordinary-live admission, which closes the account under older live replay. Before it, reverse the
+swap only after stop and drain and every existing [rollback prerequisite](#rollback); after it,
+preserve state and fix forward.
+
 Every step is bound to the embedded full Git revision plus exact binary bytes (#544). The binary
 reports `revision=<40-hex> config_identity=runtime-applied`; `--verify-staged-identity` checks that
 revision and the executable's BLAKE3 digest before staging. Continue to use sha256 for the existing

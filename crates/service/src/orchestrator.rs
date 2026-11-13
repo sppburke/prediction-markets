@@ -103,6 +103,7 @@ struct GatePlanEvidence {
     budget: CollateralAmount,
     worst_case_all_in_debit: CollateralAmount,
     checked_at_unix_ms: u64,
+    order_tick: Price,
 }
 
 struct GatePlanFailure {
@@ -2811,6 +2812,20 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 checked_at_unix_ms: Some(checked_at_unix_ms),
             });
         }
+        let Some(order_tick) = book.order_tick(admission.market.minimum_tick_size) else {
+            return Err(GatePlanFailure {
+                reason: "price-impact book unusable: book tick contradicts admission (fail closed)",
+                book: Box::new(book_failure(
+                    Some(&token_id),
+                    "tick_inconsistent",
+                    Some(&book.response_blake3),
+                    Some(book.fetched_at_ms),
+                    None,
+                    "book tick_size contradicts the admitted tick",
+                )),
+                checked_at_unix_ms: Some(checked_at_unix_ms),
+            });
+        };
         let ceiling = (if current_book_policy {
             pe_execution_core::economic::current_book_impact_ceiling(
                 best,
@@ -2961,7 +2976,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             })?;
         let schedule = admission.fee_schedule;
         let minimum_order_size = admission.market.minimum_order_size;
-        let minimum_tick_size = admission.market.minimum_tick_size;
+        let minimum_tick_size = order_tick;
         let planned = plan_sized_buy(
             &ladder,
             schedule,
@@ -3020,6 +3035,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     budget,
                     worst_case_all_in_debit,
                     checked_at_unix_ms,
+                    order_tick,
                 })
             }
             // Decision 10 taxonomy (#508): a SUCCESSFUL read whose in-band depth cannot
@@ -3049,6 +3065,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 budget: CollateralAmount::ZERO,
                 worst_case_all_in_debit: CollateralAmount::ZERO,
                 checked_at_unix_ms,
+                order_tick,
             }),
             Err(decline @ (LadderError::BelowBandAsk | LadderError::InsufficientDepth)) => {
                 Err(GatePlanFailure {
@@ -3823,7 +3840,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             Some(book) => book.during(admission_read).await,
             None => admission_read.await,
         };
-        let admission = match admission {
+        let mut admission = match admission {
             Some(Ok(admission)) => admission,
             Some(Err(error)) => {
                 drop(early_book);
@@ -4195,6 +4212,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 i64::try_from(gate_evidence.checked_at_unix_ms).unwrap_or(i64::MAX),
             );
         }
+        // The order is planned and recorded on the walked book's tick (#881).
+        admission.market.minimum_tick_size = gate_evidence.order_tick;
         let book_receipt = gate_evidence.book_receipt;
         let plan_budget = gate_evidence.budget;
         let planned_worst_case_all_in_debit = gate_evidence.worst_case_all_in_debit;
@@ -5225,6 +5244,7 @@ mod tests {
                         fetched_at_ms: now,
                         response_blake3: "early-book".to_owned(),
                         source_receipt: None,
+                        tick_size: Default::default(),
                     }),
                     stalled,
                     started: StdMutex::new(Vec::new()),

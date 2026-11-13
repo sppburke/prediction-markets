@@ -248,11 +248,12 @@
 > (transport/envelope/constants) and `pe-service::activity_ingest` (readers, liveness,
 > fan-in); the service's `trade_parser` normalizes identically to the REST path. The CLOB
 > market channel remains wallet-anonymous — the note below stands for THAT feed.
-> Last checked: 2026-10-08 (`scripts/probe_activity_ws.py` at 3:53 PM CT for #752, sending only
-> production's subscription: 2,537 `trades` frames in 60 s, no connection error, envelope keys
-> `connection_id`, `payload`, `timestamp`, `topic` and `type`, and both sampled payloads carrying
-> `asset`, `conditionId`, `outcomeIndex`, `price`, `proxyWallet`, `side`, `size`, `timestamp` and
-> `transactionHash`; 2026-10-05: 2,002 frames in 60 s; 2026-10-04: 2,694 and 1,970, same keys).
+> Last checked: 2026-11-13 (`scripts/probe_activity_ws.py` at 4:20 PM CT for #881, sending
+> production's activity subscription: 1,594 `trades` frames in 60 s, no connection error, envelope
+> keys `connection_id`, `payload`, `timestamp`, `topic` and `type`, and both sampled payloads
+> carrying `asset`, `conditionId`, `outcomeIndex`, `price`, `proxyWallet`, `side`, `size`,
+> `timestamp` and `transactionHash`, plus one empty non-JSON frame; 2026-10-08: 2,537 frames in 60 s;
+> 2026-10-05: 2,002; 2026-10-04: 2,694 and 1,970, same keys).
 > A 45 s payload-key capture on 2026-10-05 at 6:11 AM CT (1,816 payloads; 2,726 on 2026-10-04) found `asset`,
 > `conditionId`, `outcome`, `outcomeIndex`, `price`, `proxyWallet`, `side`, `size`, `timestamp` and
 > `transactionHash` on every payload (plus display fields, and `fee` on 694) and **no combo flag**:
@@ -269,7 +270,7 @@
 >
 > **`/activity` indexing latency measured (2026-06-14).** The REST `data-api.polymarket.com/activity` feed (the wallet-attributed FALLBACK source since #530; the activity websocket above is primary) indexes a trade within **~1–4s of its `timestamp`** — proven lower bound p50 1.2s / p95 3.8s / p99 5.2s / max 23s, from 4,655 live trades (the jitter-free lower-bound harness, retired with #842; recorded measurement retained). End-to-end FALLBACK-path copy latency (indexing + the 30s production poll + order placement) ≈ **~20–35s**, so a **1-minute** TTR floor is reliably copyable for near-resolution first-bets. Full methodology + run record: `docs/29-ACTIVITY-LATENCY-MEASUREMENT.md`.
 >
-> **CLOB `/book` is public/no-auth (2026-06-16, issue #350 WS2 PR-G live re-confirm).** `GET https://clob.polymarket.com/book?token_id=<id>` returns HTTP **200 with no auth header**; a bogus token id returns **404** `{"error":"No orderbook exists for the requested token id"}`. Body shape: `asks`/`bids` are arrays of `{price, size}` where **both fields are strings** (Decimal-safe), plus scalar string meta (`market`, `asset_id`, `tick_size`, `min_order_size`, `last_trade_price`, `timestamp`, `hash`) and `neg_risk` (bool). Asks are returned **high→low price** (best/lowest ask is not at index 0). `crates/service/src/clob_book.rs` parses the ask side only (liquidity capture is buy-only) into `Decimal`, deriving `best_ask` as the minimum price.
+> **CLOB `/book` is public/no-auth (2026-06-16, issue #350 WS2 PR-G live re-confirm).** `GET https://clob.polymarket.com/book?token_id=<id>` returns HTTP **200 with no auth header**; a bogus token id returns **404** `{"error":"No orderbook exists for the requested token id"}`. Body shape: `asks`/`bids` are arrays of `{price, size}` where **both fields are strings** (Decimal-safe), plus scalar string meta (`market`, `asset_id`, `tick_size`, `min_order_size`, `last_trade_price`, `timestamp`, `hash`) and `neg_risk` (bool). Asks are returned **high→low price** (best/lowest ask is not at index 0). `crates/service/src/clob_book.rs` parses the ask side only (liquidity capture is buy-only) into `Decimal`, deriving `best_ask` as the minimum price. Re-checked 2026-11-13 (#881): the [OpenAPI](https://docs.polymarket.com/api-spec/clob-openapi.yaml) documents `tick_size` and `min_order_size` as strings and `neg_risk` as a boolean beside the levels, as one snapshot without a documented linearizability guarantee, and `clob_book.rs` now also reads `tick_size` as the walked book's order tick ([rule](_GLOSSARY.md#market-admission-tick)).
 >
 > **CLOB `/markets?closed=true` does NOT populate `tokens[].winner` on old markets (2026-06-18, issue #369 PR1 live reconciliation).** Response: `{count, limit, next_cursor, data:[…]}`; each market carries snake_case `condition_id`, `closed`, `end_date_iso`, and `tokens:[{outcome, price, token_id, winner}]`; `next_cursor` terminator is `LTE=`. **Gotcha:** for old markets (≈2022–2023) the resolved winner is reflected only in the terminal token `price` (~1.0 winner / ~0.0 loser) — `tokens[].winner` is `false` on **every** token, so `clob.rs::winner_index` reports the market as voided. Measured against `source='polygon'` over 848,098 traded markets: 0 winner *contradictions* (99.976% agreement) but 202 CLOB-null-vs-polygon-winner, **all** in 2022–2023; by 2024 winner-flag coverage is complete (2024 0/11,674, 2025 2/125,388, 2026 10/709,318 null). Benign for issue #369 because the 1.19M `source='polygon'` rows are kept; CLOB only needs correctness for new markets. Also confirmed: 0 traded multi-outcome (>2-token) markets, so the positional `winner_index`↔`outcome_id` mapping risk is empirically binary-only.
 
@@ -414,10 +415,10 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/developers/CLOB/websocket/wss-overview | 2026-06-10 | 2026-08-09 |
 | https://docs.polymarket.com/ | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/llms.txt | — | — |
-| https://docs.polymarket.com/market-data/market-details | 2026-10-03 | 2026-12-02 |
+| https://docs.polymarket.com/market-data/market-details | 2026-11-13 | 2027-01-12 |
 | https://docs.polymarket.com/market-data/prices-order-books | 2026-10-03 | 2026-12-02 |
-| https://docs.polymarket.com/trading/place-orders | 2026-10-03 | 2026-12-02 |
-| https://docs.polymarket.com/resources/error-codes | 2026-10-31 | 2026-12-30 |
+| https://docs.polymarket.com/trading/place-orders | 2026-11-13 | 2027-01-12 |
+| https://docs.polymarket.com/resources/error-codes | 2026-11-13 | 2027-01-12 |
 | https://docs.polymarket.com/api-reference/rate-limits | 2026-09-17 | 2026-11-16 |
 | https://docs.polymarket.com/market-data/websocket/overview | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/market-data/websocket/market-channel | 2026-06-09 | 2026-09-01 |
@@ -473,12 +474,14 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polygon.technology/pos/concepts/finality/finality | 2026-09-05 | 2026-12-04 |
 | https://polygon.publicnode.com (`eth_chainId`, `eth_getTransactionReceipt`, `eth_getBlockByNumber`) | 2026-09-05 | 2026-12-04 |
 | https://docs.polymarket.com/api-reference/tags/get-tag-by-id | 2026-07-18 | 2026-09-16 |
-| https://clob.polymarket.com/markets/{condition_id} | 2026-10-08 | 2026-12-07 |
+| https://clob.polymarket.com/markets/{condition_id} | 2026-11-13 | 2027-01-12 |
+| https://clob.polymarket.com/clob-markets/{condition_id} (compact `mts`, `mos`, `nr`) | 2026-11-13 | 2027-01-12 |
 | https://clob.polymarket.com/markets (`neg_risk`, `neg_risk_market_id`) | 2026-10-05 | 2026-12-04 |
 | https://docs.polymarket.com/api-spec/clob-openapi.yaml (`Market` neg-risk fields) | 2026-10-05 | 2026-12-04 |
 | https://docs.polymarket.com/api-spec/clob-openapi.yaml (`BalanceAllowanceResponse`, `/balance-allowance/update`) | 2026-10-27 | 2026-12-26 |
+| https://docs.polymarket.com/api-spec/clob-openapi.yaml (`/book` `tick_size`, `min_order_size`, `neg_risk`) | 2026-11-13 | 2027-01-12 |
 | https://docs.polymarket.com/concepts/negative-risk | 2026-10-05 | 2026-12-04 |
-| https://clob.polymarket.com/book?token_id={tokenId} | 2026-07-18 | 2026-09-16 |
+| https://clob.polymarket.com/book?token_id={tokenId} | 2026-11-13 | 2027-01-12 |
 | https://clob.polymarket.com/prices-history?market={tokenId} | 2026-09-01 | 2026-10-31 |
 | https://clob.polymarket.com/prices-history?market={tokenId}&startTs={start}&endTs={cutoff}&fidelity=1 | 2026-09-18 | 2026-11-17 |
 | https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-10-13 | 2026-12-12 |
@@ -489,9 +492,32 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://gamma-api.polymarket.com/events/keyset?series_id={id}&end_date_min={iso}&limit=50&after_cursor={cursor} (documented in gamma-openapi.yaml; pages above 50 are gzip-only) | 2026-11-12 | 2027-01-11 |
 | https://gamma-api.polymarket.com/markets?clob_token_ids={token}&closed=true | 2026-09-02 | 2026-11-01 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
+| https://raw.githubusercontent.com/Polymarket/agent-skills/91ee44ae113e958affd20cd505c6e9d9d6100e0b/websocket.md (`tick_size_change` trigger) | 2026-11-13 | 2027-01-12 |
+| https://raw.githubusercontent.com/Polymarket/clob-client-v2/a60f223e38fefbf4779a35ff7a7c524aba2cd229/src/client.ts (tick cache from compact `mts`) | 2026-11-13 | 2027-01-12 |
+| https://raw.githubusercontent.com/Polymarket/ts-sdk/3f0d9b85532d745b513596f4715aa49647acea1d/packages/client/src/actions/orders/market.ts (market-order tick from the walked `/book`) | 2026-11-13 | 2027-01-12 |
 
 ## Public sources
 
+- **Tick refinement propagation (#881). Last checked: 2026-11-13; re-verify by 2027-01-12.**
+  Polymarket refines a trading market's minimum tick from `0.01` to `0.001`; the official
+  [websocket guide](https://raw.githubusercontent.com/Polymarket/agent-skills/91ee44ae113e958affd20cd505c6e9d9d6100e0b/websocket.md)
+  (fetched 18:50:19 UTC) gives the trigger as "Price hits >0.96 or <0.04". On 2026-11-13,
+  18:46:42-19:16 UTC, 452 public GETs sampled two BTC 15-minute markets
+  (`btc-updown-15m-1794595500`, `btc-updown-15m-1794596400`) about every 15 s. Compact
+  `/clob-markets/{condition_id}` showed `0.001` first (18:56:08 and 19:14:14 UTC); the books followed
+  19-50 s later; long `/markets/{condition_id}` followed 12 s and 74 s after compact and, in the
+  first market, returned `0.01` again for about 15 s; Gamma (`/markets?slug=`) followed 9 s after
+  compact in the first market and still returned `0.01` 118 s after compact in the second
+  (`Cache-Control: public, max-age=300`, `Age: 221`). Minimum size stayed 5 everywhere and no book
+  returned to `0.01`. These are sampled observations, not a venue guarantee. Ticks must divide an
+  order's price ([market details](https://docs.polymarket.com/market-data/market-details), fetched
+  18:47:51 UTC); a violation is HTTP 400 "Price ({price}) breaks minimum tick size rule: {tick}"
+  ([error codes](https://docs.polymarket.com/resources/error-codes), fetched 18:47:50 UTC). The
+  official V2 clients cache compact `mts`
+  ([TypeScript](https://raw.githubusercontent.com/Polymarket/clob-client-v2/a60f223e38fefbf4779a35ff7a7c524aba2cd229/src/client.ts));
+  the unified TypeScript SDK takes a market order's tick from the `/book` response it walks
+  ([`market.ts`](https://raw.githubusercontent.com/Polymarket/ts-sdk/3f0d9b85532d745b513596f4715aa49647acea1d/packages/client/src/actions/orders/market.ts));
+  none compares sources. pe-service's rule is in the [glossary](_GLOSSARY.md#market-admission-tick).
 - **Series listing and covered set. Last checked: 2026-11-08; re-verify by 2027-01-07.**
   The official [listing](https://docs.polymarket.com/api-reference/series/list-series) and
   [by-id](https://docs.polymarket.com/api-reference/series/get-series-by-id) references expose

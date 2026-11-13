@@ -37,10 +37,10 @@ use pe_resolver_card::{
 use pe_source_polymarket_public::{
     GAMMA_BATCH_LIMIT_PARAM, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
     GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
-    validate_live_market, validate_paper_market,
+    LiveMarketEvidence, reconcile_tick, validate_live_market, validate_paper_market,
 };
 use pe_venue_polymarket::{
-    CanaryV2Client, CanaryV2Credentials, CustodyKind, PreparedSubmission,
+    CanaryV2Client, CanaryV2Credentials, CompactMarketEvidence, CustodyKind, PreparedSubmission,
     REDEMPTION_ADAPTER_VERSION, REDEMPTION_PARSER_VERSION, REDEMPTION_SCHEMA_VERSION,
     RELAYER_DEPOSIT_WALLET_TRANSACTION_PATH_PREFIX, RedemptionTransport, RedemptionTransportError,
     RelayerApiKeyCredentials, RelayerCredentials, RelayerPollPolicy, RelayerTransportClient,
@@ -857,6 +857,25 @@ fn trade_matches_order(trade: &Value, order_id: &str) -> bool {
             })
 }
 
+/// Applies the compact CLOB market rules to validated long-market evidence: minimum order size and
+/// neg-risk must agree, and the tick reconciles as in source admission (#881), with the admitted
+/// tick written back. Admission and source-backed replay share it so both apply one rule.
+pub(crate) fn reconcile_compact_rules(
+    market: &mut LiveMarketEvidence,
+    compact: &CompactMarketEvidence,
+) -> bool {
+    let Some(tick) = reconcile_tick(market.minimum_tick_size, compact.minimum_tick_size) else {
+        return false;
+    };
+    if compact.minimum_order_size != market.minimum_order_size
+        || compact.neg_risk != market.neg_risk
+    {
+        return false;
+    }
+    market.minimum_tick_size = tick;
+    true
+}
+
 /// Fresh two-source market-admission builder for one condition.
 #[derive(Clone)]
 pub struct LiveAdmissionBuilder {
@@ -958,10 +977,7 @@ impl LiveAdmissionBuilder {
             &market.ordered_outcome_token_ids,
         )
         .map_err(|error| LiveVenueAdapterError::MarketValidation(error.to_string()))?;
-        if compact.minimum_order_size != market.minimum_order_size
-            || compact.minimum_tick_size != market.minimum_tick_size
-            || compact.neg_risk != market.neg_risk
-        {
+        if !reconcile_compact_rules(&mut market, &compact) {
             return Err(LiveVenueAdapterError::MarketValidation(
                 "compact and long CLOB market rules disagree".to_owned(),
             ));
@@ -1714,6 +1730,180 @@ mod tests {
             return StatusCode::NOT_FOUND.into_response();
         };
         (StatusCode::OK, axum::Json(body)).into_response()
+    }
+
+    /// The admission fixture with Gamma, long and compact ticks replaced (#881).
+    async fn tick_admission_fixture(
+        axum::extract::State((gamma, long, compact)): axum::extract::State<(
+            &'static str,
+            &'static str,
+            &'static str,
+        )>,
+        uri: Uri,
+    ) -> Response {
+        let path = uri.path().to_owned();
+        let original = admission_and_book_fixture(uri).await;
+        let bytes = axum::body::to_bytes(original.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        let mut body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if path == "/markets" {
+            body[0]["orderPriceMinTickSize"] = json!(gamma);
+        } else if path.strip_prefix("/markets/") == Some(ADMISSION_CONDITION) {
+            body["minimum_tick_size"] = json!(long);
+        } else if path.strip_prefix("/clob-markets/") == Some(ADMISSION_CONDITION) {
+            body["mts"] = serde_json::from_str(compact).unwrap();
+        }
+        (StatusCode::OK, axum::Json(body)).into_response()
+    }
+
+    /// PASS: every arrangement of Polymarket's `0.01`/`0.001` refinement across Gamma, long and
+    /// compact admits `0.01` for paper and live (unanimous ticks keep their value), each build
+    /// records exactly three responses, and every other disagreement refuses (#881).
+    #[tokio::test]
+    async fn tick_refinement_admits_the_coarse_tick_in_every_arrangement() {
+        let cases = [
+            ("0.01", "0.01", "0.01", Some("0.01")),
+            ("0.001", "0.001", "0.001", Some("0.001")),
+            ("0.001", "0.01", "0.01", Some("0.01")),
+            ("0.01", "0.001", "0.01", Some("0.01")),
+            ("0.01", "0.01", "0.001", Some("0.01")),
+            ("0.001", "0.001", "0.01", Some("0.01")),
+            ("0.001", "0.01", "0.001", Some("0.01")),
+            ("0.01", "0.001", "0.001", Some("0.01")),
+            ("0.1", "0.01", "0.001", None),
+            ("0.1", "0.001", "0.01", None),
+            ("0.01", "0.1", "0.001", None),
+            ("0.01", "0.001", "0.1", None),
+            ("0.001", "0.1", "0.01", None),
+            ("0.001", "0.01", "0.1", None),
+            ("0.01", "0.01", "0.005", None),
+        ];
+        for (gamma, long, compact, expected) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .fallback(get(tick_admission_fixture))
+                        .with_state((gamma, long, compact)),
+                )
+                .await
+                .unwrap();
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let sink = crate::source_event_sink::SourceEventSink::open(&path).unwrap();
+            let (source_log, source_rx) = crate::activity_ingest::SourceLogHandle::channel(8);
+            let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::channel(1);
+            let coordinator = tokio::spawn(
+                crate::activity_ingest::ActivityIngest::poll_only(
+                    sink,
+                    source_rx,
+                    trigger_tx,
+                    crate::health::new_shared_health_with_ws(false, true, 90),
+                )
+                .run(),
+            );
+            let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+            let builder =
+                LiveAdmissionBuilder::new(reqwest::Client::new(), base.clone(), base, source_log)
+                    .with_clock(std::sync::Arc::new(move || now));
+            let condition = pe_core_types::PolymarketConditionId(ADMISSION_CONDITION.to_owned());
+            let live = builder.build(&condition, now).await;
+            let paper = builder.build_paper(&condition, now).await;
+            for result in [live, paper] {
+                match expected {
+                    Some(tick) => assert_eq!(
+                        result
+                            .map(|admission| admission.market.minimum_tick_size.0.to_string())
+                            .ok()
+                            .as_deref(),
+                        Some(tick),
+                        "{gamma}/{long}/{compact}"
+                    ),
+                    None => assert!(
+                        matches!(result, Err(LiveVenueAdapterError::MarketValidation(_))),
+                        "{gamma}/{long}/{compact}: {result:?}"
+                    ),
+                }
+            }
+            let frames = Reader::replay(&path)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), 6, "{gamma}/{long}/{compact}");
+            coordinator.abort();
+            server.abort();
+        }
+    }
+
+    /// PASS: the shared compact step refuses a compact minimum-size or neg-risk disagreement even
+    /// beside a reconcilable tick pair, and writes the admitted tick otherwise (#881).
+    #[test]
+    fn compact_rules_refuse_size_and_neg_risk_disagreements_beside_a_tick_pair() {
+        let gamma = json!([{
+            "conditionId": ADMISSION_CONDITION,
+            "active": true,
+            "closed": false,
+            "acceptingOrders": true,
+            "enableOrderBook": true,
+            "negRisk": false,
+            "outcomes": "[\"Yes\",\"No\"]",
+            "clobTokenIds": "[\"11\",\"22\"]",
+            "orderPriceMinTickSize": "0.01",
+            "orderMinSize": "5",
+            "secondsDelay": 0
+        }]);
+        let long = json!({
+            "condition_id": ADMISSION_CONDITION,
+            "end_date_iso": "2026-09-06T12:00:00Z",
+            "active": true,
+            "closed": false,
+            "accepting_orders": true,
+            "enable_order_book": true,
+            "minimum_order_size": "5",
+            "minimum_tick_size": "0.01",
+            "neg_risk": false,
+            "seconds_delay": 0,
+            "tokens": [
+                {"token_id": "11", "outcome": "Yes"},
+                {"token_id": "22", "outcome": "No"}
+            ]
+        });
+        let condition = pe_core_types::PolymarketConditionId(ADMISSION_CONDITION.to_owned());
+        let market = validate_live_market(
+            &serde_json::to_vec(&gamma).unwrap(),
+            &serde_json::to_vec(&long).unwrap(),
+            &condition,
+            1_700_000_000,
+            60,
+        )
+        .unwrap();
+        let compact_body = json!({
+            "c": ADMISSION_CONDITION,
+            "t": [{"t":"11","o":"Yes"},{"t":"22","o":"No"}],
+            "mts": 0.001,
+            "mos": 5,
+            "nr": false,
+            "fd": {"r": 0.05, "e": 1, "to": true}
+        });
+        let compact = parse_compact_market(
+            &serde_json::to_vec(&compact_body).unwrap(),
+            &condition,
+            &market.ordered_outcome_token_ids,
+        )
+        .unwrap();
+        let mut admitted = market.clone();
+        assert!(reconcile_compact_rules(&mut admitted, &compact));
+        assert_eq!(admitted.minimum_tick_size.0, dec!(0.01));
+        let mut sized = compact.clone();
+        sized.minimum_order_size = pe_core_types::ShareAmount::from_whole(10).unwrap();
+        assert!(!reconcile_compact_rules(&mut market.clone(), &sized));
+        let mut grouped = compact.clone();
+        grouped.neg_risk = true;
+        assert!(!reconcile_compact_rules(&mut market.clone(), &grouped));
     }
 
     async fn delayed_admission_fixture(

@@ -36,6 +36,7 @@ async fn clob_book_fixture_roundtrip() {
             response_blake3: String::new(),
             fetched_at_ms: 0,
             source_receipt: None,
+            tick_size: Default::default(),
         },
     );
     let fetcher = FixtureClobBookFetcher::new(books);

@@ -2443,6 +2443,8 @@ async fn process_target(
     observation: &ObservationEvidence,
     now: OffsetDateTime,
 ) -> Result<PassControl, FanoutError> {
+    // The pass reads time only from the fanout clock, the wall clock outside tests.
+    let clock = Arc::clone(&state.clock);
     if pending_control_history(state, target)?.iter().any(|audit| {
         audit.outcome == pe_execution_core::live_journal::LiveTargetControlOutcome::NotArmed
     }) {
@@ -2506,12 +2508,7 @@ async fn process_target(
     let credentials = match credentials_for_target(state, target).await {
         CredentialLoad::Ready(credentials) => credentials,
         CredentialLoad::Changed => {
-            terminalize(
-                state,
-                target,
-                "credential_version_changed",
-                OffsetDateTime::now_utc(),
-            )?;
+            terminalize(state, target, "credential_version_changed", clock())?;
             return Ok(PassControl::Continue);
         }
         CredentialLoad::Transient(reason) => {
@@ -2533,8 +2530,8 @@ async fn process_target(
     };
 
     let condition_id = PolymarketConditionId(signal.market_id.0.0.clone());
-    let admission_started_at = OffsetDateTime::now_utc();
-    let admission = match state
+    let admission_started_at = clock();
+    let mut admission = match state
         .admission
         .build(&condition_id, admission_started_at)
         .await
@@ -2545,12 +2542,7 @@ async fn process_target(
             return Ok(PassControl::StopSeed);
         }
         Err(error) => {
-            terminalize(
-                state,
-                target,
-                admission_terminal_reason(&error),
-                OffsetDateTime::now_utc(),
-            )?;
+            terminalize(state, target, admission_terminal_reason(&error), clock())?;
             return Ok(PassControl::Continue);
         }
     };
@@ -2562,12 +2554,7 @@ async fn process_target(
     {
         Some(token) => token,
         None => {
-            terminalize(
-                state,
-                target,
-                "outcome_not_binary",
-                OffsetDateTime::now_utc(),
-            )?;
+            terminalize(state, target, "outcome_not_binary", clock())?;
             return Ok(PassControl::Continue);
         }
     };
@@ -2613,18 +2600,24 @@ async fn process_target(
         warn!(account_id = %target.account_id, "recorded /book receipt missing; seed paused");
         return Ok(PassControl::StopSeed);
     };
-    let now_ms = unix_ms(OffsetDateTime::now_utc());
+    let now_ms = unix_ms(clock());
     if pe_venue_polymarket::ladder_is_stale(now_ms, book.fetched_at_ms) {
         return Ok(PassControl::StopSeed);
     }
     let Some(ladder) = book.ladder() else {
-        terminalize(state, target, "ladder_invalid", OffsetDateTime::now_utc())?;
+        terminalize(state, target, "ladder_invalid", clock())?;
         return Ok(PassControl::Continue);
     };
     let Some(best_ask) = ladder.first().map(|ask| ask.price) else {
-        terminalize(state, target, "ladder_empty", OffsetDateTime::now_utc())?;
+        terminalize(state, target, "ladder_empty", clock())?;
         return Ok(PassControl::Continue);
     };
+    // The order is planned, signed and journaled on the walked book's tick (#881).
+    let Some(order_tick) = book.order_tick(admission.market.minimum_tick_size) else {
+        terminalize(state, target, "book_tick_inconsistent", clock())?;
+        return Ok(PassControl::Continue);
+    };
+    admission.market.minimum_tick_size = order_tick;
     let settings = match fetch_account_settings(state, &target.account_id).await {
         Ok(settings) => settings,
         Err(reason) => {
@@ -2636,7 +2629,7 @@ async fn process_target(
     let sizing = match settings.sizing_mode(runtime.sizing_mode) {
         Ok(sizing) => sizing,
         Err(reason) => {
-            terminalize(state, target, reason, OffsetDateTime::now_utc())?;
+            terminalize(state, target, reason, clock())?;
             return Ok(PassControl::Continue);
         }
     };
@@ -2679,7 +2672,7 @@ async fn process_target(
             state,
             target,
             winner_follow_terminal_reason(&error),
-            OffsetDateTime::now_utc(),
+            clock(),
         )?;
         return Ok(PassControl::Continue);
     }
@@ -2688,12 +2681,7 @@ async fn process_target(
     let (minimum_price, maximum_price) = match (minimum_price, maximum_price) {
         (Ok(minimum), Ok(maximum)) => (minimum, maximum),
         _ => {
-            terminalize(
-                state,
-                target,
-                "live_price_band_invalid",
-                OffsetDateTime::now_utc(),
-            )?;
+            terminalize(state, target, "live_price_band_invalid", clock())?;
             return Ok(PassControl::Continue);
         }
     };
@@ -2756,12 +2744,7 @@ async fn process_target(
     ) {
         Ok(plan) => plan,
         Err(error) => {
-            terminalize(
-                state,
-                target,
-                ladder_terminal_reason(&error),
-                OffsetDateTime::now_utc(),
-            )?;
+            terminalize(state, target, ladder_terminal_reason(&error), clock())?;
             return Ok(PassControl::Continue);
         }
     };
@@ -2880,7 +2863,7 @@ async fn process_target(
             state,
             target,
             winner_follow_terminal_reason(&decline),
-            OffsetDateTime::now_utc(),
+            clock(),
         )?;
         return Ok(PassControl::Continue);
     }
@@ -2909,7 +2892,7 @@ async fn process_target(
         ladder: plan.clone(),
         economic,
     };
-    let prepare_check_at = OffsetDateTime::now_utc();
+    let prepare_check_at = clock();
     let prepare_price_expired =
         risk_price_expired(state, &request.economic.risk, prepare_check_at)?;
     if risk_day_changed(&request.economic.risk, prepare_check_at) || prepare_price_expired {
@@ -2956,13 +2939,13 @@ async fn process_target(
                 state,
                 target,
                 winner_follow_terminal_reason(&decline),
-                OffsetDateTime::now_utc(),
+                clock(),
             )?;
             return Ok(PassControl::Continue);
         }
         request.economic.risk = refreshed;
     }
-    let final_prepare_check_at = OffsetDateTime::now_utc();
+    let final_prepare_check_at = clock();
     let final_prepare_price_expired =
         risk_price_expired(state, &request.economic.risk, final_prepare_check_at)?;
     if risk_day_changed(&request.economic.risk, final_prepare_check_at)
@@ -2981,11 +2964,7 @@ async fn process_target(
         return Ok(PassControl::StopSeed);
     }
     match executor
-        .prepare_with_observed_account_and_clock(
-            request,
-            account_state.clone(),
-            OffsetDateTime::now_utc,
-        )
+        .prepare_with_observed_account_and_clock(request, account_state.clone(), || clock())
         .await?
     {
         LivePrepareResult::Terminal(outcome) => {
@@ -2993,7 +2972,7 @@ async fn process_target(
                 return Ok(PassControl::StopSeed);
             }
             let transition = outcome_transition(&outcome);
-            persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
+            persist_outcome(state, target, &outcome, clock())?;
             Ok(if transition.freeze {
                 PassControl::FreezePass
             } else {
@@ -3013,13 +2992,13 @@ async fn process_target(
             {
                 let outcome = executor.terminalize_prepared(
                     prepared,
-                    OffsetDateTime::now_utc(),
+                    clock(),
                     pe_execution_core::LiveOrderPreparationFailure::PrePostMarkUnavailable,
                 )?;
-                persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
+                persist_outcome(state, target, &outcome, clock())?;
                 return Ok(PassControl::StopSeed);
             }
-            let post_check_at = OffsetDateTime::now_utc();
+            let post_check_at = clock();
             if prepared_ladder_is_stale(state, prepared.audit(), post_check_at)? {
                 let outcome = executor.terminalize_prepared(
                     prepared,
@@ -3048,10 +3027,10 @@ async fn process_target(
                 {
                     let outcome = executor.terminalize_prepared(
                         prepared,
-                        OffsetDateTime::now_utc(),
+                        clock(),
                         pe_execution_core::LiveOrderPreparationFailure::PrePostMarkUnavailable,
                     )?;
-                    persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
+                    persist_outcome(state, target, &outcome, clock())?;
                     return Ok(PassControl::StopSeed);
                 }
                 let refreshed = live_risk_audit(
@@ -3072,14 +3051,13 @@ async fn process_target(
                 } else {
                     pe_execution_core::LiveOrderPreparationFailure::PrePostRiskDayChanged
                 };
-                let outcome =
-                    executor.terminalize_prepared(prepared, OffsetDateTime::now_utc(), failure)?;
-                persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
+                let outcome = executor.terminalize_prepared(prepared, clock(), failure)?;
+                persist_outcome(state, target, &outcome, clock())?;
                 return Ok(PassControl::StopSeed);
             }
             // The short guard orders control publication against the final check and durable
             // submitted transition. It is released before any venue network call.
-            let final_at = OffsetDateTime::now_utc();
+            let final_at = clock();
             let (control, submitted) = state.config.live_accounts.with_publication(|| {
                 let latest = state.config.live_accounts.snapshot();
                 let latest_account = latest
@@ -3116,19 +3094,14 @@ async fn process_target(
                 persist_outcome(state, target, &outcome, final_at)?;
                 return Ok(PassControl::Continue);
             }
-            let outcome = post_prepared_target(
-                state,
-                target,
-                &executor,
-                prepared,
-                copy_deadline,
-                OffsetDateTime::now_utc,
-            )
-            .await?;
+            let outcome =
+                post_prepared_target(state, target, &executor, prepared, copy_deadline, || {
+                    clock()
+                })
+                .await?;
             let transition = outcome_transition(&outcome);
             if matches!(outcome, LiveOrderOutcome::Matched { .. }) {
-                reconcile_account_projection(state, &account.account_id, OffsetDateTime::now_utc())
-                    .await;
+                reconcile_account_projection(state, &account.account_id, clock()).await;
             }
             Ok(if transition.freeze {
                 PassControl::FreezePass
@@ -4460,7 +4433,7 @@ where
     } else {
         validate_live_market
     };
-    let market = validator(
+    let mut market = validator(
         &gamma.payload,
         &clob_long.payload,
         &economic.market.condition_id,
@@ -4478,15 +4451,12 @@ where
     .map_err(|error| {
         economic_replay_error(format!("economic compact-market replay failed: {error}"))
     })?;
-    if compact.minimum_order_size != market.minimum_order_size
-        || compact.minimum_tick_size != market.minimum_tick_size
-        || compact.neg_risk != market.neg_risk
-    {
+    if !crate::live_venue_adapter::reconcile_compact_rules(&mut market, &compact) {
         return Err(economic_replay_error(
             "economic compact and long market rules disagree",
         ));
     }
-    let admission = LiveAdmissionArtifact {
+    let mut admission = LiveAdmissionArtifact {
         settlement: pe_resolver_card::VenueSettlementRecord {
             schema_version: pe_resolver_card::VENUE_SETTLEMENT_SCHEMA_VERSION,
             condition_id: economic.market.condition_id.clone(),
@@ -4513,6 +4483,9 @@ where
     )
     .map_err(|error| economic_replay_error(format!("economic book replay failed: {error}")))?;
     let book = book.into_order_book();
+    admission.market.minimum_tick_size = book
+        .order_tick(admission.market.minimum_tick_size)
+        .ok_or_else(|| economic_replay_error("economic book tick contradicts admission"))?;
     let asks = book
         .ladder()
         .ok_or_else(|| economic_replay_error("economic book cannot form the production ladder"))?;
@@ -10464,6 +10437,332 @@ mod tests {
                 .unwrap();
             assert_eq!(recomposed.version, economic.version);
             assert_eq!(recomposed.balance.chase_ceiling, Price::ONE);
+        }
+    }
+
+    /// PASS: source-backed replay derives the order tick from the recorded receipts (#881). A
+    /// refined Gamma/compact `0.001` against long `0.01` replays on the walked book's tick for
+    /// paper and live economics; a record whose tick differs from the derived one fails
+    /// `recompose`; a contradictory book tick fails replay.
+    #[test]
+    fn source_replay_derives_the_order_tick_from_refined_receipts() {
+        for (book_tick, order_tick) in [
+            (Some("0.001"), dec!(0.001)),
+            (Some("0.01"), dec!(0.01)),
+            (None, dec!(0.01)),
+        ] {
+            for paper in [true, false] {
+                let mut economic = finality_prepared().economic.clone();
+                economic.admission.market.observed_at_unix = 20;
+                economic.admission.settlement.observed_at_unix = 20;
+                economic.risk.snapshot.per_trade_cap_bps = 10_000;
+                if paper {
+                    economic.version = pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION;
+                    economic.balance.chase_ceiling = Price::ONE;
+                }
+                let mut payloads = economic_source_payloads(&economic.market.condition_id.0);
+                let mut gamma: serde_json::Value = serde_json::from_slice(&payloads[0]).unwrap();
+                gamma[0]["orderPriceMinTickSize"] = serde_json::json!("0.001");
+                let mut compact: serde_json::Value = serde_json::from_slice(&payloads[2]).unwrap();
+                compact["mts"] = serde_json::json!(0.001);
+                let mut book: serde_json::Value = serde_json::from_slice(&payloads[3]).unwrap();
+                if let Some(tick) = book_tick {
+                    book["tick_size"] = serde_json::json!(tick);
+                }
+                payloads[0] = serde_json::to_vec(&gamma).unwrap();
+                payloads[2] = serde_json::to_vec(&compact).unwrap();
+                payloads[3] = serde_json::to_vec(&book).unwrap();
+                let receipts = [
+                    economic.admission.receipts.gamma,
+                    economic.admission.receipts.clob_long,
+                    economic.admission.receipts.clob_compact,
+                    economic.book_receipt,
+                ];
+                let sources = receipts
+                    .into_iter()
+                    .zip([
+                        GAMMA_MARKETS_SOURCE_ID,
+                        CLOB_LONG_MARKET_SOURCE_ID,
+                        CLOB_COMPACT_MARKET_SOURCE_ID,
+                        CLOB_BOOK_SOURCE_ID,
+                    ])
+                    .zip(payloads.clone())
+                    .map(|((receipt, source_id), payload)| {
+                        (
+                            receipt,
+                            RecordedEconomicSource {
+                                payload,
+                                observed_at: SourceTimestamp(
+                                    source_time_from_millis(20_100).unwrap(),
+                                ),
+                                received_at: ReceivedAt(source_time_from_millis(20_100).unwrap()),
+                                source_id: source_id.to_owned(),
+                                schema_version: 1,
+                                parser_version: 1,
+                                content_type: ContentType::Json,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let replay = |economic: &EconomicPrepared| {
+                    replay_source_backed_economic(
+                        economic,
+                        21_000,
+                        CollateralAmount::from_atomic(10_000_000),
+                        None,
+                        |receipt| {
+                            sources
+                                .iter()
+                                .find(|(candidate, _)| *candidate == receipt)
+                                .map(|(_, source)| source.clone())
+                                .ok_or_else(|| {
+                                    EconomicReplayError("fixture receipt missing".to_owned())
+                                })
+                        },
+                    )
+                };
+                let label = format!("book {book_tick:?}, paper {paper}");
+                let replayed = replay(&economic).unwrap();
+                assert_eq!(
+                    replayed.admission.market.minimum_tick_size.0, order_tick,
+                    "{label}"
+                );
+                let mut recorded = economic.clone();
+                recorded.admission.market.minimum_tick_size = Price::new(order_tick).unwrap();
+                replayed
+                    .recompose(
+                        &recorded,
+                        recorded.risk.clone(),
+                        recorded.applied_configuration_hash.clone(),
+                    )
+                    .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+                if order_tick != dec!(0.01) {
+                    assert!(
+                        replayed
+                            .recompose(
+                                &economic,
+                                economic.risk.clone(),
+                                economic.applied_configuration_hash.clone(),
+                            )
+                            .is_err(),
+                        "{label}: a record on the admitted tick must not match the book's tick"
+                    );
+                }
+            }
+        }
+        let economic = finality_prepared().economic.clone();
+        let mut payloads = economic_source_payloads(&economic.market.condition_id.0);
+        let mut book: serde_json::Value = serde_json::from_slice(&payloads[3]).unwrap();
+        book["tick_size"] = serde_json::json!("0.1");
+        payloads[3] = serde_json::to_vec(&book).unwrap();
+        let sources = [
+            economic.admission.receipts.gamma,
+            economic.admission.receipts.clob_long,
+            economic.admission.receipts.clob_compact,
+            economic.book_receipt,
+        ]
+        .into_iter()
+        .zip([
+            GAMMA_MARKETS_SOURCE_ID,
+            CLOB_LONG_MARKET_SOURCE_ID,
+            CLOB_COMPACT_MARKET_SOURCE_ID,
+            CLOB_BOOK_SOURCE_ID,
+        ])
+        .zip(payloads)
+        .map(|((receipt, source_id), payload)| {
+            (
+                receipt,
+                RecordedEconomicSource {
+                    payload,
+                    observed_at: SourceTimestamp(source_time_from_millis(20_100).unwrap()),
+                    received_at: ReceivedAt(source_time_from_millis(20_100).unwrap()),
+                    source_id: source_id.to_owned(),
+                    schema_version: 1,
+                    parser_version: 1,
+                    content_type: ContentType::Json,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+        let mut contradicted = economic;
+        contradicted.admission.market.observed_at_unix = 20;
+        contradicted.admission.settlement.observed_at_unix = 20;
+        let error = replay_source_backed_economic(
+            &contradicted,
+            21_000,
+            CollateralAmount::from_atomic(10_000_000),
+            None,
+            |receipt| {
+                sources
+                    .iter()
+                    .find(|(candidate, _)| *candidate == receipt)
+                    .map(|(_, source)| source.clone())
+                    .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.0.contains("book tick contradicts admission"),
+            "{error:?}"
+        );
+    }
+
+    /// Source-backed replay of `finality_prepared` over unanimous admission ticks written with the
+    /// given lexemes (`compact` is a JSON value; `book` `None` omits `tick_size`). Returns the
+    /// BLAKE3 of the recomposed record's serialization and its core hash.
+    fn unanimous_tick_replay(
+        paper: bool,
+        gamma: &str,
+        long: &str,
+        compact: &str,
+        book: Option<&str>,
+    ) -> (String, String) {
+        let mut economic = finality_prepared().economic.clone();
+        economic.admission.market.observed_at_unix = 20;
+        economic.admission.settlement.observed_at_unix = 20;
+        economic.risk.snapshot.per_trade_cap_bps = 10_000;
+        economic.admission.market.minimum_tick_size =
+            Price::new(Decimal::from_str(gamma).unwrap()).unwrap();
+        if paper {
+            economic.version = pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION;
+            economic.balance.chase_ceiling = Price::ONE;
+        }
+        let mut payloads = economic_source_payloads(&economic.market.condition_id.0);
+        let mut gamma_body: serde_json::Value = serde_json::from_slice(&payloads[0]).unwrap();
+        gamma_body[0]["orderPriceMinTickSize"] = serde_json::json!(gamma);
+        let mut long_body: serde_json::Value = serde_json::from_slice(&payloads[1]).unwrap();
+        long_body["minimum_tick_size"] = serde_json::json!(long);
+        let mut compact_body: serde_json::Value = serde_json::from_slice(&payloads[2]).unwrap();
+        compact_body["mts"] = serde_json::from_str(compact).unwrap();
+        let mut book_body: serde_json::Value = serde_json::from_slice(&payloads[3]).unwrap();
+        if let Some(tick) = book {
+            book_body["tick_size"] = serde_json::json!(tick);
+        }
+        for (payload, body) in
+            payloads
+                .iter_mut()
+                .zip([gamma_body, long_body, compact_body, book_body])
+        {
+            *payload = serde_json::to_vec(&body).unwrap();
+        }
+        economic.admission.settlement.raw_evidence_hash =
+            blake3::hash(&payloads[1]).to_hex().to_string();
+        let sources = [
+            economic.admission.receipts.gamma,
+            economic.admission.receipts.clob_long,
+            economic.admission.receipts.clob_compact,
+            economic.book_receipt,
+        ]
+        .into_iter()
+        .zip([
+            GAMMA_MARKETS_SOURCE_ID,
+            CLOB_LONG_MARKET_SOURCE_ID,
+            CLOB_COMPACT_MARKET_SOURCE_ID,
+            CLOB_BOOK_SOURCE_ID,
+        ])
+        .zip(payloads)
+        .map(|((receipt, source_id), payload)| {
+            (
+                receipt,
+                RecordedEconomicSource {
+                    payload,
+                    observed_at: SourceTimestamp(source_time_from_millis(20_100).unwrap()),
+                    received_at: ReceivedAt(source_time_from_millis(20_100).unwrap()),
+                    source_id: source_id.to_owned(),
+                    schema_version: 1,
+                    parser_version: 1,
+                    content_type: ContentType::Json,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+        let record = replay_source_backed_economic(
+            &economic,
+            21_000,
+            CollateralAmount::from_atomic(10_000_000),
+            None,
+            |receipt| {
+                sources
+                    .iter()
+                    .find(|(candidate, _)| *candidate == receipt)
+                    .map(|(_, source)| source.clone())
+                    .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
+            },
+        )
+        .unwrap()
+        .recompose(
+            &economic,
+            economic.risk.clone(),
+            economic.applied_configuration_hash.clone(),
+        )
+        .unwrap();
+        (
+            blake3::hash(&serde_json::to_vec(&record).unwrap())
+                .to_hex()
+                .to_string(),
+            record.core_hash().unwrap(),
+        )
+    }
+
+    const UNANIMOUS_TICK_CASES: [(&str, &str, &str, Option<&str>); 4] = [
+        ("0.01", "0.01", "0.01", Some("0.01")),
+        ("0.010", "0.01", "0.01", Some("0.0100")),
+        ("0.01", "0.010", "\"0.0100\"", None),
+        ("0.001", "0.0010", "0.001", Some("0.001")),
+    ];
+
+    /// PASS (#881, AC4): receipt sets that `eccd105` accepted (unanimous ticks, including differing
+    /// decimal scales, with an absent or equal book tick) replay to the record serialization and
+    /// core hash that `eccd105` produced, keeping Gamma's tick representation.
+    #[test]
+    fn unanimous_tick_receipts_replay_byte_identical_to_eccd105() {
+        // Printed by `unanimous_tick_replay` at eccd105: paper, then live, per case in order.
+        let mut baselines = [
+            (
+                "fe86782e6bdb5c27cc7a6dca355da1a631fe3c3487a6e5f1d777d593edbedd93",
+                "d0d5cdba00e6ac6cad1edc03d2d173c318ec8db4d6dd5bc8ab5fbfb5651e0d5e",
+            ),
+            (
+                "c239aaa8c820c17ecb3d441ae8a4556e6b6d1afd9384c1c40d94a276d8b64dea",
+                "3dc9d56f853d259c53984145b079817f62035ad6ab6b2cf93a94a44a95608b7e",
+            ),
+            (
+                "ccba8a91c563e4266bb2a114c779b655dcf1212bd30f37e1c9bda6796d1fed1c",
+                "22cdd9f5f6a47764e2bc2b626b3a19c11a9e4bf3057c711fc46066a8a236e3b8",
+            ),
+            (
+                "abd4046c533e0f9607b9f03756200fa41b434fcf640b059f6198ab593a9e9895",
+                "442cc3e898fe813ba300ac44a9f7d0b9d8e32d798e856070915c5b6915948101",
+            ),
+            (
+                "3ae34a6f0de19efcd5f8e1f6a3b44a22d3391491d99693aa5fd409abcc4a1702",
+                "b1e164ec25448ec8633feda2b8b45f1d00a708a9d391752d78558c51b353fed7",
+            ),
+            (
+                "078c86d41b58194e8906f14d2a42d55d8bc5437d66cfa5b47fe6c5495b37e68b",
+                "208229585e169227e65af22d1e0cf775b9628b103c1ec0523d5a16f8031f619a",
+            ),
+            (
+                "a3cf0883089f993a580d8279bdd2832597d6bc48dafa0506cde54e279f0cf38f",
+                "df094796419ca05f3b395193ea15a473ff31d233d16dc7e5ffbf44b81b5c4437",
+            ),
+            (
+                "0a68a5c0f101701782841a8242cf748d6c461d5f3df878568fde9447cfa10d8e",
+                "5ea7d88b5686466d982ac9104cc997d2ddaed5d31b4477e4b706674b0a97eceb",
+            ),
+        ]
+        .into_iter();
+        for (gamma, long, compact, book) in UNANIMOUS_TICK_CASES {
+            for paper in [true, false] {
+                let (serialization, core_hash) =
+                    unanimous_tick_replay(paper, gamma, long, compact, book);
+                assert_eq!(
+                    (serialization.as_str(), core_hash.as_str()),
+                    baselines.next().unwrap(),
+                    "{gamma}/{long}/{compact}/{book:?}, paper {paper}"
+                );
+            }
         }
     }
 
@@ -20715,8 +21014,11 @@ mod tests {
         state.config.book_fetcher = Arc::new(
             ReqwestClobBookFetcher::new(state.config.http.clone())
                 .with_base_url(base)
-                .with_source_log(state.config.source_log.clone()),
+                .with_source_log(state.config.source_log.clone())
+                .with_clock(Arc::new(move || now)),
         );
+        state.config.mid_price_cache =
+            MidPriceCache::new("http://127.0.0.1:9".to_owned()).with_clock(Arc::new(move || now));
         let mut runtime = state.config.runtime_config.snapshot().as_ref().clone();
         runtime.per_trade_cap = pe_strategy_winner_follow::PerTradeCap::Unlimited;
         runtime.min_fill_price = Decimal::ZERO;
@@ -20824,6 +21126,263 @@ mod tests {
         assert!(inventory.open_orders.is_empty());
         assert_eq!(inventory.terminal_admissions.len(), 1);
         server.abort();
+    }
+
+    /// PASS (#881): Gamma and compact report the refined `0.001` tick while long CLOB still reports
+    /// `0.01`. Fresh admission admits `0.01`; a `0.001` book signs its `0.639` ask with
+    /// fifth-decimal shares and a `0.01` book signs `0.64`, each through real preparation to one
+    /// local POST carrying the journaled amounts, and reopening the journal accepts the admission
+    /// but rejects it with the other tick. A contradictory book tick ends `book_tick_inconsistent`
+    /// with no POST.
+    #[tokio::test]
+    async fn refined_tick_window_prepares_on_the_walked_book_tick_through_process_target() {
+        for (book_tick, ask) in [("0.001", "0.639"), ("0.01", "0.64"), ("0.1", "0.6")] {
+            let dir = tempdir().unwrap();
+            let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+            let identity = Identity::generate();
+            let sealed = sealed_delayed_market_credentials(&identity);
+            let mut template = finality_prepared();
+            let condition = template.economic.market.condition_id.0.clone();
+            let mut payloads = economic_source_payloads_with_end(
+                &condition,
+                Some(now.unix_timestamp() + 300),
+                Some("0xee"),
+            );
+            let mut gamma: serde_json::Value = serde_json::from_slice(&payloads[0]).unwrap();
+            gamma[0]["orderPriceMinTickSize"] = serde_json::json!("0.001");
+            payloads[0] = serde_json::to_vec(&gamma).unwrap();
+            let mut compact: serde_json::Value = serde_json::from_slice(&payloads[2]).unwrap();
+            compact["mts"] = serde_json::json!(0.001);
+            payloads[2] = serde_json::to_vec(&compact).unwrap();
+            let mut book: serde_json::Value = serde_json::from_slice(&payloads[3]).unwrap();
+            book["tick_size"] = serde_json::json!(book_tick);
+            book["asks"] = serde_json::json!([{"price": ask, "size": "100"}]);
+            payloads[3] = serde_json::to_vec(&book).unwrap();
+            let posts = Arc::new(Mutex::new(Vec::new()));
+            let app = Router::new().fallback({
+                let posts = posts.clone();
+                move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+                    let posts = posts.clone();
+                    let sealed = sealed.clone();
+                    let payloads = payloads.clone();
+                    let condition = condition.clone();
+                    async move {
+                        let body = match uri.path() {
+                            "/rest/v1/account_credentials" => serde_json::json!([{
+                                "account_id":"acct", "bundle_version":1, "key_id":"key", "sealed_bundle":sealed,
+                            }]),
+                            "/rest/v1/accounts" => serde_json::json!([{
+                                "account_id":"acct", "live_sizing_mode":"dollar", "live_sizing_dollar_usd":"2.5",
+                            }]),
+                            "/markets" => serde_json::from_slice(&payloads[0]).unwrap(),
+                            path if path == format!("/markets/{condition}") => serde_json::from_slice(&payloads[1]).unwrap(),
+                            path if path == format!("/clob-markets/{condition}") => serde_json::from_slice(&payloads[2]).unwrap(),
+                            "/book" => serde_json::from_slice(&payloads[3]).unwrap(),
+                            "/api/geoblock" => serde_json::json!({"blocked":false,"country":"US"}),
+                            "/auth/ban-status/closed-only" => serde_json::json!({"closed_only":false}),
+                            "/balance-allowance" => serde_json::json!({"balance":"100000000","allowances":{
+                                pe_venue_polymarket::CTF_EXCHANGE_V2.to_string():"100000000",
+                            }}),
+                            "/v2/positions" => positions_v2_page(Vec::new()),
+                            "/version" => serde_json::json!({"version":2}),
+                            "/order" if method == axum::http::Method::POST => {
+                                posts.lock().unwrap().push(body);
+                                return (StatusCode::BAD_REQUEST, Json(serde_json::Value::Null));
+                            }
+                            _ => return (StatusCode::NOT_FOUND, Json(serde_json::Value::Null)),
+                        };
+                        (StatusCode::OK, Json(body))
+                    }
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut snapshot = armed_snapshot("acct");
+            snapshot.fetched_at_unix = Some(now.unix_timestamp());
+            let mut state = fanout_state(&dir, db.clone(), snapshot, &base, Some(identity));
+            state.clock = Arc::new(move || now);
+            state.config.clob_base_url = base.clone();
+            state.config.data_base_url = base.clone();
+            state.admission = LiveAdmissionBuilder::new(
+                state.config.http.clone(),
+                &base,
+                &base,
+                state.config.source_log.clone(),
+            )
+            .with_clock(Arc::new(move || now));
+            state.config.book_fetcher = Arc::new(
+                ReqwestClobBookFetcher::new(state.config.http.clone())
+                    .with_base_url(base)
+                    .with_source_log(state.config.source_log.clone())
+                    .with_clock(Arc::new(move || now)),
+            );
+            state.config.mid_price_cache = MidPriceCache::new("http://127.0.0.1:9".to_owned())
+                .with_clock(Arc::new(move || now));
+            let mut runtime = state.config.runtime_config.snapshot().as_ref().clone();
+            runtime.per_trade_cap = pe_strategy_winner_follow::PerTradeCap::Unlimited;
+            runtime.min_fill_price = Decimal::ZERO;
+            runtime.max_fill_price = dec!(0.99);
+            state.config.runtime_config.store(runtime);
+            let account = AccountId::new("acct").unwrap();
+            bind_empty_live_risk_to_paper_prefix(&state, &mut template, now);
+            append_economic_sources(
+                &state,
+                &mut template,
+                &account,
+                now,
+                // A frozen policy without the feed sets no send deadline (the venue checks one
+                // against the wall clock); copy-deadline scenarios cover that check.
+                Some(crate::bucket_commit::PaperFreshnessPolicy {
+                    activity_ws_enabled: false,
+                    copy_latency_budget_secs: 120,
+                }),
+                Some("0xee"),
+            )
+            .await;
+            let row = db.open_decision_pending().unwrap().remove(0);
+            let continuation: DecisionContinuationV3 =
+                serde_json::from_str(&row.frozen_inputs_json).unwrap();
+            let mut signal = projection_signal();
+            signal.source_trade_id = continuation.facts.source_trade_id;
+            signal.market_id = continuation.facts.market_id;
+            signal.leader_price = continuation.facts.price;
+            signal.observed_at =
+                OffsetDateTime::from_unix_timestamp(continuation.facts.source_epoch).unwrap();
+            signal.received_at = signal.observed_at;
+            let observation = template.economic.observation.unwrap();
+            db.close_decision_pending(
+                &signal.source_trade_id,
+                "{}",
+                "dispatch_staged",
+                now.unix_timestamp(),
+            )
+            .unwrap();
+            db.stage_dispatch_seed(&DispatchSeedRecord {
+                dispatch_id: "refined-tick".to_owned(),
+                signal_json: serde_json::to_string(
+                    &serde_json::json!({"schema_version":1,"signal":signal,"observation":observation}),
+                )
+                .unwrap(),
+                source_trade_id: signal.source_trade_id.0.clone(),
+                created_at_unix: now.unix_timestamp(),
+                targets: vec![DispatchTargetSeed {
+                    account_id: "acct".to_owned(),
+                    credential_bundle_version: 1,
+                    credential_key_id: "key".to_owned(),
+                }],
+            })
+            .unwrap();
+            db.flip_dispatch_ready("refined-tick", "fill").unwrap();
+            let seed = db.dispatch_seed("refined-tick").unwrap().unwrap();
+            let target = db.dispatch_targets("refined-tick").unwrap().remove(0);
+            process_target(&mut state, &seed, &target, &signal, &observation, now)
+                .await
+                .unwrap();
+            server.abort();
+            let events = replay_live_account(&state, &account).unwrap();
+            let admission = events.iter().find_map(|event| match &event.payload {
+                LiveJournalPayload::AdmissionEvaluated(admission) => Some(admission.clone()),
+                _ => None,
+            });
+            if book_tick == "0.1" {
+                assert!(posts.lock().unwrap().is_empty());
+                assert!(admission.is_none());
+                let target = db.dispatch_targets("refined-tick").unwrap().remove(0);
+                assert_eq!(target.state, "terminal");
+                assert_eq!(
+                    target.terminal_reason.as_deref(),
+                    Some("book_tick_inconsistent")
+                );
+                continue;
+            }
+            let order_tick = Price(Decimal::from_str(book_tick).unwrap());
+            let limit = Price(Decimal::from_str(ask).unwrap());
+            let admission = admission.unwrap();
+            assert_eq!(
+                admission.economic.admission.market.minimum_tick_size,
+                order_tick
+            );
+            assert_eq!(admission.economic.ladder.limit_price, limit);
+            let prepared = events
+                .iter()
+                .find_map(|event| match &event.payload {
+                    LiveJournalPayload::OrderPrepared(prepared) => Some(prepared.prepared.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(prepared.minimum_tick_size, order_tick);
+            assert_eq!(prepared.limit_price, limit);
+            assert_eq!(
+                prepared.maker_collateral,
+                admission.economic.ladder.principal
+            );
+            assert_eq!(
+                prepared.taker_shares,
+                admission.economic.ladder.minimum_shares
+            );
+            // A share quantity signed on tick `0.001` carries five decimals; on `0.01`, four.
+            let shares = prepared.taker_shares.to_decimal();
+            assert_eq!(
+                shares.round_dp(4) != shares,
+                book_tick == "0.001",
+                "{shares}"
+            );
+            // $2.5 less the 0.024% taker-fee reserve buys 2.49978 at the ask, floored to the tick's
+            // share decimals.
+            let (maker, taker) = if book_tick == "0.001" {
+                (2_499_780, 3_912_010)
+            } else {
+                (2_499_780, 3_905_900)
+            };
+            assert_eq!(
+                (
+                    prepared.maker_collateral.atomic(),
+                    prepared.taker_shares.atomic()
+                ),
+                (maker, taker)
+            );
+            let posted = posts.lock().unwrap().clone();
+            assert_eq!(posted.len(), 1);
+            let body: serde_json::Value = serde_json::from_slice(&posted[0]).unwrap();
+            assert_eq!(body["order"]["makerAmount"], maker.to_string());
+            assert_eq!(body["order"]["takerAmount"], taker.to_string());
+            // Reopening the journal applies the recorded admission; the same journal with the other
+            // tick closes the account at that record.
+            state.live = std::sync::Mutex::new(LiveState::default());
+            assert!(live_records(&state, &account).is_ok());
+            let tampered_path = dir.path().join("tampered.journal");
+            let tampered = Arc::new(LiveJournal::open(&tampered_path).unwrap());
+            for event in replay_account(&state.config.journal_path, &account).unwrap() {
+                let mut payload = event.payload;
+                let admitted =
+                    if let LiveJournalPayload::AdmissionEvaluated(admission) = &mut payload {
+                        admission.economic.admission.market.minimum_tick_size =
+                            Price(if book_tick == "0.001" {
+                                dec!(0.01)
+                            } else {
+                                dec!(0.001)
+                            });
+                        true
+                    } else {
+                        false
+                    };
+                tampered
+                    .append(event.account_id, event.timestamp, payload)
+                    .unwrap();
+                if admitted {
+                    break;
+                }
+            }
+            state.config.journal = tampered;
+            state.config.journal_path = tampered_path;
+            state.live = std::sync::Mutex::new(LiveState::default());
+            assert!(matches!(
+                live_records(&state, &account),
+                Err(LiveStateError::Rejected(_))
+            ));
+        }
     }
 
     #[tokio::test]

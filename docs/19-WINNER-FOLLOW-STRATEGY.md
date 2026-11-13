@@ -598,7 +598,8 @@ new-BUY admission for that account until custody reconciliation.
 Venue settlement is payoff authority (Decision 11). Ordinary live admission composes an automated
 `VenueSettlementRecord` from resolver evidence with fresh market evidence: condition, outcome, and
 token identity must agree. The compact CLOB response is the sole runtime fee authority; Gamma fee
-fields never enter economics. Missing, stale, ambiguous, or disagreeing evidence fails closed.
+fields never enter economics. Missing, stale, ambiguous, or disagreeing evidence fails closed, except
+the [`0.01`/`0.001` tick refinement](_GLOSSARY.md#market-admission-tick).
 
 Resolved positions redeem automatically (Decision 12), including losing positions: zero-payout
 resolutions remain receivables until custody. NegRisk evidence selects the V2 collateral adapter.

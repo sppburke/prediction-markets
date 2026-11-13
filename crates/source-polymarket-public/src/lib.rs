@@ -68,7 +68,7 @@ pub use gamma_markets::{
 pub use live_admission::{
     FIFTEEN_MINUTE_RECURRENCE, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
     LiveMarketError, LiveMarketEvidence, POLYMARKET_TEST_SERIES_SLUG_PREFIX,
-    event_series_recurrence, validate_live_market, validate_paper_market,
+    event_series_recurrence, reconcile_tick, validate_live_market, validate_paper_market,
 };
 pub use reconciliation::{
     ACTIVITY_MAX_OFFSET, ACTIVITY_V2_PAGE_SCHEMA_VERSION, ActivityAssetIdentity,
