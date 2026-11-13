@@ -1,5 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
+import { type DailyPnl, type FillEconomics, type SettledMarket, dailyPnl } from "./daily-pnl";
+import { MAX_MARK_KEYS } from "./marks";
 import { getSupabase } from "./supabase";
 import type { PaperFill, ServiceRuntime, WalletLiveStats } from "./types";
 
@@ -235,7 +237,7 @@ export async function fetchSettledMarketIds(): Promise<Set<string>> {
 
 /** All OPEN (not-yet-settled) paper fills, newest first, capped — the unrealized-PnL basis
  * (#398 WS3 step 19). A fill is open when its market has no `settled_markets` row. */
-export async function fetchOpenFills(limit = 5000): Promise<PaperFill[]> {
+export async function fetchOpenFills(limit = MAX_MARK_KEYS): Promise<PaperFill[]> {
   const sb = getSupabase();
   if (!sb) throw new NotConfiguredError();
   const settled = await fetchSettledMarketIds();
@@ -260,4 +262,20 @@ export async function fetchFills(wallet: string, limit = 200): Promise<PaperFill
     .limit(limit);
   if (error) throw new Error(error.message);
   return (data ?? []) as PaperFill[];
+}
+
+/** Realized paper P&L per Central Time day for the overview calendar: every fill and settlement, read in parallel. */
+export async function fetchDailyPnl(): Promise<DailyPnl[]> {
+  const sb = getSupabase();
+  if (!sb) throw new NotConfiguredError();
+  const [fills, settled] = await Promise.all([
+    fetchPagedRows<FillEconomics & Pick<PaperFill, "idempotency_key">>(
+      sb,
+      "paper_fills",
+      "idempotency_key,market_id,outcome_id,side,contracts,fill_price,principal,fee",
+      "idempotency_key",
+    ),
+    fetchPagedRows<SettledMarket>(sb, "settled_markets", "market_id,outcome_prices,settled_at_unix", "market_id"),
+  ]);
+  return dailyPnl(fills, settled);
 }

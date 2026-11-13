@@ -38,7 +38,7 @@ pe-service (Rust)                         Supabase                     site/ (Ne
   BUY `payout × exact_quantity − principal − fee`, SELL `principal − payout × exact_quantity − fee`.
   A row without principal and fee (written before the paper financial protocol) keeps the notional
   `side_sign × (payout − fill_price) × contracts`. The site's unrealized P&L nets open fills' entry fees
-  the same way (`site/lib/marks.ts` `unrealizedPnl`). The FULL OUTER join keeps both ranking-only and
+  the same way (`site/lib/marks.ts` `fillPnl`). The FULL OUTER join keeps both ranking-only and
   aged-out wallets visible. Since #518 a ranking-only row is a **bench** row: the batch
   keeps every survivor, plus non-survivor bench rows when needed to reach the publisher's
   requested minimum, with a pass/fail `survives` verdict; only survivors are admitted,
@@ -60,7 +60,10 @@ pe-service (Rust)                         Supabase                     site/ (Ne
   per-account Live views and admin RPC controls, including write-only age-sealed credentials.
   The two Paper pages are **server-rendered with ISR** (`export const
   revalidate = 60`), so the `wallet_live_stats_mv` read is fetched server-side and shared
-  across viewers rather than re-queried from every browser. Self-hosted on :3000.
+  across viewers rather than re-queried from every browser. The overview's daily realized P&L calendar
+  (`site/lib/daily-pnl.ts`) sums each settled fill's `fillPnl` at its resolved price into the Central Time day
+  its market settled, from the base tables, so it can briefly run ahead of the materialized view. Self-hosted on
+  :3000.
 
 ## Numeric precision
 

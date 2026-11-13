@@ -8,7 +8,8 @@ key; it is never sent to the browser.
 
 ## What it shows
 
-- **Overview (`/`)** — portfolio KPIs, a watched-paper realized-P&L-by-wallet bar chart, and
+- **Overview (`/`)** — portfolio KPIs, a daily realized-P&L calendar (a Central Time month grid;
+  newest day first on phones), a watched-paper realized-P&L-by-wallet bar chart, and
   a sortable per-wallet table joining historical (ranker: `ls_edge`, `hit_rate`,
   `n_trades`, …) against watched paper stats (realized P&L, win rate, fills).
 - **Wallet detail (`/wallet/<addr>`)** — the historical-vs-watched panel, a win-rate
