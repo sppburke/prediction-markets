@@ -10646,6 +10646,164 @@ mod tests {
         );
     }
 
+    /// Source-backed replay of `finality_prepared` over unanimous admission ticks written with the
+    /// given lexemes (`compact` is a JSON value; `book` `None` omits `tick_size`). Returns the
+    /// BLAKE3 of the recomposed record's serialization and its core hash.
+    fn unanimous_tick_replay(
+        paper: bool,
+        gamma: &str,
+        long: &str,
+        compact: &str,
+        book: Option<&str>,
+    ) -> (String, String) {
+        let mut economic = finality_prepared().economic.clone();
+        economic.admission.market.observed_at_unix = 20;
+        economic.admission.settlement.observed_at_unix = 20;
+        economic.risk.snapshot.per_trade_cap_bps = 10_000;
+        economic.admission.market.minimum_tick_size =
+            Price::new(Decimal::from_str(gamma).unwrap()).unwrap();
+        if paper {
+            economic.version = pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION;
+            economic.balance.chase_ceiling = Price::ONE;
+        }
+        let mut payloads = economic_source_payloads(&economic.market.condition_id.0);
+        let mut gamma_body: serde_json::Value = serde_json::from_slice(&payloads[0]).unwrap();
+        gamma_body[0]["orderPriceMinTickSize"] = serde_json::json!(gamma);
+        let mut long_body: serde_json::Value = serde_json::from_slice(&payloads[1]).unwrap();
+        long_body["minimum_tick_size"] = serde_json::json!(long);
+        let mut compact_body: serde_json::Value = serde_json::from_slice(&payloads[2]).unwrap();
+        compact_body["mts"] = serde_json::from_str(compact).unwrap();
+        let mut book_body: serde_json::Value = serde_json::from_slice(&payloads[3]).unwrap();
+        if let Some(tick) = book {
+            book_body["tick_size"] = serde_json::json!(tick);
+        }
+        for (payload, body) in
+            payloads
+                .iter_mut()
+                .zip([gamma_body, long_body, compact_body, book_body])
+        {
+            *payload = serde_json::to_vec(&body).unwrap();
+        }
+        economic.admission.settlement.raw_evidence_hash =
+            blake3::hash(&payloads[1]).to_hex().to_string();
+        let sources = [
+            economic.admission.receipts.gamma,
+            economic.admission.receipts.clob_long,
+            economic.admission.receipts.clob_compact,
+            economic.book_receipt,
+        ]
+        .into_iter()
+        .zip([
+            GAMMA_MARKETS_SOURCE_ID,
+            CLOB_LONG_MARKET_SOURCE_ID,
+            CLOB_COMPACT_MARKET_SOURCE_ID,
+            CLOB_BOOK_SOURCE_ID,
+        ])
+        .zip(payloads)
+        .map(|((receipt, source_id), payload)| {
+            (
+                receipt,
+                RecordedEconomicSource {
+                    payload,
+                    observed_at: SourceTimestamp(source_time_from_millis(20_100).unwrap()),
+                    received_at: ReceivedAt(source_time_from_millis(20_100).unwrap()),
+                    source_id: source_id.to_owned(),
+                    schema_version: 1,
+                    parser_version: 1,
+                    content_type: ContentType::Json,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+        let record = replay_source_backed_economic(
+            &economic,
+            21_000,
+            CollateralAmount::from_atomic(10_000_000),
+            None,
+            |receipt| {
+                sources
+                    .iter()
+                    .find(|(candidate, _)| *candidate == receipt)
+                    .map(|(_, source)| source.clone())
+                    .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
+            },
+        )
+        .unwrap()
+        .recompose(
+            &economic,
+            economic.risk.clone(),
+            economic.applied_configuration_hash.clone(),
+        )
+        .unwrap();
+        (
+            blake3::hash(&serde_json::to_vec(&record).unwrap())
+                .to_hex()
+                .to_string(),
+            record.core_hash().unwrap(),
+        )
+    }
+
+    const UNANIMOUS_TICK_CASES: [(&str, &str, &str, Option<&str>); 4] = [
+        ("0.01", "0.01", "0.01", Some("0.01")),
+        ("0.010", "0.01", "0.01", Some("0.0100")),
+        ("0.01", "0.010", "\"0.0100\"", None),
+        ("0.001", "0.0010", "0.001", Some("0.001")),
+    ];
+
+    /// PASS (#881, AC4): receipt sets that `eccd105` accepted (unanimous ticks, including differing
+    /// decimal scales, with an absent or equal book tick) replay to the record serialization and
+    /// core hash that `eccd105` produced, keeping Gamma's tick representation.
+    #[test]
+    fn unanimous_tick_receipts_replay_byte_identical_to_eccd105() {
+        // Printed by `unanimous_tick_replay` at eccd105: paper, then live, per case in order.
+        let mut baselines = [
+            (
+                "fe86782e6bdb5c27cc7a6dca355da1a631fe3c3487a6e5f1d777d593edbedd93",
+                "d0d5cdba00e6ac6cad1edc03d2d173c318ec8db4d6dd5bc8ab5fbfb5651e0d5e",
+            ),
+            (
+                "c239aaa8c820c17ecb3d441ae8a4556e6b6d1afd9384c1c40d94a276d8b64dea",
+                "3dc9d56f853d259c53984145b079817f62035ad6ab6b2cf93a94a44a95608b7e",
+            ),
+            (
+                "ccba8a91c563e4266bb2a114c779b655dcf1212bd30f37e1c9bda6796d1fed1c",
+                "22cdd9f5f6a47764e2bc2b626b3a19c11a9e4bf3057c711fc46066a8a236e3b8",
+            ),
+            (
+                "abd4046c533e0f9607b9f03756200fa41b434fcf640b059f6198ab593a9e9895",
+                "442cc3e898fe813ba300ac44a9f7d0b9d8e32d798e856070915c5b6915948101",
+            ),
+            (
+                "3ae34a6f0de19efcd5f8e1f6a3b44a22d3391491d99693aa5fd409abcc4a1702",
+                "b1e164ec25448ec8633feda2b8b45f1d00a708a9d391752d78558c51b353fed7",
+            ),
+            (
+                "078c86d41b58194e8906f14d2a42d55d8bc5437d66cfa5b47fe6c5495b37e68b",
+                "208229585e169227e65af22d1e0cf775b9628b103c1ec0523d5a16f8031f619a",
+            ),
+            (
+                "a3cf0883089f993a580d8279bdd2832597d6bc48dafa0506cde54e279f0cf38f",
+                "df094796419ca05f3b395193ea15a473ff31d233d16dc7e5ffbf44b81b5c4437",
+            ),
+            (
+                "0a68a5c0f101701782841a8242cf748d6c461d5f3df878568fde9447cfa10d8e",
+                "5ea7d88b5686466d982ac9104cc997d2ddaed5d31b4477e4b706674b0a97eceb",
+            ),
+        ]
+        .into_iter();
+        for (gamma, long, compact, book) in UNANIMOUS_TICK_CASES {
+            for paper in [true, false] {
+                let (serialization, core_hash) =
+                    unanimous_tick_replay(paper, gamma, long, compact, book);
+                assert_eq!(
+                    (serialization.as_str(), core_hash.as_str()),
+                    baselines.next().unwrap(),
+                    "{gamma}/{long}/{compact}/{book:?}, paper {paper}"
+                );
+            }
+        }
+    }
+
     /// PASS: gate F reads Gamma `events` best-effort, so a 15-minute series, 200-deep nesting or
     /// an out-of-range number leaves source-backed replay and the recomposed record unchanged.
     #[test]
