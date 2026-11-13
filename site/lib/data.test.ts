@@ -4,8 +4,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
 import { KpiCards } from "../components/KpiCards";
+import { PnlCalendar } from "../components/PnlCalendar";
 import { WalletTabs } from "../components/WalletTabs";
 import {
+  fetchDailyPnl,
   fetchOpenFills,
   fetchSettledMarketIds,
   fetchWalletStats,
@@ -17,6 +19,7 @@ import { getSupabase } from "./supabase";
 import type { WalletLiveStats } from "./types";
 
 vi.mock("./supabase", () => ({ getSupabase: vi.fn() }));
+vi.mock("@/lib/daily-pnl", async () => import("./daily-pnl"));
 vi.mock("@/lib/format", async () => import("./format"));
 vi.mock("@/lib/marks", async () => import("./marks"));
 
@@ -374,5 +377,71 @@ describe("overview shows the followed set and paper results, not the ranked univ
     expect(kpis).toMatch(/Watched<\/div><div[^>]*>1<\/div>/);
     expect(kpis).toContain("2 traded");
     expect(kpis).not.toContain("ranked");
+  });
+});
+
+describe("daily realized P&L calendar", () => {
+  const fill = (index: number) => ({
+    idempotency_key: `key-${String(index).padStart(5, "0")}`,
+    market_id: `market-${String(index).padStart(5, "0")}`,
+    outcome_id: 1,
+    side: "buy",
+    contracts: "10",
+    fill_price: "0.4",
+    principal: "4",
+    fee: "0.1",
+  });
+  const settlement = (index: number) => ({
+    market_id: `market-${String(index).padStart(5, "0")}`,
+    outcome_prices: ["0", "1"],
+    settled_at_unix: Date.parse("2026-11-10T12:00:00Z") / 1000,
+  });
+
+  function stubTables(count: number, failing?: string) {
+    const fills = Array.from({ length: count }, (_, index) => fill(index + 1));
+    const settled = Array.from({ length: count }, (_, index) => settlement(index + 1));
+    const pages: Record<string, number> = {};
+    stubSupabase((table, params) => {
+      pages[table] = (pages[table] ?? 0) + 1;
+      if (table === failing && pages[table] === 2) return { error: "later page failed" };
+      if (table === "paper_fills") {
+        expect(params.get("select")).toBe("idempotency_key,market_id,outcome_id,side,contracts,fill_price,principal,fee");
+        return { data: page(fills, "idempotency_key", params) };
+      }
+      expect(table).toBe("settled_markets");
+      expect(params.get("select")).toBe("market_id,outcome_prices,settled_at_unix");
+      return { data: page(settled, "market_id", params) };
+    });
+    return pages;
+  }
+
+  it.each([0, 1001])("reads every fill and settlement (%i of each)", async (count) => {
+    const pages = stubTables(count);
+    // Each won fill: 10 × 1 − 4 − 0.1 = 5.9.
+    expect(await fetchDailyPnl()).toEqual(
+      count === 0 ? [] : [{ day: "2026-11-10", pnl: expect.closeTo(count * 5.9, 6) }],
+    );
+    expect(pages).toEqual({ paper_fills: count > 1000 ? 2 : 1, settled_markets: count > 1000 ? 2 : 1 });
+  });
+
+  it.each(["paper_fills", "settled_markets"])("rejects when the second %s page fails", async (table) => {
+    stubTables(1001, table);
+    await expect(fetchDailyPnl()).rejects.toThrow("later page failed");
+  });
+
+  it.each([
+    [0.5 - 0.4 - 0.1, "$0.00", "zero"], // −2.8e-17 in floating point: break-even, never "-$0.00"
+    [-0.125, "-$0.13", "neg"], // a half cent rounds away from zero, as formatUsd does
+    [-0.005, "-$0.01", "neg"],
+    [1.005, "+$1.01", "pos"], // 1.00499… in binary; formatUsd still shows $1.01
+  ])("shows a day of %s as %s in its cell and the month total", (pnl, text, sign) => {
+    const html = renderToStaticMarkup(createElement(PnlCalendar, { days: [{ day: "2026-11-10", pnl }], today: "2026-11-13" }));
+    expect(html.split(`sign-${sign}">${text}</span>`)).toHaveLength(3);
+    expect(html.match(/sm:bg-(pos|neg)\/15/g) ?? []).toEqual(sign === "zero" ? [] : [`sm:bg-${sign}/15`]);
+  });
+
+  it("says so when nothing has settled", () => {
+    const html = renderToStaticMarkup(createElement(PnlCalendar, { days: [], today: "2026-11-13" }));
+    expect(html).toContain("No settled P&amp;L yet.");
   });
 });

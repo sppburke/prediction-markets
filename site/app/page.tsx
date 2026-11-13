@@ -1,8 +1,11 @@
 import { KpiCards } from "@/components/KpiCards";
 import { Panel, StateNotice } from "@/components/Panel";
 import { PnlBarChart } from "@/components/PnlBarChart";
+import { PnlCalendar } from "@/components/PnlCalendar";
 import { WalletTabs } from "@/components/WalletTabs";
+import { centralDay } from "@/lib/daily-pnl";
 import {
+  fetchDailyPnl,
   fetchOpenFills,
   fetchWalletStats,
   fetchWatchedSet,
@@ -36,6 +39,8 @@ export default async function OverviewPage() {
   const watchedSet =
     watchedProjection.status === "available" ? [...watchedProjection.wallets] : null;
   const openFills = await fetchOpenFills().catch(() => []);
+  // A failed read shows its message; it must never look like a calendar without P&L.
+  const daily = await fetchDailyPnl().catch((e: unknown) => new Error((e as Error).message));
 
   return (
     <div className="space-y-6">
@@ -46,6 +51,13 @@ export default async function OverviewPage() {
         </p>
       </div>
       <KpiCards rows={rows} watched={watched} />
+      <Panel title="Daily realized P&L · Central Time">
+        {daily instanceof Error ? (
+          <p className="text-xs text-neg">Daily P&L unavailable: {daily.message}</p>
+        ) : (
+          <PnlCalendar days={daily} today={centralDay(Date.now() / 1000)} />
+        )}
+      </Panel>
       <Panel title="Watched paper realized P&L by wallet">
         <PnlBarChart rows={rows} />
       </Panel>
