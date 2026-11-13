@@ -21017,6 +21017,8 @@ mod tests {
                 .with_source_log(state.config.source_log.clone())
                 .with_clock(Arc::new(move || now)),
         );
+        state.config.mid_price_cache =
+            MidPriceCache::new("http://127.0.0.1:9".to_owned()).with_clock(Arc::new(move || now));
         let mut runtime = state.config.runtime_config.snapshot().as_ref().clone();
         runtime.per_trade_cap = pe_strategy_winner_follow::PerTradeCap::Unlimited;
         runtime.min_fill_price = Decimal::ZERO;
@@ -21137,7 +21139,7 @@ mod tests {
         for (book_tick, ask) in [("0.001", "0.639"), ("0.01", "0.64"), ("0.1", "0.6")] {
             let dir = tempdir().unwrap();
             let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
-            let now = OffsetDateTime::now_utc();
+            let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
             let identity = Identity::generate();
             let sealed = sealed_delayed_market_credentials(&identity);
             let mut template = finality_prepared();
@@ -21216,6 +21218,8 @@ mod tests {
                     .with_source_log(state.config.source_log.clone())
                     .with_clock(Arc::new(move || now)),
             );
+            state.config.mid_price_cache = MidPriceCache::new("http://127.0.0.1:9".to_owned())
+                .with_clock(Arc::new(move || now));
             let mut runtime = state.config.runtime_config.snapshot().as_ref().clone();
             runtime.per_trade_cap = pe_strategy_winner_follow::PerTradeCap::Unlimited;
             runtime.min_fill_price = Decimal::ZERO;
@@ -21228,8 +21232,10 @@ mod tests {
                 &mut template,
                 &account,
                 now,
+                // A frozen policy without the feed sets no send deadline (the venue checks one
+                // against the wall clock); copy-deadline scenarios cover that check.
                 Some(crate::bucket_commit::PaperFreshnessPolicy {
-                    activity_ws_enabled: true,
+                    activity_ws_enabled: false,
                     copy_latency_budget_secs: 120,
                 }),
                 Some("0xee"),
