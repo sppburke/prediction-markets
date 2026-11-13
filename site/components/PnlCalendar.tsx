@@ -10,10 +10,10 @@ import { PRECISION, formatUsd, signClass } from "@/lib/format";
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
   "October", "November", "December"];
-const SCALE = 10 ** PRECISION.usd;
-
-/** The shown cents (−0 as 0), so sign and tint follow the display: a break-even day is never "-$0.00". */
-const cents = (value: number) => Math.round(value * SCALE) / SCALE + 0;
+/** The shown cents, rounded as `formatUsd` rounds (−0 as 0), so sign and tint follow the display: a break-even day is
+ * never "-$0.00". */
+const cents = (value: number) =>
+  Number(value.toLocaleString("en-US", { maximumFractionDigits: PRECISION.usd, useGrouping: false })) + 0;
 
 export function PnlCalendar({ days, today }: { days: DailyPnl[]; today: string }) {
   const [month, setMonth] = useState(today.slice(0, 7));

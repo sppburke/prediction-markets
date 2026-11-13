@@ -6,7 +6,6 @@ import { describe, expect, it, vi } from "vitest";
 import { KpiCards } from "../components/KpiCards";
 import { PnlCalendar } from "../components/PnlCalendar";
 import { WalletTabs } from "../components/WalletTabs";
-import { dailyPnl } from "./daily-pnl";
 import {
   fetchDailyPnl,
   fetchOpenFills,
@@ -430,15 +429,15 @@ describe("daily realized P&L calendar", () => {
     await expect(fetchDailyPnl()).rejects.toThrow("later page failed");
   });
 
-  it("shows a break-even day as a neutral $0.00, never -$0.00", () => {
-    const even = { side: "buy", contracts: "1", fill_price: "0.5", principal: "0.4", fee: "0.1" };
-    const [row] = dailyPnl([{ ...even, market_id: "even", outcome_id: 0 }],
-      [{ market_id: "even", outcome_prices: ["0.5", "0.5"], settled_at_unix: Date.parse("2026-11-10T18:00:00Z") / 1000 }]);
-    expect(row.pnl).toBeLessThan(0); // 0.5 − 0.4 − 0.1 in floating point
-    const html = renderToStaticMarkup(createElement(PnlCalendar, { days: [row], today: "2026-11-13" }));
-    expect(html).toContain("$0.00");
-    expect(html).not.toContain("-$0.00");
-    expect(html).not.toContain("sign-neg");
+  it.each([
+    [0.5 - 0.4 - 0.1, "$0.00", "zero"], // −2.8e-17 in floating point: break-even, never "-$0.00"
+    [-0.125, "-$0.13", "neg"], // a half cent rounds away from zero, as formatUsd does
+    [-0.005, "-$0.01", "neg"],
+    [1.005, "+$1.01", "pos"], // 1.00499… in binary; formatUsd still shows $1.01
+  ])("shows a day of %s as %s in its cell and the month total", (pnl, text, sign) => {
+    const html = renderToStaticMarkup(createElement(PnlCalendar, { days: [{ day: "2026-11-10", pnl }], today: "2026-11-13" }));
+    expect(html.split(`sign-${sign}">${text}</span>`)).toHaveLength(3);
+    expect(html.match(/sm:bg-(pos|neg)\/15/g) ?? []).toEqual(sign === "zero" ? [] : [`sm:bg-${sign}/15`]);
   });
 
   it("says so when nothing has settled", () => {
