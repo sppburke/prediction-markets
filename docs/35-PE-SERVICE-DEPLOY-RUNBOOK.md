@@ -1373,6 +1373,23 @@ SQL apply.
    changes to their recorded reason. Record unobserved cases explicitly; preserve all evidence and
    fix forward once the boundary exists.
 
+**#881 tick-refinement update.** An ordinary in-era update with one restart through the locked swap
+below: no configuration, schema, Supabase or Forge change, and no new financial-semantic,
+continuation or economic version. Re-run `scripts/probe_activity_ws.py` before deploying. The
+unchanged versions rest on a census of every recorded `/book` tick by the deploy kit's read-only
+`tick_audit.py census <generation-dir> <live-journal>`, kept in `$art`: run it while the old unit
+serves, again in full after the stop under the deploy lock, and again on every resume before the
+swap. It must exit 0: every readable recorded book reports a tick absent or equal to its record's
+tick, and the live journal is header-only (the kit does not scan live records). Otherwise restart
+the old binary and do not swap. After the final census and before the start,
+`tick_audit.py capture <generation-dir>` records the baseline for three daily `verify` runs. The
+rollback boundary is the first record that depends on the [tick rule](_GLOSSARY.md#market-admission-tick):
+a paper economic record admitted from disagreeing sources or planned on a changed book tick, which an
+older binary's source-backed replay rejects inside a selected qualification seal, or such an
+ordinary-live admission, which closes the account under older live replay. Before it, reverse the
+swap only after stop and drain and every existing [rollback prerequisite](#rollback); after it,
+preserve state and fix forward.
+
 Every step is bound to the embedded full Git revision plus exact binary bytes (#544). The binary
 reports `revision=<40-hex> config_identity=runtime-applied`; `--verify-staged-identity` checks that
 revision and the executable's BLAKE3 digest before staging. Continue to use sha256 for the existing

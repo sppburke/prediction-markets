@@ -132,6 +132,27 @@ pub fn validate_paper_market(
     )
 }
 
+/// The admitted tick of two reported minimum ticks (#881). Equal positive ticks keep `first`
+/// unchanged. Polymarket refines a trading market's tick from `0.01` to `0.001`, and its sources
+/// publish the change at different times, so that pair admits its `0.01` input. Zero or any other
+/// pair is a disagreement.
+pub fn reconcile_tick(first: Price, second: Price) -> Option<Price> {
+    if first == Price::ZERO || second == Price::ZERO {
+        return None;
+    }
+    if first == second {
+        return Some(first);
+    }
+    let (coarse, fine) = (Decimal::new(1, 2), Decimal::new(1, 3));
+    if first.0 == coarse && second.0 == fine {
+        Some(first)
+    } else if first.0 == fine && second.0 == coarse {
+        Some(second)
+    } else {
+        None
+    }
+}
+
 fn validate_market(
     gamma_raw: &[u8],
     clob_raw: &[u8],
@@ -210,11 +231,9 @@ fn validate_market(
     let clob_tick = price(clob.minimum_tick_size.as_ref())?;
     let gamma_minimum = shares(gamma.order_min_size.as_ref())?;
     let clob_minimum = shares(clob.minimum_order_size.as_ref())?;
-    if gamma_tick == Price::ZERO
-        || gamma_minimum == ShareAmount::ZERO
-        || gamma_tick != clob_tick
-        || gamma_minimum != clob_minimum
-    {
+    let minimum_tick_size =
+        reconcile_tick(gamma_tick, clob_tick).ok_or(LiveMarketError::SourceDisagreement)?;
+    if gamma_minimum == ShareAmount::ZERO || gamma_minimum != clob_minimum {
         return Err(LiveMarketError::SourceDisagreement);
     }
 
@@ -233,7 +252,7 @@ fn validate_market(
         neg_risk_market_id: clob.neg_risk_market_id,
         series_recurrence,
         series_slug,
-        minimum_tick_size: gamma_tick,
+        minimum_tick_size,
         minimum_order_size: gamma_minimum,
         scheduled_end_unix,
         observed_at_unix,
@@ -657,6 +676,71 @@ mod tests {
             validate(&gamma(false), &clob(true)),
             Err(LiveMarketError::SourceDisagreement)
         );
+    }
+
+    fn tick(text: &str) -> Price {
+        Price::new(text.parse().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn reconcile_tick_admits_only_the_observed_refinement() {
+        assert_eq!(
+            reconcile_tick(tick("0.01"), tick("0.001")),
+            Some(tick("0.01"))
+        );
+        assert_eq!(
+            reconcile_tick(tick("0.001"), tick("0.01")),
+            Some(tick("0.01"))
+        );
+        assert_eq!(
+            reconcile_tick(tick("0.001"), tick("0.001")),
+            Some(tick("0.001"))
+        );
+        let kept = reconcile_tick(tick("0.010"), tick("0.01")).unwrap();
+        assert_eq!(kept.0.to_string(), "0.010");
+        for (first, second) in [
+            ("0.1", "0.01"),
+            ("0.001", "0.0001"),
+            ("0.01", "0.005"),
+            ("0.01", "0.02"),
+            ("0", "0"),
+            ("0", "0.01"),
+        ] {
+            assert_eq!(
+                reconcile_tick(tick(first), tick(second)),
+                None,
+                "{first} vs {second}"
+            );
+        }
+    }
+
+    #[test]
+    fn refined_gamma_and_long_ticks_admit_the_coarser_tick_for_paper_and_live() {
+        for (gamma_tick, clob_tick) in [("0.001", "0.01"), ("0.01", "0.001")] {
+            let mut gamma = gamma(false);
+            gamma[0]["orderPriceMinTickSize"] = json!(gamma_tick);
+            let mut clob = clob(false);
+            clob["minimum_tick_size"] = json!(clob_tick);
+            assert_eq!(
+                validate(&gamma, &clob).unwrap().minimum_tick_size,
+                tick("0.01")
+            );
+            let paper = validate_paper_market(
+                &serde_json::to_vec(&gamma).unwrap(),
+                &serde_json::to_vec(&clob).unwrap(),
+                &condition(),
+                1_000,
+                30,
+            )
+            .unwrap();
+            assert_eq!(paper.minimum_tick_size, tick("0.01"));
+            let mut minimum = clob.clone();
+            minimum["minimum_order_size"] = json!("10");
+            assert_eq!(
+                validate(&gamma, &minimum),
+                Err(LiveMarketError::SourceDisagreement)
+            );
+        }
     }
 
     #[test]

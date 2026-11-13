@@ -948,8 +948,19 @@ the exact hot or removal sets stops `scripts/migrate_service_config_544.sql` bef
 
 Paper semantics 2 and 3 admit otherwise valid markets with positive or absent matching delay. Ordinary
 live re-reads each staged target through strict admission and refuses either delay before an order
-request. Both paths retain state, token mapping, minimum size, tick, freshness, and compact-fee
-checks. The isolated V2 canary keeps its separate admission and price contract.
+request. Both paths retain state, token mapping, minimum size, freshness, and compact-fee checks.
+
+<a id="market-admission-tick"></a>**Tick (#881).** Gamma, long CLOB and compact CLOB ticks must be
+positive. Equal ticks admit Gamma's value unchanged. Polymarket refines a trading market's tick from
+`0.01` to `0.001`, and its sources publish the change at different times, so any mix of exactly those
+two values admits `0.01`; every other disagreement refuses. The order is then planned, signed and
+recorded on the tick of the `/book` snapshot it walks: an absent book `tick_size` keeps the admitted
+tick, an equal one keeps it unchanged, and the other value of that pair replaces it. Any other book
+tick makes the book unusable: a value that is not a string of ASCII digits with an optional `.` and
+1 to 28 fractional digits, a value above 1, or a different tick. Paper then records the shared
+book-unusable no-copy, live terminalizes the target `book_tick_inconsistent` before any order
+request, and replay fails. Replay re-derives both ticks from the recorded receipts. The isolated V2
+canary keeps its separate admission and price contract.
 
 ### Live wallet source (Supabase ranking handoff, issue #339)
 

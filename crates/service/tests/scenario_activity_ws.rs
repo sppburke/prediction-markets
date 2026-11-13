@@ -313,6 +313,7 @@ fn build_orchestrator(
                         response_blake3: String::new(),
                         fetched_at_ms: 0,
                         source_receipt: None,
+                        tick_size: Default::default(),
                     },
                 )
             })
@@ -1654,6 +1655,7 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
         response_blake3: "scenario-book".to_owned(),
         fetched_at_ms: 0,
         source_receipt: Some(page_receipt),
+        tick_size: Default::default(),
     };
     let (control_tx, control_rx) = mpsc::channel(4);
     let (source_log, _source_rx) = SourceLogHandle::channel(4);

@@ -14,15 +14,16 @@
 //! `docs/15-SOURCES.md`). Only the ask side is parsed — the copy path is buy-only
 //! and a BUY consumes the ask side.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr as _;
 use std::time::Duration;
 
-use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp};
+use pe_core_types::{Price, ReceivedAt, SourceId, SourceTimestamp};
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
-use pe_source_polymarket_public::RateGate;
+use pe_source_polymarket_public::{RateGate, reconcile_tick};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::value::RawValue;
 
 use crate::activity_ingest::{SourceLogHandle, SourceLogHandleError};
 
@@ -107,6 +108,20 @@ pub struct OrderBook {
     /// Synchronized identity of the exact raw body when recording is enabled.
     /// Parse-only and deterministic fixture books leave this absent.
     pub source_receipt: Option<AppendReceipt>,
+    /// The snapshot's own `tick_size` (#881); typed fixture books leave it absent.
+    pub tick_size: BookTickSize,
+}
+
+/// A `/book` body's `tick_size` field (#881).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BookTickSize {
+    /// No `tick_size` key, or a body in serde's positional (array) form, which has no field names.
+    #[default]
+    Absent,
+    /// A JSON string within the lexical contract shared with the deployment auditor.
+    Valid(Price),
+    /// Explicit `null`, a number, any other JSON value, or a string outside that contract.
+    Invalid,
 }
 
 /// Parsed `/book` evidence, retaining the response's token and optional condition identity.
@@ -152,8 +167,9 @@ impl ParsedOrderBook {
 impl OrderBook {
     /// Parse a raw `/book` JSON body into the ask-side book.
     ///
-    /// Unknown fields (`bids`, `tick_size`, …) are ignored. An absent `asks` field parses to an
-    /// empty book. Production callers that must bind the retained response identity use
+    /// Unknown fields (`bids`, …) are ignored; `tick_size` is read into [`OrderBook::tick_size`]
+    /// after the ladder parses. An absent `asks` field parses to an empty book. Production callers
+    /// that must bind the retained response identity use
     /// [`Self::from_book_json_with_identity`]. Returns
     /// [`ClobBookError::Decode`] if the body is not book JSON or any ask
     /// `price`/`size` is not a valid `Decimal`.
@@ -183,10 +199,24 @@ impl OrderBook {
                 response_blake3: blake3::hash(bytes).to_hex().to_string(),
                 fetched_at_ms: 0,
                 source_receipt: None,
+                tick_size: book_tick_size(bytes),
             },
             market: raw.market,
             asset_id: raw.asset_id,
         })
+    }
+
+    /// The tick an order on this book is planned and signed on (#881): the snapshot's own tick
+    /// when it equals the admitted tick or is its partner in Polymarket's `0.01`/`0.001`
+    /// refinement, the admitted tick when the book carries none, and `None` (the book is
+    /// unusable) when its tick is invalid or contradicts the admission.
+    pub fn order_tick(&self, admitted: Price) -> Option<Price> {
+        match self.tick_size {
+            BookTickSize::Absent => Some(admitted),
+            BookTickSize::Invalid => None,
+            BookTickSize::Valid(book) if book == admitted => Some(admitted),
+            BookTickSize::Valid(book) => reconcile_tick(admitted, book).map(|_| book),
+        }
     }
 
     /// Best (lowest-price) ask, or `None` for an empty book. Computed as the
@@ -218,6 +248,38 @@ impl OrderBook {
         out.sort_by_key(|level| level.price);
         Some(out)
     }
+}
+
+/// Reads `tick_size` from a body `RawBook` already accepted, so no accepted body is newly
+/// rejected. A repeated key keeps its last value, as serde maps do.
+fn book_tick_size(bytes: &[u8]) -> BookTickSize {
+    if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'[') {
+        return BookTickSize::Absent;
+    }
+    let Ok(fields) = serde_json::from_slice::<BTreeMap<String, Box<RawValue>>>(bytes) else {
+        return BookTickSize::Invalid;
+    };
+    let Some(raw) = fields.get("tick_size") else {
+        return BookTickSize::Absent;
+    };
+    serde_json::from_str::<String>(raw.get())
+        .ok()
+        .and_then(|text| parse_book_tick(&text))
+        .map_or(BookTickSize::Invalid, BookTickSize::Valid)
+}
+
+/// The lexical contract shared with the deployment auditor (#881): ASCII digits, optionally `.`
+/// and 1 to 28 digits, nothing else, valued within [`Price`].
+fn parse_book_tick(text: &str) -> Option<Price> {
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let valid = match text.split_once('.') {
+        Some((whole, fraction)) => digits(whole) && digits(fraction) && fraction.len() <= 28,
+        None => digits(text),
+    };
+    if !valid {
+        return None;
+    }
+    Price::new(Decimal::from_str_exact(text).ok()?).ok()
 }
 
 #[derive(Debug, Deserialize)]
@@ -428,6 +490,99 @@ mod tests {
         "timestamp": "1781655409736"
     }"#;
 
+    fn tick_of(body: &str) -> BookTickSize {
+        OrderBook::from_book_json(body.as_bytes())
+            .unwrap()
+            .tick_size
+    }
+
+    fn price(text: &str) -> Price {
+        Price::new(text.parse().unwrap()).unwrap()
+    }
+
+    /// PASS: the `/book` tick follows the lexical contract shared with the deployment auditor
+    /// (#881); these vectors are the auditor's `tick_vectors.json`.
+    #[test]
+    fn book_tick_size_follows_the_shared_lexical_contract() {
+        let with_tick = |json: &str| {
+            tick_of(&format!(
+                r#"{{"asset_id":"11","asks":[],"tick_size":{json}}}"#
+            ))
+        };
+        for valid in ["0.01", "0.001", "0.0100", "0", "1"] {
+            assert_eq!(
+                with_tick(&serde_json::to_string(valid).unwrap()),
+                BookTickSize::Valid(price(valid)),
+                "{valid}"
+            );
+        }
+        for invalid in [
+            "0.01000000000000000000000000000",
+            "0.01\n",
+            " 0.01",
+            "+0.01",
+            "-0.01",
+            "0_01",
+            ".01",
+            "1e-2",
+            "",
+            "1.5",
+            "abc",
+        ] {
+            assert_eq!(
+                with_tick(&serde_json::to_string(invalid).unwrap()),
+                BookTickSize::Invalid,
+                "{invalid:?}"
+            );
+        }
+        for value in ["null", "0.001", "true", r#"["0.01"]"#, r#"{"v":"0.01"}"#] {
+            assert_eq!(with_tick(value), BookTickSize::Invalid, "{value}");
+        }
+        assert_eq!(
+            tick_of(r#"{"asset_id":"11","asks":[]}"#),
+            BookTickSize::Absent
+        );
+        assert_eq!(tick_of(REAL_SHAPE), BookTickSize::Valid(price("0.01")));
+        assert_eq!(
+            tick_of(r#"{"asset_id":"11","tick_size":"0.01","tick_size":"0.001"}"#),
+            BookTickSize::Valid(price("0.001"))
+        );
+        assert_eq!(
+            tick_of(r#"[null,"11",[{"price":"0.50","size":"10"}]]"#),
+            BookTickSize::Absent
+        );
+    }
+
+    /// PASS: the order tick is the walked book's own tick only within Polymarket's `0.01`/`0.001`
+    /// refinement; a missing tick keeps the admitted one and anything else makes the book unusable.
+    #[test]
+    fn order_tick_follows_the_walked_book_within_the_refinement() {
+        let book = |tick_size| OrderBook {
+            tick_size,
+            ..OrderBook::default()
+        };
+        let cases = [
+            (BookTickSize::Absent, "0.01", Some("0.01")),
+            (BookTickSize::Valid(price("0.01")), "0.01", Some("0.01")),
+            (BookTickSize::Valid(price("0.001")), "0.01", Some("0.001")),
+            (BookTickSize::Valid(price("0.01")), "0.001", Some("0.01")),
+            (BookTickSize::Valid(price("0.1")), "0.01", None),
+            (BookTickSize::Valid(price("0")), "0.01", None),
+            (BookTickSize::Invalid, "0.01", None),
+        ];
+        for (tick_size, admitted, expected) in cases {
+            assert_eq!(
+                book(tick_size).order_tick(price(admitted)),
+                expected.map(price),
+                "{tick_size:?} against {admitted}"
+            );
+        }
+        let kept = book(BookTickSize::Valid(price("0.0100")))
+            .order_tick(price("0.01"))
+            .unwrap();
+        assert_eq!(kept.0.to_string(), "0.01");
+    }
+
     #[tokio::test]
     async fn rate_gate_idle_spacing_and_deadline_refusal() {
         let fetcher = ReqwestClobBookFetcher::new(reqwest::Client::new());
@@ -579,6 +734,7 @@ mod tests {
                 response_blake3: String::new(),
                 fetched_at_ms: 0,
                 source_receipt: None,
+                tick_size: Default::default(),
             },
         );
         let fetcher = FixtureClobBookFetcher::new(books);

@@ -96,6 +96,8 @@ Trade net edge, not gross edge.
 For pe-service Data API requests, cursor completeness, recording and replay, use the
 [canonical v2 contract](_GLOSSARY.md#data-api-v2-contract-pe-service-phase-1); source verification
 and retirement provenance live in [`15-SOURCES.md`](15-SOURCES.md#data-api-v2-retirement-and-contract-phase-1).
+Market admission's tick rule and the order tick taken from the walked `/book` are canonical in the
+[glossary](_GLOSSARY.md#market-admission-tick).
 
 Polymarket is the primary Winner-Follow venue because its public data surfaces support trader-centric reconstruction:
 

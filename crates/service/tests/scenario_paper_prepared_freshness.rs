@@ -563,7 +563,7 @@ impl Harness {
         ordinal: u32,
         paper_rule: Option<(Decimal, Decimal, Option<i64>)>,
     ) -> Recorded {
-        self.record_with_economics(ordinal, paper_rule, None, None)
+        self.record_with_economics(ordinal, paper_rule, None, None, None)
             .await
     }
 
@@ -573,6 +573,7 @@ impl Harness {
         paper_rule: Option<(Decimal, Decimal, Option<i64>)>,
         economics: Option<BookEconomics>,
         group: Option<&str>,
+        ticks: Option<[&str; 4]>,
     ) -> Recorded {
         let condition = format!("0x{ordinal:064x}");
         let token = (ordinal * 2 + 11).to_string();
@@ -659,6 +660,8 @@ impl Harness {
             gamma[0]["orderPriceMinTickSize"] = "0.0001".into();
             long["minimum_tick_size"] = "0.0001".into();
             compact["mts"] = json!("0.0001");
+            // The walked book reports the same tick as admission (#881).
+            book["tick_size"] = "0.0001".into();
             if economics.fee_free {
                 compact["fd"]["r"] = json!(0);
                 for field in ["makerBaseFee", "takerBaseFee"] {
@@ -670,6 +673,12 @@ impl Harness {
                 compact["mbf"] = json!(0);
                 compact["tbf"] = json!(0);
             }
+        }
+        if let Some([gamma_tick, long_tick, compact_tick, book_tick]) = ticks {
+            gamma[0]["orderPriceMinTickSize"] = gamma_tick.into();
+            long["minimum_tick_size"] = long_tick.into();
+            compact["mts"] = json!(compact_tick);
+            book["tick_size"] = book_tick.into();
         }
         let activity = serde_json::to_vec(&activity).unwrap();
         let gamma = serde_json::to_vec(&gamma).unwrap();
@@ -737,7 +746,7 @@ impl Harness {
         group: &str,
     ) -> Recorded {
         let mut recorded = self
-            .record_with_economics(ordinal, None, None, Some(group))
+            .record_with_economics(ordinal, None, None, Some(group), None)
             .await;
         let market = &recorded.admission.market;
         let token = market.ordered_outcome_token_ids[outcome].0.clone();
@@ -4390,6 +4399,82 @@ async fn reverse_completion_admission_executes_and_qualifies_exactly() {
     );
 }
 
+/// PASS (#881): Gamma and compact report the refined `0.001` tick while long CLOB still reports
+/// `0.01`. The real builder admits `0.01`, the walked `0.001` book fills its `0.639` ask on tick
+/// `0.001`, and exact sealed qualification replays the fill; a book tick that contradicts the
+/// admission is the shared book-unusable no-copy.
+#[tokio::test]
+async fn refined_tick_window_fills_on_the_walked_book_tick_and_qualifies_exactly() {
+    for book_tick in ["0.001", "0.1"] {
+        let mut h = Harness::new_with_configuration(
+            pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
+            dollar_runtime(),
+        )
+        .await;
+        h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+        let recorded = h
+            .record_with_economics(
+                1,
+                Some((dec!(0.63), dec!(0.639), Some(0))),
+                None,
+                None,
+                Some(["0.001", "0.01", "0.001", book_tick]),
+            )
+            .await;
+        let source = h.source.clone();
+        let (responses, _requests, server) =
+            hold_admission_responses(&mut h, &recorded, source).await;
+        for release in &responses.release {
+            release.add_permits(1);
+        }
+        h.hooks.age_clock.lock().unwrap().extend([at(); 3]);
+        h.start(true);
+        h.poll(&recorded).await;
+        server.abort();
+        let row = h.terminal(&recorded);
+        if book_tick == "0.1" {
+            assert_eq!(row.terminal_disposition.as_deref(), Some("no_fill"));
+            assert_eq!(
+                replay_decision_pending(&row)
+                    .unwrap()
+                    .post_boundary
+                    .body
+                    .terminal
+                    .reason,
+                "price-impact book unusable: book tick contradicts admission (fail closed)"
+            );
+            assert_eq!(h.prepared_count(), 0);
+            continue;
+        }
+        assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
+        let economic = scan_paper_log(&h.dir.path().join("paper.log"))
+            .unwrap()
+            .iter()
+            .find_map(|frame| match &frame.frame {
+                PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                    payload: pe_service::paper_recovery::FinancialPayload::Fill { economic, .. },
+                    ..
+                }) => Some(economic.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            economic.admission.market.minimum_tick_size,
+            pe_core_types::Price::new(dec!(0.001)).unwrap()
+        );
+        assert_eq!(
+            economic.ladder.limit_price,
+            pe_core_types::Price::new(dec!(0.639)).unwrap()
+        );
+        // Planned on tick `0.001`, the signed shares use their fifth decimal.
+        let shares = economic.ladder.minimum_shares.to_decimal();
+        assert_ne!(shares.round_dp(4), shares, "{shares}");
+        let report = h.qualify_one_fill().await;
+        assert!(report.replay.exact, "{:?}", report.reasons);
+        assert_eq!(report.replay.fills, 1);
+    }
+}
+
 fn source_envelope(h: &Harness, receipt: AppendReceipt) -> pe_event_log::EventEnvelope {
     let (_, envelope) = pe_event_log::Reader::replay(h.dir.path().join("source.log"))
         .unwrap()
@@ -4421,6 +4506,7 @@ async fn floor_fill_without_mid() {
                     depth: dec!(1000),
                     fee_free: true,
                 }),
+                None,
                 None,
             )
             .await;
@@ -4493,6 +4579,7 @@ async fn semantic_three_partial_replay() {
                     depth: dec!(20.123457),
                     fee_free: false,
                 }),
+                None,
                 None,
             )
             .await;
@@ -7125,6 +7212,7 @@ async fn frame_below_minimum_counts_and_terminal_survive_rest_and_financial_boot
                 depth: dec!(0.000199),
                 fee_free: true,
             }),
+            None,
             None,
         )
         .await;
