@@ -47,9 +47,11 @@ pe-service (Rust)                         Supabase                     site/ (Ne
 - **`wallet_live_stats_mv` materialized view** (`scripts/supabase_wallet_live_stats_mv.sql`):
   a periodically-refreshed cache of `wallet_live_stats` (the aggregation is expensive and was
   recomputed on every page view). `pg_cron` runs `refresh materialized view concurrently`
-  every 2 min; a unique index on `wallet` enables the concurrent refresh. The site reads the
+  every 20 seconds; a unique index on `wallet` enables the concurrent refresh. A daily
+  `purge_cron_job_run_details` job deletes `cron.job_run_details` rows older than 7 days, which
+  pg_cron never prunes. The site reads the
   matview in unique-wallet-key pages, so refreshed profit values cannot repeat or skip a wallet
-  across page boundaries. Watched membership and settled-market IDs also page by their unique
+  across page boundaries. Watched membership, fills and settlements also page by their unique
   keys; the runtime-token/count guard covers the whole watched traversal and retries one replace
   race. A failed later page fails the read, rather than displaying a partial total. Apply the SQL
   to Supabase, then deploy the site. (The pg_cron block self-skips on a
@@ -58,12 +60,12 @@ pe-service (Rust)                         Supabase                     site/ (Ne
   historical-vs-watched panels remain read-only Next.js views (App Router + Tailwind + Recharts +
   `@supabase/supabase-js`) using anon RLS. Phase C adds Google-authenticated, service-role-backed
   per-account Live views and admin RPC controls, including write-only age-sealed credentials.
-  The two Paper pages are **server-rendered with ISR** (`export const
-  revalidate = 60`), so the `wallet_live_stats_mv` read is fetched server-side and shared
-  across viewers rather than re-queried from every browser. The overview's daily realized P&L calendar
-  (`site/lib/daily-pnl.ts`) sums each settled fill's `fillPnl` at its resolved price into the Central Time day
-  its market settled, from the base tables, so it can briefly run ahead of the materialized view. Self-hosted on
-  :3000.
+  The two Paper pages render on every request (`export const dynamic = "force-dynamic"`), so one
+  reload shows the latest base-table results; the overview starts its reads together, and one paged
+  read of every fill and settlement feeds both the daily realized P&L calendar and the open fills
+  behind Unrealized P&L. The calendar (`site/lib/daily-pnl.ts`) sums each settled fill's `fillPnl` at its
+  resolved price into the Central Time day its market settled, from the base tables, so it can briefly run
+  ahead of the materialized view. Self-hosted on :3000.
 
 ## Numeric precision
 

@@ -3,7 +3,9 @@
 
 Add future drift suites to DRIFT_SUITES. Their mutable fixtures are temporary or
 in-memory; repository paths are read-only inputs. No current suites need a serial
-group. Scenario phases within a suite stay in their original order.
+group. Scenario phases within a suite stay in their original order. A suite listed in
+DRIFT_SHARDS runs as that many processes, each given SHARD=i/n (the suite keeps every
+n-th test); they start first because they are the longest.
 """
 
 from __future__ import annotations
@@ -28,7 +30,6 @@ DRIFT_SUITES = (
     "test_ranker_decay.py",
     "test_rank_72hr_consolidated.py",
     "test_clob_reconciliation.py",
-    "test_rank_and_push.py",
     "test_rank_cycle_manifest.py",
     "test_rank_and_push_loop.py",
     "test_ranker_duck_parity.py",
@@ -48,6 +49,7 @@ DRIFT_SUITES = (
     "test_ranker_clv_source_comparison.py",
     "verify_bakeoff_components.py",
 )
+DRIFT_SHARDS = {"test_rank_and_push.py": 4}
 
 
 def run_suite(command, overrides, cwd):
@@ -149,8 +151,11 @@ def main():
         if args.group == "postgres":
             suites = postgres_suites(stack)
         else:
-            suites = [(name, [sys.executable, str(ROOT / "scripts" / name)], {}, None)
-                      for name in DRIFT_SUITES]
+            suites = [(f"{name} {index}/{total}", [sys.executable, str(ROOT / "scripts" / name)],
+                       {"SHARD": f"{index}/{total}"}, None)
+                      for name, total in DRIFT_SHARDS.items() for index in range(1, total + 1)]
+            suites += [(name, [sys.executable, str(ROOT / "scripts" / name)], {}, None)
+                       for name in DRIFT_SUITES]
         return run_suites(suites)
 
 

@@ -4637,5 +4637,19 @@ class CapacitySamplerUnitTest(unittest.TestCase):
         self.assertEqual(self._main(self.tmp / "once.jsonl", iter([4242]), "--once"), (1, []))
 
 
+def load_tests(loader, tests, pattern):
+    """CI runs this suite in parallel processes: `SHARD=i/n` (default 1/1) keeps every n-th test by id."""
+    index, _, total = (os.environ.get("SHARD") or "1/1").partition("/")
+    if not (index.isdigit() and total.isdigit() and 1 <= int(index) <= int(total)):
+        raise SystemExit(f"invalid SHARD: {os.environ['SHARD']}")
+
+    def flatten(suite):
+        for item in suite:
+            yield from flatten(item) if isinstance(item, unittest.TestSuite) else (item,)
+
+    ordered = sorted(flatten(tests), key=lambda test: test.id())
+    return unittest.TestSuite(test for position, test in enumerate(ordered) if position % int(total) == int(index) - 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

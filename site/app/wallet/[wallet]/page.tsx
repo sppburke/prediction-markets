@@ -6,9 +6,8 @@ import { WinRateCompareChart } from "@/components/WinRateCompareChart";
 import { fetchFills, fetchWalletStat, NotConfiguredError } from "@/lib/data";
 import type { PaperFill, WalletLiveStats } from "@/lib/types";
 
-// Server-rendered with ISR (see app/page.tsx): the wallet_live_stats_mv read + fills read run
-// on the server and are cached for up to `revalidate` seconds per wallet.
-export const revalidate = 60;
+// Rendered on every request (see app/page.tsx), so one reload shows the wallet's latest fills.
+export const dynamic = "force-dynamic";
 
 export default async function WalletDetailPage({
   params,

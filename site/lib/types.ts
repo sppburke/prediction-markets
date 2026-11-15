@@ -64,6 +64,12 @@ export interface PaperFill extends FillBase {
   prepared_seq: number;
 }
 
+// An unsettled paper fill: what the overview's unrealized P&L needs (wallet, mark key, `fillPnl` inputs).
+export type OpenFill = Pick<
+  PaperFill,
+  "leader_wallet" | "market_id" | "outcome_id" | "side" | "contracts" | "fill_price" | "principal" | "fee"
+>;
+
 // Display-safe #508 account control state. Credential ciphertext is intentionally absent.
 export interface AccountAdminRow {
   account_id: string;

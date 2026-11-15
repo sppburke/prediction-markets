@@ -22,7 +22,7 @@ describe("parseMarkKeys", () => {
     expect(parseMarkKeys({ keys: [KEY, 7] })).toBeNull();
   });
 
-  it("rejects more keys than the page can load", () => {
+  it("rejects more keys than one prices request may carry", () => {
     expect(parseMarkKeys({ keys: Array(MAX_MARK_KEYS).fill(KEY) })).toEqual([KEY]);
     expect(parseMarkKeys({ keys: Array(MAX_MARK_KEYS + 1).fill(KEY) })).toBeNull();
   });
