@@ -22,7 +22,7 @@ export function fillPnl(
   return fillPrice === null ? null : sideSign * (price - fillPrice) * contracts;
 }
 
-/** Matches `fetchOpenFills`' row cap, so one request never asks for more keys than the page loads. */
+/** The most keys one prices request may carry (the overview sends one per open market outcome). */
 export const MAX_MARK_KEYS = 5000;
 
 /** Trimmed, de-duplicated keys from `{ keys: string[] }`, or `null` when the body is malformed. */

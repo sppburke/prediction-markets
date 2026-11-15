@@ -14,7 +14,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { formatUsd, toNum } from "@/lib/format";
 import { fillPnl } from "@/lib/marks";
-import type { PaperFill, WalletLiveStats } from "@/lib/types";
+import type { OpenFill, WalletLiveStats } from "@/lib/types";
 import { Stat } from "./Stat";
 import { WalletTable } from "./WalletTable";
 
@@ -27,7 +27,7 @@ export function WalletTabs({
 }: {
   rows: WalletLiveStats[];
   watchedSet: string[] | null;
-  openFills: PaperFill[];
+  openFills: OpenFill[];
 }) {
   const [tab, setTab] = useState<TabKey>("live");
   const [unrealized, setUnrealized] = useState<Map<string, number>>(new Map());

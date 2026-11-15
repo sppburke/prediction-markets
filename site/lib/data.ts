@@ -1,9 +1,8 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-import { type DailyPnl, type FillEconomics, type SettledMarket, dailyPnl } from "./daily-pnl";
-import { MAX_MARK_KEYS } from "./marks";
+import { type DailyPnl, type SettledMarket, dailyPnl } from "./daily-pnl";
 import { getSupabase } from "./supabase";
-import type { PaperFill, ServiceRuntime, WalletLiveStats } from "./types";
+import type { OpenFill, PaperFill, ServiceRuntime, WalletLiveStats } from "./types";
 
 export class NotConfiguredError extends Error {
   constructor() {
@@ -14,7 +13,9 @@ export class NotConfiguredError extends Error {
 
 const PAGE_SIZE = 1000;
 
-/** Traverse a unique key so refreshed values cannot move rows across page boundaries. */
+/** Traverse a unique key so refreshed values cannot move rows across page boundaries. Each page carries a
+ * fresh signal, which opts it out of Next's per-render fetch deduplication: a repeated traversal (the watched
+ * read's retry) must read current rows, not replay the first. */
 async function fetchPagedRows<Row>(
   sb: SupabaseClient,
   table: string,
@@ -26,7 +27,7 @@ async function fetchPagedRows<Row>(
   for (;;) {
     let query = sb.from(table).select(columns).order(key, { ascending: true }).limit(PAGE_SIZE);
     if (cursor !== null) query = query.gt(key, cursor);
-    const { data, error } = await query;
+    const { data, error } = await query.abortSignal(new AbortController().signal);
     if (error) throw new Error(error.message);
     if (!data) throw new Error(`The ${table} query returned no data.`);
     const page = data as Row[];
@@ -189,21 +190,23 @@ export async function readConsistentWatchedSet(
  * after the rows and retries one observed race. Read failures and inconsistent snapshots return a
  * typed unavailable state, distinct from a valid empty projection (#544). */
 export async function fetchWatchedSet(): Promise<WatchedSetResult> {
-  const sb = getSupabase();
-  if (!sb) {
-    return {
-      status: "unavailable",
-      reason: "not_configured",
-      message: "Supabase is not configured.",
-    };
-  }
   try {
+    const sb = getSupabase();
+    if (!sb) {
+      return {
+        status: "unavailable",
+        reason: "not_configured",
+        message: "Supabase is not configured.",
+      };
+    }
     return await readConsistentWatchedSet(
       async () => {
+        // Like every page read, the token read carries a signal so its repeats reach the database.
         const result = await sb
           .from("service_runtime")
           .select("watchlist_size, updated_at")
           .eq("id", 1)
+          .abortSignal(new AbortController().signal)
           .maybeSingle();
         return {
           data: (result.data as ServiceRuntime | null) ?? null,
@@ -224,32 +227,6 @@ export async function fetchWatchedSet(): Promise<WatchedSetResult> {
   }
 }
 
-/** Market ids that have resolved (have a `settled_markets` row) — used to split open vs settled
- * fills for the unrealized-PnL feature. Fail-CLOSED (throws on read error, not soft-fail): a silent
- * empty set would mislabel already-settled fills as open and double-count realized P&L as
- * unrealized. The caller (`fetchOpenFills` → page `.catch`) degrades to "no unrealized" instead. */
-export async function fetchSettledMarketIds(): Promise<Set<string>> {
-  const sb = getSupabase();
-  if (!sb) throw new NotConfiguredError();
-  const rows = await fetchPagedRows<{ market_id: string }>(sb, "settled_markets", "market_id", "market_id");
-  return new Set(rows.map((row) => row.market_id));
-}
-
-/** All OPEN (not-yet-settled) paper fills, newest first, capped — the unrealized-PnL basis
- * (#398 WS3 step 19). A fill is open when its market has no `settled_markets` row. */
-export async function fetchOpenFills(limit = MAX_MARK_KEYS): Promise<PaperFill[]> {
-  const sb = getSupabase();
-  if (!sb) throw new NotConfiguredError();
-  const settled = await fetchSettledMarketIds();
-  const { data, error } = await sb
-    .from("paper_fills")
-    .select("*")
-    .order("inserted_at", { ascending: false })
-    .limit(limit);
-  if (error) throw new Error(error.message);
-  return ((data ?? []) as PaperFill[]).filter((f) => !settled.has(f.market_id));
-}
-
 /** A wallet's paper-fill tape, newest first (capped for display). */
 export async function fetchFills(wallet: string, limit = 200): Promise<PaperFill[]> {
   const sb = getSupabase();
@@ -264,18 +241,24 @@ export async function fetchFills(wallet: string, limit = 200): Promise<PaperFill
   return (data ?? []) as PaperFill[];
 }
 
-/** Realized paper P&L per Central Time day for the overview calendar: every fill and settlement, read in parallel. */
-export async function fetchDailyPnl(): Promise<DailyPnl[]> {
+/** The overview's paper results from one read of every fill and every settlement: realized P&L per
+ * Central Time day, and the open (not-yet-settled) fills that are the unrealized-P&L basis (#398 WS3
+ * step 19). Every read pages a unique key, so neither table is truncated at the API's row cap. */
+export async function fetchPaperResults(): Promise<{ daily: DailyPnl[]; openFills: OpenFill[] }> {
   const sb = getSupabase();
   if (!sb) throw new NotConfiguredError();
   const [fills, settled] = await Promise.all([
-    fetchPagedRows<FillEconomics & Pick<PaperFill, "idempotency_key">>(
+    fetchPagedRows<OpenFill & Pick<PaperFill, "idempotency_key">>(
       sb,
       "paper_fills",
-      "idempotency_key,market_id,outcome_id,side,contracts,fill_price,principal,fee",
+      "idempotency_key,leader_wallet,market_id,outcome_id,side,contracts,fill_price,principal,fee",
       "idempotency_key",
     ),
     fetchPagedRows<SettledMarket>(sb, "settled_markets", "market_id,outcome_prices,settled_at_unix", "market_id"),
   ]);
-  return dailyPnl(fills, settled);
+  const settledIds = new Set(settled.map((market) => market.market_id));
+  return {
+    daily: dailyPnl(fills, settled),
+    openFills: fills.filter((fill) => !settledIds.has(fill.market_id)),
+  };
 }

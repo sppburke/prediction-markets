@@ -7,9 +7,7 @@ import { KpiCards } from "../components/KpiCards";
 import { PnlCalendar } from "../components/PnlCalendar";
 import { WalletTabs } from "../components/WalletTabs";
 import {
-  fetchDailyPnl,
-  fetchOpenFills,
-  fetchSettledMarketIds,
+  fetchPaperResults,
   fetchWalletStats,
   fetchWatchedSet,
   guardWatchedSnapshot,
@@ -211,20 +209,17 @@ describe("dashboard pagination (#757)", () => {
   });
 
   it.each([0, 1, 100, 200, 1000, 1001, 2000])(
-    "reads complete sets of %i wallets and settled markets, including full-page boundaries",
+    "reads complete sets of %i wallets, including full-page boundaries",
     async (count) => {
       const stats = Array.from({ length: count }, (_, index) => statsRow(index + 1));
       const watchlist = stats.map((row) => ({ wallet_hex: row.wallet }));
-      const settled = stats.map((_, index) => ({ market_id: `market-${String(index + 1).padStart(4, "0")}` }));
       const reads: Record<string, number> = {};
       stubSupabase((table, params) => {
         reads[table] = (reads[table] ?? 0) + 1;
         if (table === "service_runtime") return { data: runtime("t1", count) };
         if (table === "service_watchlist") return { data: page(watchlist, "wallet_hex", params) };
-        if (table === "wallet_live_stats_mv") return { data: page(stats, "wallet", params) };
-        expect(table).toBe("settled_markets");
-        expect(params.get("select")).toBe("market_id");
-        return { data: page(settled, "market_id", params) };
+        expect(table).toBe("wallet_live_stats_mv");
+        return { data: page(stats, "wallet", params) };
       });
       expect(await fetchWalletStats()).toEqual(stats);
       expect(await fetchWatchedSet()).toEqual({
@@ -233,18 +228,16 @@ describe("dashboard pagination (#757)", () => {
         token: "t1",
         wallets: new Set(watchlist.map((row) => row.wallet_hex)),
       });
-      expect(await fetchSettledMarketIds()).toEqual(new Set(settled.map((row) => row.market_id)));
       const pages = Math.floor(count / 1000) + 1;
       expect(reads).toEqual({
         wallet_live_stats_mv: pages,
         service_runtime: 2,
         service_watchlist: pages,
-        settled_markets: pages,
       });
     },
   );
 
-  it.each(["service_watchlist", "wallet_live_stats_mv", "settled_markets"])(
+  it.each(["service_watchlist", "wallet_live_stats_mv"])(
     "fails closed when the second %s page fails",
     async (table) => {
       const stats = Array.from({ length: 1001 }, (_, index) => statsRow(index + 1));
@@ -257,17 +250,14 @@ describe("dashboard pagination (#757)", () => {
         if (table === "service_watchlist") {
           return { data: page(stats.map((row) => ({ wallet_hex: row.wallet })), "wallet_hex", params) };
         }
-        if (table === "wallet_live_stats_mv") return { data: page(stats, "wallet", params) };
-        return { data: page(stats.map((row) => ({ market_id: row.wallet })), "market_id", params) };
+        return { data: page(stats, "wallet", params) };
       });
       if (table === "service_watchlist") {
         expect(await fetchWatchedSet()).toEqual({
           status: "unavailable", reason: "read_error", message: "later page failed",
         });
-      } else if (table === "wallet_live_stats_mv") {
-        await expect(fetchWalletStats()).rejects.toThrow("later page failed");
       } else {
-        await expect(fetchOpenFills()).rejects.toThrow("later page failed");
+        await expect(fetchWalletStats()).rejects.toThrow("later page failed");
       }
       expect(pages).toBe(2);
     },
@@ -305,6 +295,35 @@ describe("dashboard pagination (#757)", () => {
       }
     },
   );
+
+  it("sends every token and watchlist read with a signal, so Next never replays a repeat", async () => {
+    const signals: (AbortSignal | null | undefined)[] = [];
+    vi.mocked(getSupabase).mockReturnValue(createClient("https://supabase.test", "test-anon-key", {
+      auth: { persistSession: false },
+      global: {
+        fetch: vi.fn<typeof fetch>(async (input, init) => {
+          const table = new URL(String(input)).pathname.split("/").at(-1);
+          signals.push(init?.signal);
+          const body = table === "service_runtime" ? runtime("t1", 0) : [];
+          return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+        }),
+      },
+    }));
+    expect(await fetchWatchedSet()).toMatchObject({ status: "available", count: 0 });
+    expect(signals).toHaveLength(3); // runtime, watchlist page, runtime
+    expect(signals.every((signal) => signal instanceof AbortSignal)).toBe(true);
+  });
+
+  it("returns unavailable, never a rejection, when the client cannot be built", async () => {
+    vi.mocked(getSupabase).mockImplementationOnce(() => {
+      throw new Error("Invalid supabaseUrl: Must be a valid HTTP or HTTPS URL.");
+    });
+    await expect(fetchWatchedSet()).resolves.toEqual({
+      status: "unavailable",
+      reason: "read_error",
+      message: "Invalid supabaseUrl: Must be a valid HTTP or HTTPS URL.",
+    });
+  });
 
   it("rejects a count mismatch after reading all watchlist pages", async () => {
     const rows = Array.from({ length: 1001 }, (_, index) => ({ wallet_hex: wallet(index + 1) }));
@@ -380,9 +399,10 @@ describe("overview shows the followed set and paper results, not the ranked univ
   });
 });
 
-describe("daily realized P&L calendar", () => {
+describe("paper results: daily realized P&L and open fills", () => {
   const fill = (index: number) => ({
     idempotency_key: `key-${String(index).padStart(5, "0")}`,
+    leader_wallet: wallet(index),
     market_id: `market-${String(index).padStart(5, "0")}`,
     outcome_id: 1,
     side: "buy",
@@ -397,15 +417,17 @@ describe("daily realized P&L calendar", () => {
     settled_at_unix: Date.parse("2026-11-10T12:00:00Z") / 1000,
   });
 
-  function stubTables(count: number, failing?: string) {
+  function stubTables(count: number, failing?: string, settledCount = count) {
     const fills = Array.from({ length: count }, (_, index) => fill(index + 1));
-    const settled = Array.from({ length: count }, (_, index) => settlement(index + 1));
+    const settled = Array.from({ length: settledCount }, (_, index) => settlement(index + 1));
     const pages: Record<string, number> = {};
     stubSupabase((table, params) => {
       pages[table] = (pages[table] ?? 0) + 1;
       if (table === failing && pages[table] === 2) return { error: "later page failed" };
       if (table === "paper_fills") {
-        expect(params.get("select")).toBe("idempotency_key,market_id,outcome_id,side,contracts,fill_price,principal,fee");
+        expect(params.get("select")).toBe(
+          "idempotency_key,leader_wallet,market_id,outcome_id,side,contracts,fill_price,principal,fee",
+        );
         return { data: page(fills, "idempotency_key", params) };
       }
       expect(table).toBe("settled_markets");
@@ -415,18 +437,27 @@ describe("daily realized P&L calendar", () => {
     return pages;
   }
 
-  it.each([0, 1001])("reads every fill and settlement (%i of each)", async (count) => {
+  it.each([0, 1000, 1001])("reads every fill and settlement (%i of each)", async (count) => {
     const pages = stubTables(count);
     // Each won fill: 10 × 1 − 4 − 0.1 = 5.9.
-    expect(await fetchDailyPnl()).toEqual(
-      count === 0 ? [] : [{ day: "2026-11-10", pnl: expect.closeTo(count * 5.9, 6) }],
-    );
-    expect(pages).toEqual({ paper_fills: count > 1000 ? 2 : 1, settled_markets: count > 1000 ? 2 : 1 });
+    expect(await fetchPaperResults()).toEqual({
+      daily: count === 0 ? [] : [{ day: "2026-11-10", pnl: expect.closeTo(count * 5.9, 6) }],
+      openFills: [],
+    });
+    const fullPages = Math.floor(count / 1000) + 1;
+    expect(pages).toEqual({ paper_fills: fullPages, settled_markets: fullPages });
+  });
+
+  it("returns exactly the unsettled fills, including those past the first 1,000 rows", async () => {
+    stubTables(1001, undefined, 999);
+    const { daily, openFills } = await fetchPaperResults();
+    expect(daily).toEqual([{ day: "2026-11-10", pnl: expect.closeTo(999 * 5.9, 6) }]);
+    expect(openFills).toEqual([fill(1000), fill(1001)]);
   });
 
   it.each(["paper_fills", "settled_markets"])("rejects when the second %s page fails", async (table) => {
     stubTables(1001, table);
-    await expect(fetchDailyPnl()).rejects.toThrow("later page failed");
+    await expect(fetchPaperResults()).rejects.toThrow("later page failed");
   });
 
   it.each([

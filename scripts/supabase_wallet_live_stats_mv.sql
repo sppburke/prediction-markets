@@ -23,21 +23,27 @@ create unique index if not exists wallet_live_stats_mv_wallet
 -- The site reads this with the anon key (same exposure as the `wallet_live_stats` view).
 grant select on wallet_live_stats_mv to anon;
 
--- Schedule a refresh every 2 minutes (analytics — 2-min staleness is fine). Guarded by a
--- pg_cron availability check so this file still loads on a vanilla Postgres (CI / docker),
--- which has no pg_cron; on Supabase (pg_cron available) it enables the extension and schedules.
--- `cron.schedule(jobname, ...)` is idempotent by name. If pg_cron is absent, schedule the
--- refresh externally (`refresh materialized view concurrently wallet_live_stats_mv`).
+-- Refresh every 20 seconds and keep one week of run history. Guarded by a pg_cron availability
+-- check so this file still loads on a vanilla Postgres (CI / docker), which has no pg_cron; on
+-- Supabase (pg_cron available) it enables the extension and schedules. `cron.schedule(jobname, ...)`
+-- is idempotent by name. pg_cron never deletes `cron.job_run_details`, so the daily purge bounds it.
+-- If pg_cron is absent, schedule the refresh externally
+-- (`refresh materialized view concurrently wallet_live_stats_mv`).
 do $$
 begin
   if exists (select 1 from pg_available_extensions where name = 'pg_cron') then
     create extension if not exists pg_cron;
     perform cron.schedule(
       'refresh_wallet_live_stats_mv',
-      '*/2 * * * *',
+      '20 seconds',
       'refresh materialized view concurrently wallet_live_stats_mv'
     );
-    raise notice 'pg_cron: scheduled refresh_wallet_live_stats_mv every 2 minutes';
+    perform cron.schedule(
+      'purge_cron_job_run_details',
+      '17 3 * * *',
+      'delete from cron.job_run_details where end_time < now() - interval ''7 days'''
+    );
+    raise notice 'pg_cron: refresh_wallet_live_stats_mv every 20 seconds; run history purged daily';
   else
     raise notice 'pg_cron not available; refresh wallet_live_stats_mv externally';
   end if;

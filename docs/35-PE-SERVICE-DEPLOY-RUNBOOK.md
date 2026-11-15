@@ -1112,7 +1112,7 @@ Projection convergence requires the status token to equal
 Retention-aware source continuity and paper/live prefixes must pass. Neither manifest membership
 nor `max(batch_id)` is compared (`verified_ranking_membership: skipped: successor`).
 
-After the materialized-view refresh and the site's existing page revalidation, confirm that paper
+After the materialized-view refresh and a site reload, confirm that paper
 P&L/trades contain only the current era; new-era trades may already appear. Historical ranking
 statistics remain. This dashboard confirmation is an operator check, not a driver PASS field.
 

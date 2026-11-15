@@ -5,22 +5,26 @@ import { PnlCalendar } from "@/components/PnlCalendar";
 import { WalletTabs } from "@/components/WalletTabs";
 import { centralDay } from "@/lib/daily-pnl";
 import {
-  fetchDailyPnl,
-  fetchOpenFills,
+  fetchPaperResults,
   fetchWalletStats,
   fetchWatchedSet,
   NotConfiguredError,
 } from "@/lib/data";
 
-// Server-rendered with ISR: the wallet_live_stats_mv read runs on the server and the result is
-// cached + shared across all viewers for up to `revalidate` seconds, instead of re-querying
-// Supabase from every browser on every page view.
-export const revalidate = 60;
+// Rendered on every request, so one reload shows the latest paper results. The wallet stats come
+// from the `wallet_live_stats_mv` materialized view, which pg_cron refreshes every 20 seconds.
+export const dynamic = "force-dynamic";
 
 export default async function OverviewPage() {
+  // The three reads are independent: start them together, then await each in display order.
+  const statsRead = fetchWalletStats();
+  const watchedRead = fetchWatchedSet();
+  // A failed read shows its message; it must never look like a calendar without P&L.
+  const paperRead = fetchPaperResults().catch((e: unknown) => new Error((e as Error).message));
+
   let rows;
   try {
-    rows = await fetchWalletStats();
+    rows = await statsRead;
   } catch (e: unknown) {
     const message =
       e instanceof NotConfiguredError
@@ -34,13 +38,11 @@ export default async function OverviewPage() {
 
   // The count and set come from the same token-guarded projection snapshot. Unavailable is not
   // represented as an empty set: the UI keeps that state visibly distinct from valid empty.
-  const watchedProjection = await fetchWatchedSet();
+  const watchedProjection = await watchedRead;
   const watched = watchedProjection.status === "available" ? watchedProjection.count : null;
   const watchedSet =
     watchedProjection.status === "available" ? [...watchedProjection.wallets] : null;
-  const openFills = await fetchOpenFills().catch(() => []);
-  // A failed read shows its message; it must never look like a calendar without P&L.
-  const daily = await fetchDailyPnl().catch((e: unknown) => new Error((e as Error).message));
+  const paper = await paperRead;
 
   return (
     <div className="space-y-6">
@@ -52,17 +54,21 @@ export default async function OverviewPage() {
       </div>
       <KpiCards rows={rows} watched={watched} />
       <Panel title="Daily realized P&L · Central Time">
-        {daily instanceof Error ? (
-          <p className="text-xs text-neg">Daily P&L unavailable: {daily.message}</p>
+        {paper instanceof Error ? (
+          <p className="text-xs text-neg">Daily P&L unavailable: {paper.message}</p>
         ) : (
-          <PnlCalendar days={daily} today={centralDay(Date.now() / 1000)} />
+          <PnlCalendar days={paper.daily} today={centralDay(Date.now() / 1000)} />
         )}
       </Panel>
       <Panel title="Watched paper realized P&L by wallet">
         <PnlBarChart rows={rows} />
       </Panel>
       <Panel title="Wallets — historical vs watched">
-        <WalletTabs rows={rows} watchedSet={watchedSet} openFills={openFills} />
+        <WalletTabs
+          rows={rows}
+          watchedSet={watchedSet}
+          openFills={paper instanceof Error ? [] : paper.openFills}
+        />
       </Panel>
     </div>
   );
