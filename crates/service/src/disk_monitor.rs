@@ -104,7 +104,6 @@ impl DiskMonitor {
             &config.paper_state_db_path,
             &config.event_log_path,
             &config.status_path,
-            &config.jsonl_log_path,
         ] {
             let parent = path
                 .parent()
@@ -324,18 +323,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("not-a-directory");
         std::fs::write(&file, []).unwrap();
-        let setters: [fn(&mut ServiceConfig, PathBuf); 5] = [
+        let setters: [fn(&mut ServiceConfig, PathBuf); 4] = [
             |config, path| config.source_event_log_path = path,
             |config, path| config.paper_state_db_path = path,
             |config, path| config.event_log_path = path,
             |config, path| config.status_path = path,
-            |config, path| config.jsonl_log_path = path,
         ];
         for set_path in setters {
             let mut config = config_at(directory.path());
             set_path(&mut config, file.join("durable-file"));
             assert!(DiskMonitor::from_config(&config).is_err());
         }
+        let mut config = config_at(directory.path());
+        config.jsonl_log_path = file.join("unused.jsonl");
+        assert!(DiskMonitor::from_config(&config).is_ok());
     }
 
     #[test]

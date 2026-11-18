@@ -629,10 +629,7 @@ async fn run() -> Result<()> {
         );
     }
 
-    // Hold the rolling-log worker guards for the whole process; dropping them flushes the
-    // non-blocking writers (losing buffered lines), so keep `log_guards` alive until exit.
-    let log_guards =
-        pe_service::logging::setup(&cfg.jsonl_log_path, "info", cfg.log_retention_days)?;
+    pe_service::logging::setup("info")?;
     info!("pe-service starting");
     let nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile);
     if nofile.current != nofile.maximum {
@@ -1326,8 +1323,6 @@ async fn run() -> Result<()> {
         .clone();
     let (shutdown, _) = ShutdownController::new();
     let mut supervisor = TaskSupervisor::new(task_status.clone());
-    supervisor.register_external(TaskName::JsonTracingFullAppender);
-    supervisor.register_external(TaskName::JsonTracingErrorAppender);
     let paper_checkpoints = pe_service::disk_monitor::PaperCheckpointSlot::default();
     supervisor.spawn(
         TaskName::DiskMonitor,
@@ -2280,9 +2275,6 @@ async fn run() -> Result<()> {
         final_status_deadline,
     )
     .await;
-    drop(log_guards);
-    task_status.mark_stopped(TaskName::JsonTracingFullAppender);
-    task_status.mark_stopped(TaskName::JsonTracingErrorAppender);
     shutdown.advance(ShutdownPhase::Complete);
     let owners_joined = supervisor.join_all_bounded().await;
     #[cfg(feature = "scenario")]
@@ -2357,8 +2349,7 @@ fn log_task_event(event: &TaskEvent) {
             pe_service::supervisor::TaskClass::Critical => {
                 error!(task = %event.name, failure = %format_task_failure(event), "critical owner exited")
             }
-            pe_service::supervisor::TaskClass::BestEffortAnalytics
-            | pe_service::supervisor::TaskClass::BestEffortObservability => {
+            pe_service::supervisor::TaskClass::BestEffortAnalytics => {
                 warn!(task = %event.name, failure = %format_task_failure(event), "best-effort owner degraded")
             }
         }

@@ -9,7 +9,7 @@
 #   - Binary already built: cargo build --release -p pe-service
 #
 # The process runs for 30 minutes, then SIGINT is sent automatically.
-# Logs land in smoke-test/paper.jsonl (JSONL) and smoke-test/paper.log (binary).
+# Logs land in smoke-test/service.log (JSONL) and smoke-test/paper.log (binary).
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -30,11 +30,11 @@ source .env
 set +a
 
 echo "Starting pe-service smoke test (30 min)..."
-echo "Logs: smoke-test/paper.jsonl"
+echo "Logs: smoke-test/service.log"
 echo "Press Ctrl-C to stop early."
 
 # Run for 30 minutes then send SIGINT for graceful shutdown.
-timeout --signal=INT 1800 ./target/release/pe-service smoke-test/service.toml || {
+timeout --signal=INT 1800 ./target/release/pe-service smoke-test/service.toml 2> >(tee smoke-test/service.log >&2) || {
     code=$?
     # exit code 124 = timeout (expected); 130 = SIGINT (user Ctrl-C); 0 = clean exit
     if [[ $code -eq 124 || $code -eq 130 || $code -eq 0 ]]; then
@@ -47,15 +47,15 @@ timeout --signal=INT 1800 ./target/release/pe-service smoke-test/service.toml ||
 
 echo ""
 echo "=== Smoke-test summary ==="
-echo "JSONL log: smoke-test/paper.jsonl"
+echo "JSONL log: smoke-test/service.log"
 echo "Binary log: smoke-test/paper.log"
 
-if [[ -f smoke-test/paper.jsonl ]]; then
+if [[ -f smoke-test/service.log ]]; then
     echo ""
     echo "--- Last 20 log lines ---"
-    tail -20 smoke-test/paper.jsonl
+    tail -20 smoke-test/service.log
     echo ""
     echo "--- Event counts ---"
-    jq -r '.msg // .message // "unknown"' smoke-test/paper.jsonl 2>/dev/null | sort | uniq -c | sort -rn | head -20 || \
-        grep -o '"msg":"[^"]*"' smoke-test/paper.jsonl | sort | uniq -c | sort -rn | head -20 || true
+    jq -r '.msg // .message // "unknown"' smoke-test/service.log 2>/dev/null | sort | uniq -c | sort -rn | head -20 || \
+        grep -o '"msg":"[^"]*"' smoke-test/service.log | sort | uniq -c | sort -rn | head -20 || true
 fi

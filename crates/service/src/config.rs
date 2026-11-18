@@ -82,9 +82,7 @@ pub struct ServiceConfig {
     #[serde(default = "default_copy_latency_budget_secs")]
     pub copy_latency_budget_secs: u64,
 
-    /// Base path for the rolling JSONL observability logs. Its directory + file stem name the
-    /// full-stream files (`<stem>.<date>.jsonl`); an `errors.<date>.jsonl` (WARN+ERROR only) is
-    /// written alongside. Both rotate daily, keeping `log_retention_days` files.
+    /// Accepted for compatibility but unused. Tracing goes to stderr; no log files are written.
     #[serde(default = "default_jsonl_log_path")]
     pub jsonl_log_path: PathBuf,
 
@@ -98,11 +96,6 @@ pub struct ServiceConfig {
     /// See `docs/_GLOSSARY.md`: `status_interval_secs`.
     #[serde(default = "default_status_interval_secs")]
     pub status_interval_secs: u64,
-
-    /// Daily-rotated JSONL files kept per sink (full stream + errors). Bounds disk; older
-    /// files are deleted. Default: 7. See `docs/_GLOSSARY.md`: `log_retention_days`.
-    #[serde(default = "default_log_retention_days")]
-    pub log_retention_days: usize,
 
     // ── Paper trading state ──────────────────────────────────────────────────
     /// Path to the crash-safe paper-state SQLite database.
@@ -412,10 +405,6 @@ const fn default_status_interval_secs() -> u64 {
     30
 }
 
-const fn default_log_retention_days() -> usize {
-    7
-}
-
 fn default_paper_state_db_path() -> PathBuf {
     PathBuf::from("./paper_state.db")
 }
@@ -469,7 +458,6 @@ impl Default for ServiceConfig {
             jsonl_log_path: default_jsonl_log_path(),
             status_path: default_status_path(),
             status_interval_secs: default_status_interval_secs(),
-            log_retention_days: default_log_retention_days(),
             paper_state_db_path: default_paper_state_db_path(),
             legacy_wallet_history_path: default_legacy_wallet_history_path(),
             gamma_base_url: default_gamma_base_url(),
@@ -547,7 +535,6 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
         "jsonl_log_path",
         "status_path",
         "status_interval_secs",
-        "log_retention_days",
         "paper_state_db_path",
         "legacy_wallet_history_path",
         "gamma_base_url",
@@ -673,7 +660,6 @@ mod tests {
         assert_eq!(cfg.bind, "127.0.0.1:8080");
         assert_eq!(cfg.status_path, PathBuf::from("./status.json"));
         assert_eq!(cfg.status_interval_secs, 30);
-        assert_eq!(cfg.log_retention_days, 7);
         assert_eq!(cfg.polymarket_channel_capacity, 256);
         assert_eq!(
             cfg.polygon_receipt_rpc_url,

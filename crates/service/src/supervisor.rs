@@ -46,13 +46,11 @@ pub enum TaskName {
     DiskMonitor,
     SupabaseAnalyticsSink,
     LiquiditySnapshotWorker,
-    JsonTracingFullAppender,
-    JsonTracingErrorAppender,
 }
 
 impl TaskName {
     /// Complete ordinary-service owner inventory used by scenario coverage.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 16] = [
         Self::ActivityIngest,
         Self::PublicActivityPoll,
         Self::Orchestrator,
@@ -69,8 +67,6 @@ impl TaskName {
         Self::DiskMonitor,
         Self::SupabaseAnalyticsSink,
         Self::LiquiditySnapshotWorker,
-        Self::JsonTracingFullAppender,
-        Self::JsonTracingErrorAppender,
     ];
 
     #[must_use]
@@ -78,9 +74,6 @@ impl TaskName {
         match self {
             Self::SupabaseAnalyticsSink | Self::LiquiditySnapshotWorker => {
                 TaskClass::BestEffortAnalytics
-            }
-            Self::JsonTracingFullAppender | Self::JsonTracingErrorAppender => {
-                TaskClass::BestEffortObservability
             }
             _ => TaskClass::Critical,
         }
@@ -105,9 +98,6 @@ impl TaskName {
             | Self::LiquiditySnapshotWorker => ShutdownPhase::StopSinks,
             Self::HttpServer => ShutdownPhase::StopHttp,
             Self::StatusWriter => ShutdownPhase::FinalStatus,
-            Self::JsonTracingFullAppender | Self::JsonTracingErrorAppender => {
-                ShutdownPhase::Complete
-            }
         }
     }
 }
@@ -131,8 +121,6 @@ impl fmt::Display for TaskName {
             Self::DiskMonitor => "disk_monitor",
             Self::SupabaseAnalyticsSink => "supabase_analytics_sink",
             Self::LiquiditySnapshotWorker => "liquidity_snapshot_worker",
-            Self::JsonTracingFullAppender => "json_tracing_full_appender",
-            Self::JsonTracingErrorAppender => "json_tracing_error_appender",
         })
     }
 }
@@ -143,7 +131,6 @@ impl fmt::Display for TaskName {
 pub enum TaskClass {
     Critical,
     BestEffortAnalytics,
-    BestEffortObservability,
 }
 
 /// Ordered shutdown stages. Owners stop only at their declared stage.
@@ -349,9 +336,7 @@ impl TaskStatus {
             }
             entry.state = match entry.class {
                 TaskClass::Critical => TaskRunState::Failed,
-                TaskClass::BestEffortAnalytics | TaskClass::BestEffortObservability => {
-                    TaskRunState::Degraded
-                }
+                TaskClass::BestEffortAnalytics => TaskRunState::Degraded,
             };
             entry.failure.clone()
         } else {
@@ -385,9 +370,7 @@ impl TaskStatus {
         }
         entry.state = match entry.class {
             TaskClass::Critical => TaskRunState::Failed,
-            TaskClass::BestEffortAnalytics | TaskClass::BestEffortObservability => {
-                TaskRunState::Degraded
-            }
+            TaskClass::BestEffortAnalytics => TaskRunState::Degraded,
         };
     }
 
@@ -644,7 +627,7 @@ mod tests {
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), TaskName::ALL.len());
-        assert_eq!(TaskName::ALL.len(), 18);
+        assert_eq!(TaskName::ALL.len(), 16);
         assert!(unique.contains(&TaskName::SourceCheckpoint));
         assert_eq!(TaskName::SourceCheckpoint.class(), TaskClass::Critical);
         assert_eq!(

@@ -3611,7 +3611,7 @@ async fn checkpoint_prefix_mismatch_invalidates_and_full_walks() {
     let output = boot_binary(&fixture.config_path, false).await;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("CRC"));
-    assert!(!fixture.logs().contains("pe-service listening"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("pe-service listening"));
     {
         use std::io::{Seek, SeekFrom};
         let mut file = std::fs::OpenOptions::new()
@@ -3902,7 +3902,7 @@ async fn retention_fence_on_an_unreadable_invalidation_record_exits_78() {
         String::from_utf8_lossy(&output.stderr).contains("install source retention fence"),
         "{output:?}"
     );
-    assert!(!fixture.logs().contains("pe-service listening"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("pe-service listening"));
 }
 
 fn checkpoint_sidecar(source: &Path, suffix: &str) -> PathBuf {
@@ -4085,7 +4085,7 @@ async fn previous_binary_rollback_matrix() {
                     String::from_utf8_lossy(&output.stderr).contains("CRC"),
                     "{row}: {output:?}"
                 );
-                assert!(!fixture.logs().contains("pe-service listening"));
+                assert!(!String::from_utf8_lossy(&output.stderr).contains("pe-service listening"));
                 assert_eq!(std::fs::read(&record).ok(), record_before);
                 std::fs::write(source, &source_before).unwrap();
             }
@@ -4101,7 +4101,7 @@ async fn previous_binary_rollback_matrix() {
                         .contains("install source retention fence"),
                     "{direction}: {output:?}"
                 );
-                assert!(!fixture.logs().contains("pe-service listening"));
+                assert!(!String::from_utf8_lossy(&output.stderr).contains("pe-service listening"));
                 assert_eq!(std::fs::read(&record).ok(), record_before, "{direction}");
                 let mut command = std::process::Command::new(binary);
                 command
@@ -4660,16 +4660,11 @@ async fn previous_binary_reuses_runtime_tail_anchor() {
         assert_eq!(census["walked"], 0, "{label}: {logs}");
         assert!(!bracketed, "{label} must reuse the tail anchor: {logs}");
         assert_eq!(live, vec![wallet.to_string()], "{label}: {logs}");
-        let mut all_logs = format!(
+        let all_logs = format!(
             "{logs}\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        for entry in std::fs::read_dir(fixture.dir.path()).unwrap().flatten() {
-            if entry.file_name().to_string_lossy().ends_with(".jsonl") {
-                all_logs.push_str(&std::fs::read_to_string(entry.path()).unwrap());
-            }
-        }
         assert!(
             !all_logs.lines().any(|line| {
                 let line = line.to_ascii_lowercase();

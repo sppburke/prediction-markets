@@ -32,6 +32,7 @@ DRIFT_SUITES = (
     "test_clob_reconciliation.py",
     "test_rank_cycle_manifest.py",
     "test_rank_and_push_loop.py",
+    "test_pe_watchdog.py",
     "test_ranker_duck_parity.py",
     "test_latency_shift_ref_oracle.py",
     "test_probe_gamma_ua.py",

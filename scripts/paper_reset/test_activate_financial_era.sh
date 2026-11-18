@@ -2344,7 +2344,7 @@ drive_to_verified "$root" || fail "target database override redirected the finan
 # FAIL: any target-file unrequested or LD-prefixed assignment reaches an offline target execution.
 root=$TEST_TMP/offline-environment-allowlist
 setup_fixture "$root"
-printf '%s\n' 'PE_MODE=paper' 'UNREQUESTED_OFFLINE=hidden' 'LD_DEBUG=libs' \
+printf '%s\n' 'PE_MODE=paper' 'PE_LOG_RETENTION_DAYS=7' 'UNREQUESTED_OFFLINE=hidden' 'LD_DEBUG=libs' \
   >> "$root/target/service.env"
 write_rehearsal_evidence "$root"
 driver_args "$root"
@@ -2369,6 +2369,7 @@ controls = {
 assert names - controls <= set(allowlisted), sorted(names - controls - set(allowlisted))
 assert environment[b"PE_MODE"] == b"paper"
 assert environment[b"PE_SUPABASE_SECRET_KEY"] == b"sb_secret_test_service_role"
+assert b"PE_LOG_RETENTION_DAYS" not in environment
 assert b"UNREQUESTED_OFFLINE" not in environment
 assert not any(name.startswith("LD_") for name in names), sorted(names)
 PY
