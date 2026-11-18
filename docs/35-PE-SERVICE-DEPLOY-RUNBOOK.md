@@ -1168,10 +1168,11 @@ new ranking publication only.
 **One log copy per host.** Every process on Forge and the VPS logs to journald only. Read it with
 `journalctl -o json --all`: one JSON object per record, and `--all` keeps fields over 4096 bytes.
 
-- Both hosts: `/etc/systemd/journald.conf.d/50-pe-logs.conf` holds `[Journal]`, `ForwardToSyslog=no` and
-  `MaxRetentionSec=14day` (about two weeks; journald deletes whole files, so the oldest line kept can be a little
-  under 14 days old, and the size caps still apply). rsyslog is disabled and its `/var/log/syslog*`, `auth.log*` and
-  `kern.log*` files are removed.
+- Both hosts: `/etc/systemd/journald.conf.d/50-pe-logs.conf` holds `[Journal]`, `ForwardToSyslog=no`,
+  `MaxRetentionSec=14day` and `MaxFileSec=1day`. journald deletes an archived file once its first entry is older than
+  `MaxRetentionSec` and never deletes the active file (systemd `journal-vacuum.c`), so daily files keep 13 to 14 days
+  instead of dropping a weeks-long file at once (journald.conf(5), `MaxFileSec=`). The size caps still apply. rsyslog is
+  disabled and its `/var/log/syslog*`, `auth.log*` and `kern.log*` files are removed.
 - Both hosts: `/etc/systemd/journald.conf.d/syslog.conf` is a symlink to `/dev/null`. It disables the rsyslog
   package's `/usr/lib/systemd/journald.conf.d/syslog.conf`, whose `ForwardToSyslog=yes` sorts after `50-pe-logs.conf`
   and would otherwise win (journald.conf(5)). `systemd-analyze cat-config systemd/journald.conf` shows the result.
