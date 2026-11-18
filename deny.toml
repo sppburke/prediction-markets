@@ -36,6 +36,11 @@ ignore = [
     # [bans] entries keep every other affected version out. Will resolve when rusqlite moves to
     # 0.41 or later.
     "RUSTSEC-2026-0459",
+    # chrono reaches us through the vendored polymarket_client_sdk_v2 and through serde_with
+    # (alloy-eips). Unmaintained notice only (RUSTSEC-2026-0543, all versions), no
+    # vulnerability, and no maintained release to move to. Will resolve when the SDK and
+    # serde_with move off chrono.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
