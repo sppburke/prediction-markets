@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Read-only Forge/VPS watchdog, run every minute by Hermes --no-agent.
 
-Stdout goes to Telegram verbatim; no news means no output. Python 3.11+, stdlib only.
+Stdout goes to Telegram verbatim, only for a problem, its resolution or a requested test
+(owner, 2026-11-18: no routine status); otherwise no output. Python 3.11+, stdlib only.
 Config: ~/.config/pe-watchdog/watchdog.env (KEY=VALUE: PE_SUPABASE_URL,
 PE_SUPABASE_ANON_KEY, PE_HEALTH_URL). State: ~/.local/state/pe-watchdog/state.json.
 Create ~/.config/pe-watchdog/send-test-alert for a TEST line. --dry-run prints only
@@ -27,7 +28,6 @@ TEST_FLAG = HOME / ".config/pe-watchdog/send-test-alert"
 STATE = HOME / ".local/state/pe-watchdog/state.json"
 CT = ZoneInfo("America/Chicago")
 LATE_HOURS = 11
-SUMMARY_HOUR = 9
 HOST_TIMEOUT = 120
 JOURNAL_LIMIT = 20000
 EVENT_WINDOW = dt.timedelta(hours=24)
@@ -370,12 +370,9 @@ def evaluate(state, observation, now):
             if host == "forge":
                 if active:
                     close_problem("loop_down", "Forge loop running again")
-                    s["planned_stop"] = s["stop_noted"] = False
-                elif s.get("planned_stop"):
-                    if not s.get("stop_noted"):
-                        messages.append(f"NOTE: Forge loop stopped by flag_stop at {ct(now)}")
-                        s["stop_noted"] = True
-                else:
+                    s["planned_stop"] = False
+                elif not s.get("planned_stop"):
+                    # A flag_stop is planned and silent; if it lasts, the no-new-batch check below reports it.
                     open_problem("loop_down", f"Forge loop not running since {ct(now)}")
             else:
                 polls = s["unit_polls"].setdefault(unit, {"down": 0, "active": 0})
@@ -408,17 +405,6 @@ def evaluate(state, observation, now):
                           if observation["batch_error"] else "")
             open_problem("late", f"no new ranking batch for {age_h:.1f} h (last: batch {batch_id} at {ct(created)});"
                          " the Forge loop may be stalled or stopped" + unreadable, batch_id=batch_id)
-
-    local = now.astimezone(CT)
-    if local.hour >= SUMMARY_HOUR and s.get("summary_date") != local.date().isoformat():
-        s["summary_date"] = local.date().isoformat()
-        last = s.get("last_batch")
-        batch = (f"last batch {last['id']} at {ct(dt.datetime.fromisoformat(last['created']))}" if last
-                 else "last batch unknown")
-        if observation["batch_error"]:
-            batch += " (newest batch unreadable)"
-        problems = "; ".join(i["text"] for i in s["open"].values()) or "no open problems"
-        messages.append(f"DAILY: {batch}; copy service {'ready' if health_ok else 'NOT ready'}; {problems}")
     return s, messages + evidence
 
 

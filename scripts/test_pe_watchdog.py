@@ -24,7 +24,7 @@ LOOP = "pe-rank-loop-15m5m.service"
 SERVICE = "pe-service.service"
 SITE = "pe-site.service"
 NGINX = "nginx.service"
-QUIET = {"summary_date": "2026-11-17"}
+QUIET = {}
 TEMPFAIL = "   [collect] TEMPFAIL exit 75 (temporary failure); aborting run for supervised retry"
 SUCCESS = "LOOP_CYCLE_END cycle=3 utc=2026-11-17T20:00:00Z status=0"
 DATADASH = "winner_discovery: datadash source failed — continuing with zero counts"
@@ -127,20 +127,18 @@ class Rules(unittest.TestCase):
         s, m = self.step(s, obs(), 2)
         self.assertTrue(m[0].startswith("RESOLVED: Forge loop running again"))
 
-    def test_planned_stop_one_note_persists_until_active_and_rearms(self):
+    def test_planned_stop_is_silent_until_active_and_rearms(self):
         for stop in ["LOOP_STOP reason=flag_stop", "LOOP_STOP reason=flag_stop_during_success_wait"]:
             with self.subTest(stop=stop):
                 s, m = self.step(observation=obs(forge_records=[forge(stop)], forge_state="inactive"))
-                self.assertEqual(len(m), 1)
-                self.assertTrue(m[0].startswith("NOTE: Forge loop stopped by flag_stop"))
+                self.assertEqual(m, [])
                 self.assertNotIn("loop_down", s["open"])
                 s, m = self.step(s, obs(forge_state="inactive"), 1)
                 self.assertEqual(m, [])
                 s, m = self.step(s, obs(), 2)
                 self.assertEqual(m, [])
-                s, m = self.step(s, obs(forge_records=[forge(stop)], forge_state="inactive"), 3)
-                self.assertEqual(len(m), 1)
-                self.assertTrue(m[0].startswith("NOTE:"))
+                s, m = self.step(s, obs(forge_state="inactive"), 3)
+                self.assertTrue(m[0].startswith("PROBLEM: Forge loop not running"))
 
     def test_missing_flag_is_not_a_planned_stop(self):
         _, m = self.step(observation=obs(forge_records=[forge("LOOP_STOP reason=flag_missing")], forge_state="inactive"))
@@ -291,25 +289,12 @@ class Rules(unittest.TestCase):
         s, m = self.step(s, obs(ok=False, created=T0, errors={"forge": "timeout"}), 241)
         self.assertEqual(m, [])
 
-    def test_daily_summary_once_after_nine_central(self):
-        morning = dt.datetime(2026, 11, 18, 14, 59, tzinfo=UTC)
-        s, m = w.evaluate(QUIET, obs(created=morning), morning)
-        self.assertEqual(m, [])
-        s, m = w.evaluate(s, obs(created=morning), morning + dt.timedelta(minutes=1))
-        self.assertEqual(m, ["DAILY: last batch 159 at 8:59 AM Nov 18; copy service ready; no open problems"])
-        s, m = w.evaluate(s, obs(created=morning), morning + dt.timedelta(minutes=2))
-        self.assertEqual(m, [])
-
-    def test_daily_includes_open_problems_and_last_known_batch_on_query_failure(self):
-        s, _ = self.step(observation=obs())
-        s.pop("summary_date")
-        s, _ = self.step(s, obs(ok=False), 1)
-        s.pop("summary_date")
-        _, m = self.step(s, obs(ok=False, err="timeout"), 2)
-        daily = next(x for x in m if x.startswith("DAILY:"))
-        self.assertIn("last batch 159 at 1:00 PM Nov 17 (newest batch unreadable)", daily)
-        self.assertIn("copy service NOT ready", daily)
-        self.assertIn("copy service not ready on the cloud server", daily)
+    def test_healthy_days_send_nothing(self):
+        s = QUIET
+        for minutes in range(0, 48 * 60, 30):  # across two 9 AM CT mornings
+            now = T0 + dt.timedelta(minutes=minutes)
+            s, m = w.evaluate(s, obs(created=now - dt.timedelta(hours=1)), now)
+            self.assertEqual(m, [])
 
     def test_central_time_uses_daylight_saving_time(self):
         self.assertEqual(w.ct(dt.datetime(2026, 7, 1, 14, 0, tzinfo=UTC)), "9:00 AM Jul 1")
@@ -400,7 +385,6 @@ class Events(unittest.TestCase):
                 self.assertEqual(m, [])
                 later = copy.deepcopy(o)
                 later["created"] = T0 + dt.timedelta(hours=24)
-                s["summary_date"] = "2026-11-18"
                 s, m = self.step(s, later, 24 * 60 - 1)
                 self.assertEqual(m, [])
                 s, m = self.step(s, later, 24 * 60)
@@ -458,7 +442,6 @@ class Events(unittest.TestCase):
             with self.subTest(recovery=recovery):
                 s, _ = self.step(observation=obs(vps_records=[service(failure, "ERROR")]))
                 later = T0 + dt.timedelta(hours=24, seconds=1)
-                s["summary_date"] = "2026-11-18"
                 s, m = w.evaluate(s, obs(vps_records=[service(recovery, "INFO")], created=later), later)
                 self.assertEqual(m, [])
                 self.assertEqual(s["events"], {})
@@ -855,12 +838,13 @@ class Main(unittest.TestCase):
         return output.getvalue()
 
     def test_normal_writes_state_atomically_no_lock_and_prints_header(self):
+        self.observer.return_value = obs(vps_records=[service("unexpected failure", "ERROR")])
         replace = w.os.replace
         with patch.object(w.os, "replace", wraps=replace) as atomic:
             output = self.run_main()
-        self.assertTrue(output.startswith("pe-watchdog\nDAILY:"))
+        self.assertTrue(output.startswith("pe-watchdog\nEVENT: copy service warning/error"))
         atomic.assert_called_once_with(self.state.with_suffix(".tmp"), self.state)
-        self.assertEqual(json.loads(self.state.read_text())["summary_date"], "2026-11-17")
+        self.assertEqual(json.loads(self.state.read_text())["last_batch"]["id"], 159)
         self.assertFalse(self.state.with_suffix(".tmp").exists())
         self.assertFalse(self.state.with_suffix(".lock").exists())
         conf = self.observer.call_args.args[0]
@@ -868,8 +852,8 @@ class Main(unittest.TestCase):
         self.assertEqual(conf["PE_HEALTH_URL"], "http://82.22.32.225:8080/health/ready")
         self.assertEqual(output.splitlines()[0], "pe-watchdog")
 
-    def test_healthy_subsequent_run_stdout_is_empty(self):
-        self.run_main()
+    def test_healthy_runs_print_nothing(self):
+        self.assertEqual(self.run_main(), "")
         self.assertEqual(self.run_main(), "")
 
     def test_flag_sends_test_and_is_removed_once(self):
@@ -883,8 +867,7 @@ class Main(unittest.TestCase):
         self.flag.touch()
         with patch.object(w.os, "replace") as replace:
             output = self.run_main(dry=True)
-        self.assertTrue(output.startswith("pe-watchdog\nDAILY:"))
-        self.assertIn("\nTEST: pe-watchdog is running on merlin", output)
+        self.assertEqual(output, "pe-watchdog\nTEST: pe-watchdog is running on merlin (2:00 PM Nov 17)\n")
         self.assertTrue(self.flag.exists())
         self.assertFalse(self.state.parent.exists())
         replace.assert_not_called()
