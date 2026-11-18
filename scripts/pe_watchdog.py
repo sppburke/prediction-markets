@@ -149,7 +149,10 @@ def read_host(host, cursor=None):
             raise ValueError("SSH exit 255")
         parsed = parse_host_output(host, result.stdout)
         if parsed["error"]:
-            reset_cursor = bool(cursor and parsed["journal_failed"])
+            # Only a cursor journalctl cannot seek to is unrecoverable; any other journal
+            # error keeps the cursor so the next read resumes without a gap.
+            reset_cursor = bool(cursor and parsed["journal_failed"]
+                                and "Failed to seek to cursor" in stderr)
             raise ValueError(parsed["error"])
         return parsed
     except Exception as error:

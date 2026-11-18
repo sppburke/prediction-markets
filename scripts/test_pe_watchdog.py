@@ -723,13 +723,21 @@ class Reads(unittest.TestCase):
                 s, _ = w.evaluate({**QUIET, "cursors": {"forge": "previous"}}, observation, T0)
                 self.assertEqual(s["cursors"]["forge"], "previous")
 
-    def test_journal_failure_resets_cursor_even_if_other_output_is_incomplete(self):
+    def test_only_a_cursor_seek_failure_resets_the_cursor(self):
         for output in ("@@ 1\n", '{"MESSAGE":"missing cursor"}\n@@ 1\n', "bad JSON\n@@ 1\n"):
-            result = subprocess.CompletedProcess([], 0, stdout=output, stderr="journalctl failed")
-            with self.subTest(output=output), patch.object(w.subprocess, "run", return_value=result):
-                read = w.read_host("forge", "previous")
-            self.assertIn("journalctl exit 1", read["error"])
-            self.assertTrue(read["reset_cursor"])
+            for stderr, reset in (("Failed to seek to cursor: Invalid argument", True),
+                                  ("Failed to iterate through journal: Input/output error", False),
+                                  ("journalctl failed", False)):
+                result = subprocess.CompletedProcess([], 0, stdout=output, stderr=stderr)
+                with self.subTest(output=output, stderr=stderr), \
+                        patch.object(w.subprocess, "run", return_value=result):
+                    read = w.read_host("forge", "previous")
+                self.assertIn("journalctl exit 1", read["error"])
+                self.assertEqual(read["reset_cursor"], reset)
+                observation = obs()
+                observation["hosts"]["forge"] = read
+                s, _ = w.evaluate({**QUIET, "cursors": {"forge": "previous"}}, observation, T0)
+                self.assertEqual("forge" in s["cursors"], not reset)
 
     def test_only_exactly_20000_records_accepts_nonzero_status_and_advances_cursor(self):
         for host, units in w.HOST_UNITS.items():
@@ -753,7 +761,7 @@ class Reads(unittest.TestCase):
                         self.assertEqual(m, [])
                     else:
                         self.assertIn("journalctl exit 141", read["error"])
-                        self.assertEqual(read["reset_cursor"], count < 20000)
+                        self.assertFalse(read["reset_cursor"])  # "Broken pipe", not a seek failure
 
     def test_cursors_advance_per_host_and_resume_after_failed_reads(self):
         s = {**QUIET, "cursors": {"forge": "f0", "vps": "v0"}}

@@ -461,15 +461,26 @@ impl Child {
 
             let mut bytes = Vec::new();
             let mut chunk = [0; 8192];
+            let mut logged = 0;
             loop {
                 let read = pipe.read(&mut chunk).unwrap();
                 if read == 0 {
                     break;
                 }
-                if let Some(log) = &mut log {
-                    log.write_all(&chunk[..read]).unwrap();
-                }
+                let start = bytes.len();
                 bytes.extend_from_slice(&chunk[..read]);
+                // Publish whole lines only, so a log reader never sees half a JSON record.
+                if let (Some(log), Some(offset)) = (
+                    &mut log,
+                    chunk[..read].iter().rposition(|&byte| byte == b'\n'),
+                ) {
+                    let end = start + offset + 1;
+                    log.write_all(&bytes[logged..end]).unwrap();
+                    logged = end;
+                }
+            }
+            if let Some(log) = &mut log {
+                log.write_all(&bytes[logged..]).unwrap();
             }
             bytes
         }
