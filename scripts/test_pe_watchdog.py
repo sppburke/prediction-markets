@@ -529,6 +529,19 @@ class Events(unittest.TestCase):
             '2026/11/17 20:00:00 [error] 123#123: *4 connect() failed (111: Connection refused) while connecting to upstream', NGINX)]))
         self.assertEqual(len(alerts(m)), 1)
 
+    def test_nginx_reload_notice_and_warn_silent_but_crit_and_emerg_report(self):
+        quiet = [record("2026/11/18 16:40:30 [notice] 1856204#1856204: signal process started", NGINX,
+                        SYSLOG_IDENTIFIER="nginx", _TRANSPORT="stdout"),
+                 record('2026/11/18 16:40:30 [warn] 1856204#1856204: conflicting server name "polymarketpe.duckdns.org" '
+                        "on 0.0.0.0:3000, ignored", NGINX)]
+        _, m = self.step(observation=obs(vps_records=quiet))
+        self.assertEqual(m, [])
+        _, m = self.step(observation=obs(vps_records=[
+            record("fxvps332192 nginx: 2026/11/18 16:45:00 [crit] 717#717: *9 SSL_do_handshake() failed", NGINX),
+            record('2026/11/18 16:45:00 [emerg] 1856300#1856300: unknown directive "acces_log" in /etc/nginx/nginx.conf:40',
+                   NGINX)]))
+        self.assertEqual(len(alerts(m)), 2)
+
     def test_host_kernel_io_error_reports_but_sshd_and_wait_online_timeouts_do_not(self):
         noise = [record("Failed password for invalid user admin from 192.0.2.5 port 42100 ssh2", "ssh.service", PRIORITY="3", SYSLOG_IDENTIFIER="sshd"),
                  record("error: kex_exchange_identification: Connection closed by remote host", "", PRIORITY="3", SYSLOG_IDENTIFIER="sshd"),

@@ -92,7 +92,9 @@ NGINX_ACCESS = re.compile(
     r'\S+ \S+ \S+ \[[^\]]+\] "(?P<method>\S+) (?P<path>\S+) [^"]+" '
     r'(?P<status>\d{3}) (?:\d+|-) "[^"]*" "[^"]*"'
 )
-NGINX_ERROR = re.compile(r"\[(?:emerg|alert|crit|error|warn|notice|info|debug)\]")
+# Only error-level entries are site errors: error_log defaults to level error, and every
+# `nginx -s reload` prints "[notice] ... signal process started" on stdout.
+NGINX_ERROR = re.compile(r"\[(?:emerg|alert|crit|error)\]")
 
 
 def fetch_json(url, headers=None, timeout=8):
