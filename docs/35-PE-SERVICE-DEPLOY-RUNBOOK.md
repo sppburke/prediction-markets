@@ -1169,8 +1169,12 @@ new ranking publication only.
 `journalctl -o json --all`: one JSON object per record, and `--all` keeps fields over 4096 bytes.
 
 - Both hosts: `/etc/systemd/journald.conf.d/50-pe-logs.conf` holds `[Journal]`, `ForwardToSyslog=no` and
-  `MaxRetentionSec=14day` (about two weeks; the size caps still apply). rsyslog is disabled and its
-  `/var/log/syslog*`, `auth.log*` and `kern.log*` files are removed.
+  `MaxRetentionSec=14day` (about two weeks; journald deletes whole files, so the oldest line kept can be a little
+  under 14 days old, and the size caps still apply). rsyslog is disabled and its `/var/log/syslog*`, `auth.log*` and
+  `kern.log*` files are removed.
+- Both hosts: `/etc/systemd/journald.conf.d/syslog.conf` is a symlink to `/dev/null`. It disables the rsyslog
+  package's `/usr/lib/systemd/journald.conf.d/syslog.conf`, whose `ForwardToSyslog=yes` sorts after `50-pe-logs.conf`
+  and would otherwise win (journald.conf(5)). `systemd-analyze cat-config systemd/journald.conf` shows the result.
 - VPS nginx: `/etc/nginx/nginx.conf` sends `error_log` and `access_log` to `syslog:server=unix:/dev/log`, so both
   appear in `journalctl -u nginx`.
 - pe-service writes no log files; `jsonl_log_path` is accepted but unused.
@@ -1190,8 +1194,9 @@ Telegram (empty output is silent).
   test line on the next run.
 - Pause with `hermes cron pause <job>`. To remove it, run `hermes cron remove <job>` and delete the files above.
 
-Rollback of the log settings: delete `50-pe-logs.conf` and `systemctl restart systemd-journald` (stdout streams survive
-a restart); `systemctl enable --now rsyslog`; restore the two nginx lines, `nginx -t`, reload nginx.
+Rollback of the log settings: delete `50-pe-logs.conf` and the `syslog.conf` symlink, then `systemctl restart
+systemd-journald` (stdout streams survive a restart); `systemctl enable --now rsyslog`; restore the two nginx lines,
+`nginx -t`, reload nginx.
 
 ## #705 paper financial-semantic-2 cutover
 
