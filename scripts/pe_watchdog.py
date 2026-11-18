@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""Read-only Forge/VPS watchdog, run every minute by Hermes --no-agent.
+
+Stdout goes to Telegram verbatim; no news means no output. Python 3.11+, stdlib only.
+Config: ~/.config/pe-watchdog/watchdog.env (KEY=VALUE: PE_SUPABASE_URL,
+PE_SUPABASE_ANON_KEY, PE_HEALTH_URL). State: ~/.local/state/pe-watchdog/state.json.
+Create ~/.config/pe-watchdog/send-test-alert for a TEST line. --dry-run prints only
+what would be sent, without writing state or removing that flag. Runs never overlap.
+"""
+
+import copy
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+HOME = Path.home()
+CONF = HOME / ".config/pe-watchdog/watchdog.env"
+TEST_FLAG = HOME / ".config/pe-watchdog/send-test-alert"
+STATE = HOME / ".local/state/pe-watchdog/state.json"
+CT = ZoneInfo("America/Chicago")
+LATE_HOURS = 11
+SUMMARY_HOUR = 9
+HOST_TIMEOUT = 120
+JOURNAL_LIMIT = 20000
+EVENT_WINDOW = dt.timedelta(hours=24)
+LOOP = "pe-rank-loop-15m5m.service"
+VPS_UNITS = ("pe-service.service", "pe-site.service", "nginx.service")
+HOST_UNITS = {"forge": (LOOP,), "vps": VPS_UNITS}
+SSH_OPTIONS = ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+               "-o", "StrictHostKeyChecking=yes")
+
+FORGE_ROUTINE = frozenset({
+    "market participant skipped: infra tombstone",
+    "activity wallet excluded from generation",
+    "activity wallets excluded from the generation; see per-wallet exclusion reasons",
+    "activate-next: candidate pile depleted; activated remaining wallets",
+    "clob: transient fetch error — retrying page",
+    "events: transient fetch error — retrying page",
+    "market-scope: transient fetch error — retrying page",
+})
+SERVICE_ROUTINE = frozenset({
+    "activity ws connect failed",
+    "activity ws closed by peer",
+    "activity ws read error",
+    "activity ws reader produced no normalized activity row; dropping socket",
+    "unparseable activity frame",
+    "activity frames without payload",
+    "canary control connection failed",
+    "wallet scope problem ignored",
+    "wallet scope revision ignored",
+    "wallet scope ambiguity ignored",
+    "wallet scope dropped",
+    "live accounts poll attempt failed; retrying inside the tick",
+    "admission invalidated by durable wallet fence",
+    "position bracket: activity assets recorded raw-only",
+    "snapshot worker: requests dropped (channel full)",
+    "supabase sink: skipping non-winner-follow fill (no leader in idempotency key)",
+    "supabase sink: skipping non-winner-follow fill (no leader)",
+    "supabase sink: events dropped since last reconcile (self-healing)",
+    "anchor refresh skipped because wallet is durably fenced",
+    "anchor refresh skipped because causal validation fenced the wallet",
+    "live reentry: capacity changed before locked apply; retrying next tick",
+    "knockout: capacity changed during live reentry preparation; retrying batch",
+    "maintenance: candidate fetch returned 0; backfill paused (no surviving bench rows outside the live set, or the bench predates last_trade_unix)",
+    # Logged by the linked source crate; both precede a bounded retry
+    # (crates/source-polymarket-public/src/fetcher.rs:348-390).
+    "rate limited by the venue; retrying after the requested wait",
+    "venue reply is not one complete JSON document",
+})
+RECOVERIES = {
+    "paper-state WAL checkpoint error cleared":
+        "paper-state WAL checkpoint failed; retrying every tick",
+    "disk free space recovered": "disk free space below warning threshold",
+    "live watchlist refreshed from supabase":
+        "supabase refresh failed; keeping current watchlist",
+}
+PUBLISH_RETRY = re.compile(
+    r"WARNING: transient Supabase \S+ failure; retry \d+/\d+ in \d+s:"
+)
+LOOP_SUCCESS = re.compile(r"\bLOOP_(?:CYCLE_END|RESUME_END)\b.*\bstatus=0(?:\s|$)")
+# Match combined access logs before checking error-log severity markers: a user agent
+# or request path can itself contain '[error]'. Syslog may prepend a program name.
+NGINX_ACCESS = re.compile(
+    r'\S+ \S+ \S+ \[[^\]]+\] "(?P<method>\S+) (?P<path>\S+) [^"]+" '
+    r'(?P<status>\d{3}) (?:\d+|-) "[^"]*" "[^"]*"'
+)
+NGINX_ERROR = re.compile(r"\[(?:emerg|alert|crit|error|warn|notice|info|debug)\]")
+
+
+def fetch_json(url, headers=None, timeout=8):
+    req = urllib.request.Request(url, headers=headers or {})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as resp:
+        return resp.status, json.loads(resp.read(65536) or b"null")
+
+
+def remote_argv(host, cursor=None):
+    """Only the stored cursor is variable in the remote shell command."""
+    resume = "--after-cursor=" + shlex.quote(cursor) if cursor else "--since=-15min"
+    command = ("journalctl --all -o json --no-pager " + resume +
+               f" | head -n {JOURNAL_LIMIT}; " + 'echo "@@ ${PIPESTATUS[0]}"; ')
+    if host == "forge":
+        return [*SSH_OPTIONS, "pi@forge.tail72525f.ts.net",
+                command + "systemctl --user is-active pe-rank-loop-15m5m.service"]
+    if host == "vps":
+        return [*SSH_OPTIONS, "-i", str(HOME / ".ssh/id_personal"), "sean@82.22.32.225",
+                command + "systemctl is-active pe-service pe-site nginx"]
+    raise ValueError("unknown watchdog host")
+
+
+def parse_host_output(host, output):
+    lines = output.splitlines()
+    divider = next((i for i, line in enumerate(lines) if re.fullmatch(r"@@ [0-9]+", line)), None)
+    if divider is None:
+        raise ValueError("missing journalctl exit status")
+    journal_status = int(lines[divider].split()[1])
+    record_lines = [line for line in lines[:divider] if line.strip()]
+    if journal_status != 0 and len(record_lines) != JOURNAL_LIMIT:
+        return {"error": f"journalctl exit {journal_status} ({len(record_lines)} records)",
+                "journal_failed": len(record_lines) < JOURNAL_LIMIT}
+    records = [json.loads(line) for line in record_lines]
+    if any(not isinstance(r, dict) or not isinstance(r.get("__CURSOR"), str)
+           or not r["__CURSOR"] for r in records):
+        raise ValueError("journal record missing __CURSOR")
+    states = lines[divider + 1:]
+    if len(states) != len(HOST_UNITS[host]) or any(not s.strip() for s in states):
+        raise ValueError("incomplete systemctl states")
+    return {"records": records, "units": dict(zip(HOST_UNITS[host], states)), "error": None}
+
+
+def read_host(host, cursor=None):
+    stderr, reset_cursor = "", False
+    try:
+        result = subprocess.run(remote_argv(host, cursor), capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=HOST_TIMEOUT,
+                                check=False)
+        stderr = result.stderr
+        # The final systemctl status is independent of journalctl's pipeline status.
+        # SSH transport failures use 255; stderr may contain harmless remote notices.
+        if result.returncode == 255:
+            raise ValueError("SSH exit 255")
+        parsed = parse_host_output(host, result.stdout)
+        if parsed["error"]:
+            # Only a cursor journalctl cannot seek to is unrecoverable; any other journal
+            # error keeps the cursor so the next read resumes without a gap.
+            reset_cursor = bool(cursor and parsed["journal_failed"]
+                                and "Failed to seek to cursor" in stderr)
+            raise ValueError(parsed["error"])
+        return parsed
+    except Exception as error:
+        stderr = getattr(error, "stderr", None) or stderr
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        detail = one_line(f"{type(error).__name__}: {error}", 100)
+        if stderr.strip():
+            detail += "; stderr: " + one_line(stderr.strip(), 90)
+        return {"error": detail, "reset_cursor": reset_cursor}
+
+
+def observe(conf, state):
+    """Parsed hosts plus health_ok/detail, batch_id/created, and batch_error.
+
+    Each successful host has records (journal dictionaries) and units (canonical
+    unit -> is-active state); a failed host has an error string and may request
+    reset_cursor. created is an aware UTC datetime or None. All I/O is outside evaluate.
+    """
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reads = {h: pool.submit(read_host, h, state.get("cursors", {}).get(h))
+                 for h in HOST_UNITS}
+        try:
+            status, body = fetch_json(conf["PE_HEALTH_URL"], timeout=5)
+            health_ok = status == 200 and isinstance(body, dict) and body.get("ready") is True
+            health_detail = f"HTTP {status}, ready={body.get('ready') if isinstance(body, dict) else body!r}"
+        except Exception as error:
+            health_ok, health_detail = False, f"{type(error).__name__}: {error}"[:200]
+        batch_id = created = batch_error = None
+        try:
+            key = conf["PE_SUPABASE_ANON_KEY"]
+            url = (conf["PE_SUPABASE_URL"].rstrip("/") +
+                   "/rest/v1/ranking_batches?select=batch_id,created_at&order=batch_id.desc&limit=1")
+            status, rows = fetch_json(url, {"apikey": key, "Authorization": f"Bearer {key}"}, timeout=10)
+            row = rows[0]
+            created = dt.datetime.fromisoformat(row["created_at"].replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+            batch_id = int(row["batch_id"])
+        except Exception as error:
+            batch_id = created = None
+            batch_error = f"{type(error).__name__}: {error}"[:200]
+        return {"hosts": {h: f.result() for h, f in reads.items()},
+                "health_ok": health_ok, "health_detail": health_detail,
+                "batch_id": batch_id, "created": created, "batch_error": batch_error}
+
+
+def ct(t):
+    return t.astimezone(CT).strftime("%-I:%M %p %b %-d")
+
+
+def one_line(text, limit=500):
+    text = " ".join(text.splitlines())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def message_parts(record):
+    raw = record.get("MESSAGE", "")
+    if isinstance(raw, list):
+        raw = bytes(raw).decode("utf-8", errors="replace")
+    if not isinstance(raw, str):
+        raw = ""
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        fields = body.get("fields")
+        fields = fields if isinstance(fields, dict) else body
+        message = fields.get("message", "")
+        return raw, str(message), str(body.get("level", "")), fields.get("kind"), "kind" in fields, True
+    return raw, raw, "", None, False, False
+
+
+def record_unit(host, record):
+    fields = ("_SYSTEMD_USER_UNIT", "USER_UNIT") if host == "forge" else ("_SYSTEMD_UNIT", "UNIT")
+    for field in fields:
+        if record.get(field) in HOST_UNITS[host]:
+            return record[field]
+    for field in (*fields, "_SYSTEMD_UNIT", "UNIT"):
+        if record.get(field):
+            return record[field]
+    return ""
+
+
+def masked_text(text):
+    # Short bare words such as 'bad' are not identifiers; prefixed hex always is.
+    text = re.sub(r"\b(?:0x[0-9a-fA-F]+|[0-9a-fA-F]{6,})\b", "#", text)
+    return re.sub(r"\d+", "#", text)
+
+
+def host_noise(record, unit, message):
+    identities = (unit, record.get("SYSLOG_IDENTIFIER", ""), record.get("_COMM", ""))
+    if any(i.startswith("sshd") or i == "ssh.service" for i in identities):
+        return True
+    return (any("systemd-networkd-wait-online" in i for i in identities)
+            and re.search(r"timeout|timed out", message, re.IGNORECASE) is not None)
+
+
+def evaluate(state, observation, now):
+    """Pure rule step: (new JSON-serializable state, plain-text message lines).
+
+    See observe's observation schema. now is an aware UTC datetime. Failed reads
+    break unit poll streaks; journalctl failures request a cursor reset. Recovery
+    events resolve matching recent message keys (including every kind variant).
+    """
+    s = copy.deepcopy(state)
+    for key in ("open", "cursors", "events", "host_failures", "unit_polls"):
+        s.setdefault(key, {})
+    s["events"] = {key: last for key, last in s["events"].items()
+                   if now - dt.datetime.fromisoformat(last) <= EVENT_WINDOW}
+    messages, evidence = [], []
+
+    def open_problem(key, text, **details):
+        if key not in s["open"]:
+            s["open"][key] = {"since": now.isoformat(), "text": text, **details}
+            messages.append(f"PROBLEM: {text}")
+
+    def close_problem(key, text):
+        if key in s["open"]:
+            since = dt.datetime.fromisoformat(s["open"].pop(key)["since"])
+            mins = int((now - since).total_seconds() // 60)
+            messages.append(f"RESOLVED: {text} (lasted {mins // 60} h {mins % 60} min)")
+
+    def event(host, unit, parts, label, identity=None):
+        raw, message, level, kind, has_kind, structured = parts
+        if identity is None:
+            identity = [message] + ([kind] if has_kind else []) if structured else [masked_text(raw)]
+        key = json.dumps([host, unit, *identity], ensure_ascii=False)
+        last = s["events"].get(key)
+        if last is None or now - dt.datetime.fromisoformat(last) >= EVENT_WINDOW:
+            s["events"][key] = now.isoformat()
+            detail = message + (f" (kind={kind})" if has_kind else "")
+            messages.append(f"EVENT: {label} at {ct(now)}: {one_line(detail, 200)}")
+            if len(evidence) < 5:
+                evidence.append(f"  {host} {unit or 'host'}: {one_line(raw)}")
+
+    for host, units in HOST_UNITS.items():
+        result = observation["hosts"][host]
+        host_key = "host:" + host
+        if result.get("error"):
+            if result.get("reset_cursor"):
+                s["cursors"].pop(host, None)
+            s["host_failures"][host] = s["host_failures"].get(host, 0) + 1
+            if s["host_failures"][host] >= 2:
+                open_problem(host_key, f"{host} host unreachable since {ct(now)} ({one_line(result['error'], 200)})")
+            for unit in units:
+                s["unit_polls"][unit] = {"down": 0, "active": 0}
+            continue
+        s["host_failures"][host] = 0
+        close_problem(host_key, f"{host} host reachable again")
+        records = result["records"]
+        if records:
+            s["cursors"][host] = records[-1]["__CURSOR"]
+        failed_units = set()
+        for record in records:
+            unit = record_unit(host, record)
+            parts = message_parts(record)
+            raw, message, level, kind, has_kind, structured = parts
+            if unit not in units:
+                try:
+                    priority = int(record.get("PRIORITY", 6))
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= priority <= 3 and not host_noise(record, unit, message):
+                    event(host, unit, parts, f"{host} host error")
+                continue
+            if host == "forge":
+                if (any(marker in raw for marker in ("TEMPFAIL", "FATAL", "panicked", "Traceback", "Failed with result"))
+                        or level == "ERROR"):
+                    open_problem("loop_failing", f"Forge loop failing since {ct(now)} ({one_line(message, 200)})")
+                if LOOP_SUCCESS.search(message) or re.search(r"\bLOOP_SUCCESS\b", message):
+                    close_problem("loop_failing", "Forge loop successful again")
+                if re.search(r"\bLOOP_STOP reason=flag_stop\S*", message):
+                    s["planned_stop"] = True
+                warning = (level == "WARN" and message not in FORGE_ROUTINE if structured else
+                           ("WARNING:" in raw or "WARN:" in raw) and not PUBLISH_RETRY.search(raw))
+                if warning:
+                    event(host, unit, parts, "Forge warning")
+                continue
+            if "Failed with result" in message:
+                failed_units.add(unit)
+                open_problem("down:" + unit, f"{unit.removesuffix('.service')} down on the cloud server since {ct(now)}")
+            if unit == "pe-service.service":
+                failure = RECOVERIES.get(message)
+                if failure:
+                    cleared = False
+                    for key in list(s["events"]):
+                        if json.loads(key)[:3] == [host, unit, failure]:
+                            del s["events"][key]
+                            cleared = True
+                    if cleared:
+                        messages.append(f"RESOLVED: copy service {failure} cleared at {ct(now)} ({message})")
+                    continue
+                routine = message in SERVICE_ROUTINE or (
+                    message == "anchor refresh deferred" and kind == "validation.intervening_activity")
+                if level == "ERROR" or "panicked" in raw or (level == "WARN" and not routine):
+                    event(host, unit, parts, "copy service warning/error")
+            elif unit == "pe-site.service":
+                auth_noise = ("[auth][error]" in raw and
+                              re.search(r"\b(?:MissingCSRF|UnknownAction)\b", raw))
+                if ("⨯" in raw or "[error]" in raw) and not auth_noise:
+                    event(host, unit, parts, "site error")
+            elif unit == "nginx.service":
+                access = NGINX_ACCESS.search(raw)
+                if access:
+                    status = access["status"]
+                    if 500 <= int(status) <= 599:
+                        identity = [status, access["method"], access["path"].split("?", 1)[0]]
+                        event(host, unit, parts, "site error (nginx " + " ".join(identity) + ")", identity)
+                elif NGINX_ERROR.search(raw):
+                    event(host, unit, parts, "site error (nginx error log)")
+        for unit in units:
+            active = result["units"][unit] == "active"
+            if host == "forge":
+                if active:
+                    close_problem("loop_down", "Forge loop running again")
+                    s["planned_stop"] = s["stop_noted"] = False
+                elif s.get("planned_stop"):
+                    if not s.get("stop_noted"):
+                        messages.append(f"NOTE: Forge loop stopped by flag_stop at {ct(now)}")
+                        s["stop_noted"] = True
+                else:
+                    open_problem("loop_down", f"Forge loop not running since {ct(now)}")
+            else:
+                polls = s["unit_polls"].setdefault(unit, {"down": 0, "active": 0})
+                polls["down"] = 0 if active else polls["down"] + 1
+                polls["active"] = polls["active"] + 1 if active and unit not in failed_units else 0
+                if polls["down"] >= 2:
+                    open_problem("down:" + unit, f"{unit.removesuffix('.service')} down on the cloud server since {ct(now)}")
+                if polls["active"] >= 2:
+                    close_problem("down:" + unit, f"{unit.removesuffix('.service')} running again")
+
+    health_ok = observation["health_ok"]
+    s["not_ready"] = 0 if health_ok else s.get("not_ready", 0) + 1
+    if s["not_ready"] >= 2:
+        open_problem("health", f"copy service not ready on the cloud server since {ct(now)} ({one_line(observation['health_detail'], 200)})")
+    elif health_ok:
+        close_problem("health", "copy service ready again")
+
+    if not observation["batch_error"]:
+        batch_id, created = observation["batch_id"], observation["created"]
+        s["last_batch"] = {"id": batch_id, "created": created.isoformat()}
+    last = s.get("last_batch")
+    if last:
+        batch_id, created = last["id"], dt.datetime.fromisoformat(last["created"])
+        late = s["open"].get("late")
+        age_h = (now - created).total_seconds() / 3600
+        if not observation["batch_error"] and late and batch_id > late["batch_id"]:
+            close_problem("late", f"new ranking batch {batch_id} published at {ct(created)}")
+        elif age_h > LATE_HOURS:
+            unreadable = (f"; newest batch unreadable: {one_line(observation['batch_error'], 200)}"
+                          if observation["batch_error"] else "")
+            open_problem("late", f"no new ranking batch for {age_h:.1f} h (last: batch {batch_id} at {ct(created)});"
+                         " the Forge loop may be stalled or stopped" + unreadable, batch_id=batch_id)
+
+    local = now.astimezone(CT)
+    if local.hour >= SUMMARY_HOUR and s.get("summary_date") != local.date().isoformat():
+        s["summary_date"] = local.date().isoformat()
+        last = s.get("last_batch")
+        batch = (f"last batch {last['id']} at {ct(dt.datetime.fromisoformat(last['created']))}" if last
+                 else "last batch unknown")
+        if observation["batch_error"]:
+            batch += " (newest batch unreadable)"
+        problems = "; ".join(i["text"] for i in s["open"].values()) or "no open problems"
+        messages.append(f"DAILY: {batch}; copy service {'ready' if health_ok else 'NOT ready'}; {problems}")
+    return s, messages + evidence
+
+
+def main():
+    dry = "--dry-run" in sys.argv[1:]
+    conf = dict(line.split("=", 1) for line in CONF.read_text().splitlines() if "=" in line)
+    conf.setdefault("PE_HEALTH_URL", "http://82.22.32.225:8080/health/ready")
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    now = dt.datetime.now(dt.timezone.utc)
+    new_state, messages = evaluate(state, observe(conf, state), now)
+    test = TEST_FLAG.exists()
+    if test:
+        messages.append(f"TEST: pe-watchdog is running on merlin ({ct(now)})")
+    if not dry:
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STATE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(new_state))
+        os.replace(tmp, STATE)
+        if test:
+            TEST_FLAG.unlink()
+    if messages:
+        print("pe-watchdog\n" + "\n".join(messages))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,24 +1,10 @@
-//! Agent-friendly, bounded JSONL tracing (issue #184; rotation + split sinks).
-//!
-//! Three JSONL sinks, none unbounded:
-//! - **stderr** (→ journald) — full stream at the `RUST_LOG` / `default_filter` level.
-//! - **`<stem>.<date>.jsonl`** — the full stream on disk, rotated **daily**, keeping the most
-//!   recent `retention_days` files (so per-file greps are small and total disk is bounded).
-//! - **`errors.<date>.jsonl`** — **WARN+ERROR only**, the clean "what broke" tape (no INFO
-//!   chatter like `signal did not produce order`), rotated daily the same way.
-//!
-//! Paired with the [`crate::status_writer`] `status.json` snapshot, an agent reads
-//! `status.json` for current health, `errors.<date>.jsonl` for problems, and the dated full
-//! stream for detail — each focused and bounded, none a multi-GB firehose.
+//! JSONL tracing to stderr (→ journald), with WARN+ERROR always enabled.
 //!
 //! See `docs/_GLOSSARY.md` "JSONL observability sidecar schema" for the per-kind field tables.
 
 use std::io::{self, Write};
-use std::path::Path;
 
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::filter::{FilterExt as _, LevelFilter};
 use tracing_subscriber::{
     EnvFilter, Layer as _, fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _,
 };
@@ -41,76 +27,23 @@ impl<W: Write, F: Fn() -> W> Write for BlockingWriter<F> {
 
 /// Initialise the global tracing subscriber.
 ///
-/// `jsonl_path` is the **base** path: its directory holds the rolling files and its file stem
-/// names the full-stream files (`<stem>.<date>.jsonl`). `retention_days` bounds how many dated
-/// files each rolling sink keeps (clamped to ≥ 1 so a misconfig cannot disable file logging).
-///
-/// Returns the non-blocking [`WorkerGuard`]s — the caller **must** keep them alive for the
-/// process lifetime; dropping them flushes and stops the writer threads (losing buffered lines).
-pub fn setup(
-    jsonl_path: &Path,
-    default_filter: &str,
-    retention_days: usize,
-) -> anyhow::Result<Vec<WorkerGuard>> {
-    let dir = jsonl_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let stem = jsonl_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("paper")
-        .to_string();
-    let keep = retention_days.max(1);
-
-    let full_appender = RollingFileAppender::builder()
-        .rotation(Rotation::DAILY)
-        .filename_prefix(&stem)
-        .filename_suffix("jsonl")
-        .max_log_files(keep)
-        .build(dir)
-        .map_err(|e| anyhow::anyhow!("build full log appender in {}: {e}", dir.display()))?;
-    let (full_nb, full_guard) = tracing_appender::non_blocking(full_appender);
-
-    let err_appender = RollingFileAppender::builder()
-        .rotation(Rotation::DAILY)
-        .filename_prefix("errors")
-        .filename_suffix("jsonl")
-        .max_log_files(keep)
-        .build(dir)
-        .map_err(|e| anyhow::anyhow!("build errors log appender in {}: {e}", dir.display()))?;
-    let (err_nb, err_guard) = tracing_appender::non_blocking(err_appender);
-
-    // Per-layer filters (not a single global filter): stderr + the full stream honour
-    // `RUST_LOG`/`default_filter`; `errors.jsonl` always captures WARN+ERROR regardless of
-    // `RUST_LOG`, so the safety-net tape can never be silenced by a verbosity setting.
-    let env =
-        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+/// `RUST_LOG` overrides `default_filter`; WARN+ERROR can never be silenced by either.
+/// No log files or background writers are created.
+pub fn setup(default_filter: &str) -> anyhow::Result<()> {
+    let env = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
 
     let stderr_layer = fmt::layer()
         .with_writer(|| BlockingWriter(std::io::stderr))
         .json()
         .flatten_event(true)
-        .with_filter(env());
-    let full_layer = fmt::layer()
-        .json()
-        .with_writer(full_nb)
-        .flatten_event(true)
-        .with_filter(env());
-    let err_layer = fmt::layer()
-        .json()
-        .with_writer(err_nb)
-        .flatten_event(true)
-        .with_filter(LevelFilter::WARN);
+        .with_filter(env.or(LevelFilter::WARN));
 
     tracing_subscriber::registry()
         .with(stderr_layer)
-        .with(full_layer)
-        .with(err_layer)
         .try_init()
         .map_err(|e| anyhow::anyhow!("tracing init: {e}"))?;
 
-    Ok(vec![full_guard, err_guard])
+    Ok(())
 }
 
 #[cfg(test)]
@@ -128,6 +61,72 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             self.0.lock().unwrap().flush()
+        }
+    }
+
+    #[test]
+    fn stderr_filter_preserves_warnings_and_json_format() {
+        const CHILD: &str = "PE_TEST_LOGGING_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            setup("info").unwrap();
+            tracing::debug!(target: "pe_service", sample = 42, "debug sample");
+            tracing::info!(target: "pe_service", sample = 42, "info sample");
+            tracing::warn!(target: "pe_service", sample = 42, "warn sample");
+            tracing::error!(target: "pe_service", sample = 42, "error sample");
+            return;
+        }
+
+        for (filter, levels) in [
+            (None, vec!["INFO", "WARN", "ERROR"]),
+            (Some("off"), vec!["WARN", "ERROR"]),
+            (Some("error"), vec!["WARN", "ERROR"]),
+            (Some("debug,pe_service=off"), vec!["WARN", "ERROR"]),
+            (
+                Some("off,pe_service=debug"),
+                vec!["DEBUG", "INFO", "WARN", "ERROR"],
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "logging::tests::stderr_filter_preserves_warnings_and_json_format",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .current_dir(directory.path())
+                .env(CHILD, "1")
+                .env_remove("RUST_LOG");
+            if let Some(filter) = filter {
+                command.env("RUST_LOG", filter);
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{filter:?}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            let events = String::from_utf8(output.stderr)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event["level"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                levels,
+                "{filter:?}"
+            );
+            for event in events {
+                assert_eq!(event["sample"], 42);
+                assert!(event["message"].as_str().unwrap().ends_with(" sample"));
+                assert!(event.get("fields").is_none());
+            }
+            assert!(
+                std::fs::read_dir(directory.path())
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
         }
     }
 

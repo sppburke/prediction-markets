@@ -1116,26 +1116,25 @@ call count.
 | `PAPER_CHECKPOINT_SECS` | 1 s | Compiled `disk_monitor` constant, no TOML/env key. Paper-state WAL checkpoints: when the owner starts, the service's shared paper-state connection stops checkpointing inside its commits (`wal_autocheckpoint = 0`); the owner then runs `wal_checkpoint(PASSIVE)` on the handle's checkpoint connection, which writes no rows, so its syncs never hold the shared connection, immediately and at this cadence, one at a time, in a blocking task that main joins at shutdown within `POST_ABORT_JOIN_BOUND`, while free-space sampling continues. It copies only committed frames, including while a caller-owned batch is open. If the setting cannot be stopped (read back as 0), the critical owner fails. A partial checkpoint (behind a reader or a concurrent commit) or a busy one (another process checkpointing) is not a failure: the next tick continues. An SQL error logs one ERROR, retries every tick and never stops the owner, while the WAL grows; the next error-free call logs INFO. Checkpoint progress itself is not alarmed. CLI, migration and test handles keep SQLite's automatic checkpoints. |
 
 Disk checks cover the parent directories of `source_event_log_path`, `paper_state_db_path`,
-`event_log_path`, `status_path`, and `jsonl_log_path`, once per device. Before a parent exists,
+`event_log_path`, and `status_path`, once per device. Before a parent exists,
 its nearest existing directory supplies the filesystem sample; startup creates no directory for
 this check.
 
 ### Agent-friendly log layout
 
-pe-service writes three bounded JSONL artifacts (so an agent reads one tiny file for health,
-a focused file for problems, and a bounded stream for detail — never an unbounded firehose):
+pe-service writes one snapshot file and one log stream (so an agent reads one tiny file for health
+and one bounded stream for detail):
 
 | Artifact | Shape | Use |
 |---|---|---|
 | `status.json` (`status_path`) | single file, atomically rewritten every `status_interval_secs` | **current health snapshot** — includes the embedded source `revision`, top-level `applied_config_hash`, sticky named `tasks` with class/state/typed failure, `status_error`, the prior financial/source/live fields, optional `runtime_config` (applied hash, applied canonical `sizing_mode` text, and separately typed rejected raw proposal), and optional `watchlist_projection` (`pending`/`applied` token, count, time plus `last_error`). Optional `live_wallets` and `live_wallets_at_unix_ms` sample the live snapshot minus durable fences (`effective_projection_entries`) together with its time under the structural writer lock. A fence-read failure omits both fields; it never substitutes an empty list. `watchlist_size` is the live snapshot's membership count before that fence subtraction; `watchlist_target_size` is the last safely applied runtime cap. Read this first; no grep. |
-| `<stem>.<date>.jsonl` (from `jsonl_log_path`) | full stream, rotated **daily**, keeps `log_retention_days` | full detail; grep one day's file |
-| `errors.<date>.jsonl` (same dir) | **WARN+ERROR only**, rotated daily | the clean "what broke" tape (no INFO chatter) |
+| stderr, stored by journald | one flattened JSON object per line; `RUST_LOG` (default `info`) selects detail and WARN/ERROR are always written | read with `journalctl -u pe-service -o json --all` (or `-o cat`); journald keeps about two weeks (`docs/35` "Logs and watchdog") |
 
 | Config | Default | Description |
 |---|---|---|
 | `status_path` | `./status.json` | `ServiceConfig` field. Path of the health snapshot. `PE_STATUS_PATH`. |
 | `status_interval_secs` | 30 | `ServiceConfig` field. Seconds between `status.json` writes; `0` disables. `PE_STATUS_INTERVAL_SECS`. |
-| `log_retention_days` | 7 | `ServiceConfig` field. Dated JSONL files kept per sink (full + errors); bounds disk. `PE_LOG_RETENTION_DAYS`. |
+| `jsonl_log_path` | `./paper.jsonl` | `ServiceConfig` field, accepted for compatibility and unused: pe-service writes no log files. `PE_JSONL_LOG_PATH`. |
 
 ### Durable log, migration, and supervisor boundaries (#544)
 
@@ -1277,14 +1276,14 @@ side main; path, prefix, hash, identity, or phase drift fails closed. Pre-bounda
 audit/replay history and cannot create v2 state. Once v2 input has appended or active state has
 committed, rollback to v1 is refused; restart the v2-compatible binary to resume roll-forward.
 
-Ordinary production has one named supervisor over 18 retained owners. Activity ingest, public
+Ordinary production has one named supervisor over 16 retained owners. Activity ingest, public
 poll/reconciliation, orchestrator, resolution poller, configured live-account/fan-out owners,
 watchlist refresh/projection, maintenance, capacity/config workers, source checkpoint, disk monitor,
 status writer, and HTTP server
 are critical: an unexpected typed error, early return, channel close, or join failure sticks in
-readiness/status and initiates ordered shutdown. Supabase analytics, liquidity snapshots, and JSON
-tracing appenders are best-effort and degrade status without failing trading readiness. Shutdown
-orders producers → orchestrator drain → healthy sinks → HTTP → final status → tracing;
+readiness/status and initiates ordered shutdown. Supabase analytics and liquidity snapshots are
+best-effort and degrade status without failing trading readiness. Shutdown
+orders producers → orchestrator drain → healthy sinks → HTTP → final status;
 synchronization-uncertain work remains unseen for restart recovery. Expected failures are typed.
 Production release profiles use `panic = "abort"`; a panic is recovered by systemd restart from
 durable state, never by unwinding through service owners. Transient market-end fetch failure is not
@@ -1292,14 +1291,14 @@ cached and is retried on the next request.
 
 ### JSONL observability sidecar schema
 
-Written to the rolling full-stream files derived from `jsonl_log_path` (default base:
-`./paper.jsonl` → `paper.<date>.jsonl`). One JSON object per line.
+Written to pe-service's stderr, which journald stores (`journalctl -u pe-service -o json --all`
+returns each line in the record's `MESSAGE`). One JSON object per line.
 
 **Required fields on every line:**
 
 | Field | Type | Description |
 |---|---|---|
-| `ts` | RFC-3339 UTC string | When the event was emitted |
+| `timestamp` | RFC-3339 UTC string | When the event was emitted |
 | `level` | string | `INFO`, `WARN`, `ERROR`, `DEBUG` |
 | `message` | string | Human-readable description |
 
@@ -1314,8 +1313,8 @@ Written to the rolling full-stream files derived from `jsonl_log_path` (default 
 ### Logging conventions (issue #184)
 
 Runtime log lines in the workspace are JSONL, emitted via the `tracing` crate. Subscribers
-are configured to `.json()` in `pe-bootstrap`, `pe-backtest`, and `pe-service` (both
-stderr and file layers for service). Operators wanting human-readable console output
+are configured to `.json()` in `pe-bootstrap`, `pe-backtest`, and `pe-service` (stderr only;
+journald stores it). Operators wanting human-readable console output
 pipe through `jq`. Command-mode stdout also carries operator receipts and executable identities.
 
 **Canonical field shapes:**

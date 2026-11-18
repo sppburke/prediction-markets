@@ -456,18 +456,48 @@ impl Child {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        fn drain(mut pipe: impl std::io::Read) -> Vec<u8> {
+        fn drain(mut pipe: impl std::io::Read, mut log: Option<std::fs::File>) -> Vec<u8> {
+            use std::io::Write as _;
+
             let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes).unwrap();
+            let mut chunk = [0; 8192];
+            let mut logged = 0;
+            loop {
+                let read = pipe.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                let start = bytes.len();
+                bytes.extend_from_slice(&chunk[..read]);
+                // Publish whole lines only, so a log reader never sees half a JSON record.
+                if let (Some(log), Some(offset)) = (
+                    &mut log,
+                    chunk[..read].iter().rposition(|&byte| byte == b'\n'),
+                ) {
+                    let end = start + offset + 1;
+                    log.write_all(&bytes[logged..end]).unwrap();
+                    logged = end;
+                }
+            }
+            if let Some(log) = &mut log {
+                log.write_all(&bytes[logged..]).unwrap();
+            }
             bytes
         }
         let stdout = process.stdout.take().unwrap();
         let stderr = process.stderr.take().unwrap();
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(config.parent().unwrap().join("service.log"))
+            .unwrap();
         Self {
             process,
             root: config.parent().unwrap().to_path_buf(),
-            stdout: Some(tokio::task::spawn_blocking(move || drain(stdout))),
-            stderr: Some(tokio::task::spawn_blocking(move || drain(stderr))),
+            stdout: Some(tokio::task::spawn_blocking(move || drain(stdout, None))),
+            stderr: Some(tokio::task::spawn_blocking(move || {
+                drain(stderr, Some(log))
+            })),
         }
     }
     pub fn signal_checkpoint(&self, signal: &str) {
@@ -543,8 +573,7 @@ impl Drop for Child {
                 let path = entry.path();
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if (name == "status.json"
-                    || (name.starts_with("service.") && name.ends_with(".jsonl")))
+                if (name == "status.json" || name == "service.log")
                     && let Ok(text) = std::fs::read_to_string(&path)
                 {
                     let lines = text.lines().collect::<Vec<_>>();
@@ -1952,21 +1981,7 @@ async fn run_waiting_admission(
 }
 
 fn service_logs(root: &Path) -> String {
-    let mut entries = std::fs::read_dir(root)
-        .unwrap()
-        .flatten()
-        .collect::<Vec<_>>();
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    entries
-        .into_iter()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            (name.starts_with("service.") && name.ends_with(".jsonl") && !name.contains("error"))
-                .then(|| std::fs::read_to_string(entry.path()).unwrap_or_default())
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    std::fs::read_to_string(root.join("service.log")).unwrap_or_default()
 }
 
 async fn seal_and_replay(
@@ -2552,11 +2567,7 @@ impl CheckpointFixture {
         until(|| self.paper.list_fills().unwrap().len() == 1).await;
     }
     pub fn clear_logs(&self) {
-        for entry in std::fs::read_dir(self.dir.path()).unwrap().flatten() {
-            if entry.file_name().to_string_lossy().ends_with(".jsonl") {
-                std::fs::remove_file(entry.path()).unwrap();
-            }
-        }
+        std::fs::write(self.dir.path().join("service.log"), []).unwrap();
     }
     pub fn stale_anchors(&self) {
         rusqlite::Connection::open(&self.cfg.paper_state_db_path)

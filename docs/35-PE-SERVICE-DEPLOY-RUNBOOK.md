@@ -1151,7 +1151,7 @@ owner reviews this breakdown and accepts the PASS before consenting to productio
 | backup convention | before the swap: `cp -p target/release/pe-service target/release/pe-service.bak-<prior-sha12>` (hash-named, once-only) |
 | env | `.env` on the VPS (REST URL plus both credential identities: publishable/anon-class `PE_SUPABASE_ANON_KEY` and secret/service-role-class `PE_SUPABASE_SECRET_KEY`; **no** `SUPABASE_DB_URL` there). The #545 rehearsal derives its publishable-only file from this reviewed production target and never installs the derivative. `PE_SUPABASE_AUTHORITATIVE` defaults to `false` but must be `true` in the #545 production target. `PE_` booleans must be `true`/`false`, never `1`/`0` (figment rejects ints → restart loop). Websocket knobs live there too (`PE_POLYMARKET_ACTIVITY_WS_ENABLED`, `PE_SOURCE_EVENT_LOG_PATH`, `PE_COPY_LATENCY_BUDGET_SECS`) |
 | build box | the VPS has no cargo — build on the dev box and `scp`. Release-like builds derive the full revision directly from the checked-out Git object and reject a dirty, unknown, or invalid checkout; no environment override is accepted. Dev/test builds use the explicit `dev-dirty` sentinel when needed. |
-| logs | `journalctl -u pe-service -f` (Tier-1 prod check); JSONL sinks per `jsonl_log_path`; `status.json` in the working directory |
+| logs | `journalctl -u pe-service -f` (Tier-1 prod check; `-o json --all` gives one JSON object per record); no log files; `status.json` in the working directory |
 
 ## Topology (#546)
 
@@ -1162,6 +1162,36 @@ unit starts the process again. Forge's independent ranking loop (`pe-rank-loop`,
 [`26-…RUNBOOK.md`](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md) "Continuous Forge supervisor",
 [`deploy/systemd/README.md`](../deploy/systemd/README.md)) is not in the copy path: its reboot pauses
 new ranking publication only.
+
+## Logs and watchdog (#885)
+
+**One log copy per host.** Every process on Forge and the VPS logs to journald only. Read it with
+`journalctl -o json --all`: one JSON object per record, and `--all` keeps fields over 4096 bytes.
+
+- Both hosts: `/etc/systemd/journald.conf.d/50-pe-logs.conf` holds `[Journal]`, `ForwardToSyslog=no` and
+  `MaxRetentionSec=14day` (about two weeks; the size caps still apply). rsyslog is disabled and its
+  `/var/log/syslog*`, `auth.log*` and `kern.log*` files are removed.
+- VPS nginx: `/etc/nginx/nginx.conf` sends `error_log` and `access_log` to `syslog:server=unix:/dev/log`, so both
+  appear in `journalctl -u nginx`.
+- pe-service writes no log files; `jsonl_log_path` is accepted but unused.
+
+**Watchdog.** Hermes on merlin runs `scripts/pe_watchdog.py` every minute as a `--no-agent` job whose output goes to
+Telegram (empty output is silent).
+
+- Files on merlin: the script at `~/.hermes/scripts/pe_watchdog.py`; config `~/.config/pe-watchdog/watchdog.env`
+  (mode 0600: `PE_SUPABASE_URL`, `PE_SUPABASE_ANON_KEY`, `PE_HEALTH_URL`); state
+  `~/.local/state/pe-watchdog/state.json`; the host keys for `forge.tail72525f.ts.net` and `82.22.32.225` in
+  `~/.ssh/known_hosts`, copied from a machine that already trusts them.
+- Reads, and nothing else: `ssh pi@forge.tail72525f.ts.net` and `ssh -i ~/.ssh/id_personal sean@82.22.32.225`, each
+  running `journalctl --all -o json --no-pager --after-cursor=<stored cursor>` then `systemctl [--user] is-active` for
+  the watched units; plus `/health/ready` and the newest `ranking_batches` row. merlin keeps the owner's full access to
+  both hosts (owner decision, 2026-11-17).
+- Test: `python3 ~/.hermes/scripts/pe_watchdog.py --dry-run`; `touch ~/.config/pe-watchdog/send-test-alert` sends a
+  test line on the next run.
+- Pause with `hermes cron pause <job>`. To remove it, run `hermes cron remove <job>` and delete the files above.
+
+Rollback of the log settings: delete `50-pe-logs.conf` and `systemctl restart systemd-journald` (stdout streams survive
+a restart); `systemctl enable --now rsyslog`; restore the two nginx lines, `nginx -t`, reload nginx.
 
 ## #705 paper financial-semantic-2 cutover
 
