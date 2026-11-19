@@ -82,6 +82,17 @@ RECOVERIES = {
     "live watchlist refreshed from supabase":
         "supabase refresh failed; keeping current watchlist",
 }
+# pe-service reads service_config every 30 s and keeps its last settings after a failed read
+# (crates/service/src/config_poller.rs), so only repeated failures are a problem.
+CONFIG_READ_FAILURES = frozenset({
+    "service_config poll failed; keeping last-known-good config",
+    "service_config poll timed out; keeping last-known-good config",
+})
+CONFIG_READ_WINDOW = dt.timedelta(minutes=5)
+CONFIG_READ_PROBLEM = 3
+# A coordinated pe-service stop ends within SHUTDOWN_DEADLINE = 45 s (crates/service/src/supervisor.rs);
+# meanwhile a best-effort task whose input channel closed first logs "best-effort owner degraded".
+SHUTDOWN_WINDOW = dt.timedelta(minutes=2)
 PUBLISH_RETRY = re.compile(
     r"WARNING: transient Supabase \S+ failure; retry \d+/\d+ in \d+s:"
 )
@@ -227,6 +238,10 @@ def message_parts(record):
     return raw, raw, "", None, False, False
 
 
+def record_time(record):
+    return dt.datetime.fromtimestamp(int(record["__REALTIME_TIMESTAMP"]) / 1_000_000, dt.timezone.utc)
+
+
 def record_unit(host, record):
     fields = ("_SYSTEMD_USER_UNIT", "USER_UNIT") if host == "forge" else ("_SYSTEMD_UNIT", "UNIT")
     for field in fields:
@@ -258,10 +273,12 @@ def evaluate(state, observation, now):
     See observe's observation schema. now is an aware UTC datetime. Failed reads
     break unit poll streaks; journalctl failures request a cursor reset. Recovery
     events resolve matching recent message keys (including every kind variant).
+    Failed settings reads count by journal time, so a backlog of old ones stays silent.
     """
     s = copy.deepcopy(state)
     for key in ("open", "cursors", "events", "host_failures", "unit_polls"):
         s.setdefault(key, {})
+    s.setdefault("config_read_failures", [])
     s["events"] = {key: last for key, last in s["events"].items()
                    if now - dt.datetime.fromisoformat(last) <= EVENT_WINDOW}
     messages, evidence = [], []
@@ -308,6 +325,7 @@ def evaluate(state, observation, now):
         if records:
             s["cursors"][host] = records[-1]["__CURSOR"]
         failed_units = set()
+        config_read_raw = None
         for record in records:
             unit = record_unit(host, record)
             parts = message_parts(record)
@@ -337,6 +355,12 @@ def evaluate(state, observation, now):
                 failed_units.add(unit)
                 open_problem("down:" + unit, f"{unit.removesuffix('.service')} down on the cloud server since {ct(now)}")
             if unit == "pe-service.service":
+                if message == "shutdown signal received":
+                    s["service_shutdown"] = record_time(record).isoformat()
+                if message in CONFIG_READ_FAILURES:
+                    s["config_read_failures"].append(record_time(record).isoformat())
+                    config_read_raw = raw
+                    continue
                 failure = RECOVERIES.get(message)
                 if failure:
                     cleared = False
@@ -347,7 +371,10 @@ def evaluate(state, observation, now):
                     if cleared:
                         messages.append(f"RESOLVED: copy service {failure} cleared at {ct(now)} ({message})")
                     continue
-                routine = message in SERVICE_ROUTINE or (
+                stopping = (message == "best-effort owner degraded" and "service_shutdown" in s and
+                            dt.timedelta(0) <= record_time(record) - dt.datetime.fromisoformat(s["service_shutdown"])
+                            <= SHUTDOWN_WINDOW)
+                routine = message in SERVICE_ROUTINE or stopping or (
                     message == "anchor refresh deferred" and kind == "validation.intervening_activity")
                 if level == "ERROR" or "panicked" in raw or (level == "WARN" and not routine):
                     event(host, unit, parts, "copy service warning/error")
@@ -365,6 +392,18 @@ def evaluate(state, observation, now):
                         event(host, unit, parts, "site error (nginx " + " ".join(identity) + ")", identity)
                 elif NGINX_ERROR.search(raw):
                     event(host, unit, parts, "site error (nginx error log)")
+        if host == "vps":
+            reads = [t for t in s["config_read_failures"]
+                     if now - dt.datetime.fromisoformat(t) <= CONFIG_READ_WINDOW]
+            s["config_read_failures"] = reads
+            if len(reads) >= CONFIG_READ_PROBLEM and "config_reads" not in s["open"]:
+                open_problem("config_reads", "copy service cannot read its settings from Supabase since "
+                             f"{ct(dt.datetime.fromisoformat(reads[0]))} ({len(reads)} failed reads in 5 min;"
+                             " it keeps its last settings)")
+                if config_read_raw:
+                    evidence.append(f"  vps pe-service.service: {one_line(config_read_raw)}")
+            elif not reads:
+                close_problem("config_reads", "copy service reads its settings again")
         for unit in units:
             active = result["units"][unit] == "active"
             if host == "forge":
