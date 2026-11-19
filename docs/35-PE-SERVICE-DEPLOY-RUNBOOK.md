@@ -1186,6 +1186,10 @@ Telegram (empty output is silent).
 - It messages only for a problem, when that problem clears, or for a requested test line: no daily or routine status
   (owner, 2026-11-18). A planned `flag_stop` is silent; if the loop stays stopped, the no-new-batch alert (11 hours
   after the last batch) still fires.
+- pe-service rereads `service_config` every 30 s and keeps its last settings after a failed read, so a single failed
+  read is silent; three within 5 minutes are a problem, which clears after 5 minutes without one. A
+  `best-effort owner degraded` warning within 2 minutes after `shutdown signal received` is part of a coordinated stop
+  and is silent too.
 - Files on merlin: the script at `~/.hermes/scripts/pe_watchdog.py`; config `~/.config/pe-watchdog/watchdog.env`
   (mode 0600: `PE_SUPABASE_URL`, `PE_SUPABASE_ANON_KEY`, `PE_HEALTH_URL`); state
   `~/.local/state/pe-watchdog/state.json`; the host keys for `forge.tail72525f.ts.net` and `82.22.32.225` in

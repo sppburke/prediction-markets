@@ -43,6 +43,18 @@ def service(message, level="WARN", **fields):
     return record(json.dumps({"message": message, "level": level, **fields}))
 
 
+CONFIG_ERROR = ("supabase request failed: error sending request for url "
+                "(https://example.supabase.co/rest/v1/service_config?select=key,value,value_type)")
+
+
+def at(r, when):
+    return {**r, "__REALTIME_TIMESTAMP": str(int(when.timestamp() * 1_000_000))}
+
+
+def config_read(when, message="service_config poll failed; keeping last-known-good config"):
+    return at(service(message, error=CONFIG_ERROR), when)
+
+
 def forge(message, level=None, **fields):
     if level:
         message = json.dumps({"level": level, "fields": {"message": message, **fields}})
@@ -578,6 +590,72 @@ class Events(unittest.TestCase):
         self.assertEqual(len(m) - len(alerts(m)), 5)
         self.assertEqual(len(s["events"]), 8)
         self.assertTrue(all("\n" not in line for line in m))
+
+    def test_isolated_failed_settings_reads_are_silent(self):
+        # The 14 days before 2026-11-19 held five failed reads, each alone (45 min to 11 days apart).
+        timed_out = "service_config poll timed out; keeping last-known-good config"
+        s = QUIET
+        for minutes, extra in ((0, ()), (45, (timed_out,)), (24 * 60, ())):
+            now = T0 + dt.timedelta(minutes=minutes)
+            s, m = w.evaluate(s, obs(vps_records=[config_read(now - dt.timedelta(seconds=20), *extra)],
+                                     created=now - dt.timedelta(hours=1)), now)
+            self.assertEqual(m, [])
+        _, m = self.step(observation=obs(vps_records=[config_read(T0), config_read(T0 + dt.timedelta(seconds=30))]),
+                         minutes=1)
+        self.assertEqual(m, [])
+
+    def test_three_failed_settings_reads_in_five_minutes_report_until_five_quiet_minutes(self):
+        def sec(n):
+            return T0 + dt.timedelta(seconds=n)
+
+        s, m = self.step(observation=obs(vps_records=[config_read(sec(0)), config_read(sec(30))]), minutes=1)
+        self.assertEqual(m, [])
+        s, m = self.step(s, obs(vps_records=[config_read(sec(60))]), 2)
+        self.assertEqual(alerts(m), ["PROBLEM: copy service cannot read its settings from Supabase since "
+                                     "2:00 PM Nov 17 (3 failed reads in 5 min; it keeps its last settings)"])
+        self.assertEqual(len(m), 2)
+        self.assertIn(CONFIG_ERROR, m[1])
+        s, m = self.step(s, obs(vps_records=[config_read(sec(90)), config_read(sec(120))]), 3)
+        self.assertEqual(m, [])
+        s, m = self.step(s, obs(), 7)  # the 2:02:00 failure is still inside the window
+        self.assertEqual(m, [])
+        s, m = self.step(s, obs(), 8)
+        self.assertEqual(m, ["RESOLVED: copy service reads its settings again (lasted 0 h 6 min)"])
+        self.assertEqual(s["config_read_failures"], [])
+
+    def test_a_backlog_of_old_failed_settings_reads_is_silent(self):
+        old = [config_read(T0 - dt.timedelta(minutes=n)) for n in (30, 20, 10, 6)]
+        s, m = self.step(observation=obs(vps_records=old))
+        self.assertEqual(m, [])
+        self.assertEqual(s["config_read_failures"], [])
+
+    def test_unreadable_vps_keeps_the_settings_problem_open(self):
+        reads = [config_read(T0 + dt.timedelta(seconds=n)) for n in (0, 30, 60)]
+        s, m = self.step(observation=obs(vps_records=reads), minutes=1)
+        self.assertTrue(alerts(m)[0].startswith("PROBLEM: copy service cannot read its settings"))
+        for minutes in range(2, 12):
+            s, m = self.step(s, obs(errors={"vps": "timeout"}), minutes)
+            self.assertFalse(any("settings again" in x for x in m))
+        s, m = self.step(s, obs(), 12)
+        self.assertIn("RESOLVED: copy service reads its settings again (lasted 0 h 11 min)", m)
+
+    def test_degraded_best_effort_owner_is_silent_only_during_a_coordinated_stop(self):
+        degraded = "best-effort owner degraded"
+        stop = at(service("shutdown signal received", "INFO"), T0)
+        within = at(service(degraded, task="liquidity_snapshot_worker"), T0 + dt.timedelta(seconds=1))
+        s, m = self.step(observation=obs(vps_records=[stop, within]))
+        self.assertEqual(m, [])
+        late = at(service(degraded, task="liquidity_snapshot_worker"), T0 + dt.timedelta(minutes=2, seconds=1))
+        _, m = self.step(s, obs(vps_records=[late]), 3)
+        self.assertEqual(alerts(m), ["EVENT: copy service warning/error at 2:03 PM Nov 17: " + degraded])
+        # A stop seen in one read covers its degraded owners in the next read.
+        s, _ = self.step(observation=obs(vps_records=[stop]))
+        _, m = self.step(s, obs(vps_records=[at(service(degraded), T0 + dt.timedelta(seconds=50))]), 1)
+        self.assertEqual(m, [])
+        for records in ([within], [at(service(degraded), T0 - dt.timedelta(seconds=1)), stop]):
+            with self.subTest(records=len(records)):
+                _, m = self.step(observation=obs(vps_records=records))
+                self.assertEqual(alerts(m), ["EVENT: copy service warning/error at 2:00 PM Nov 17: " + degraded])
 
 
 class Reads(unittest.TestCase):
