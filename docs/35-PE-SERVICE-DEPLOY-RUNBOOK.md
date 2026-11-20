@@ -1208,8 +1208,10 @@ Telegram (empty output is silent).
   process that opens the installed file; no manual `hermes cron run` meanwhile). Then
   `touch ~/.config/pe-watchdog/reset-health-episode` and `mv -T` the new file into place from a temporary name beside
   it. The new version's first run drops any readiness-episode keys an earlier version left in the state and removes
-  the flag. Rollback: `mv -T` the backup into place, nothing else; the previous version keeps counting with the same
-  `not_ready` key.
+  the flag. Check that the installed file's sha256 equals the new file's, run
+  `python3 ~/.hermes/scripts/pe_watchdog.py --dry-run` (it neither writes state nor removes the flag), and confirm
+  that the next scheduled run removed the flag and stayed silent. Rollback: `mv -T` the backup into place, nothing
+  else; the previous version keeps counting with the same `not_ready` key.
 - Reads, and nothing else: `ssh pi@forge.tail72525f.ts.net` and `ssh -i ~/.ssh/id_personal sean@82.22.32.225`, each
   running `journalctl --all -o json --no-pager --after-cursor=<stored cursor>` then `systemctl [--user] is-active` for
   the watched units; plus `/health/ready` and the newest `ranking_batches` row. merlin keeps the owner's full access to

@@ -152,7 +152,7 @@ def fetch_json(url, headers=None, timeout=8, error_body=False):
             try:
                 if len(raw) > 65536:
                     raise ValueError("reply over 65,536 bytes")
-                return error.code, json.loads(raw or b"null")
+                return error.code, json.loads(raw)
             except ValueError:
                 raise error from None
 

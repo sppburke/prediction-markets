@@ -1017,7 +1017,7 @@ class Reads(unittest.TestCase):
         self.assertEqual(result, (503, {"ready": False, "issues": FEED}))
         self.assertTrue(error.fp.closed)
         hidden_suffix = feed_body + b" " * (65536 - len(feed_body)) + b"x"  # first 65,536 bytes parse
-        for body in (b"<html>unavailable</html>", feed_body[:30], hidden_suffix):
+        for body in (b"", b"<html>unavailable</html>", feed_body[:30], hidden_suffix):
             with self.subTest(size=len(body)):
                 result, error = fetch(body, True)
                 self.assertIs(result, error)
@@ -1133,6 +1133,18 @@ class Main(unittest.TestCase):
         self.assertEqual(output, f"pe-watchdog\n{NOT_READY} ({FEED_WORDS}; earlier: {w.UNCLASSIFIED})\n")
         self.assertFalse(self.reset.exists())
         self.assertEqual(json.loads(self.state.read_text())["not_ready"], 2)
+
+    def test_failed_state_write_keeps_the_reset_flag_and_the_previous_state(self):
+        self.run_main()
+        before = self.state.read_bytes()
+        self.reset.touch()
+        for target in ("write_text", "replace"):
+            failing = (patch.object(w.Path, "write_text", side_effect=OSError("disk full")) if target == "write_text"
+                       else patch.object(w.os, "replace", side_effect=OSError("disk full")))
+            with self.subTest(target=target), failing, self.assertRaises(OSError):
+                self.run_main()
+            self.assertTrue(self.reset.exists())
+            self.assertEqual(self.state.read_bytes(), before)
 
     def test_dry_run_keeps_the_reset_flag_and_writes_nothing(self):
         self.reset.touch()
