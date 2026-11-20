@@ -153,7 +153,7 @@ def fetch_json(url, headers=None, timeout=8, error_body=False):
                 if len(raw) > 65536:
                     raise ValueError("reply over 65,536 bytes")
                 return error.code, json.loads(raw)
-            except ValueError:
+            except (ValueError, RecursionError):  # deep nesting overflows the parser
                 raise error from None
 
 

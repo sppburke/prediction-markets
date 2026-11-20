@@ -1017,7 +1017,7 @@ class Reads(unittest.TestCase):
         self.assertEqual(result, (503, {"ready": False, "issues": FEED}))
         self.assertTrue(error.fp.closed)
         hidden_suffix = feed_body + b" " * (65536 - len(feed_body)) + b"x"  # first 65,536 bytes parse
-        for body in (b"", b"<html>unavailable</html>", feed_body[:30], hidden_suffix):
+        for body in (b"", b"<html>unavailable</html>", feed_body[:30], b"[" * 10000, hidden_suffix):
             with self.subTest(size=len(body)):
                 result, error = fetch(body, True)
                 self.assertIs(result, error)
