@@ -1190,10 +1190,26 @@ Telegram (empty output is silent).
   read is silent; three within 5 minutes are a problem, which clears after 5 minutes without one. A
   `best-effort owner degraded` warning within 2 minutes after `shutdown signal received` is part of a coordinated stop
   and is silent too.
+- pe-service answers `/health/ready` with 503 while fewer than two of its live trade-feed connections are receiving
+  trades. That also happens whenever Polymarket pauses trading, for example during its announced trading-engine
+  restarts, and copying continues through the 30-second polling backup meanwhile. So a not-ready episode whose answers
+  list only `activity_ws_unavailable` or `activity_ws_redundancy_degraded` stays silent until it has lasted
+  [`watchdog_feed_quiet_window`](_GLOSSARY.md#watchdog_feed_quiet_window); any other reason, a mix of reasons, an
+  unreadable reply or no reply is a problem at the second consecutive check. The message names the reasons in plain
+  words and the time of the episode's first not-ready answer.
 - Files on merlin: the script at `~/.hermes/scripts/pe_watchdog.py`; config `~/.config/pe-watchdog/watchdog.env`
   (mode 0600: `PE_SUPABASE_URL`, `PE_SUPABASE_ANON_KEY`, `PE_HEALTH_URL`); state
   `~/.local/state/pe-watchdog/state.json`; the host keys for `forge.tail72525f.ts.net` and `82.22.32.225` in
-  `~/.ssh/known_hosts`, copied from a machine that already trusts them.
+  `~/.ssh/known_hosts`, copied from a machine that already trusts them; and, only between an install and the next run,
+  `~/.config/pe-watchdog/reset-health-episode`.
+- Install a new script version (also after a rollback): skip it if the installed file already has the new sha256.
+  Otherwise back up the installed file, and with it still installed wait until
+  `pgrep -f '.hermes/scripts/pe_watchdog.py'` prints nothing on two checks 10 s apart (each Hermes run starts a child
+  process that opens the installed file; no manual `hermes cron run` meanwhile). Then
+  `touch ~/.config/pe-watchdog/reset-health-episode` and `mv -T` the new file into place from a temporary name beside
+  it. The new version's first run drops any readiness-episode keys an earlier version left in the state and removes
+  the flag. Rollback: `mv -T` the backup into place, nothing else; the previous version keeps counting with the same
+  `not_ready` key.
 - Reads, and nothing else: `ssh pi@forge.tail72525f.ts.net` and `ssh -i ~/.ssh/id_personal sean@82.22.32.225`, each
   running `journalctl --all -o json --no-pager --after-cursor=<stored cursor>` then `systemctl [--user] is-active` for
   the watched units; plus `/health/ready` and the newest `ranking_batches` row. merlin keeps the owner's full access to

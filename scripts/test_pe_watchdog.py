@@ -5,11 +5,13 @@ import datetime as dt
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -32,6 +34,10 @@ PRUNE = ("WARNING: ranking_batches prune failed (RuntimeError: unavailable); his
          "bounded and self-heals on the next successful push")
 FAILURE = "pe-service.service: Failed with result 'exit-code'."
 KERNEL_IO = "I/O error, dev sda, sector 123456 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 2"
+FEED = ["activity_ws_unavailable"]
+DEGRADED = ["activity_ws_redundancy_degraded"]
+FEED_WORDS = "no live trade-feed connection receiving trades"
+NOT_READY = "PROBLEM: copy service not ready on the cloud server since 2:00 PM Nov 17"
 
 
 def record(message, unit=SERVICE, host="vps", cursor="c1", **fields):
@@ -67,13 +73,14 @@ def host_result(host, records=(), **states):
 
 
 def obs(forge_records=(), vps_records=(), forge_state="active", vps_states=None,
-        ok=True, batch=159, created=T0 - dt.timedelta(hours=1), err=None, errors=None):
+        ok=True, batch=159, created=T0 - dt.timedelta(hours=1), err=None, errors=None, issues=None):
     hosts = {"forge": host_result("forge", forge_records, **{LOOP: forge_state}),
              "vps": host_result("vps", vps_records, **(vps_states or {}))}
     for host, error in (errors or {}).items():
         hosts[host] = {"error": error}
-    return {"hosts": hosts, "health_ok": ok,
-            "health_detail": "HTTP 200, ready=True" if ok else "HTTP 503, ready=False",
+    detail = ("HTTP 200, ready=True" if ok else
+              "; ".join(w.READY_ISSUES.get(i, i) for i in issues) if issues else "HTTP 503, ready=False")
+    return {"hosts": hosts, "health_ok": ok, "health_issues": None if ok else issues, "health_detail": detail,
             "batch_id": None if err else batch, "created": None if err else created, "batch_error": err}
 
 
@@ -311,6 +318,106 @@ class Rules(unittest.TestCase):
     def test_central_time_uses_daylight_saving_time(self):
         self.assertEqual(w.ct(dt.datetime(2026, 7, 1, 14, 0, tzinfo=UTC)), "9:00 AM Jul 1")
         self.assertEqual(w.ct(dt.datetime(2026, 11, 17, 15, 0, tzinfo=UTC)), "9:00 AM Nov 17")
+
+
+class Readiness(unittest.TestCase):
+    step = Rules.step
+
+    def answers(self, observations, state=None):
+        """Apply {minute: observation} in order; return (state, {minute: messages} for minutes that sent any)."""
+        s, sent = QUIET if state is None else state, {}
+        for minute, observation in sorted(observations.items()):
+            s, m = self.step(s, observation, minute)
+            if m:
+                sent[minute] = m
+        return s, sent
+
+    def test_feed_only_waits_twenty_minutes_names_reasons_and_resolves_from_the_start(self):
+        s, sent = self.answers({minute: obs(ok=False, issues=FEED) for minute in range(20)})
+        self.assertEqual(sent, {})
+        s, m = self.step(s, obs(ok=False, issues=FEED), 20)
+        self.assertEqual(m, [f"{NOT_READY} ({FEED_WORDS})"])
+        s, m = self.step(s, obs(ok=False, issues=FEED), 21)
+        self.assertEqual(m, [])
+        s, m = self.step(s, obs(), 25)
+        self.assertEqual(m, ["RESOLVED: copy service ready again (lasted 0 h 25 min)"])
+        self.assertEqual(s["not_ready"], 0)
+        self.assertNotIn("not_ready_since", s)
+        self.assertNotIn("not_ready_other", s)
+
+    def test_replayed_november_20_night_is_silent(self):
+        # Not ready, feed only, 12:03-12:05 and 12:09-12:13 AM CT; ready otherwise.
+        _, sent = self.answers({minute: obs(ok=False, issues=FEED) if minute in (3, 4, 5, 9, 10, 11, 12, 13) else obs()
+                                for minute in range(20)})
+        self.assertEqual(sent, {})
+
+    def test_feed_only_episode_ending_before_twenty_minutes_is_silent(self):
+        observations = {minute: obs(ok=False, issues=FEED) for minute in range(19)}
+        observations.update({19: obs(), 20: obs()})
+        _, sent = self.answers(observations)
+        self.assertEqual(sent, {})
+
+    def test_switching_between_feed_reasons_keeps_the_clock(self):
+        _, sent = self.answers({minute: obs(ok=False, issues=FEED if minute % 2 else DEGRADED) for minute in range(21)})
+        self.assertEqual(sent, {20: [f"{NOT_READY} (only one live trade-feed connection receiving trades)"]})
+
+    def test_mixed_reasons_message_at_the_second_check_naming_each(self):
+        mixed = ["activity_ws_unavailable", "copy_admission_blocked"]
+        _, sent = self.answers({0: obs(ok=False, issues=mixed), 1: obs(ok=False, issues=mixed)})
+        self.assertEqual(sent, {1: [f"{NOT_READY} ({FEED_WORDS}; copying paused: live trade feed and polling backup"
+                                    " both down)"]})
+
+    def test_other_then_feed_only_messages_at_the_second_answer_naming_the_earlier_reason(self):
+        _, sent = self.answers({0: obs(ok=False), 1: obs(ok=False, issues=FEED)})
+        self.assertEqual(sent, {1: [f"{NOT_READY} ({FEED_WORDS}; earlier: HTTP 503, ready=False)"]})
+
+    def test_feed_only_then_other_messages_at_the_second_answer(self):
+        _, sent = self.answers({0: obs(ok=False, issues=FEED), 1: obs(ok=False, issues=["critical_task_failed"])})
+        self.assertEqual(sent, {1: [f"{NOT_READY} (a critical task failed)"]})
+
+    def test_other_arriving_mid_grace_messages_at_once_with_the_episode_start(self):
+        observations = {minute: obs(ok=False, issues=FEED) for minute in range(5)}
+        observations[5] = obs(ok=False, issues=["brand_new_reason"])
+        _, sent = self.answers(observations)
+        self.assertEqual(sent, {5: [f"{NOT_READY} (brand_new_reason)"]})
+
+    def test_unexplained_failures_keep_the_two_check_rule_and_text(self):
+        _, sent = self.answers({0: obs(ok=False), 1: obs(ok=False)})
+        self.assertEqual(sent, {1: [f"{NOT_READY} (HTTP 503, ready=False)"]})
+
+    def test_counter_matches_the_previous_version(self):
+        # The previous version reads not_ready (plus the shared open problems): +1 per not-ready answer, 0 when ready.
+        observations = [obs(ok=False, issues=FEED), obs(ok=False), obs(), obs(ok=False, issues=["copy_admission_blocked"]),
+                        obs(ok=False, issues=DEGRADED), obs(ok=False, issues=FEED), obs()]
+        s = QUIET
+        for minute, (observation, count) in enumerate(zip(observations, [1, 2, 0, 1, 2, 3, 0])):
+            s, _ = self.step(s, observation, minute)
+            self.assertEqual(s["not_ready"], count)
+
+    def test_episode_state_round_trips_through_json_mid_grace(self):
+        s, _ = self.answers({minute: obs(ok=False, issues=FEED) for minute in range(10)})
+        _, sent = self.answers({minute: obs(ok=False, issues=FEED) for minute in range(10, 21)}, json.loads(json.dumps(s)))
+        self.assertEqual(list(sent), [20])
+
+    def test_previous_version_state_with_a_zero_count_gets_the_full_grace(self):
+        _, sent = self.answers({minute: obs(ok=False, issues=FEED) for minute in range(21)}, {"not_ready": 0})
+        self.assertEqual(list(sent), [20])
+
+    def test_previous_version_positive_count_messages_at_the_next_not_ready_answer(self):
+        _, sent = self.answers({0: obs(ok=False, issues=FEED)}, {"not_ready": 1})
+        self.assertEqual(sent, {0: [f"{NOT_READY} ({FEED_WORDS}; earlier: {w.UNCLASSIFIED})"]})
+
+    def test_previous_version_open_problem_is_kept_and_resolves_from_its_start(self):
+        opened = {"since": (T0 - dt.timedelta(minutes=10)).isoformat(), "text": "copy service not ready"}
+        s, sent = self.answers({0: obs(ok=False, issues=FEED)}, {"not_ready": 3, "open": {"health": opened}})
+        self.assertEqual(sent, {})
+        s, m = self.step(s, obs(), 1)
+        self.assertEqual(m, ["RESOLVED: copy service ready again (lasted 0 h 11 min)"])
+
+    def test_stale_episode_keys_with_a_zero_count_start_a_fresh_episode(self):
+        stale = {"not_ready": 0, "not_ready_since": (T0 - dt.timedelta(hours=1)).isoformat(), "not_ready_other": "old"}
+        _, sent = self.answers({minute: obs(ok=False, issues=FEED) for minute in range(21)}, stale)
+        self.assertEqual(sent, {20: [f"{NOT_READY} ({FEED_WORDS})"]})
 
 
 class Events(unittest.TestCase):
@@ -882,7 +989,7 @@ class Reads(unittest.TestCase):
             o = w.observe(conf, {})
         self.assertEqual(o["batch_id"], 159)
         self.assertEqual(o["created"], T0)
-        self.assertEqual(fetch.call_args_list, [unittest.mock.call("http://ready", timeout=5),
+        self.assertEqual(fetch.call_args_list, [unittest.mock.call("http://ready", timeout=5, error_body=True),
             unittest.mock.call("https://db/rest/v1/ranking_batches?select=batch_id,created_at&order=batch_id.desc&limit=1",
                                {"apikey": "anon", "Authorization": "Bearer anon"}, timeout=10)])
         with patch.object(w, "read_host", side_effect=lambda h, c: host_result(h)), \
@@ -893,6 +1000,59 @@ class Reads(unittest.TestCase):
         self.assertIn("ValueError", o["batch_error"])
         self.assertIsNone(o["created"])
 
+    def test_fetch_json_returns_error_bodies_only_on_request_and_closes_them(self):
+        feed_body = json.dumps({"ready": False, "issues": FEED}).encode()
+
+        def fetch(body, error_body):
+            error = urllib.error.HTTPError("http://ready", 503, "Service Unavailable", {}, io.BytesIO(body))
+            opener = unittest.mock.Mock()
+            opener.open.side_effect = error
+            with patch.object(w.urllib.request, "build_opener", return_value=opener):
+                try:
+                    return w.fetch_json("http://ready", timeout=5, error_body=error_body), error
+                except urllib.error.HTTPError as raised:
+                    return raised, error
+
+        result, error = fetch(feed_body, True)
+        self.assertEqual(result, (503, {"ready": False, "issues": FEED}))
+        self.assertTrue(error.fp.closed)
+        hidden_suffix = feed_body + b" " * (65536 - len(feed_body)) + b"x"  # first 65,536 bytes parse
+        for body in (b"<html>unavailable</html>", feed_body[:30], hidden_suffix):
+            with self.subTest(size=len(body)):
+                result, error = fetch(body, True)
+                self.assertIs(result, error)
+                self.assertTrue(error.fp.closed)
+        result, error = fetch(feed_body, False)  # the Supabase read keeps raising
+        self.assertIs(result, error)
+
+    def test_observe_validates_the_readiness_reasons(self):
+        conf = {"PE_HEALTH_URL": "health", "PE_SUPABASE_URL": "supabase", "PE_SUPABASE_ANON_KEY": "anon"}
+        batch = (200, [{"batch_id": 159, "created_at": T0.isoformat()}])
+        cases = [((503, {"ready": False, "issues": FEED}), FEED, FEED_WORDS),
+                 ((503, {"ready": False, "issues": ["brand_new_reason"]}), ["brand_new_reason"], "brand_new_reason"),
+                 ((503, {"ready": False, "issues": "activity_ws_unavailable"}), None, "HTTP 503, ready=False"),
+                 ((503, {"ready": False, "issues": []}), None, "HTTP 503, ready=False"),
+                 ((503, {"ready": False, "issues": [1]}), None, "HTTP 503, ready=False"),
+                 ((503, {"ready": False, "issues": [""]}), None, "HTTP 503, ready=False"),
+                 ((503, {"ready": True, "issues": FEED}), None, "HTTP 503, ready=True"),
+                 ((500, {"ready": False, "issues": FEED}), None, "HTTP 500, ready=False"),
+                 ((503, {"error": "maintenance"}), None, "HTTP 503, ready=None"),
+                 (urllib.error.HTTPError("health", 503, "Service Unavailable", {}, io.BytesIO(b"")), None,
+                  "HTTPError: HTTP Error 503: Service Unavailable")]
+        for reply, issues, detail in cases:
+            with self.subTest(reply=reply), patch.object(w, "read_host", side_effect=lambda h, c: host_result(h)), \
+                 patch.object(w, "fetch_json", side_effect=[reply, batch]):
+                o = w.observe(conf, {})
+                self.assertFalse(o["health_ok"])
+                self.assertEqual(o["health_issues"], issues)
+                self.assertEqual(o["health_detail"], detail)
+
+    def test_reasons_table_matches_the_copy_service(self):
+        source = (Path(__file__).resolve().parents[1] / "crates/service/src/health.rs").read_text()
+        reported = set(re.findall(r'issues\.push\("([a-z_]+)"\)', source))
+        self.assertEqual(reported, set(w.READY_ISSUES))
+        self.assertLessEqual(w.FEED_ISSUES, reported)
+
 
 class Main(unittest.TestCase):
     def setUp(self):
@@ -900,10 +1060,12 @@ class Main(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         self.conf, self.state, self.flag = root / "watchdog.env", root / "state/state.json", root / "send-test-alert"
+        self.reset = root / "reset-health-episode"
         self.conf.write_text("PE_SUPABASE_URL=https://db\nPE_SUPABASE_ANON_KEY=anon=value\n")
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        for name, path in (("CONF", self.conf), ("STATE", self.state), ("TEST_FLAG", self.flag)):
+        for name, path in (("CONF", self.conf), ("STATE", self.state), ("TEST_FLAG", self.flag),
+                           ("RESET_FLAG", self.reset)):
             self.stack.enter_context(patch.object(w, name, path))
         self.clock = self.stack.enter_context(patch.object(w.dt, "datetime", wraps=dt.datetime))
         self.clock.now.return_value = T0
@@ -956,6 +1118,27 @@ class Main(unittest.TestCase):
         before = self.state.read_bytes()
         self.assertEqual(self.run_main(dry=True), "")
         self.assertEqual(self.state.read_bytes(), before)
+
+    def test_reset_flag_drops_earlier_episode_keys_and_is_removed_after_the_write(self):
+        # State an earlier install leaves when the install fence is followed: episode keys from a run before the flag,
+        # then previous-version runs that saw ready and another failure (not_ready 1).
+        stale = json.dumps({"not_ready": 1, "not_ready_since": (T0 - dt.timedelta(minutes=5)).isoformat()})
+        self.observer.return_value = obs(ok=False, issues=FEED)
+        self.state.parent.mkdir(parents=True)
+        self.state.write_text(stale)
+        self.assertEqual(self.run_main(), "")  # without the flag the 5-minute-old episode is trusted
+        self.state.write_text(stale)
+        self.reset.touch()
+        output = self.run_main()
+        self.assertEqual(output, f"pe-watchdog\n{NOT_READY} ({FEED_WORDS}; earlier: {w.UNCLASSIFIED})\n")
+        self.assertFalse(self.reset.exists())
+        self.assertEqual(json.loads(self.state.read_text())["not_ready"], 2)
+
+    def test_dry_run_keeps_the_reset_flag_and_writes_nothing(self):
+        self.reset.touch()
+        self.assertEqual(self.run_main(dry=True), "")
+        self.assertTrue(self.reset.exists())
+        self.assertFalse(self.state.parent.exists())
 
 
 if __name__ == "__main__":
