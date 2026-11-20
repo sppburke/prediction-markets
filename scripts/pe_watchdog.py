@@ -5,8 +5,10 @@ Stdout goes to Telegram verbatim, only for a problem, its resolution or a reques
 (owner, 2026-11-18: no routine status); otherwise no output. Python 3.11+, stdlib only.
 Config: ~/.config/pe-watchdog/watchdog.env (KEY=VALUE: PE_SUPABASE_URL,
 PE_SUPABASE_ANON_KEY, PE_HEALTH_URL). State: ~/.local/state/pe-watchdog/state.json.
-Create ~/.config/pe-watchdog/send-test-alert for a TEST line. --dry-run prints only
-what would be sent, without writing state or removing that flag. Runs never overlap.
+Create ~/.config/pe-watchdog/send-test-alert for a TEST line. Create
+~/.config/pe-watchdog/reset-health-episode just before installing a new version (docs/35): the
+next run drops readiness-episode keys an earlier version left in the state. --dry-run prints only
+what would be sent, without writing state or removing either flag. Runs never overlap.
 """
 
 import copy
@@ -17,6 +19,7 @@ import re
 import shlex
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -25,6 +28,7 @@ from zoneinfo import ZoneInfo
 HOME = Path.home()
 CONF = HOME / ".config/pe-watchdog/watchdog.env"
 TEST_FLAG = HOME / ".config/pe-watchdog/send-test-alert"
+RESET_FLAG = HOME / ".config/pe-watchdog/reset-health-episode"
 STATE = HOME / ".local/state/pe-watchdog/state.json"
 CT = ZoneInfo("America/Chicago")
 LATE_HOURS = 11
@@ -93,6 +97,30 @@ CONFIG_READ_PROBLEM = 3
 # A coordinated pe-service stop ends within SHUTDOWN_DEADLINE = 45 s (crates/service/src/supervisor.rs);
 # meanwhile a best-effort task whose input channel closed first logs "best-effort owner degraded".
 SHUTDOWN_WINDOW = dt.timedelta(minutes=2)
+# pe-service answers /health/ready with 503 while fewer than two of its live trade-feed connections
+# deliver trades (crates/service/src/health.rs readiness_issues), and copying continues through its
+# polling backup meanwhile. Polymarket's announced trading-engine restarts silence that feed for
+# minutes, so a 503 listing only these reasons is a problem once it lasts FEED_QUIET_WINDOW
+# (docs/_GLOSSARY.md watchdog_feed_quiet_window).
+FEED_ISSUES = frozenset({"activity_ws_unavailable", "activity_ws_redundancy_degraded"})
+FEED_QUIET_WINDOW = dt.timedelta(minutes=20)
+# Plain words for every reason readiness_issues can report; an unknown reason is shown as named.
+READY_ISSUES = {
+    "polygon_source_dead": "Polygon chain source down",
+    "polygon_source_stale": "no Polygon chain data for over a minute",
+    "polymarket_source_stale": "no fresh Polymarket data for over a minute",
+    "event_log_not_writable": "event log not writable",
+    "paper_durability_uncertain": "paper ledger write failed, paper copying stopped",
+    "live_journal_durability_uncertain": "live order journal write failed",
+    "configuration_generation_pending": "follow-list size change still being applied",
+    "critical_task_failed": "a critical task failed",
+    "coordinated_shutdown": "shutting down",
+    "activity_ws_sink_poisoned": "live trade feed paused by a failed source-log write",
+    "activity_ws_unavailable": "no live trade-feed connection receiving trades",
+    "activity_ws_redundancy_degraded": "only one live trade-feed connection receiving trades",
+    "copy_admission_blocked": "copying paused: live trade feed and polling backup both down",
+}
+UNCLASSIFIED = "not classified (recorded before an install)"
 PUBLISH_RETRY = re.compile(
     r"WARNING: transient Supabase \S+ failure; retry \d+/\d+ in \d+s:"
 )
@@ -108,11 +136,25 @@ NGINX_ACCESS = re.compile(
 NGINX_ERROR = re.compile(r"\[(?:emerg|alert|crit|error)\]")
 
 
-def fetch_json(url, headers=None, timeout=8):
+def fetch_json(url, headers=None, timeout=8, error_body=False):
+    """(status, parsed JSON). error_body=True also returns an HTTP error reply's JSON body (the
+    readiness reply lists its reasons); one over 65,536 bytes or not JSON re-raises the HTTPError."""
     req = urllib.request.Request(url, headers=headers or {})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=timeout) as resp:
-        return resp.status, json.loads(resp.read(65536) or b"null")
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read(65536) or b"null")
+    except urllib.error.HTTPError as error:
+        if not error_body:
+            raise
+        with error:
+            raw = error.read(65537)
+            try:
+                if len(raw) > 65536:
+                    raise ValueError("reply over 65,536 bytes")
+                return error.code, json.loads(raw)
+            except (ValueError, RecursionError):  # deep nesting overflows the parser
+                raise error from None
 
 
 def remote_argv(host, cursor=None):
@@ -179,21 +221,29 @@ def read_host(host, cursor=None):
 
 
 def observe(conf, state):
-    """Parsed hosts plus health_ok/detail, batch_id/created, and batch_error.
+    """Parsed hosts plus health_ok/issues/detail, batch_id/created, and batch_error.
 
     Each successful host has records (journal dictionaries) and units (canonical
     unit -> is-active state); a failed host has an error string and may request
-    reset_cursor. created is an aware UTC datetime or None. All I/O is outside evaluate.
+    reset_cursor. health_issues is the reason list of a 503 ready=false reply, else None.
+    created is an aware UTC datetime or None. All I/O is outside evaluate.
     """
     with ThreadPoolExecutor(max_workers=2) as pool:
         reads = {h: pool.submit(read_host, h, state.get("cursors", {}).get(h))
                  for h in HOST_UNITS}
         try:
-            status, body = fetch_json(conf["PE_HEALTH_URL"], timeout=5)
-            health_ok = status == 200 and isinstance(body, dict) and body.get("ready") is True
-            health_detail = f"HTTP {status}, ready={body.get('ready') if isinstance(body, dict) else body!r}"
+            status, body = fetch_json(conf["PE_HEALTH_URL"], timeout=5, error_body=True)
+            is_object = isinstance(body, dict)
+            ready = body.get("ready") if is_object else body
+            issues = body.get("issues") if is_object else None
+            health_ok = status == 200 and is_object and ready is True
+            health_issues = (issues if status == 503 and ready is False and isinstance(issues, list)
+                             and issues and all(isinstance(i, str) and i for i in issues) else None)
+            health_detail = ("; ".join(READY_ISSUES.get(i, i) for i in health_issues) if health_issues
+                             else f"HTTP {status}, ready={ready!r}")
         except Exception as error:
-            health_ok, health_detail = False, f"{type(error).__name__}: {error}"[:200]
+            health_ok, health_issues = False, None
+            health_detail = f"{type(error).__name__}: {error}"[:200]
         batch_id = created = batch_error = None
         try:
             key = conf["PE_SUPABASE_ANON_KEY"]
@@ -207,7 +257,7 @@ def observe(conf, state):
             batch_id = created = None
             batch_error = f"{type(error).__name__}: {error}"[:200]
         return {"hosts": {h: f.result() for h, f in reads.items()},
-                "health_ok": health_ok, "health_detail": health_detail,
+                "health_ok": health_ok, "health_issues": health_issues, "health_detail": health_detail,
                 "batch_id": batch_id, "created": created, "batch_error": batch_error}
 
 
@@ -274,6 +324,9 @@ def evaluate(state, observation, now):
     break unit poll streaks; journalctl failures request a cursor reset. Recovery
     events resolve matching recent message keys (including every kind variant).
     Failed settings reads count by journal time, so a backlog of old ones stays silent.
+    A not-ready episode whose every answer lists only FEED_ISSUES stays silent until it lasts
+    FEED_QUIET_WINDOW; any other not-ready answer in it keeps the two-answer rule. not_ready is
+    the counter the previous version also keeps; not_ready_since/not_ready_other describe the episode.
     """
     s = copy.deepcopy(state)
     for key in ("open", "cursors", "events", "host_failures", "unit_polls"):
@@ -422,12 +475,32 @@ def evaluate(state, observation, now):
                 if polls["active"] >= 2:
                     close_problem("down:" + unit, f"{unit.removesuffix('.service')} running again")
 
-    health_ok = observation["health_ok"]
-    s["not_ready"] = 0 if health_ok else s.get("not_ready", 0) + 1
-    if s["not_ready"] >= 2:
-        open_problem("health", f"copy service not ready on the cloud server since {ct(now)} ({one_line(observation['health_detail'], 200)})")
-    elif health_ok:
+    previous = s.get("not_ready", 0)
+    if observation["health_ok"]:
+        s["not_ready"] = 0
+        s.pop("not_ready_since", None)
+        s.pop("not_ready_other", None)
         close_problem("health", "copy service ready again")
+    else:
+        s["not_ready"] = previous + 1
+        if previous == 0:
+            s["not_ready_since"] = now.isoformat()
+            s.pop("not_ready_other", None)
+        elif "not_ready_since" not in s:
+            # Earlier answers of this episode were seen by another version: treat them as other.
+            s["not_ready_since"] = s["open"].get("health", {}).get("since", now.isoformat())
+            s["not_ready_other"] = UNCLASSIFIED
+        issues = observation["health_issues"]
+        feed_only = bool(issues) and FEED_ISSUES.issuperset(issues)
+        if not feed_only:
+            s["not_ready_other"] = observation["health_detail"]
+        since = dt.datetime.fromisoformat(s["not_ready_since"])
+        if s["not_ready"] >= 2 and (s.get("not_ready_other") or now - since >= FEED_QUIET_WINDOW):
+            detail = observation["health_detail"]
+            if feed_only and s.get("not_ready_other"):
+                detail += f"; earlier: {s['not_ready_other']}"
+            open_problem("health", f"copy service not ready on the cloud server since {ct(since)}"
+                         f" ({one_line(detail, 200)})", since=since.isoformat())
 
     if not observation["batch_error"]:
         batch_id, created = observation["batch_id"], observation["created"]
@@ -452,6 +525,11 @@ def main():
     conf = dict(line.split("=", 1) for line in CONF.read_text().splitlines() if "=" in line)
     conf.setdefault("PE_HEALTH_URL", "http://82.22.32.225:8080/health/ready")
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    reset = RESET_FLAG.exists()
+    if reset:
+        # First run after an install: episode keys written before it are never trusted.
+        state.pop("not_ready_since", None)
+        state.pop("not_ready_other", None)
     now = dt.datetime.now(dt.timezone.utc)
     new_state, messages = evaluate(state, observe(conf, state), now)
     test = TEST_FLAG.exists()
@@ -464,6 +542,8 @@ def main():
         os.replace(tmp, STATE)
         if test:
             TEST_FLAG.unlink()
+        if reset:
+            RESET_FLAG.unlink()
     if messages:
         print("pe-watchdog\n" + "\n".join(messages))
 
