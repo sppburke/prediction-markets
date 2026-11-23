@@ -2196,13 +2196,18 @@ class MarketScopeLoad(unittest.TestCase):
                     self.load(value)
 
     def test_recorded_exclusions_validate_in_both_modes(self):
-        """#871: `excluded_series` names test or slugless series the scope never read or walked; the reader ignores it,
-        and an excluded pinned series has no by-id read."""
+        """#871: `excluded_series` names test or slugless series the scope never read or walked; #892:
+        `excluded_events` names events of kept series whose own slug kept their markets out. The reader ignores both,
+        returns only the kept ids, and an excluded pinned series has no by-id read."""
         excluded = [{"id": "14", "slug": None, "reason": "no_slug"},
                     {"id": "13005", "slug": "polyv2-soak-btc-up-or-down-15m", "reason": "test_series"}]
+        events = [{"series_id": "2", "event_id": "1183821", "slug": "polyv2zec-updown-15m-1791927000",
+                   "reason": "test_event", "condition_ids": ["0xc"]},
+                  {"series_id": "2", "event_id": "7", "slug": None, "reason": "no_slug", "condition_ids": ["0xd"]}]
         for mode, value in (("listing", self.two_series()), ("pinned", self.pinned())):
             with self.subTest(mode=mode):
                 value["excluded_series"] = excluded
+                value["excluded_events"] = events
                 ids, summary = self.load(value)
                 self.assertEqual(ids, frozenset({"0xa", "0xb"}))
                 self.assertEqual(summary["count"], 2)

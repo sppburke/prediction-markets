@@ -1164,6 +1164,7 @@ mod tests {
                             completed_at_unix: NOW,
                             series,
                             excluded_series: Vec::new(),
+                            excluded_events: Vec::new(),
                             pages: vec![],
                             count: u64::try_from(condition_ids.len()).unwrap(),
                             condition_ids,

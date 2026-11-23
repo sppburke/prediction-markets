@@ -489,7 +489,7 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/api-spec/gamma-openapi.yaml (`Market.events`, `Event.series`, `Series.recurrence`, `Series.slug`) | 2026-11-08 | 2027-01-07 |
 | https://gamma-api.polymarket.com/series?exclude_events=true&limit=50&offset={k} (discover additions to the covered set) | 2026-11-08 | 2027-01-07 |
 | https://gamma-api.polymarket.com/series/{id} (read each covered series by id; verify its slug and recurrence for discovery and ranking) | 2026-11-08 | 2027-01-07 |
-| https://gamma-api.polymarket.com/events/keyset?series_id={id}&end_date_min={iso}&limit=50&after_cursor={cursor} (documented in gamma-openapi.yaml; pages above 50 are gzip-only) | 2026-11-12 | 2027-01-11 |
+| https://gamma-api.polymarket.com/events/keyset?series_id={id}&end_date_min={iso}&limit=50&after_cursor={cursor} (documented in gamma-openapi.yaml; pages above 50 are gzip-only) | 2026-11-23 | 2027-01-22 |
 | https://gamma-api.polymarket.com/markets?clob_token_ids={token}&closed=true | 2026-09-02 | 2026-11-01 |
 | https://docs.polymarket.com/developers/clob/markets | 2026-05-12 | 2026-07-11 |
 | https://raw.githubusercontent.com/Polymarket/agent-skills/91ee44ae113e958affd20cd505c6e9d9d6100e0b/websocket.md (`tick_size_change` trigger) | 2026-11-13 | 2027-01-12 |
@@ -612,6 +612,16 @@ Treat as research inspiration; not a production decision input unless an authori
   200; `/events?limit=100` 406; `/events` at the default size and `/markets?limit=500` 200. The ranker had walked
   every scope series at `limit=100` until 04:04 CT that day. pe-bootstrap pages both endpoints at 50, because the
   workspace HTTP client does not negotiate gzip.
+
+- 2026-11-23 (ranker event slugs, #892): the official
+  [keyset reference](https://docs.polymarket.com/api-reference/events/list-events-keyset-pagination), read 2026-11-23,
+  types each event's `id` as a string and `slug` as a nullable string, with `series[]` (`id`, `slug`, `recurrence`) and
+  `markets[].conditionId`; it says nothing about test events. Gamma's listing of production series 12518
+  `zec-up-or-down-15m` (2026-11-23 15:00–15:03Z, end ≥ 2026-05-26) held 14,425 events, 3,736 of them with their own
+  slug `polyv2zec-updown-15m-<ts>` (ending 2026-10-13 21:45Z – 2026-11-21 19:30Z) and the production series embedded,
+  so the series rule kept them; the other 12 series with events held none, and all 141,476 events walked carried a
+  non-blank slug and one market. The prefix stays an inference from this census, not a venue guarantee. Evidence:
+  `/mnt/data/pm-study/v26-testevents-1123/census-20261123/`.
 
 - 2026-11-08 (ranker scope, #871): re-read the official `gamma-openapi.yaml` (`Series.slug`
   `type: string, nullable: true`) and re-ran the full `/series?exclude_events=true` listing
