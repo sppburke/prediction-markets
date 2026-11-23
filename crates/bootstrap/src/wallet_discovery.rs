@@ -3389,6 +3389,9 @@ mod tests {
         assert_eq!(cache.wallet_pile_size().unwrap(), 0);
     }
 
+    /// One subset sweep's kept markets and excluded events.
+    type Sweep = (Vec<u64>, Vec<ExcludedEvent>);
+
     fn excluded_event(series: &str, id: &str, markets: &[u64]) -> ExcludedEvent {
         ExcludedEvent {
             series_id: series.into(),
@@ -3419,8 +3422,8 @@ mod tests {
     async fn discover_with(
         cache: &mut WalletCache,
         audit: &Path,
-        covered_sweep: (Vec<u64>, Vec<ExcludedEvent>),
-        addition_sweep: (Vec<u64>, Vec<ExcludedEvent>),
+        covered_sweep: Sweep,
+        addition_sweep: Sweep,
         fetcher: TestFetcher<impl Fn(&str) -> Result<Value, SourceError> + Sync>,
     ) -> (Result<SourceDiscoveryResult, BootstrapError>, usize) {
         let covered = vec![production_series("1")];
@@ -3515,11 +3518,7 @@ mod tests {
     /// exclusions and contiguous Gamma pages in the audit.
     #[tokio::test]
     async fn participants_conflicting_sweeps_fail_before_any_trades_request() {
-        let cases: Vec<(
-            &str,
-            (Vec<u64>, Vec<ExcludedEvent>),
-            (Vec<u64>, Vec<ExcludedEvent>),
-        )> = vec![
+        let cases: Vec<(&str, Sweep, Sweep)> = vec![
             (
                 "kept, then excluded",
                 (vec![5], vec![]),
