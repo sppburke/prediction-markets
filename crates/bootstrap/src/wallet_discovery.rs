@@ -3510,7 +3510,28 @@ mod tests {
             .collect();
         assert_eq!(ids, ["100", "200"]);
         assert_eq!(audit["record"]["excluded_events"], 2);
+        assert!(
+            audit["record"]["excluded_events"].is_u64(),
+            "the summary counts exclusions only"
+        );
         assert_eq!(audit["record"]["status"], "ok");
+        let ordinals: Vec<u64> = audit["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|page| {
+                page["url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("http://gamma.test/")
+            })
+            .map(|page| page["ordinal"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            ordinals,
+            [0, 1, 2],
+            "listing, covered sweep, addition sweep"
+        );
     }
 
     /// FAIL (#892): a kept/excluded market across the two sweeps (either direction), or one excluded event id with other
@@ -3544,6 +3565,12 @@ mod tests {
             let (dir, mut cache) = tmp_cache();
             let audit = audit_path(&dir);
             let excluded = covered_sweep.1.len() + addition_sweep.1.len();
+            let records: Vec<ExcludedEvent> = covered_sweep
+                .1
+                .iter()
+                .chain(&addition_sweep.1)
+                .cloned()
+                .collect();
             let (result, sweeps) = discover_with(
                 &mut cache,
                 &audit,
@@ -3564,6 +3591,15 @@ mod tests {
             let audit: Value = serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
             assert_eq!(audit["record"]["status"], "failed:gamma", "{name}");
             assert_eq!(audit["record"]["excluded_events"], excluded, "{name}");
+            let serialized = if records.is_empty() {
+                Value::Null
+            } else {
+                serde_json::to_value(&records).unwrap()
+            };
+            assert_eq!(
+                audit["excluded_events"], serialized,
+                "{name}: both sweeps' records, in order"
+            );
             let ordinals: Vec<u64> = audit["pages"]
                 .as_array()
                 .unwrap()

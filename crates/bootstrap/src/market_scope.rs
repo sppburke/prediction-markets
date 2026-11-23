@@ -165,19 +165,32 @@ pub struct ExcludedEvent {
 #[derive(Debug, Default)]
 pub(crate) struct ScopeMembership {
     kept: BTreeSet<String>,
+    /// The first kept event of each kept market, as named in a conflict.
+    kept_by: HashMap<String, String>,
     excluded: Vec<ExcludedEvent>,
     by_event: HashMap<String, usize>,
-    excluded_ids: HashSet<String>,
+    /// Each excluded market's excluded event id.
+    excluded_ids: HashMap<String, String>,
 }
 
 impl ScopeMembership {
-    fn keep(&mut self, condition_id: String, at: &str) -> Result<(), BootstrapError> {
-        if self.excluded_ids.contains(&condition_id) {
+    fn keep(
+        &mut self,
+        condition_id: String,
+        kept_event: &str,
+        at: &str,
+    ) -> Result<(), BootstrapError> {
+        if let Some(excluded) = self.excluded_ids.get(&condition_id) {
             return Err(membership_conflict(
                 at,
-                &format!("market {condition_id} is listed by both a kept and an excluded event"),
+                &format!(
+                    "market {condition_id} is listed by kept event {kept_event} and excluded event {excluded}"
+                ),
             ));
         }
+        self.kept_by
+            .entry(condition_id.clone())
+            .or_insert_with(|| kept_event.to_owned());
         self.kept.insert(condition_id);
         Ok(())
     }
@@ -200,16 +213,19 @@ impl ScopeMembership {
             .iter()
             .find(|id| self.kept.contains(*id))
         {
+            let kept_event = self.kept_by.get(kept).map_or("?", String::as_str);
             return Err(membership_conflict(
                 at,
                 &format!(
-                    "market {kept} is listed by both a kept and an excluded event ({})",
+                    "market {kept} is listed by kept event {kept_event} and excluded event {}",
                     event.event_id
                 ),
             ));
         }
-        self.excluded_ids
-            .extend(event.condition_ids.iter().cloned());
+        for condition_id in &event.condition_ids {
+            self.excluded_ids
+                .insert(condition_id.clone(), event.event_id.clone());
+        }
         self.by_event
             .insert(event.event_id.clone(), self.excluded.len());
         self.excluded.push(event);
@@ -222,7 +238,11 @@ impl ScopeMembership {
             self.exclude(event.clone(), "participant sweeps")?;
         }
         for condition_id in &scope.condition_ids {
-            self.keep(condition_id.clone(), "participant sweeps")?;
+            self.keep(
+                condition_id.clone(),
+                "(another participant sweep)",
+                "participant sweeps",
+            )?;
         }
         Ok(())
     }
@@ -723,8 +743,17 @@ fn collect_event(
     }
     let slug = event.get("slug").and_then(Value::as_str);
     let Some(reason) = event_exclusion(slug) else {
+        // A kept event needs no id; a conflict names whatever it has.
+        let kept_event = decimal_id(event.get("id")).map_or_else(
+            || {
+                event
+                    .get("id")
+                    .map_or_else(|| "(no id)".to_owned(), Value::to_string)
+            },
+            |(number, _)| number.to_string(),
+        );
         for condition_id in condition_ids {
-            membership.keep(condition_id, url)?;
+            membership.keep(condition_id, &kept_event, url)?;
         }
         return Ok(());
     };
@@ -1989,59 +2018,50 @@ mod tests {
     }
 
     /// FAIL (#892): a market listed by both a kept and an excluded event, in either order, on one page, across pages or
-    /// across series, is kept, dropped or anything but a temporary failure (exit 75) naming the market.
+    /// across series, is kept, dropped or anything but a temporary failure (exit 75) naming the market and both events.
     #[tokio::test]
     async fn a_market_is_never_both_kept_and_excluded() {
         let market = condition(5);
-        let kept = |series: &str, id: u64| {
-            named_event(
-                series,
-                json!(id),
-                json!(format!("ok-{id}")),
-                &[condition(5)],
-            )
-        };
-        let excluded = |series: &str, id: u64| {
-            named_event(
-                series,
-                json!(id),
-                json!(format!("polyv2x-{id}")),
-                &[condition(5)],
-            )
+        let kept = |series: &str| named_event(series, json!(1), json!("ok-1"), &[condition(5)]);
+        let excluded =
+            |series: &str| named_event(series, json!(2), json!("polyv2x-2"), &[condition(5)]);
+        let one_page =
+            |first: Value, second: Value| vec![("7", None, json!({"events": [first, second]}))];
+        let two_pages = |first: Value, second: Value| {
+            vec![
+                ("7", None, json!({"events": [first], "next_cursor": "c1"})),
+                ("7", Some("c1"), json!({"events": [second]})),
+            ]
         };
         for (name, pages) in [
             (
-                "kept, then excluded on the same page",
-                vec![(
-                    "7",
-                    None,
-                    json!({"events": [kept("7", 1), excluded("7", 2)]}),
-                )],
+                "kept, then excluded on one page",
+                one_page(kept("7"), excluded("7")),
             ),
             (
-                "excluded, then kept on the same page",
-                vec![(
-                    "7",
-                    None,
-                    json!({"events": [excluded("7", 2), kept("7", 1)]}),
-                )],
+                "excluded, then kept on one page",
+                one_page(excluded("7"), kept("7")),
             ),
             (
-                "across pages",
+                "kept, then excluded across pages",
+                two_pages(kept("7"), excluded("7")),
+            ),
+            (
+                "excluded, then kept across pages",
+                two_pages(excluded("7"), kept("7")),
+            ),
+            (
+                "kept, then excluded across series",
                 vec![
-                    (
-                        "7",
-                        None,
-                        json!({"events": [kept("7", 1)], "next_cursor": "c1"}),
-                    ),
-                    ("7", Some("c1"), json!({"events": [excluded("7", 2)]})),
+                    ("7", None, json!({"events": [kept("7")]})),
+                    ("8", None, json!({"events": [excluded("8")]})),
                 ],
             ),
             (
-                "across series",
+                "excluded, then kept across series",
                 vec![
-                    ("7", None, json!({"events": [excluded("7", 2)]})),
-                    ("8", None, json!({"events": [kept("8", 1)]})),
+                    ("7", None, json!({"events": [excluded("7")]})),
+                    ("8", None, json!({"events": [kept("8")]})),
                 ],
             ),
         ] {
@@ -2051,7 +2071,13 @@ mod tests {
                 matches!(error, BootstrapError::TransientSource { .. }),
                 "{name}: {error}"
             );
-            assert!(error.to_string().contains(&market), "{name}: {error}");
+            let text = error.to_string();
+            assert!(
+                text.contains(&format!(
+                    "market {market} is listed by kept event 1 and excluded event 2"
+                )),
+                "{name}: {text}"
+            );
         }
     }
 
@@ -2092,9 +2118,12 @@ mod tests {
         assert!(scope.excluded_events.is_empty());
     }
 
-    /// FAIL (#892): on real Gamma event shapes (trimmed from `events/keyset?series_id=12518`, cursor after id 1182367,
-    /// fetched 2026-11-23 09:00 CST, page sha256 bf2057d5349e318c…: two production and two `polyv2zec` events, extra
-    /// fields included), a test event's market is kept or a production one dropped.
+    /// FAIL (#892): on real Gamma event shapes, a test event's market is kept, a production one dropped, the digest or
+    /// page provenance wrong, an excluded event's ids not its own, or a competing error reported in another order.
+    /// Fixture `gamma_keyset_zec_mixed.json`: two production and two `polyv2zec` events (fields trimmed, extra fields
+    /// kept) from the reply to
+    /// `https://gamma-api.polymarket.com/events/keyset?series_id=12518&end_date_min=2026-05-26T00%3A00%3A00Z&limit=50&after_cursor=G4UOe7vzghe3R2KGEzHefxd4KvhoMHhxK7C84PCQLKJ7InYiOjEsImsiOiJldmVudHMiLCJvaCI6IjRmNTNjZGExOGMyYmFhMGMwMzU0YmI1ZjlhM2VjYmU1ZWQxMmFiNGQ4ZTExYmE4NzNjMmYxMTE2MTIwMmI5NDUiLCJrZXlzIjpbeyJ0Ijoic3RyaW5nIiwidiI6IjExODIzNjcifV19`
+    /// fetched 2026-11-23 09:00 CST (reply sha256 bf2057d5349e318ce32cdda89c2b4fa0344c14740337173d59a0b12e612f7bd4).
     #[tokio::test]
     async fn real_mixed_zec_page_keeps_production_events_and_records_test_ones() {
         let page: Value = serde_json::from_slice(include_bytes!(
@@ -2102,43 +2131,109 @@ mod tests {
         ))
         .unwrap();
         let events = page["events"].as_array().unwrap().clone();
-        let production: Vec<String> = events
-            .iter()
-            .filter(|e| !e["slug"].as_str().unwrap().starts_with("polyv2"))
-            .map(|e| e["markets"][0]["conditionId"].as_str().unwrap().to_owned())
-            .collect();
-        let scope = sweep(move |url: &str, _| {
-            Ok(if url.contains("/series?") {
-                br#"[{"id":"12518","slug":"zec-up-or-down-15m","recurrence":"15m"}]"#.to_vec()
-            } else {
-                serde_json::to_vec(&page).unwrap()
-            })
-        })
-        .await
-        .unwrap();
-        let mut expected = production;
-        expected.sort();
-        assert_eq!(scope.condition_ids, expected);
-        let recorded: Vec<(&str, &str)> = scope
+        let ids_of = |test: bool| -> Vec<(String, Vec<String>)> {
+            events
+                .iter()
+                .filter(|e| e["slug"].as_str().unwrap().starts_with("polyv2") == test)
+                .map(|e| {
+                    let markets = e["markets"].as_array().unwrap();
+                    let ids = markets
+                        .iter()
+                        .map(|m| m["conditionId"].as_str().unwrap().to_owned())
+                        .collect();
+                    (e["id"].as_str().unwrap().to_owned(), ids)
+                })
+                .collect()
+        };
+        let serve_page = |page: Value| {
+            let body = serde_json::to_vec(&page).unwrap();
+            move |url: &str, _| -> Result<Vec<u8>, SourceError> {
+                Ok(if url.contains("/series?") {
+                    br#"[{"id":"12518","slug":"zec-up-or-down-15m","recurrence":"15m"}]"#.to_vec()
+                } else {
+                    body.clone()
+                })
+            }
+        };
+        let body = serde_json::to_vec(&page).unwrap();
+        let scope = sweep(serve_page(page.clone())).await.unwrap();
+        let mut kept: Vec<String> = ids_of(false).into_iter().flat_map(|(_, ids)| ids).collect();
+        kept.sort();
+        assert_eq!(scope.condition_ids, kept);
+        assert_eq!(
+            scope.digest,
+            format!("{:x}", Sha256::digest(kept.join("\n").as_bytes()))
+        );
+        let recorded: Vec<(String, Option<String>, Vec<String>)> = scope
             .excluded_events
             .iter()
-            .map(|e| (e.event_id.as_str(), e.slug.as_deref().unwrap()))
+            .map(|e| (e.event_id.clone(), e.slug.clone(), e.condition_ids.clone()))
             .collect();
+        let expected: Vec<(String, Option<String>, Vec<String>)> = ids_of(true)
+            .into_iter()
+            .map(|(id, ids)| {
+                let slug = events.iter().find(|e| e["id"] == id.as_str()).unwrap()["slug"]
+                    .as_str()
+                    .map(str::to_owned);
+                (id, slug, ids)
+            })
+            .collect();
+        assert_eq!(recorded, expected);
         assert_eq!(
-            recorded,
-            [
-                ("1183821", "polyv2zec-updown-15m-1791927000"),
-                ("1183864", "polyv2zec-updown-15m-1791927900")
-            ]
+            recorded
+                .iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["1183821", "1183864"]
         );
         assert!(
             scope
                 .excluded_events
                 .iter()
-                .all(|e| e.reason == ExclusionReason::TestEvent
-                    && e.series_id == "12518"
-                    && e.condition_ids.len() == 1)
+                .all(|e| e.reason == ExclusionReason::TestEvent && e.series_id == "12518")
         );
-        assert_eq!(scope.pages.last().unwrap().rows, 4);
+        let events_page = scope.pages.last().unwrap();
+        assert_eq!(events_page.kind, "events");
+        assert_eq!(events_page.series_id.as_deref(), Some("12518"));
+        assert_eq!(
+            events_page.url,
+            events_url(BASE, "12518", FLOOR_ISO, None).unwrap()
+        );
+        assert_eq!(events_page.request_cursor, None);
+        assert_eq!(events_page.returned_next_cursor, None);
+        assert_eq!(events_page.rows, 4);
+        assert_eq!(
+            events_page.raw_sha256,
+            format!("{:x}", Sha256::digest(&body))
+        );
+        // Competing errors keep their order: the embedded series, then the markets, then the excluded event's id.
+        let first_test = events
+            .iter()
+            .position(|e| e["slug"].as_str().unwrap().starts_with("polyv2"))
+            .unwrap();
+        let mutate = |change: &dyn Fn(&mut Value)| {
+            let mut page = page.clone();
+            change(&mut page["events"][first_test]);
+            page
+        };
+        let embedded_test = mutate(&|e| {
+            e["series"][0]["slug"] = json!("polyv2-soak-zec");
+            e["markets"][0]["conditionId"] = json!("0xAB");
+        });
+        let error = sweep(serve_page(embedded_test)).await.unwrap_err();
+        assert_eq!(error.exit_code(), 75, "{error}");
+        let malformed_market = mutate(&|e| {
+            e["markets"][0]["conditionId"] = json!("0xAB");
+            e.as_object_mut().unwrap().remove("id");
+        });
+        let error = sweep(serve_page(malformed_market)).await.unwrap_err();
+        assert_eq!(error.exit_code(), 1, "{error}");
+        assert!(error.to_string().contains("conditionId"), "{error}");
+        let no_id = mutate(&|e| {
+            e.as_object_mut().unwrap().remove("id");
+        });
+        let error = sweep(serve_page(no_id)).await.unwrap_err();
+        assert_eq!(error.exit_code(), 1, "{error}");
+        assert!(error.to_string().contains("no decimal id"), "{error}");
     }
 }
