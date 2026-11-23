@@ -26,9 +26,9 @@ use crate::datadash_discovery::{
 };
 use crate::error::BootstrapError;
 use crate::market_scope::{
-    ExcludedSeries, MarketScope, ScopeFetcher, ScopePage, ScopeSeries, canonical_recurrences,
-    list_market_series, no_markets, partition_series, recent_market_scope, require_markets,
-    settle_exclusions,
+    ExcludedEvent, ExcludedSeries, MarketScope, ScopeFetcher, ScopeMembership, ScopePage,
+    ScopeSeries, canonical_recurrences, list_market_series, no_markets, partition_series,
+    recent_market_scope, require_markets, settle_exclusions,
 };
 use crate::pile::{self, ActivationPolicy, SRC_MARKET_PARTICIPANT};
 
@@ -577,24 +577,26 @@ where
             make_fetcher().map_err(|error| participant_failure("failed:client", &error))?;
         let mut wallets = BTreeSet::new();
         // Covered series always list markets, so an empty covered sweep is a Gamma failure. A newly listed series may
-        // have none yet: it joins the coverage with nothing to collect (owner, 2026-11-06).
+        // have none yet: it joins the coverage with nothing to collect (owner, 2026-11-06). Both sweeps finish, with
+        // their evidence retained, and pass the scope's membership checks before any trades request, so no market
+        // that either sweep excludes is ever requested (#892).
+        let mut membership = ScopeMembership::default();
+        let mut swept = Vec::new();
         for (start, subset, is_covered) in [(lo, covered, true), (addition_lo, additions, false)] {
             if subset.is_empty() {
                 continue;
             }
             let market_scope = sweep(start, subset)
                 .await
-                .and_then(|scope| {
-                    if is_covered {
-                        require_markets(&scope)?;
-                    }
-                    Ok(scope)
-                })
                 .map_err(|error| participant_failure("failed:gamma", &error))?;
-            // Keep both subset sweeps in the summary's union, with all Gamma provenance.
+            // Keep both subset sweeps in the summary's union, with all Gamma provenance and exclusions, before any
+            // rule that can fail on them.
             if let Some(combined) = &mut record.market_scope {
                 combined.series.extend(market_scope.series.iter().cloned());
                 combined.pages.extend(market_scope.pages.iter().cloned());
+                combined
+                    .excluded_events
+                    .extend(market_scope.excluded_events.iter().cloned());
                 combined
                     .condition_ids
                     .extend(market_scope.condition_ids.iter().cloned());
@@ -615,12 +617,22 @@ where
                 combined.pages.splice(0..0, listing_pages.iter().cloned());
                 record.market_scope = Some(combined);
             }
+            if is_covered {
+                require_markets(&market_scope)
+                    .map_err(|error| participant_failure("failed:gamma", &error))?;
+            }
+            membership
+                .absorb(&market_scope)
+                .map_err(|error| participant_failure("failed:gamma", &error))?;
+            swept.push((start, market_scope));
+        }
+        for (start, market_scope) in &swept {
             wallets.extend(
                 collect_participant_trades(
                     &fetcher,
                     &config.polymarket_base_url,
-                    &market_scope,
-                    start,
+                    market_scope,
+                    *start,
                     now,
                     &mut record.trades_pages,
                     &mut record.chunks,
@@ -628,14 +640,7 @@ where
                 .await?,
             );
         }
-        if let Some(scope) = &mut record.market_scope {
-            scope.series.sort_by(|a, b| a.id.cmp(&b.id));
-            for (ordinal, page) in scope.pages.iter_mut().enumerate() {
-                page.ordinal = u64::try_from(ordinal).map_err(|_| "failed:page-count")?;
-            }
-        }
         // No covered series and only empty additions (a first discovery): an answer with no market is a Gamma failure.
-        // Checked after renumbering, so the failed record's audit keeps contiguous page ordinals.
         if record
             .market_scope
             .as_ref()
@@ -647,6 +652,9 @@ where
         Ok(wallets.into_iter().collect())
     }
     .await;
+    // Every exit renumbers the retained Gamma pages once, so a failed record's audit keeps contiguous ordinals too.
+    let renumbered = renumber_scope_pages(record.market_scope.as_mut());
+    let collected = collected.and_then(|wallets| renumbered.map(|()| wallets));
     let wallets = match collected {
         Ok(wallets) => wallets,
         Err(status) => {
@@ -684,6 +692,7 @@ where
             "digest": s.digest,
         })),
         "excluded_series": record.excluded_series,
+        "excluded_events": scope.map_or(0, |s| s.excluded_events.len()),
         "gamma_pages": gamma_pages.len(),
         "trades_pages": record.trades_pages.len(),
         "chunks": record.chunks.len(),
@@ -698,6 +707,7 @@ where
                 record: &summary,
                 chunks: &record.chunks,
                 pages: gamma_pages.iter().chain(&record.trades_pages).collect(),
+                excluded_events: scope.map_or(&[], |s| s.excluded_events.as_slice()),
             };
             crate::cache_migration::atomic_write_json(path, &audit)?;
             let bytes = std::fs::read(path)?;
@@ -764,6 +774,17 @@ fn participant_fetcher() -> Result<ReqwestFetcher, BootstrapError> {
         .with_rate_limit_retry_max_secs(RECONCILIATION_RATE_LIMIT_RETRY_SECS))
 }
 
+/// Sort the combined scope's series and number its Gamma pages (listing, then each sweep) from zero.
+fn renumber_scope_pages(scope: Option<&mut MarketScope>) -> Result<(), &'static str> {
+    if let Some(scope) = scope {
+        scope.series.sort_by(|a, b| a.id.cmp(&b.id));
+        for (ordinal, page) in scope.pages.iter_mut().enumerate() {
+            page.ordinal = u64::try_from(ordinal).map_err(|_| "failed:page-count")?;
+        }
+    }
+    Ok(())
+}
+
 fn participant_failure(reason: &'static str, error: &impl std::fmt::Display) -> &'static str {
     tracing::warn!(error = %error, status = reason, "winner_discovery: participant source failed");
     reason
@@ -780,6 +801,10 @@ struct ParticipantAudit<'a> {
     record: &'a serde_json::Value,
     chunks: &'a [ParticipantChunk],
     pages: Vec<&'a ScopePage>,
+    /// Every event the retained sweeps left out by its own slug (#892); omitted when there are none, and only counted
+    /// in the journal summary.
+    #[serde(skip_serializing_if = "<[ExcludedEvent]>::is_empty")]
+    excluded_events: &'a [ExcludedEvent],
 }
 
 #[derive(Serialize)]
@@ -950,6 +975,7 @@ mod tests {
     use serde_json::json;
 
     use crate::market_scope::{FetchedPage, ScopeSeries};
+    use std::collections::BTreeSet;
     use tempfile::TempDir;
 
     use super::*;
@@ -1080,6 +1106,7 @@ mod tests {
                 slug: Some("two".into()),
             }],
             excluded_series: Vec::new(),
+            excluded_events: Vec::new(),
             pages: Vec::new(),
             condition_ids: (0..markets).map(|n| format!("0x{n:064x}")).collect(),
             count: u64::try_from(markets).unwrap(),
@@ -1182,7 +1209,7 @@ mod tests {
                 json!({"source_id": PARTICIPANT_SOURCE_ID, "schema_version": 2,
                 "parser_version": 2, "window_start_unix": NOW, "window_end_unix": NOW,
                 "status": "disabled", "wallet_count": 0, "scope": null,
-                "excluded_series": null, "gamma_pages": 0, "trades_pages": 0, "chunks": 0})
+                "excluded_series": null, "excluded_events": 0, "gamma_pages": 0, "trades_pages": 0, "chunks": 0})
             );
             if supplied {
                 let bytes = std::fs::read(&path).unwrap();
@@ -3360,5 +3387,261 @@ mod tests {
             .unwrap();
         upsert_participants(&mut cache, contracts).unwrap();
         assert_eq!(cache.wallet_pile_size().unwrap(), 0);
+    }
+
+    /// One subset sweep's kept markets and excluded events.
+    type Sweep = (Vec<u64>, Vec<ExcludedEvent>);
+
+    fn excluded_event(series: &str, id: &str, markets: &[u64]) -> ExcludedEvent {
+        ExcludedEvent {
+            series_id: series.into(),
+            event_id: id.into(),
+            slug: Some(format!("polyv2x-{id}")),
+            reason: crate::market_scope::ExclusionReason::TestEvent,
+            condition_ids: markets.iter().map(|n| format!("0x{n:064x}")).collect(),
+        }
+    }
+
+    fn gamma_page(kind: &'static str, series: Option<&str>) -> ScopePage {
+        ScopePage {
+            ordinal: 0,
+            kind,
+            series_id: series.map(str::to_owned),
+            url: format!("http://gamma.test/{kind}/{}", series.unwrap_or("all")),
+            request_cursor: None,
+            returned_next_cursor: None,
+            raw_sha256: format!("{:x}", Sha256::digest(kind.as_bytes())),
+            rows: 1,
+            observed_at_unix: 110,
+            received_at_unix: 111,
+            source_at_unix: Some(109),
+        }
+    }
+
+    /// A covered series 1 and a newly listed series 11, swept with the given kept markets and excluded events.
+    async fn discover_with(
+        cache: &mut WalletCache,
+        audit: &Path,
+        covered_sweep: Sweep,
+        addition_sweep: Sweep,
+        fetcher: TestFetcher<impl Fn(&str) -> Result<Value, SourceError> + Sync>,
+    ) -> (Result<SourceDiscoveryResult, BootstrapError>, usize) {
+        let covered = vec![production_series("1")];
+        let mut prior = coverage(10, 100, 20);
+        prior.scope = ParticipantScope::new(&["15m".into()], Some(&covered)).unwrap();
+        cache.set_participant_discovery_coverage(&prior).unwrap();
+        let listed = vec![production_series("1"), production_series("11")];
+        let sweeps = std::cell::Cell::new(0);
+        let result = run_participant_discovery(
+            &config(5),
+            cache,
+            ActivationPolicy::Deferred,
+            200,
+            || Ok(fetcher),
+            || async { Ok((listed.clone(), vec![gamma_page("series", None)])) },
+            |_, subset| {
+                sweeps.set(sweeps.get() + 1);
+                let addition = subset.iter().any(|series| series.id == "11");
+                let (markets, excluded) = if addition {
+                    addition_sweep.clone()
+                } else {
+                    covered_sweep.clone()
+                };
+                let mut scope = scope(0);
+                scope.pages = vec![gamma_page(
+                    "events",
+                    Some(if addition { "11" } else { "1" }),
+                )];
+                scope.series = subset;
+                scope.condition_ids = markets.iter().map(|n| format!("0x{n:064x}")).collect();
+                scope.excluded_events = excluded;
+                async { Ok(scope) }
+            },
+            Some(audit),
+        )
+        .await;
+        (result, sweeps.get())
+    }
+
+    /// FAIL (#892): a market that either sweep excludes gets a trades request, or the audit misses an excluded event
+    /// or its journal count.
+    #[tokio::test]
+    async fn participants_request_no_trades_for_excluded_markets_and_audit_them() {
+        let (dir, mut cache) = tmp_cache();
+        let audit = audit_path(&dir);
+        let fetcher = fetcher(|_: &str| {
+            Ok(envelope(
+                json!([{"proxy_wallet": wallet(1), "timestamp": 99}]),
+                None,
+            ))
+        });
+        let urls = Arc::clone(&fetcher.urls);
+        let (result, sweeps) = discover_with(
+            &mut cache,
+            &audit,
+            (vec![1], vec![excluded_event("1", "100", &[9])]),
+            (vec![11], vec![excluded_event("11", "200", &[8])]),
+            fetcher,
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(sweeps, 2);
+        let requested: BTreeSet<String> = urls
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|url| {
+                query(url)["condition"]
+                    .split(',')
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            requested,
+            BTreeSet::from([format!("0x{:064x}", 1), format!("0x{:064x}", 11)])
+        );
+        let audit: Value = serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
+        let ids: Vec<&str> = audit["excluded_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["event_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["100", "200"]);
+        assert_eq!(audit["record"]["excluded_events"], 2);
+        assert!(
+            audit["record"]["excluded_events"].is_u64(),
+            "the summary counts exclusions only"
+        );
+        assert_eq!(audit["record"]["status"], "ok");
+        let ordinals: Vec<u64> = audit["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|page| {
+                page["url"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("http://gamma.test/")
+            })
+            .map(|page| page["ordinal"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            ordinals,
+            [0, 1, 2],
+            "listing, covered sweep, addition sweep"
+        );
+    }
+
+    /// FAIL (#892): a kept/excluded market across the two sweeps (either direction), or one excluded event id with other
+    /// markets or another series, reaches any trades request, or fails other than `failed:gamma` (75) with both sweeps'
+    /// exclusions and contiguous Gamma pages in the audit.
+    #[tokio::test]
+    async fn participants_conflicting_sweeps_fail_before_any_trades_request() {
+        let cases: Vec<(&str, Sweep, Sweep)> = vec![
+            (
+                "kept, then excluded",
+                (vec![5], vec![]),
+                (vec![11], vec![excluded_event("11", "300", &[5])]),
+            ),
+            (
+                "excluded, then kept",
+                (vec![1], vec![excluded_event("1", "300", &[5])]),
+                (vec![5], vec![]),
+            ),
+            (
+                "one event id, other markets",
+                (vec![1], vec![excluded_event("1", "400", &[6])]),
+                (vec![11], vec![excluded_event("1", "400", &[7])]),
+            ),
+            (
+                "one event id, other series",
+                (vec![1], vec![excluded_event("1", "400", &[6])]),
+                (vec![11], vec![excluded_event("11", "400", &[6])]),
+            ),
+        ];
+        for (name, covered_sweep, addition_sweep) in cases {
+            let (dir, mut cache) = tmp_cache();
+            let audit = audit_path(&dir);
+            let excluded = covered_sweep.1.len() + addition_sweep.1.len();
+            let records: Vec<ExcludedEvent> = covered_sweep
+                .1
+                .iter()
+                .chain(&addition_sweep.1)
+                .cloned()
+                .collect();
+            let (result, sweeps) = discover_with(
+                &mut cache,
+                &audit,
+                covered_sweep,
+                addition_sweep,
+                fetcher(|_: &str| -> Result<Value, SourceError> {
+                    panic!("a trades request was made")
+                }),
+            )
+            .await;
+            let error = result.unwrap_err();
+            assert_eq!(error.exit_code(), 75, "{name}: {error}");
+            assert!(
+                error.to_string().contains("failed:gamma"),
+                "{name}: {error}"
+            );
+            assert_eq!(sweeps, 2, "{name}");
+            let audit: Value = serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
+            assert_eq!(audit["record"]["status"], "failed:gamma", "{name}");
+            assert_eq!(audit["record"]["excluded_events"], excluded, "{name}");
+            let serialized = if records.is_empty() {
+                Value::Null
+            } else {
+                serde_json::to_value(&records).unwrap()
+            };
+            assert_eq!(
+                audit["excluded_events"], serialized,
+                "{name}: both sweeps' records, in order"
+            );
+            let ordinals: Vec<u64> = audit["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|page| page["ordinal"].as_u64().unwrap())
+                .collect();
+            assert_eq!(
+                ordinals,
+                [0, 1, 2],
+                "{name}: listing, covered sweep, addition sweep"
+            );
+        }
+    }
+
+    /// FAIL (#892): a covered sweep whose every event is excluded (no market) reaches the additions sweep or a trades
+    /// request, or its failed audit loses the exclusions or the page numbering.
+    #[tokio::test]
+    async fn participants_all_excluded_covered_sweep_fails_with_its_exclusions() {
+        let (dir, mut cache) = tmp_cache();
+        let audit = audit_path(&dir);
+        let (result, sweeps) = discover_with(
+            &mut cache,
+            &audit,
+            (vec![], vec![excluded_event("1", "500", &[9])]),
+            (vec![11], vec![]),
+            fetcher(|_: &str| -> Result<Value, SourceError> {
+                panic!("a trades request was made")
+            }),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert_eq!(error.exit_code(), 75, "{error}");
+        assert_eq!(sweeps, 1, "the additions sweep never runs");
+        let audit: Value = serde_json::from_slice(&std::fs::read(&audit).unwrap()).unwrap();
+        assert_eq!(audit["record"]["status"], "failed:gamma");
+        assert_eq!(audit["excluded_events"][0]["event_id"], "500");
+        let ordinals: Vec<u64> = audit["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|page| page["ordinal"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ordinals, [0, 1]);
     }
 }

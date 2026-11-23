@@ -1,0 +1,105 @@
+{
+ "events": [
+  {
+   "id": "1182484",
+   "slug": "zec-updown-15m-1791979200",
+   "title": "ZCash Up or Down - October 14, 8:00AM-8:15AM ET",
+   "startDate": "2026-10-13T12:10:39.529917Z",
+   "endDate": "2026-10-14T12:15:00Z",
+   "closed": true,
+   "series": [
+    {
+     "id": "12518",
+     "slug": "zec-up-or-down-15m",
+     "recurrence": "15m",
+     "title": "ZEC Up or Down 15m"
+    }
+   ],
+   "markets": [
+    {
+     "conditionId": "0x3adbe083a8ff30758244cbbdf2ad3fa3f7c7e8737b6e46aeb7647ae1a820e34f",
+     "slug": "zec-updown-15m-1791979200",
+     "endDate": "2026-10-14T12:15:00Z",
+     "closed": true,
+     "outcomes": "[\"Up\", \"Down\"]"
+    }
+   ]
+  },
+  {
+   "id": "1182539",
+   "slug": "zec-updown-15m-1791980100",
+   "title": "ZCash Up or Down - October 14, 8:15AM-8:30AM ET",
+   "startDate": "2026-10-13T12:23:59.399822Z",
+   "endDate": "2026-10-14T12:30:00Z",
+   "closed": true,
+   "series": [
+    {
+     "id": "12518",
+     "slug": "zec-up-or-down-15m",
+     "recurrence": "15m",
+     "title": "ZEC Up or Down 15m"
+    }
+   ],
+   "markets": [
+    {
+     "conditionId": "0xe8b1dab9512cf721eb6aa026092e6217e471aa165754900fce58d5631552ba31",
+     "slug": "zec-updown-15m-1791980100",
+     "endDate": "2026-10-14T12:30:00Z",
+     "closed": true,
+     "outcomes": "[\"Up\", \"Down\"]"
+    }
+   ]
+  },
+  {
+   "id": "1183821",
+   "slug": "polyv2zec-updown-15m-1791927000",
+   "title": "Zcash Up or Down - October 13, 5:30PM-5:45PM ET",
+   "startDate": "2026-10-13T17:31:01Z",
+   "endDate": "2026-10-13T21:45:00Z",
+   "closed": true,
+   "series": [
+    {
+     "id": "12518",
+     "slug": "zec-up-or-down-15m",
+     "recurrence": "15m",
+     "title": "ZEC Up or Down 15m"
+    }
+   ],
+   "markets": [
+    {
+     "conditionId": "0x0185465f1ef446d7b455929c0990a1317a000000000000000000000000000000",
+     "slug": "polyv2zec-updown-15m-1791927000",
+     "endDate": "2026-10-13T21:45:00Z",
+     "closed": true,
+     "outcomes": "[\"Up\", \"Down\"]"
+    }
+   ]
+  },
+  {
+   "id": "1183864",
+   "slug": "polyv2zec-updown-15m-1791927900",
+   "title": "Zcash Up or Down - October 13, 5:45PM-6:00PM ET",
+   "startDate": "2026-10-13T17:46:03Z",
+   "endDate": "2026-10-13T22:00:00Z",
+   "closed": true,
+   "series": [
+    {
+     "id": "12518",
+     "slug": "zec-up-or-down-15m",
+     "recurrence": "15m",
+     "title": "ZEC Up or Down 15m"
+    }
+   ],
+   "markets": [
+    {
+     "conditionId": "0x01a6da3e4d6d77f742608b9029e69c191d000000000000000000000000000000",
+     "slug": "polyv2zec-updown-15m-1791927900",
+     "endDate": "2026-10-13T22:00:00Z",
+     "closed": true,
+     "outcomes": "[\"Up\", \"Down\"]"
+    }
+   ]
+  }
+ ],
+ "next_cursor": null
+}

@@ -587,7 +587,11 @@ cycle evidence; later attempts choose new names. See [discovery modes and journa
 Each ranking run, resumes included, runs `pe-bootstrap market-scope`: Gamma's
 15-minute series and their events ending at or after the window start minus one day, about 1,350 requests at ≤ 2/s (14 min on the dev box), written to
 `market_scope.json` in the run directory ([`ranker_market_scope`](_GLOSSARY.md#ranker-market-scope),
-#784). The legacy lanes run it after refresh. The fresh lane starts it beside activity collection,
+#784); events whose own slug fails gate F's rule stay out and are listed as `excluded_events` (#892). A release that
+changes this rule also checks its first cycle as #892's AC7 states: every observed test or slugless event excluded and
+none of their ids kept, the exclusions compared with the 2026-11-23 incident census and between the participant audit
+and the ranking scope (series, floors and acquisition windows recorded; every difference explained, any unexplained one
+failing the release), the batch published with its standard checks, then the three ordinary publications above. The legacy lanes run it after refresh. The fresh lane starts it beside activity collection,
 right after the candidate targets, and joins it before the cutover checks and export with the same
 exit handling, so its Gamma snapshot is taken when collection starts, still after the window end. **Stage 1** ranks the full trade universe (`--universe-from-trades` — have-data ⇒
 in-universe), scoring only first entries in the scope's markets. Schema two exports every

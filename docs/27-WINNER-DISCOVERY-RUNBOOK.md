@@ -152,7 +152,11 @@ by its current slug) never joins it, and neither is swept. A covered series that
 keeps the rename rule even when its current listing slug fails. The apply check partitions the
 prior set the same way, accepts exactly that drop, and refuses (77) a collected set holding an
 excluded series. Each kept series' events must embed a passing slug in their first series, or
-the sweep fails `failed:gamma` (exit 75).
+the sweep fails `failed:gamma` (exit 75). Each event must also pass the rule by its own slug
+(#892): a failing event's markets are never requested, and the audit lists the event under
+`excluded_events`. Both subset sweeps finish, with their pages and exclusions retained, and pass
+the scope's membership checks (no market both kept and excluded, one record per excluded event
+id) before the first trades request; a breach fails `failed:gamma` (exit 75).
 Every in-scope market is read over the whole discovery interval, regardless of its end date or
 open status. Trades after a market's end,
 and an old market trading between runs then closing, remain discoverable. Future markets can be
@@ -196,11 +200,12 @@ sidecars, mutation lock, collector spool or either atomic-write temporary file. 
 not spool-refusal 77. Paths name files in existing directories.
 
 At the participant emission boundary, collection atomically writes and syncs one JSON document:
-`{"version":1,"record":<summary>,"chunks":[...],"pages":[...]}`. The summary retains source id
+`{"version":1,"record":<summary>,"chunks":[...],"pages":[...]}`, plus `"excluded_events":[...]` when the retained
+sweeps left any event out by its own slug (#892). The summary retains source id
 `polymarket-data-api-trades`, schema/parser versions, frozen window, wallet count, status, the
 Gamma scope's own source ID, version, schema/parser versions, digest, count and series, the
-top-level `excluded_series` (`{id, slug, reason}`, once classification ran; null before), and page
-counts. Chunks retain lower bound, newest/oldest timestamps, page count and stop reason
+top-level `excluded_series` (`{id, slug, reason}`, once classification ran; null before), the count of
+`excluded_events`, and page counts. Chunks retain lower bound, newest/oldest timestamps, page count and stop reason
 (`terminal` or `threshold`). Pages retain URL, raw sha256, rows, observed/received/source times
 and request/returned cursors, in Gamma sweep then trades order; ordinals are per stream.
 The counts match the retained arrays. Each trades URL lists its condition ids; the scope digest
