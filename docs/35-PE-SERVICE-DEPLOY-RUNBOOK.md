@@ -1198,6 +1198,12 @@ Telegram (empty output is silent).
   [`watchdog_feed_quiet_window`](_GLOSSARY.md#watchdog_feed_quiet_window); any other reason, a mix of reasons, an
   unreadable reply or no reply is a problem at the second consecutive check. The message names the reasons in plain
   words and the time of the episode's first not-ready answer.
+- pe-service logs a signal it skips over an unusable order book only at INFO (`price-impact book unusable: …`). Each
+  such record is one message, except for an empty ask book, a normal market state. Every run also times a new
+  connection from the VPS to Polymarket's order service and its data service, and
+  [`watchdog_slow_connect`](_GLOSSARY.md#watchdog_slow_connect) says when slow or failing ones are a problem. Nothing
+  messaged about either during the 2026-11-23 network fault
+  ([#894](https://github.com/sppburke/prediction-markets/issues/894)).
 - Files on merlin: the script at `~/.hermes/scripts/pe_watchdog.py`; config `~/.config/pe-watchdog/watchdog.env`
   (mode 0600: `PE_SUPABASE_URL`, `PE_SUPABASE_ANON_KEY`, `PE_HEALTH_URL`); state
   `~/.local/state/pe-watchdog/state.json`; the host keys for `forge.tail72525f.ts.net` and `82.22.32.225` in
@@ -1208,15 +1214,16 @@ Telegram (empty output is silent).
   `pgrep -f '.hermes/scripts/pe_watchdog.py'` prints nothing on two checks 10 s apart (each Hermes run starts a child
   process that opens the installed file; no manual `hermes cron run` meanwhile). Then
   `touch ~/.config/pe-watchdog/reset-health-episode` and `mv -T` the new file into place from a temporary name beside
-  it. The new version's first run drops any readiness-episode keys an earlier version left in the state and removes
-  the flag. Check that the installed file's sha256 equals the new file's, run
+  it. The new version's first run drops any readiness-episode keys and any connection samples and problems an earlier
+  version left in the state, and removes the flag. Check that the installed file's sha256 equals the new file's, run
   `python3 ~/.hermes/scripts/pe_watchdog.py --dry-run` (it neither writes state nor removes the flag), and confirm
   that the next scheduled run removed the flag and stayed silent. Rollback: `mv -T` the backup into place, nothing
   else; the previous version keeps counting with the same `not_ready` key.
 - Reads, and nothing else: `ssh pi@forge.tail72525f.ts.net` and `ssh -i ~/.ssh/id_personal sean@82.22.32.225`, each
   running `journalctl --all -o json --no-pager --after-cursor=<stored cursor>` then `systemctl [--user] is-active` for
-  the watched units; plus `/health/ready` and the newest `ranking_batches` row. merlin keeps the owner's full access to
-  both hosts (owner decision, 2026-11-17).
+  the watched units; a second VPS login that runs `curl` once against `https://clob.polymarket.com/` and once against
+  `https://data-api.polymarket.com/` and discards the bodies; plus `/health/ready` and the newest `ranking_batches` row.
+  merlin keeps the owner's full access to both hosts (owner decision, 2026-11-17).
 - Test: `python3 ~/.hermes/scripts/pe_watchdog.py --dry-run`; `touch ~/.config/pe-watchdog/send-test-alert` sends a
   test line on the next run.
 - Pause with `hermes cron pause <job>`. To remove it, run `hermes cron remove <job>` and delete the files above.

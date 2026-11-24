@@ -33,6 +33,7 @@ STATE = HOME / ".local/state/pe-watchdog/state.json"
 CT = ZoneInfo("America/Chicago")
 LATE_HOURS = 11
 HOST_TIMEOUT = 120
+PROBE_TIMEOUT = 30
 JOURNAL_LIMIT = 20000
 EVENT_WINDOW = dt.timedelta(hours=24)
 LOOP = "pe-rank-loop-15m5m.service"
@@ -121,6 +122,18 @@ READY_ISSUES = {
     "copy_admission_blocked": "copying paused: live trade feed and polling backup both down",
 }
 UNCLASSIFIED = "not classified (recorded before an install)"
+# pe-service skips a signal whose order book it cannot use and logs it only at INFO
+# (crates/service/src/orchestrator.rs). An empty ask book is a normal market state.
+BOOK_SKIP = re.compile(r"price-impact book unusable: (?!empty ask book \()(.+) \(fail closed\)")
+# A new connection from the VPS to each of these is through TLS in about 0.05 s. One that takes longer than
+# SLOW_CONNECT_SECONDS, or never gets there, is a bad sample. Two within SLOW_WINDOW are a problem until
+# SLOW_CLEAR good ones in a row (docs/_GLOSSARY.md watchdog_slow_connect).
+PROBES = {"clob": ("order service", "clob.polymarket.com"), "data": ("data service", "data-api.polymarket.com")}
+SLOW_CONNECT_SECONDS = 2.0
+SLOW_WINDOW = dt.timedelta(minutes=30)
+SLOW_CLEAR = 30
+# curl exits before or during the TLS handshake: DNS, connect, timeout, TLS, certificate.
+CONNECT_FAILURES = frozenset({6, 7, 28, 35, 60})
 PUBLISH_RETRY = re.compile(
     r"WARNING: transient Supabase \S+ failure; retry \d+/\d+ in \d+s:"
 )
@@ -220,17 +233,51 @@ def read_host(host, cursor=None):
         return {"error": detail, "reset_cursor": reset_cursor}
 
 
+def probe_argv():
+    """remote_argv's VPS login, running two anonymous HTTPS requests at once; their bodies are discarded."""
+    curls = " & ".join(
+        f"curl -s -o /dev/null -m 10 -w '{label} %{{exitcode}} %{{time_appconnect}}\\n' https://{host}/"
+        for label, (_, host) in PROBES.items())
+    return [*remote_argv("vps")[:-1], f"{curls} & wait"]
+
+
+def parse_probe(output):
+    """label -> "ok" or "bad" for each endpoint with a usable `label exitcode seconds` line."""
+    samples = {}
+    for line in output.splitlines():
+        match = re.fullmatch(r"(\w+) (\d+) (\d+(?:\.\d+)?)", line.strip())
+        if not match or match[1] not in PROBES:
+            continue
+        exitcode, seconds = int(match[2]), float(match[3])
+        if seconds > 0:
+            samples[match[1]] = "ok" if seconds <= SLOW_CONNECT_SECONDS else "bad"
+        elif exitcode in CONNECT_FAILURES:
+            samples[match[1]] = "bad"
+    return samples
+
+
+def read_probe():
+    """The samples of one probe; a failed call gives none."""
+    try:
+        result = subprocess.run(probe_argv(), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                timeout=PROBE_TIMEOUT, check=True)
+        return parse_probe(result.stdout)
+    except Exception:
+        return {}
+
+
 def observe(conf, state):
-    """Parsed hosts plus health_ok/issues/detail, batch_id/created, and batch_error.
+    """Parsed hosts plus health_ok/issues/detail, batch_id/created, batch_error and probe (label -> sample).
 
     Each successful host has records (journal dictionaries) and units (canonical
     unit -> is-active state); a failed host has an error string and may request
     reset_cursor. health_issues is the reason list of a 503 ready=false reply, else None.
     created is an aware UTC datetime or None. All I/O is outside evaluate.
     """
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         reads = {h: pool.submit(read_host, h, state.get("cursors", {}).get(h))
                  for h in HOST_UNITS}
+        probe = pool.submit(read_probe)
         try:
             status, body = fetch_json(conf["PE_HEALTH_URL"], timeout=5, error_body=True)
             is_object = isinstance(body, dict)
@@ -256,7 +303,7 @@ def observe(conf, state):
         except Exception as error:
             batch_id = created = None
             batch_error = f"{type(error).__name__}: {error}"[:200]
-        return {"hosts": {h: f.result() for h, f in reads.items()},
+        return {"hosts": {h: f.result() for h, f in reads.items()}, "probe": probe.result(),
                 "health_ok": health_ok, "health_issues": health_issues, "health_detail": health_detail,
                 "batch_id": batch_id, "created": created, "batch_error": batch_error}
 
@@ -284,8 +331,9 @@ def message_parts(record):
         fields = body.get("fields")
         fields = fields if isinstance(fields, dict) else body
         message = fields.get("message", "")
-        return raw, str(message), str(body.get("level", "")), fields.get("kind"), "kind" in fields, True
-    return raw, raw, "", None, False, False
+        return (raw, str(message), str(body.get("level", "")), fields.get("kind"), "kind" in fields, True,
+                str(fields.get("reason", "")))
+    return raw, raw, "", None, False, False, ""
 
 
 def record_time(record):
@@ -329,7 +377,7 @@ def evaluate(state, observation, now):
     the counter the previous version also keeps; not_ready_since/not_ready_other describe the episode.
     """
     s = copy.deepcopy(state)
-    for key in ("open", "cursors", "events", "host_failures", "unit_polls"):
+    for key in ("open", "cursors", "events", "host_failures", "unit_polls", "probe"):
         s.setdefault(key, {})
     s.setdefault("config_read_failures", [])
     s["events"] = {key: last for key, last in s["events"].items()
@@ -348,7 +396,7 @@ def evaluate(state, observation, now):
             messages.append(f"RESOLVED: {text} (lasted {mins // 60} h {mins % 60} min)")
 
     def event(host, unit, parts, label, identity=None):
-        raw, message, level, kind, has_kind, structured = parts
+        raw, message, level, kind, has_kind, structured, _ = parts
         if identity is None:
             identity = [message] + ([kind] if has_kind else []) if structured else [masked_text(raw)]
         key = json.dumps([host, unit, *identity], ensure_ascii=False)
@@ -382,7 +430,7 @@ def evaluate(state, observation, now):
         for record in records:
             unit = record_unit(host, record)
             parts = message_parts(record)
-            raw, message, level, kind, has_kind, structured = parts
+            raw, message, level, kind, has_kind, structured, reason = parts
             if unit not in units:
                 try:
                     priority = int(record.get("PRIORITY", 6))
@@ -410,6 +458,13 @@ def evaluate(state, observation, now):
             if unit == "pe-service.service":
                 if message == "shutdown signal received":
                     s["service_shutdown"] = record_time(record).isoformat()
+                skip = BOOK_SKIP.fullmatch(reason)
+                if skip and level == "INFO" and message == "signal did not produce order":
+                    key = json.dumps([host, unit, message, record["__CURSOR"]])
+                    if key not in s["events"]:
+                        s["events"][key] = now.isoformat()
+                        messages.append(f"EVENT: copy service skipped a trade at {ct(record_time(record))}"
+                                        f" (order book: {skip[1]})")
                 if message in CONFIG_READ_FAILURES:
                     s["config_read_failures"].append(record_time(record).isoformat())
                     config_read_raw = raw
@@ -475,6 +530,18 @@ def evaluate(state, observation, now):
                 if polls["active"] >= 2:
                     close_problem("down:" + unit, f"{unit.removesuffix('.service')} running again")
 
+    for label, sample in observation["probe"].items():
+        target = "new connections from the cloud server to Polymarket's {} ({})".format(*PROBES[label])
+        probe = s["probe"].setdefault(label, {"bad": None, "good": 0})
+        if sample == "bad":
+            if probe["bad"] and now - dt.datetime.fromisoformat(probe["bad"]) < SLOW_WINDOW:
+                open_problem("slow:" + label, f"{target} slow or failing since {ct(now)}")
+            probe.update(bad=now.isoformat(), good=0)
+        else:
+            probe["good"] += 1
+            if probe["good"] >= SLOW_CLEAR:
+                close_problem("slow:" + label, f"{target} fast again")
+
     previous = s.get("not_ready", 0)
     if observation["health_ok"]:
         s["not_ready"] = 0
@@ -530,6 +597,9 @@ def main():
         # First run after an install: episode keys written before it are never trusted.
         state.pop("not_ready_since", None)
         state.pop("not_ready_other", None)
+        state.pop("probe", None)
+        for label in PROBES:
+            state.get("open", {}).pop("slow:" + label, None)
     now = dt.datetime.now(dt.timezone.utc)
     new_state, messages = evaluate(state, observe(conf, state), now)
     test = TEST_FLAG.exists()
