@@ -34,6 +34,14 @@ PRUNE = ("WARNING: ranking_batches prune failed (RuntimeError: unavailable); his
          "bounded and self-heals on the next successful push")
 FAILURE = "pe-service.service: Failed with result 'exit-code'."
 KERNEL_IO = "I/O error, dev sda, sector 123456 op 0x0:(READ) flags 0x0 phys_seg 1 prio class 2"
+USB_RESET = "usb 3-1: reset SuperSpeed USB device number 2 using xhci-hcd"
+RETRY = "rate limited by the venue; retrying after the requested wait"
+GIVEN_UP = "fixed-end activity reconciliation will retry"
+DEFERRED = "anchor refresh deferred"
+ACTIVITY_READ = ("activity reconciliation: activity fetch failed for "
+                 "https://data-api.polymarket.com/v2/activity?user=0xabc&limit=1000: ")
+POSITIONS_READ = ("positions read for 0xabc: positions fetch failed for "
+                  "https://data-api.polymarket.com/v2/positions?user=0xabc&limit=1000: ")
 FEED = ["activity_ws_unavailable"]
 DEGRADED = ["activity_ws_redundancy_degraded"]
 FEED_WORDS = "no live trade-feed connection receiving trades"
@@ -64,6 +72,16 @@ def config_read(when, message="service_config poll failed; keeping last-known-go
 def skipped(reason, level="INFO", cursor="c1"):
     return at({**service("signal did not produce order", level, reason=reason, market="0xabc"), "__CURSOR": cursor},
               T0 - dt.timedelta(minutes=3))
+
+
+def refused(when, message=RETRY, level="WARN", cursor=None, **fields):
+    fields = fields or {"path": "/v2/activity", "retry_after_secs": 1, "attempt": 1, "rate_limit_retries": 1}
+    return {**at(service(message, level, **fields), when), "__CURSOR": cursor or when.isoformat()}
+
+
+def kernel(message, cursor="c1", transport="kernel"):
+    return at({"MESSAGE": message, "__CURSOR": cursor, "_TRANSPORT": transport, "PRIORITY": "6",
+               "SYSLOG_IDENTIFIER": "kernel"}, T0 - dt.timedelta(minutes=3))
 
 
 def probe_line(label="clob", code=0, seconds=0.05):
@@ -487,6 +505,186 @@ class Readiness(unittest.TestCase):
         self.assertEqual(sent, {20: [f"{NOT_READY} ({FEED_WORDS})"]})
 
 
+class Refusals(unittest.TestCase):
+    OPENED = ("PROBLEM: Polymarket repeatedly refused requests from the copy service (12 refusals logged from 2:00 PM"
+              " Nov 17 to {} PM Nov 17); the service retries by itself, but a copy could be late or skipped")
+    ENDED = ("RESOLVED: the copy service logged no more of these Polymarket refusals in 20 completed checks"
+             " (lasted {} min)")
+    LOST = {"error": "journalctl exit 1 (0 records)", "reset_cursor": True}
+    STOPPED = host_result("vps", **{SERVICE: "inactive"})
+
+    def run_at(self, state, minutes, *records, vps=None):
+        now = T0 + dt.timedelta(minutes=minutes)
+        observation = obs(vps_records=records, created=now)
+        if vps:
+            observation["hosts"]["vps"] = vps
+        s, m = w.evaluate(json.loads(json.dumps(state)), observation, now)
+        self.assertLessEqual(len(s["venue"]["refusals"]), w.VENUE_REFUSALS)
+        return s, m
+
+    def quiet(self, state, minutes, *records, vps=None):
+        for minute in minutes:
+            state, m = self.run_at(state, minute, *records, vps=vps)
+            self.assertFalse(any("refus" in x for x in m))
+        return state
+
+    def burst(self, count=12, seconds=1, start=0, **fields):
+        return [refused(T0 + dt.timedelta(minutes=start, seconds=n * seconds), **fields) for n in range(count)]
+
+    def test_twelve_refusals_in_thirty_minutes_open_once_and_twenty_quiet_checks_resolve(self):
+        s = QUIET
+        for minutes in range(1, 12):  # one a minute
+            s, m = self.run_at(s, minutes, refused(T0 + dt.timedelta(minutes=minutes - 1)))
+            self.assertEqual(m, [])
+        s, m = self.run_at(s, 31, refused(T0 + dt.timedelta(minutes=30)))
+        self.assertEqual(m, [self.OPENED.format("2:30")])
+        s, m = self.run_at(s, 32, *self.burst(50, 1, 31))
+        self.assertEqual(m, [])
+        s = self.quiet(s, range(33, 52))
+        s, m = self.run_at(s, 52)
+        self.assertEqual(m, [self.ENDED.format("0 h 21")])
+        s, m = self.run_at(s, 53, *self.burst(11, 1, 52))  # the resolved episode's refusals do not count again
+        self.assertEqual(m, [])
+        s, m = self.run_at(s, 54, refused(T0 + dt.timedelta(minutes=53)))
+        self.assertEqual(m, [self.OPENED.format("2:53").replace("2:00 PM", "2:52 PM")])
+
+    def test_twelve_refusals_over_more_than_thirty_minutes_are_silent(self):
+        for extra, count in ((0, 1), (1, 0)):
+            late = refused(T0 + dt.timedelta(minutes=30, microseconds=extra))
+            _, m = self.run_at(QUIET, 31, refused(T0), *self.burst(10, 1, 5), late)
+            self.assertEqual(len(m), count)
+
+    def test_two_bursts_with_quiet_checks_between_them_count_together(self):
+        s, m = self.run_at(QUIET, 1, *self.burst(6))
+        s = self.quiet(s, range(2, 22))
+        self.assertEqual(self.run_at(s, 22, *self.burst(6, 1, 21))[1], [self.OPENED.format("2:21")])
+
+    def test_a_clock_set_back_does_not_shorten_the_span(self):
+        times = [T0] + [T0 + dt.timedelta(minutes=31)] * 10 + [T0 + dt.timedelta(minutes=30)]
+        records = [refused(when, cursor=f"c{n}") for n, when in enumerate(times)]
+        self.assertEqual(self.run_at(QUIET, 32, *records)[1], [])
+
+    def test_earlier_refusals_do_not_hide_a_burst(self):
+        records = [refused(T0 - dt.timedelta(minutes=n)) for n in (45, 40, 35, 31)] + self.burst()
+        self.assertEqual(self.run_at(QUIET, 1, *records)[1], [self.OPENED.format("2:00")])
+
+    def test_refusals_within_twenty_checks_of_each_other_are_one_problem(self):
+        s, m = self.run_at(QUIET, 1, *self.burst())
+        self.assertEqual(m, [self.OPENED.format("2:00")])
+        for minutes in range(2, 80):
+            again = [refused(T0 + dt.timedelta(minutes=minutes))] if minutes in (21, 41, 60) else []
+            s = self.quiet(s, [minutes], *again)
+        self.assertEqual(self.run_at(s, 80)[1], [self.ENDED.format("1 h 19")])
+
+    def test_each_kind_of_refusal_counts_and_is_silent_alone(self):
+        for kind in (
+            {}, {"path": "/markets", "retry_after_secs": 1},
+            {"message": GIVEN_UP, "error": ACTIVITY_READ + "transient error: HTTP 503"},
+            {"message": GIVEN_UP, "error": ACTIVITY_READ + "transient error: HTTP 408"},
+            {"message": GIVEN_UP, "error": ACTIVITY_READ + "rate limited: retry after 1s"},
+            {"message": DEFERRED, "kind": "source.transient", "error": POSITIONS_READ + "transient error: HTTP 503"},
+            {"message": DEFERRED, "kind": "source.rate_limited", "error": POSITIONS_READ + "rate limited: retry after 30s"},
+            {"message": DEFERRED, "kind": "source.transient", "error":
+             ACTIVITY_READ.replace("reconciliation", "catch-up for 0xabc") + "transient error: HTTP 500"},
+        ):
+            with self.subTest(kind=kind):
+                s, m = self.run_at(QUIET, 1, *self.burst(11, **kind))
+                self.assertEqual((m, len(s["venue"]["refusals"])), ([], 11))
+                s, m = self.run_at(s, 1, *self.burst(1, start=0.5, **kind))
+                self.assertEqual(m, [self.OPENED.format("2:00")])
+
+    def test_other_failures_of_the_same_messages_still_report(self):
+        echo = "fetch failed for https://x/: transient error: HTTP 503"
+        for message, error, level in (
+            (GIVEN_UP, ACTIVITY_READ + "transient error: error sending request for url (https://x/)", "WARN"),
+            (GIVEN_UP, ACTIVITY_READ + "transient error: request deadline elapsed before send", "WARN"),
+            (GIVEN_UP, ACTIVITY_READ + "transient error: reply is not one complete JSON document: EOF", "WARN"),
+            (GIVEN_UP, ACTIVITY_READ + "fatal error: HTTP 404", "WARN"),
+            (GIVEN_UP, "activity reconciliation: v2 activity cursor proof: v2 cursor repeated: activity " + echo, "WARN"),
+            (GIVEN_UP, ACTIVITY_READ + "transient error: HTTP 503 and more", "WARN"),
+            (GIVEN_UP, "asset identity resolution: transient error: transient error: HTTP 500", "WARN"),
+            (GIVEN_UP, "market membership acquisition: retry CLOB market membership read", "WARN"),
+            (GIVEN_UP, ["not text"], "WARN"),
+            (DEFERRED, POSITIONS_READ + "fatal error: HTTP 400", "WARN"),
+            (DEFERRED, "positions read for 0xabc: positions row 0 has invalid wallet: positions " + echo, "WARN"),
+            (DEFERRED, POSITIONS_READ + "transient error: HTTP 503", "ERROR"),
+            ("another read failed", ACTIVITY_READ + "transient error: HTTP 503", "WARN"),
+            (RETRY, "", "ERROR"),
+        ):
+            with self.subTest(message=message, error=error, level=level):
+                s, m = self.run_at(QUIET, 1, refused(T0, message, level, error=error, kind="source.x"))
+                self.assertEqual(alerts(m), [f"EVENT: copy service warning/error at 2:01 PM Nov 17: {message} (kind=source.x)"])
+                self.assertEqual(s["venue"], {"refusals": {}, "quiet": 0})
+
+    def test_a_lost_cursor_keeps_the_refusals_and_counts_a_record_read_again_once(self):
+        sparse = [refused(T0 + dt.timedelta(minutes=2 * n)) for n in range(12)]
+        s, m = self.run_at(QUIET, 21, *sparse[:11])
+        s, m = self.run_at(s, 22, vps=self.LOST)
+        s, m = self.run_at(s, 23, *sparse[4:])  # the last 15 minutes again, and the newest
+        self.assertEqual(m, [self.OPENED.format("2:22")])
+        slow = self.burst(12, 165)  # more than thirty minutes
+        s, m = self.run_at(QUIET, 31, *slow)
+        s, m = self.run_at(s, 31, vps=self.LOST)
+        s, m = self.run_at(s, 31, *slow[6:])
+        self.assertEqual((m, len(s["venue"]["refusals"])), ([], 12))
+
+    def test_refusals_logged_in_the_same_microsecond_all_count(self):
+        records = [refused(T0, cursor=f"c{n}") for n in range(12)]
+        self.assertEqual(self.run_at(QUIET, 1, *records)[1], [self.OPENED.format("2:00")])
+
+    def test_a_backlog_over_several_full_reads_is_reported_with_its_own_times(self):
+        burst, other = self.burst(12, 30), service("frame admission ignored", "INFO")
+        s = self.quiet(QUIET, range(1, 3), vps={"error": "timeout"})
+        with patch.object(w, "JOURNAL_LIMIT", 8):
+            s, m = self.run_at(s, 180, *burst[:8])
+            self.assertFalse(any("refus" in x for x in m))
+            s, m = self.run_at(s, 181, *burst[8:], *[other] * 4)
+            self.assertEqual(m, [self.OPENED.format("2:05")])
+            s = self.quiet(s, range(182, 201))
+            self.assertEqual(self.run_at(s, 201)[1], [self.ENDED.format("0 h 20")])
+
+    def test_full_and_failed_reads_and_a_stopped_service_pause_the_quiet_count(self):
+        s, _ = self.run_at(QUIET, 1, *self.burst())
+        s = self.quiet(s, range(2, 12))
+        page = [service("frame admission ignored", "INFO")] * 3
+        with patch.object(w, "JOURNAL_LIMIT", 3):
+            s = self.quiet(s, range(12, 40), *page)
+            s = self.quiet(s, range(40, 60), vps={"error": "timeout"})
+            s = self.quiet(s, range(60, 90), vps=self.STOPPED)
+            s = self.quiet(s, range(90, 99), *page[:2])
+            self.assertIn(self.ENDED.format("1 h 38"), self.run_at(s, 99, *page[:2])[1])
+
+    def test_a_lost_cursor_restarts_the_quiet_count(self):
+        s, _ = self.run_at(QUIET, 1, *self.burst())
+        s = self.quiet(s, range(2, 21))
+        s = self.quiet(s, [21], vps=self.LOST)
+        s = self.quiet(s, range(22, 41))
+        self.assertEqual(self.run_at(s, 41)[1], [self.ENDED.format("0 h 40")])
+
+    def test_messages_and_error_texts_match_the_copy_service(self):
+        crates = Path(__file__).resolve().parents[1] / "crates"
+        source = {path: (crates / path).read_text() for path in (
+            "source-polymarket-public/src/fetcher.rs", "source-polymarket-public/src/reconciliation.rs",
+            "source-core/src/lib.rs", "service/src/trade_poller.rs", "service/src/watchlist_admission.rs",
+            "service/src/position_seeder.rs")}
+        for path, texts in zip(source, (
+            [f'"{RETRY}"'],
+            ['"activity fetch failed for {url}: {source}"', '"positions fetch failed for {url}: {source}"'],
+            ['"transient error: {message}"', '"rate limited: retry after {retry_after_secs}s"'],
+            [f'warn!(wallet = %wallet, error = %error, "{GIVEN_UP}")', '"activity reconciliation: {0}"'],
+            [f'warn!(wallet = %wallet, kind = error.kind(), error = %error, "{DEFERRED}")'],
+            ['"activity catch-up for {wallet}: {source}"', '"positions read for {wallet}: {source}"'],
+        )):
+            for text in texts:
+                with self.subTest(path=path, text=text):
+                    self.assertIn(text, source[path])
+        self.assertEqual((w.VENUE_RETRY, w.VENUE_GIVEN_UP), (RETRY, {GIVEN_UP, DEFERRED}))
+        fetcher = source["source-polymarket-public/src/fetcher.rs"]
+        self.assertRegex(fetcher, r'is_retryable_status\(status\) \{\s+format!\("HTTP \{status\}"\)')
+        retries = re.search(r"RECONCILIATION_RATE_LIMIT_MAX_RETRIES: u32 = (\d+);", fetcher)
+        self.assertGreater(w.VENUE_REFUSALS, int(retries[1]) + 1)  # one request's retries and its give-up
+
+
 class Events(unittest.TestCase):
     step = Rules.step
 
@@ -517,8 +715,6 @@ class Events(unittest.TestCase):
 
     def test_all_service_routine_warnings_are_silent(self):
         routine = [
-            # The two bounded-retry warnings of the linked source crate.
-            "rate limited by the venue; retrying after the requested wait",
             "venue reply is not one complete JSON document",
             "activity ws connect failed", "activity ws closed by peer", "activity ws read error",
             "activity ws reader produced no normalized activity row; dropping socket",
@@ -536,7 +732,7 @@ class Events(unittest.TestCase):
             "knockout: capacity changed during live reentry preparation; retrying batch",
             "maintenance: candidate fetch returned 0; backfill paused (no surviving bench rows outside the live set, or the bench predates last_trade_unix)",
         ]
-        self.assertEqual(len(routine), 25)
+        self.assertEqual(len(routine), 24)
         self.assertEqual(set(routine), w.SERVICE_ROUTINE)
         _, m = self.step(observation=obs(vps_records=[service(x) for x in routine]))
         self.assertEqual(m, [])
@@ -759,6 +955,28 @@ class Events(unittest.TestCase):
         _, m = self.step(observation=obs(forge_records=[record(KERNEL_IO, "", "forge", PRIORITY="3", SYSLOG_IDENTIFIER="kernel")]))
         self.assertEqual(len(alerts(m)), 1)
         self.assertIn(KERNEL_IO, m[-1])
+
+    def test_every_drive_reset_on_forge_is_one_line(self):
+        for port, drive in (("3-1", "cache drive"), ("5-1", "second drive"), ("1-1.2", "USB device")):
+            with self.subTest(port=port):
+                line = f"EVENT: Linux reset Forge's {drive} (USB port {port}) at 1:57 PM Nov 17"
+                reset = USB_RESET.replace("3-1", port)
+                s, m = self.step(observation=obs(forge_records=[kernel(reset)]))
+                self.assertEqual(m, [line])
+                s, m = self.step(s, obs(forge_records=[kernel(reset)]), 1)  # the same record read again
+                self.assertEqual(m, [])
+                s, m = self.step(s, obs(forge_records=[kernel(reset, cursor="c2"), kernel(reset, cursor="c3")]), 2)
+                self.assertEqual(m, [line, line])
+
+    def test_other_kernel_lines_and_hosts_give_no_reset_line(self):
+        quiet = [kernel(m) for m in ("sd 0:0:0:0: [sda] tag#4 uas_eh_abort_handler 0 uas-tag 5 inflight: CMD IN",
+                                     "scsi host0: uas_eh_device_reset_handler start",
+                                     "scsi host0: uas_eh_device_reset_handler success",
+                                     "usb 3-1: new SuperSpeed USB device number 3 using xhci-hcd",
+                                     "usb 3-1: USB disconnect, device number 2", "note: " + USB_RESET)]
+        quiet += [kernel(USB_RESET, transport="syslog"), kernel(USB_RESET, transport="stdout")]
+        _, m = self.step(observation=obs(forge_records=quiet, vps_records=[kernel(USB_RESET)]))
+        self.assertEqual(m, [])
 
     def test_only_outside_watched_units_priorities_zero_through_three_are_host_errors(self):
         for priority in ("0", "1", "2", "3", "4", "6", "bad", None):
@@ -1305,6 +1523,16 @@ class Main(unittest.TestCase):
         self.assertEqual(self.run_main(), "")  # one bad sample, none from before
         self.assertEqual(set(json.loads(self.state.read_text())["open"]), {"loop_failing"})
         self.assertIn("clob.polymarket.com", self.run_main())  # the second opens it again
+
+    def test_reset_flag_drops_earlier_refusals_and_their_problem_only(self):
+        old = {"since": T0.isoformat(), "text": "from before the install"}
+        self.state.parent.mkdir(parents=True)
+        self.state.write_text(json.dumps({"venue": {"refusals": {"c1": T0.isoformat()}, "quiet": 0},
+                                          "open": {"venue": old, "loop_failing": old}}))
+        self.reset.touch()
+        self.assertEqual(self.run_main(), "")
+        state = json.loads(self.state.read_text())
+        self.assertEqual((set(state["open"]), state["venue"]), ({"loop_failing"}, {"refusals": {}, "quiet": 0}))
 
     def test_failed_state_write_keeps_the_reset_flag_and_the_previous_state(self):
         self.run_main()
