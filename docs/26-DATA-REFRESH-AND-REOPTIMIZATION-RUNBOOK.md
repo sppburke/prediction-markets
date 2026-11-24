@@ -31,7 +31,7 @@ cargo build --release -p pe-bootstrap
   `PE_BOOTSTRAP_CACHE_PATH=data/wallet_cache.db` (`rank_and_push.sh` exports this for you).
 - **SQLite scratch space (`SQLITE_TMPDIR`).** Bundled SQLite writes its working files —
   the `VACUUM` temp database and the external-sort spill of every `CREATE INDEX` on a
-  large table — into the system temp directory, NOT beside the cache. On a host whose
+  large table and of the payout install — into the system temp directory, NOT beside the cache. On a host whose
   root filesystem is a different (smaller, or failure-prone) device than the cache
   volume, point `SQLITE_TMPDIR` at a writable directory on the CACHE volume, e.g.
   `SQLITE_TMPDIR=/mnt/t7/sqlite-tmp` in `.env` on Forge (the wrapper exports its whole `.env` to
