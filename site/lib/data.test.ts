@@ -47,13 +47,12 @@ const statsRow = (index: number): WalletLiveStats => ({
   last_trade_unix: null,
 });
 
-function stubSupabase(read: (table: string, params: URLSearchParams) => {
-  data?: unknown;
-  error?: string;
-}) {
+type Reply = { data?: unknown; error?: string };
+
+function stubSupabase(read: (table: string, params: URLSearchParams) => Reply | Promise<Reply>) {
   const request = vi.fn<typeof fetch>(async (input) => {
     const url = new URL(typeof input === "string" ? input : input instanceof URL ? input : input.url);
-    const result = read(url.pathname.split("/").at(-1) ?? "", url.searchParams);
+    const result = await read(url.pathname.split("/").at(-1) ?? "", url.searchParams);
     return new Response(JSON.stringify(result.error ? { message: result.error } : result.data), {
       status: result.error ? 400 : 200,
       headers: { "content-type": "application/json" },
@@ -65,16 +64,24 @@ function stubSupabase(read: (table: string, params: URLSearchParams) => {
   }));
 }
 
+/** The one order the fake API filters and sorts by. */
+const byText = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
 function page<Row>(rows: Row[], key: keyof Row & string, params: URLSearchParams): Row[] {
   expect(params.get("order")).toBe(`${key}.asc`);
   expect(params.get("limit")).toBe("1000");
   expect(params.has("offset")).toBe(false);
-  const filter = params.get(key);
-  if (filter !== null) expect(filter).toMatch(/^gt\./);
-  const cursor = filter?.slice(3);
+  const filters = params.getAll(key).map((filter) => {
+    const [op, value] = [filter.slice(0, filter.indexOf(".")), filter.slice(filter.indexOf(".") + 1)];
+    expect(["gt", "gte", "lt"]).toContain(op);
+    return (text: string) => {
+      const order = byText(text, value);
+      return op === "gt" ? order > 0 : op === "gte" ? order >= 0 : order < 0;
+    };
+  });
   return rows
-    .filter((row) => cursor === undefined || String(row[key]) > cursor)
-    .sort((a, b) => String(a[key]).localeCompare(String(b[key])))
+    .filter((row) => filters.every((passes) => passes(String(row[key]))))
+    .sort((a, b) => byText(String(a[key]), String(b[key])))
     .slice(0, Number(params.get("limit")));
 }
 
@@ -400,8 +407,9 @@ describe("overview shows the followed set and paper results, not the ranked univ
 });
 
 describe("paper results: daily realized P&L and open fills", () => {
-  const fill = (index: number) => ({
-    idempotency_key: `key-${String(index).padStart(5, "0")}`,
+  // Keys of a wallet starting with each hex digit in turn, so the fills lie in all four key ranges.
+  const fill = (index: number, key = `wf|0x${(index % 16).toString(16)}|${String(index).padStart(5, "0")}`) => ({
+    idempotency_key: key,
     leader_wallet: wallet(index),
     market_id: `market-${String(index).padStart(5, "0")}`,
     outcome_id: 1,
@@ -417,46 +425,84 @@ describe("paper results: daily realized P&L and open fills", () => {
     settled_at_unix: Date.parse("2026-11-10T12:00:00Z") / 1000,
   });
 
-  function stubTables(count: number, failing?: string, settledCount = count) {
-    const fills = Array.from({ length: count }, (_, index) => fill(index + 1));
+  const fills = (count: number, key?: (index: number) => string) =>
+    Array.from({ length: count }, (_, index) => fill(index + 1, key?.(index + 1)));
+  const inOneRange = (index: number) => `wf|0x5|${String(index).padStart(5, "0")}`;
+  const inKeyOrder = (rows: ReturnType<typeof fill>[]) =>
+    [...rows].sort((a, b) => byText(a.idempotency_key, b.idempotency_key));
+
+  /** Serves the two tables and returns each request's table and key filters. */
+  function stubTables(rows: ReturnType<typeof fill>[], settledCount = rows.length, fails?: string) {
     const settled = Array.from({ length: settledCount }, (_, index) => settlement(index + 1));
-    const pages: Record<string, number> = {};
+    const requests: { table: string; filters: string[] }[] = [];
     stubSupabase((table, params) => {
-      pages[table] = (pages[table] ?? 0) + 1;
-      if (table === failing && pages[table] === 2) return { error: "later page failed" };
+      const key = table === "paper_fills" ? "idempotency_key" : "market_id";
+      const filters = params.getAll(key);
+      requests.push({ table, filters });
+      if (table === fails && filters.some((filter) => filter.startsWith("gt."))) return { error: "later page failed" };
       if (table === "paper_fills") {
         expect(params.get("select")).toBe(
           "idempotency_key,leader_wallet,market_id,outcome_id,side,contracts,fill_price,principal,fee",
         );
-        return { data: page(fills, "idempotency_key", params) };
+        return { data: page(rows, "idempotency_key", params) };
       }
       expect(table).toBe("settled_markets");
       expect(params.get("select")).toBe("market_id,outcome_prices,settled_at_unix");
       return { data: page(settled, "market_id", params) };
     });
-    return pages;
+    return requests;
   }
 
   it.each([0, 1000, 1001])("reads every fill and settlement (%i of each)", async (count) => {
-    const pages = stubTables(count);
+    const requests = stubTables(fills(count));
     // Each won fill: 10 × 1 − 4 − 0.1 = 5.9.
     expect(await fetchPaperResults()).toEqual({
       daily: count === 0 ? [] : [{ day: "2026-11-10", pnl: expect.closeTo(count * 5.9, 6) }],
       openFills: [],
     });
-    const fullPages = Math.floor(count / 1000) + 1;
-    expect(pages).toEqual({ paper_fills: fullPages, settled_markets: fullPages });
+    expect(requests.filter(({ table }) => table === "paper_fills")).toHaveLength(4);
+    expect(requests.filter(({ table }) => table === "settled_markets")).toHaveLength(Math.floor(count / 1000) + 1);
   });
 
-  it("returns exactly the unsettled fills, including those past the first 1,000 rows", async () => {
-    stubTables(1001, undefined, 999);
+  it("returns exactly the unsettled fills, including those past the first 1,000 rows of a range", async () => {
+    stubTables(fills(1001, inOneRange), 999);
     const { daily, openFills } = await fetchPaperResults();
     expect(daily).toEqual([{ day: "2026-11-10", pnl: expect.closeTo(999 * 5.9, 6) }]);
-    expect(openFills).toEqual([fill(1000), fill(1001)]);
+    expect(openFills).toEqual([fill(1000, inOneRange(1000)), fill(1001, inOneRange(1001))]);
   });
 
-  it.each(["paper_fills", "settled_markets"])("rejects when the second %s page fails", async (table) => {
-    stubTables(1001, table);
+  it("reads each key once, in order, at and around every bound, and bounds every page of a range", async () => {
+    const edges = ["other", "wf|0x3f", "wf|0x4", "wf|0x7f", "wf|0x8", "wf|0xbf", "wf|0xc", "wf|0xff", "wf|zz", "zz"];
+    const rows = [...fills(1001, inOneRange), ...edges.map((key, index) => fill(2000 + index, key))];
+    const requests = stubTables(rows, 0);
+    const { openFills } = await fetchPaperResults();
+    expect(openFills).toEqual(inKeyOrder(rows));
+    expect(requests.filter(({ table }) => table === "paper_fills").map(({ filters }) => filters)).toEqual([
+      ["lt.wf|0x4"],
+      ["gte.wf|0x4", "lt.wf|0x8"],
+      ["gte.wf|0x8", "lt.wf|0xc"],
+      ["gte.wf|0xc"],
+      [`gt.${inOneRange(999)}`, "lt.wf|0x8"],
+    ]);
+  });
+
+  it("asks for the four ranges at once and keeps key order when they answer in reverse", async () => {
+    const rows = fills(64);
+    const held: (() => void)[] = [];
+    stubSupabase(async (table, params) => {
+      if (table !== "paper_fills") return { data: [] };
+      await new Promise<void>((answer) => {
+        held.push(answer);
+        if (held.length === 4) for (const next of held.reverse()) next();
+      });
+      return { data: page(rows, "idempotency_key", params) };
+    });
+    const { openFills } = await fetchPaperResults();
+    expect(openFills).toEqual(inKeyOrder(rows));
+  });
+
+  it.each(["paper_fills", "settled_markets"])("rejects when a later %s page fails", async (table) => {
+    stubTables(fills(1001, inOneRange), 1001, table);
     await expect(fetchPaperResults()).rejects.toThrow("later page failed");
   });
 
