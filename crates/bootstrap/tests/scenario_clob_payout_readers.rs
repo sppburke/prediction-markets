@@ -17,6 +17,7 @@ const HALF: &str =
 const WINNER: &str =
     include_str!("../../source-polymarket-public/tests/fixtures/clob_market_winner.json");
 const HALF_ID: &str = "0x0fbd0991b8cd88bebb6b48441c549d32a1eedb1e5ce47a5730829cec02c0e635";
+const WINNER_ID: &str = "0x12a0cb60174abc437bf1178367c72d11f069e1a3add20b148fb0ab4279b772b2";
 
 fn page_url(cursor: Option<&str>) -> String {
     match cursor {
@@ -381,7 +382,7 @@ fn stage_two_pages_repeating_a_market(
         .commit_clob_payout_page_v2(
             state.generation,
             &first,
-            &evidence(&[HALF, WINNER]),
+            &evidence(&[WINNER, HALF]),
             1_800_000_010,
         )
         .unwrap();
@@ -389,6 +390,17 @@ fn stage_two_pages_repeating_a_market(
         .commit_clob_payout_page_v2(state.generation, &second, &evidence(&[HALF]), 1_800_000_020)
         .unwrap();
     ClobCoverageManifest::complete(state.generation, vec![first, second]).unwrap()
+}
+
+/// A payout evidence table's markets in the order its rows are stored.
+fn stored_markets(connection: &rusqlite::Connection, table: &str) -> Vec<String> {
+    connection
+        .prepare(&format!("SELECT market_id FROM {table} ORDER BY rowid"))
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
 }
 
 /// Every column of a payout evidence table, its generation column last, by market.
@@ -413,9 +425,9 @@ fn evidence_rows(
         .unwrap()
 }
 
-/// PASS: completion installs exactly the staged rows, column by column, and leaves
-/// no staging, page or walk-state row behind. FAIL: a row or column differs, or
-/// the walk survives its install.
+/// PASS: completion installs exactly the staged rows, column by column, stored by
+/// market, and leaves no staging, page or walk-state row behind. FAIL: a row or
+/// column differs, the rows keep the walk's order, or the walk survives its install.
 #[test]
 fn completion_installs_the_staged_rows_and_clears_the_walk() {
     let dir = TempDir::new().unwrap();
@@ -425,11 +437,19 @@ fn completion_installs_the_staged_rows_and_clears_the_walk() {
     let connection = rusqlite::Connection::open(&db_path).unwrap();
     let staged = evidence_rows(&connection, "clob_payout_evidence_staging_v2", "generation");
     assert_eq!(staged.len(), 2, "the repeated market is staged once");
+    assert_eq!(
+        stored_markets(&connection, "clob_payout_evidence_staging_v2"),
+        [WINNER_ID, HALF_ID]
+    );
 
     cache
         .complete_clob_payout_walk_v2(&manifest, 1_800_000_030)
         .unwrap();
 
+    assert_eq!(
+        stored_markets(&connection, "clob_payout_evidence_v2"),
+        [HALF_ID, WINNER_ID]
+    );
     assert_eq!(
         evidence_rows(
             &connection,

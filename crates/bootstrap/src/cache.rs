@@ -119,7 +119,9 @@ pub const REQUIRED_TRADES_INDEXES: [&str; 3] = [
 /// Copies a finished walk's staged evidence into `clob_payout_evidence_v2` in
 /// [`WalletCache::complete_clob_payout_walk_v2`]. `NOT INDEXED` reads staging in
 /// rowid order, which is the walk's page order; through the `(generation,
-/// market_id)` key every staged row would be a random table read.
+/// market_id)` key every staged row would be a random table read. `ORDER BY`
+/// stores the rows by market, so a reader that walks the market key finds
+/// neighbouring markets on the same table pages.
 const CLOB_PAYOUT_INSTALL_SQL: &str = "INSERT INTO clob_payout_evidence_v2 \
      (market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, closed, \
       tokens_json, raw_page_sha256, coverage_generation, page_ordinal, \
@@ -127,7 +129,7 @@ const CLOB_PAYOUT_INSTALL_SQL: &str = "INSERT INTO clob_payout_evidence_v2 \
      SELECT market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, closed, \
             tokens_json, raw_page_sha256, generation, page_ordinal, schema_version, \
             parser_version, fetched_at_unix, origin, neg_risk_market_id, neg_risk \
-     FROM clob_payout_evidence_staging_v2 NOT INDEXED WHERE generation = ?1";
+     FROM clob_payout_evidence_staging_v2 NOT INDEXED WHERE generation = ?1 ORDER BY market_id";
 
 /// Clears staging once [`WalletCache::complete_clob_payout_walk_v2`] has copied it.
 /// Staging only ever holds the active walk's rows: a walk clears it in the
@@ -6668,9 +6670,9 @@ mod tests {
         page
     }
 
-    /// PASS: the completion copies staging in table order and frees staging's pages
-    /// in one step. FAIL: the copy goes through the `(generation, market_id)` key, or
-    /// the clear deletes row by row.
+    /// PASS: the completion reads staging in table order, sorts it once, and frees
+    /// staging's pages in one step. FAIL: the copy goes through the `(generation,
+    /// market_id)` key or is not sorted, or the clear deletes row by row.
     #[test]
     fn clob_payout_completion_scans_staging_and_clears_it_without_row_deletes() {
         let dir = TempDir::new().unwrap();
@@ -6683,7 +6685,13 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(plan, ["SCAN clob_payout_evidence_staging_v2"]);
+        assert_eq!(
+            plan,
+            [
+                "SCAN clob_payout_evidence_staging_v2",
+                "USE TEMP B-TREE FOR ORDER BY"
+            ]
+        );
         let opcodes = cache
             .conn
             .prepare(&format!("EXPLAIN {CLOB_PAYOUT_STAGING_CLEAR_SQL}"))
