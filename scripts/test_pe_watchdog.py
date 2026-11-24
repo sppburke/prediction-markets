@@ -61,6 +61,15 @@ def config_read(when, message="service_config poll failed; keeping last-known-go
     return at(service(message, error=CONFIG_ERROR), when)
 
 
+def skipped(reason, level="INFO", cursor="c1"):
+    return at({**service("signal did not produce order", level, reason=reason, market="0xabc"), "__CURSOR": cursor},
+              T0 - dt.timedelta(minutes=3))
+
+
+def probe_line(label="clob", code=0, seconds=0.05):
+    return f"{label} {code} {seconds:.6f}"
+
+
 def forge(message, level=None, **fields):
     if level:
         message = json.dumps({"level": level, "fields": {"message": message, **fields}})
@@ -73,7 +82,7 @@ def host_result(host, records=(), **states):
 
 
 def obs(forge_records=(), vps_records=(), forge_state="active", vps_states=None,
-        ok=True, batch=159, created=T0 - dt.timedelta(hours=1), err=None, errors=None, issues=None):
+        ok=True, batch=159, created=T0 - dt.timedelta(hours=1), err=None, errors=None, issues=None, probe=None):
     hosts = {"forge": host_result("forge", forge_records, **{LOOP: forge_state}),
              "vps": host_result("vps", vps_records, **(vps_states or {}))}
     for host, error in (errors or {}).items():
@@ -81,7 +90,8 @@ def obs(forge_records=(), vps_records=(), forge_state="active", vps_states=None,
     detail = ("HTTP 200, ready=True" if ok else
               "; ".join(w.READY_ISSUES.get(i, i) for i in issues) if issues else "HTTP 503, ready=False")
     return {"hosts": hosts, "health_ok": ok, "health_issues": None if ok else issues, "health_detail": detail,
-            "batch_id": None if err else batch, "created": None if err else created, "batch_error": err}
+            "batch_id": None if err else batch, "created": None if err else created, "batch_error": err,
+            "probe": probe or {}}
 
 
 def alerts(messages):
@@ -320,6 +330,63 @@ class Rules(unittest.TestCase):
         self.assertEqual(w.ct(dt.datetime(2026, 11, 17, 15, 0, tzinfo=UTC)), "9:00 AM Nov 17")
 
 
+class Connections(unittest.TestCase):
+    TARGET = "new connections from the cloud server to Polymarket's order service (clob.polymarket.com)"
+
+    def run_samples(self, samples, state=None, start=0):
+        """One probe a minute; returns the state and the (minute, message) list."""
+        sent = []
+        for minute, sample in enumerate(samples, start):
+            state, messages = w.evaluate(state or QUIET, obs(probe={"clob": sample} if sample else {}),
+                                         T0 + dt.timedelta(minutes=minute))
+            sent += [(minute, m) for m in messages]
+        return state, sent
+
+    def slow(self, minute):
+        return minute, f"PROBLEM: {self.TARGET} slow or failing since 2:{minute:02d} PM Nov 17"
+
+    def fast(self, minute, lasted):
+        return minute, f"RESOLVED: {self.TARGET} fast again (lasted {lasted})"
+
+    def test_one_bad_sample_is_silent_and_a_second_within_thirty_minutes_opens_once(self):
+        self.assertEqual(self.run_samples(["bad"] + ["ok"] * 50)[1], [])
+        self.assertEqual(self.run_samples(["bad"] + ["ok"] * 28 + ["bad"])[1], [self.slow(29)])
+        self.assertEqual(self.run_samples(["bad"] + ["ok"] * 29 + ["bad"])[1], [])
+        self.assertEqual(self.run_samples(["bad"] * 5)[1], [self.slow(1)])
+
+    def test_thirty_good_samples_in_a_row_resolve(self):
+        state, sent = self.run_samples(["bad", "bad"] + ["ok"] * 29)
+        self.assertEqual(sent, [self.slow(1)])
+        state, sent = self.run_samples(["ok"], state, 31)
+        self.assertEqual(sent, [self.fast(31, "0 h 30 min")])
+        self.assertEqual(self.run_samples(["ok", "bad", "ok", "bad"], state, 32)[1], [self.slow(35)])
+
+    def test_half_slow_connections_are_one_problem_and_one_recovery(self):
+        self.assertEqual(self.run_samples(["bad", "ok"] * 90 + ["ok"] * 35)[1], [self.slow(2), self.fast(208, "3 h 26 min")])
+
+    def test_a_missing_sample_neither_opens_nor_resolves(self):
+        state, sent = self.run_samples(["bad"] + [None] * 29 + ["bad"])  # thirty minutes apart
+        self.assertEqual(sent, [])
+        state, sent = self.run_samples(["bad"] + ["ok"] * 29 + [None] * 60, state, 31)  # an hour without samples
+        self.assertEqual(sent, [self.slow(31)])
+        self.assertEqual(self.run_samples(["ok"], state, 121)[1], [self.fast(121, "1 h 30 min")])
+
+    def test_endpoints_are_independent_of_each_other_and_of_the_host_reads(self):
+        state, sent = QUIET, []
+        for minute, (clob, data) in enumerate((("bad", "ok"), ("ok", "bad"), ("ok", "bad"))):
+            state, messages = w.evaluate(state, obs(probe={"clob": clob, "data": data}, errors={"vps": "timeout"}),
+                                         T0 + dt.timedelta(minutes=minute))
+            sent += messages
+        self.assertEqual(sent, [
+            "PROBLEM: vps host unreachable since 2:01 PM Nov 17 (timeout)",
+            "PROBLEM: new connections from the cloud server to Polymarket's data service (data-api.polymarket.com)"
+            " slow or failing since 2:02 PM Nov 17"])
+
+    def test_state_survives_json(self):
+        state, _ = self.run_samples(["bad"])
+        self.assertEqual(self.run_samples(["bad"], json.loads(json.dumps(state)), 1)[1], [self.slow(1)])
+
+
 class Readiness(unittest.TestCase):
     step = Rules.step
 
@@ -508,6 +575,45 @@ class Events(unittest.TestCase):
                 self.assertEqual(m, [])
                 s, m = self.step(s, later, 24 * 60)
                 self.assertEqual(len(alerts(m)), 1)
+
+    def test_every_skipped_trade_with_an_unusable_order_book_is_one_line(self):
+        for why in ("/book fetch timed out", "/book fetch failed", "stale snapshot", "corrupt ask levels",
+                    "missing CLOB token", "book tick contradicts admission"):
+            with self.subTest(why=why):
+                reason = f"price-impact book unusable: {why} (fail closed)"
+                line = f"EVENT: copy service skipped a trade at 1:57 PM Nov 17 (order book: {why})"
+                s, m = self.step(observation=obs(vps_records=[skipped(reason)]))
+                self.assertEqual(m, [line])
+                s, m = self.step(s, obs(vps_records=[skipped(reason)]), 1)  # the same record read again
+                self.assertEqual(m, [])
+                s, m = self.step(s, obs(vps_records=[skipped(reason, cursor="c2"), skipped(reason, cursor="c3")]), 2)
+                self.assertEqual(m, [line, line])
+
+    def test_skipped_trades_leave_the_evidence_to_other_events(self):
+        reason = "price-impact book unusable: stale snapshot (fail closed)"
+        many = [skipped(reason, cursor=f"c{n}") for n in range(6)] + [service("unexpected failure", "ERROR")]
+        messages = self.step(observation=obs(vps_records=many))[1]
+        self.assertEqual(len(alerts(messages)), 7)
+        self.assertEqual(messages[7:], ["  vps pe-service.service: " + many[6]["MESSAGE"]])
+
+    def test_normal_skip_reasons_and_other_records_give_no_skip_line(self):
+        book = "price-impact book unusable: /book fetch timed out (fail closed)"
+        other = [skipped(reason) for reason in (
+            "series_recurrence", "price-impact ladder walk failed (fail closed)", "market resolves too far out",
+            "price-impact book unusable: empty ask book (fail closed)", "current market price unavailable",
+            "paper budget afforded no atomic share within the impact band (paper-only)", [book], {"a": book}, None)]
+        other += [skipped(book, level="DEBUG"), service("signal produced order", "INFO", reason=book),
+                  record(json.dumps({"message": "signal did not produce order", "level": "INFO", "reason": book}), SITE),
+                  record("signal did not produce order " + book)]
+        self.assertEqual(self.step(observation=obs(vps_records=other))[1], [])
+        self.assertEqual(alerts(self.step(observation=obs(vps_records=[skipped(book, level="WARN")]))[1]),
+                         ["EVENT: copy service warning/error at 2:00 PM Nov 17: signal did not produce order"])
+
+    def test_skip_reasons_match_the_copy_service(self):
+        source = (Path(__file__).resolve().parents[1] / "crates/service/src/orchestrator.rs").read_text()
+        reasons = set(re.findall(r'"(price-impact book unusable: [^"]+)"', source))
+        normal = {reason for reason in reasons if not w.BOOK_SKIP.fullmatch(reason)}
+        self.assertEqual(normal, {"price-impact book unusable: empty ask book (fail closed)"})
 
     def test_each_recovery_resolves_once_and_rearms_all_failure_kinds(self):
         pairs = [
@@ -765,7 +871,62 @@ class Events(unittest.TestCase):
                 self.assertEqual(alerts(m), ["EVENT: copy service warning/error at 2:00 PM Nov 17: " + degraded])
 
 
+class Probe(unittest.TestCase):
+    def test_argv_is_constant(self):
+        with patch.object(w, "HOME", Path("/home/merlin")):
+            self.assertEqual(w.probe_argv(), [
+                "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes",
+                "-i", "/home/merlin/.ssh/id_personal", "sean@82.22.32.225",
+                "curl -s -o /dev/null -m 10 -w 'clob %{exitcode} %{time_appconnect}\\n' https://clob.polymarket.com/"
+                " & curl -s -o /dev/null -m 10 -w 'data %{exitcode} %{time_appconnect}\\n' https://data-api.polymarket.com/"
+                " & wait"])
+
+    def test_samples_from_curl_output(self):
+        cases = [(probe_line(seconds=0.05), {"clob": "ok"}), (probe_line(seconds=2.0), {"clob": "ok"}),
+                 (probe_line(seconds=2.000001), {"clob": "bad"}), (probe_line(seconds=6.4), {"clob": "bad"}),
+                 (probe_line(code=28, seconds=0.05), {"clob": "ok"}),  # the handshake was fast, the reply was not
+                 (probe_line(code=28, seconds=3.1), {"clob": "bad"}),
+                 *((probe_line(code=code, seconds=0), {"clob": "bad"}) for code in (6, 7, 28, 35, 60)),
+                 *((probe_line(code=code, seconds=0), {}) for code in (0, 2, 23, 127)),
+                 (probe_line("github"), {}), ("clob 0", {}), ("clob 0 fast", {}), ("clob 0 -1.0", {}), ("", {}),
+                 ("Welcome to Ubuntu\n" + probe_line("data", 0, 0.04) + "\n" + probe_line("clob", 35, 0), {"data": "ok", "clob": "bad"})]
+        for output, expected in cases:
+            with self.subTest(output=output):
+                self.assertEqual(w.parse_probe(output), expected)
+
+    def test_a_failed_call_gives_no_sample(self):
+        printed = probe_line("data", 0, 0.04) + "\n"
+        with patch.object(w.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, printed, "")) as run:
+            self.assertEqual(w.read_probe(), {"data": "ok"})
+        self.assertEqual((run.call_args.args, run.call_args.kwargs["timeout"]), ((w.probe_argv(),), 30))
+        dropped = subprocess.CalledProcessError(255, "ssh", printed)
+        for failure in (dropped, subprocess.TimeoutExpired("ssh", 30, printed), OSError("no ssh")):
+            with self.subTest(failure=failure), patch.object(w.subprocess, "run", side_effect=failure):
+                self.assertEqual(w.read_probe(), {})
+        self.assertTrue(run.call_args.kwargs["check"])  # a dropped SSH session raises, like the others
+
+    def test_observe_reports_the_probe_and_runs_it_beside_the_host_reads(self):
+        barrier = threading.Barrier(3)
+
+        def wait(*_):
+            barrier.wait(timeout=3)
+            return {}
+
+        with patch.object(w, "read_host", side_effect=lambda h, c: wait() or host_result(h)), \
+             patch.object(w, "read_probe", side_effect=lambda: wait() or {"clob": "bad"}), \
+             patch.object(w, "fetch_json", side_effect=[(200, {"ready": True}),
+                                                        (200, [{"batch_id": 159, "created_at": T0.isoformat()}])]):
+            o = w.observe({"PE_HEALTH_URL": "health", "PE_SUPABASE_URL": "supabase", "PE_SUPABASE_ANON_KEY": "anon"}, {})
+        self.assertEqual(o["probe"], {"clob": "bad"})
+        self.assertIsNone(o["hosts"]["vps"]["error"])
+
+
 class Reads(unittest.TestCase):
+    def setUp(self):
+        probe = patch.object(w, "read_probe", return_value={})
+        probe.start()
+        self.addCleanup(probe.stop)
+
     def test_remote_argv_initial_commands_are_constant(self):
         options = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes"]
         with patch.object(w, "HOME", Path("/home/merlin")):
@@ -1133,6 +1294,17 @@ class Main(unittest.TestCase):
         self.assertEqual(output, f"pe-watchdog\n{NOT_READY} ({FEED_WORDS}; earlier: {w.UNCLASSIFIED})\n")
         self.assertFalse(self.reset.exists())
         self.assertEqual(json.loads(self.state.read_text())["not_ready"], 2)
+
+    def test_reset_flag_drops_earlier_connection_samples_and_problems_only(self):
+        self.observer.return_value = obs(probe={"clob": "bad"})
+        old = {"since": T0.isoformat(), "text": "from before the install"}
+        self.state.parent.mkdir(parents=True)
+        self.state.write_text(json.dumps({"probe": {"clob": {"bad": T0.isoformat(), "good": 0}},
+                                          "open": {"slow:clob": old, "loop_failing": old}}))
+        self.reset.touch()
+        self.assertEqual(self.run_main(), "")  # one bad sample, none from before
+        self.assertEqual(set(json.loads(self.state.read_text())["open"]), {"loop_failing"})
+        self.assertIn("clob.polymarket.com", self.run_main())  # the second opens it again
 
     def test_failed_state_write_keeps_the_reset_flag_and_the_previous_state(self):
         self.run_main()
