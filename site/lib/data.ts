@@ -15,18 +15,23 @@ const PAGE_SIZE = 1000;
 
 /** Traverse a unique key so refreshed values cannot move rows across page boundaries. Each page carries a
  * fresh signal, which opts it out of Next's per-render fetch deduplication: a repeated traversal (the watched
- * read's retry) must read current rows, not replay the first. */
+ * read's retry) must read current rows, not replay the first. `from` (inclusive) and `to` (exclusive) limit the
+ * traversal to one range of the key. */
 async function fetchPagedRows<Row>(
   sb: SupabaseClient,
   table: string,
   columns: string,
   key: keyof Row & string,
+  from?: string,
+  to?: string,
 ): Promise<Row[]> {
   const rows: Row[] = [];
   let cursor: string | null = null;
   for (;;) {
     let query = sb.from(table).select(columns).order(key, { ascending: true }).limit(PAGE_SIZE);
     if (cursor !== null) query = query.gt(key, cursor);
+    else if (from !== undefined) query = query.gte(key, from);
+    if (to !== undefined) query = query.lt(key, to);
     const { data, error } = await query.abortSignal(new AbortController().signal);
     if (error) throw new Error(error.message);
     if (!data) throw new Error(`The ${table} query returned no data.`);
@@ -241,21 +246,32 @@ export async function fetchFills(wallet: string, limit = 200): Promise<PaperFill
   return (data ?? []) as PaperFill[];
 }
 
+/** Fill keys are `wf|{wallet}|…`: these bounds split them by the wallet's first hex digit into four ranges that
+ * are read side by side. The outer ranges are unbounded, so every key is in exactly one. */
+const FILL_KEY_BOUNDS = [undefined, "wf|0x4", "wf|0x8", "wf|0xc", undefined];
+
 /** The overview's paper results from one read of every fill and every settlement: realized P&L per
  * Central Time day, and the open (not-yet-settled) fills that are the unrealized-P&L basis (#398 WS3
  * step 19). Every read pages a unique key, so neither table is truncated at the API's row cap. */
 export async function fetchPaperResults(): Promise<{ daily: DailyPnl[]; openFills: OpenFill[] }> {
   const sb = getSupabase();
   if (!sb) throw new NotConfiguredError();
-  const [fills, settled] = await Promise.all([
-    fetchPagedRows<OpenFill & Pick<PaperFill, "idempotency_key">>(
-      sb,
-      "paper_fills",
-      "idempotency_key,leader_wallet,market_id,outcome_id,side,contracts,fill_price,principal,fee",
-      "idempotency_key",
+  const [fillRanges, settled] = await Promise.all([
+    Promise.all(
+      FILL_KEY_BOUNDS.slice(1).map((to, i) =>
+        fetchPagedRows<OpenFill & Pick<PaperFill, "idempotency_key">>(
+          sb,
+          "paper_fills",
+          "idempotency_key,leader_wallet,market_id,outcome_id,side,contracts,fill_price,principal,fee",
+          "idempotency_key",
+          FILL_KEY_BOUNDS[i],
+          to,
+        ),
+      ),
     ),
     fetchPagedRows<SettledMarket>(sb, "settled_markets", "market_id,outcome_prices,settled_at_unix", "market_id"),
   ]);
+  const fills = fillRanges.flat();
   const settledIds = new Set(settled.map((market) => market.market_id));
   return {
     daily: dailyPnl(fills, settled),
