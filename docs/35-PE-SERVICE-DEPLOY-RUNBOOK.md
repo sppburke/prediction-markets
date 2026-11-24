@@ -1216,17 +1216,20 @@ Telegram (empty output is silent).
   `~/.ssh/known_hosts`, copied from a machine that already trusts them; and, only between an install and the next run,
   `~/.config/pe-watchdog/reset-health-episode`.
 - Install a new script version (also after a rollback): skip it if the installed file already has the new sha256 and the
-  job is not paused. Otherwise back up the installed file and run `hermes cron pause <job>`. A minute later, once
+  job is not paused. Otherwise copy the installed file to `pe_watchdog.py.bak-<first 8 digits of its sha256>` beside it
+  (repeating an interrupted install then keeps the older backups) and run `hermes cron pause <job>`. A minute later, once
   `pgrep -f '.hermes/scripts/pe_watchdog.py'` prints nothing (each Hermes run starts a child process that opens the
   installed file; no manual `hermes cron run` meanwhile) and the state shows `not_ready` 0 and no open problem (a
   refusals problem left over from a rollback does not count), `touch ~/.config/pe-watchdog/reset-health-episode` and
-  `mv -T` the new file into place from a temporary name beside it. Check that the installed file's sha256 equals the new
-  file's, run `python3 ~/.hermes/scripts/pe_watchdog.py --dry-run` (it neither writes state nor removes the flag) and
+  `mv -T` the new file into place from a temporary name beside it; if the state shows anything else, resume the job and
+  install later. Check that the installed file's sha256 equals the new file's, run
+  `python3 ~/.hermes/scripts/pe_watchdog.py --dry-run` (it neither writes state nor removes the flag) and
   `hermes cron resume <job>`, and confirm that the next scheduled run removed the flag and sent nothing without a reason.
   That first run drops any readiness-episode keys and any connection samples, refusals and open problems about either
   that an earlier version left in the state. Rollback, also when a check fails: with the job paused in the same way,
-  `mv -T` the backup into place, remove the flag if it is still there, and resume the job; the previous version keeps
-  counting with the same `not_ready` key and sends no all-clear for an open problem it does not know.
+  `mv -T` the previous version's backup into place, remove the flag if it is still there, and resume the job; the
+  previous version keeps counting with the same `not_ready` key and sends no all-clear for an open problem it does not
+  know.
 - Reads, and nothing else: `ssh pi@forge.tail72525f.ts.net` and `ssh -i ~/.ssh/id_personal sean@82.22.32.225`, each
   running `journalctl --all -o json --no-pager --after-cursor=<stored cursor>` then `systemctl [--user] is-active` for
   the watched units; a second VPS login that runs `curl` once against `https://clob.polymarket.com/` and once against
