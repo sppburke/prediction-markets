@@ -1184,9 +1184,9 @@ new ranking publication only.
 **Watchdog.** Hermes on merlin runs `scripts/pe_watchdog.py` every minute as a `--no-agent` job whose output goes to
 Telegram (empty output is silent).
 
-- It messages only for a problem, when that problem clears, or for a requested test line: no daily or routine status
-  (owner, 2026-11-18). A planned `flag_stop` is silent; if the loop stays stopped, the no-new-batch alert (11 hours
-  after the last batch) still fires.
+- It messages only for a problem, when that problem clears, for a single event, or for a requested test line: no daily
+  or routine status (owner, 2026-11-18). A planned `flag_stop` is silent; if the loop stays stopped, the no-new-batch
+  alert (11 hours after the last batch) still fires.
 - pe-service rereads `service_config` every 30 s and keeps its last settings after a failed read, so a single failed
   read is silent; three within 5 minutes are a problem, which clears after 5 minutes without one. A
   `best-effort owner degraded` warning within 2 minutes after `shutdown signal received` is part of a coordinated stop
@@ -1204,21 +1204,29 @@ Telegram (empty output is silent).
   [`watchdog_slow_connect`](_GLOSSARY.md#watchdog_slow_connect) says when slow or failing ones are a problem. Nothing
   messaged about either during the 2026-11-23 network fault
   ([#894](https://github.com/sppburke/prediction-markets/issues/894)).
+- pe-service's warnings that Polymarket refused a request are counted instead of messaged one by one;
+  [`watchdog_venue_refusals`](_GLOSSARY.md#watchdog_venue_refusals) says which ones, when many of them are a problem and
+  when it ends. Every other warning keeps its existing handling.
+- Linux logs at information level that it reset a USB device. Each such kernel record on Forge is one message naming
+  the drive by its USB port (`FORGE_DRIVES` in the script; change it when a drive moves), or only the port when it is
+  neither drive's.
 - Files on merlin: the script at `~/.hermes/scripts/pe_watchdog.py`; config `~/.config/pe-watchdog/watchdog.env`
   (mode 0600: `PE_SUPABASE_URL`, `PE_SUPABASE_ANON_KEY`, `PE_HEALTH_URL`); state
   `~/.local/state/pe-watchdog/state.json`; the host keys for `forge.tail72525f.ts.net` and `82.22.32.225` in
   `~/.ssh/known_hosts`, copied from a machine that already trusts them; and, only between an install and the next run,
   `~/.config/pe-watchdog/reset-health-episode`.
-- Install a new script version (also after a rollback): skip it if the installed file already has the new sha256.
-  Otherwise back up the installed file, and with it still installed wait until
-  `pgrep -f '.hermes/scripts/pe_watchdog.py'` prints nothing on two checks 10 s apart (each Hermes run starts a child
-  process that opens the installed file; no manual `hermes cron run` meanwhile). Then
-  `touch ~/.config/pe-watchdog/reset-health-episode` and `mv -T` the new file into place from a temporary name beside
-  it. The new version's first run drops any readiness-episode keys and any connection samples and problems an earlier
-  version left in the state, and removes the flag. Check that the installed file's sha256 equals the new file's, run
-  `python3 ~/.hermes/scripts/pe_watchdog.py --dry-run` (it neither writes state nor removes the flag), and confirm
-  that the next scheduled run removed the flag and stayed silent. Rollback: `mv -T` the backup into place, nothing
-  else; the previous version keeps counting with the same `not_ready` key.
+- Install a new script version (also after a rollback): skip it if the installed file already has the new sha256 and the
+  job is not paused. Otherwise back up the installed file and run `hermes cron pause <job>`. A minute later, once
+  `pgrep -f '.hermes/scripts/pe_watchdog.py'` prints nothing (each Hermes run starts a child process that opens the
+  installed file; no manual `hermes cron run` meanwhile) and the state shows `not_ready` 0 and no open problem (a
+  refusals problem left over from a rollback does not count), `touch ~/.config/pe-watchdog/reset-health-episode` and
+  `mv -T` the new file into place from a temporary name beside it. Check that the installed file's sha256 equals the new
+  file's, run `python3 ~/.hermes/scripts/pe_watchdog.py --dry-run` (it neither writes state nor removes the flag) and
+  `hermes cron resume <job>`, and confirm that the next scheduled run removed the flag and sent nothing without a reason.
+  That first run drops any readiness-episode keys and any connection samples, refusals and open problems about either
+  that an earlier version left in the state. Rollback, also when a check fails: with the job paused in the same way,
+  `mv -T` the backup into place, remove the flag if it is still there, and resume the job; the previous version keeps
+  counting with the same `not_ready` key and sends no all-clear for an open problem it does not know.
 - Reads, and nothing else: `ssh pi@forge.tail72525f.ts.net` and `ssh -i ~/.ssh/id_personal sean@82.22.32.225`, each
   running `journalctl --all -o json --no-pager --after-cursor=<stored cursor>` then `systemctl [--user] is-active` for
   the watched units; a second VPS login that runs `curl` once against `https://clob.polymarket.com/` and once against

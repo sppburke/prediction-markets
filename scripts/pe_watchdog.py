@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Read-only Forge/VPS watchdog, run every minute by Hermes --no-agent.
 
-Stdout goes to Telegram verbatim, only for a problem, its resolution or a requested test
+Stdout goes to Telegram verbatim, only for a problem, its resolution, an event or a requested test
 (owner, 2026-11-18: no routine status); otherwise no output. Python 3.11+, stdlib only.
 Config: ~/.config/pe-watchdog/watchdog.env (KEY=VALUE: PE_SUPABASE_URL,
 PE_SUPABASE_ANON_KEY, PE_HEALTH_URL). State: ~/.local/state/pe-watchdog/state.json.
 Create ~/.config/pe-watchdog/send-test-alert for a TEST line. Create
 ~/.config/pe-watchdog/reset-health-episode just before installing a new version (docs/35): the
-next run drops readiness-episode keys an earlier version left in the state. --dry-run prints only
-what would be sent, without writing state or removing either flag. Runs never overlap.
+next run drops what an earlier version left in the state. --dry-run prints only what would be sent,
+without writing state or removing either flag. Runs never overlap.
 """
 
 import copy
@@ -75,9 +75,7 @@ SERVICE_ROUTINE = frozenset({
     "live reentry: capacity changed before locked apply; retrying next tick",
     "knockout: capacity changed during live reentry preparation; retrying batch",
     "maintenance: candidate fetch returned 0; backfill paused (no surviving bench rows outside the live set, or the bench predates last_trade_unix)",
-    # Logged by the linked source crate; both precede a bounded retry
-    # (crates/source-polymarket-public/src/fetcher.rs:348-390).
-    "rate limited by the venue; retrying after the requested wait",
+    # Logged by the linked source crate before a bounded retry (crates/source-polymarket-public/src/fetcher.rs).
     "venue reply is not one complete JSON document",
 })
 RECOVERIES = {
@@ -134,6 +132,18 @@ SLOW_WINDOW = dt.timedelta(minutes=30)
 SLOW_CLEAR = 30
 # curl exits before or during the TLS handshake: DNS, connect, timeout, TLS, certificate.
 CONNECT_FAILURES = frozenset({6, 7, 28, 35, 60})
+# Polymarket refused a request: an HTTP 429 that the fetcher retries, or a data-service read given up after its
+# retries over an HTTP status (docs/_GLOSSARY.md watchdog_venue_refusals). The given-up messages carry other errors too.
+VENUE_RETRY = "rate limited by the venue; retrying after the requested wait"
+VENUE_GIVEN_UP = frozenset({"fixed-end activity reconciliation will retry", "anchor refresh deferred"})
+VENUE_ERROR = re.compile(r"[^:]+: (?:activity|positions) fetch failed for \S+: "
+                         r"(?:transient error: HTTP \d+|rate limited: retry after \d+s)")
+VENUE_REFUSALS = 12
+VENUE_WINDOW = dt.timedelta(minutes=30)
+VENUE_CLEAR = 20
+# Linux logs at information level that it reset a USB device. Forge's drives by USB port:
+DRIVE_RESET = re.compile(r"usb (\S+): reset .* USB device number \d+ ")
+FORGE_DRIVES = {"3-1": "cache drive", "5-1": "second drive"}
 PUBLISH_RETRY = re.compile(
     r"WARNING: transient Supabase \S+ failure; retry \d+/\d+ in \d+s:"
 )
@@ -331,9 +341,8 @@ def message_parts(record):
         fields = body.get("fields")
         fields = fields if isinstance(fields, dict) else body
         message = fields.get("message", "")
-        return (raw, str(message), str(body.get("level", "")), fields.get("kind"), "kind" in fields, True,
-                str(fields.get("reason", "")))
-    return raw, raw, "", None, False, False, ""
+        return raw, str(message), str(body.get("level", "")), fields.get("kind"), "kind" in fields, True, fields
+    return raw, raw, "", None, False, False, {}
 
 
 def record_time(record):
@@ -369,9 +378,10 @@ def evaluate(state, observation, now):
     """Pure rule step: (new JSON-serializable state, plain-text message lines).
 
     See observe's observation schema. now is an aware UTC datetime. Failed reads
-    break unit poll streaks; journalctl failures request a cursor reset. Recovery
+    break unit poll streaks; a failed cursor seek requests a cursor reset. Recovery
     events resolve matching recent message keys (including every kind variant).
-    Failed settings reads count by journal time, so a backlog of old ones stays silent.
+    Failed settings reads count by journal time, so a backlog of old ones stays silent; refused
+    Polymarket requests are compared with each other by it, so a backlog of them is reported.
     A not-ready episode whose every answer lists only FEED_ISSUES stays silent until it lasts
     FEED_QUIET_WINDOW; any other not-ready answer in it keeps the two-answer rule. not_ready is
     the counter the previous version also keeps; not_ready_since/not_ready_other describe the episode.
@@ -380,6 +390,7 @@ def evaluate(state, observation, now):
     for key in ("open", "cursors", "events", "host_failures", "unit_polls", "probe"):
         s.setdefault(key, {})
     s.setdefault("config_read_failures", [])
+    venue = s.setdefault("venue", {"refusals": {}, "quiet": 0})  # cursor -> journal time
     s["events"] = {key: last for key, last in s["events"].items()
                    if now - dt.datetime.fromisoformat(last) <= EVENT_WINDOW}
     messages, evidence = [], []
@@ -408,12 +419,20 @@ def evaluate(state, observation, now):
             if len(evidence) < 5:
                 evidence.append(f"  {host} {unit or 'host'}: {one_line(raw)}")
 
+    def event_once(host, unit, message, record, text):
+        key = json.dumps([host, unit, message, record["__CURSOR"]])
+        if key not in s["events"]:
+            s["events"][key] = now.isoformat()
+            messages.append(f"EVENT: {text}")
+
     for host, units in HOST_UNITS.items():
         result = observation["hosts"][host]
         host_key = "host:" + host
         if result.get("error"):
             if result.get("reset_cursor"):
                 s["cursors"].pop(host, None)
+                if host == "vps":
+                    venue["quiet"] = 0  # the next read reaches back only 15 minutes
             s["host_failures"][host] = s["host_failures"].get(host, 0) + 1
             if s["host_failures"][host] >= 2:
                 open_problem(host_key, f"{host} host unreachable since {ct(now)} ({one_line(result['error'], 200)})")
@@ -427,11 +446,17 @@ def evaluate(state, observation, now):
             s["cursors"][host] = records[-1]["__CURSOR"]
         failed_units = set()
         config_read_raw = None
+        refused = False
         for record in records:
             unit = record_unit(host, record)
             parts = message_parts(record)
-            raw, message, level, kind, has_kind, structured, reason = parts
+            raw, message, level, kind, has_kind, structured, fields = parts
             if unit not in units:
+                reset = host == "forge" and record.get("_TRANSPORT") == "kernel" and DRIVE_RESET.match(message)
+                if reset:
+                    drive = FORGE_DRIVES.get(reset[1], "USB device")
+                    event_once(host, unit, message, record, f"Linux reset Forge's {drive} (USB port {reset[1]}) at"
+                               f" {ct(record_time(record))}")
                 try:
                     priority = int(record.get("PRIORITY", 6))
                 except (TypeError, ValueError):
@@ -458,13 +483,21 @@ def evaluate(state, observation, now):
             if unit == "pe-service.service":
                 if message == "shutdown signal received":
                     s["service_shutdown"] = record_time(record).isoformat()
-                skip = BOOK_SKIP.fullmatch(reason)
+                skip = BOOK_SKIP.fullmatch(str(fields.get("reason", "")))
                 if skip and level == "INFO" and message == "signal did not produce order":
-                    key = json.dumps([host, unit, message, record["__CURSOR"]])
-                    if key not in s["events"]:
-                        s["events"][key] = now.isoformat()
-                        messages.append(f"EVENT: copy service skipped a trade at {ct(record_time(record))}"
-                                        f" (order book: {skip[1]})")
+                    event_once(host, unit, message, record, f"copy service skipped a trade at {ct(record_time(record))}"
+                               f" (order book: {skip[1]})")
+                if level == "WARN" and (message == VENUE_RETRY or message in VENUE_GIVEN_UP
+                                        and VENUE_ERROR.fullmatch(str(fields.get("error", "")))):
+                    refused = True
+                    refusals = {**venue["refusals"], record["__CURSOR"]: record_time(record).isoformat()}
+                    venue["refusals"] = dict(list(refusals.items())[-VENUE_REFUSALS:])
+                    times = sorted(map(dt.datetime.fromisoformat, venue["refusals"].values()))
+                    if len(times) == VENUE_REFUSALS and times[-1] - times[0] <= VENUE_WINDOW:
+                        open_problem("venue", "Polymarket repeatedly refused requests from the copy service"
+                                     f" ({VENUE_REFUSALS} refusals logged from {ct(times[0])} to {ct(times[-1])}); the"
+                                     " service retries by itself, but a copy could be late or skipped")
+                    continue
                 if message in CONFIG_READ_FAILURES:
                     s["config_read_failures"].append(record_time(record).isoformat())
                     config_read_raw = raw
@@ -512,6 +545,16 @@ def evaluate(state, observation, now):
                     evidence.append(f"  vps pe-service.service: {one_line(config_read_raw)}")
             elif not reads:
                 close_problem("config_reads", "copy service reads its settings again")
+            if refused:
+                venue["quiet"] = 0
+            # A full read may have stopped before newer refusals, and a stopped service logs none.
+            elif ("venue" in s["open"] and len(records) < JOURNAL_LIMIT
+                  and result["units"]["pe-service.service"] == "active"):
+                venue["quiet"] += 1
+                if venue["quiet"] >= VENUE_CLEAR:
+                    venue["refusals"] = {}
+                    close_problem("venue", "the copy service logged no more of these Polymarket refusals in"
+                                  f" {VENUE_CLEAR} completed checks")
         for unit in units:
             active = result["units"][unit] == "active"
             if host == "forge":
@@ -598,8 +641,9 @@ def main():
         state.pop("not_ready_since", None)
         state.pop("not_ready_other", None)
         state.pop("probe", None)
-        for label in PROBES:
-            state.get("open", {}).pop("slow:" + label, None)
+        state.pop("venue", None)
+        for key in ("venue", *("slow:" + label for label in PROBES)):
+            state.get("open", {}).pop(key, None)
     now = dt.datetime.now(dt.timezone.utc)
     new_state, messages = evaluate(state, observe(conf, state), now)
     test = TEST_FLAG.exists()
