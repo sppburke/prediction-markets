@@ -1,0 +1,8 @@
+[Unit]
+Description=TRIM the ranking cache's drive every six hours
+
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+
+[Install]
+WantedBy=timers.target
