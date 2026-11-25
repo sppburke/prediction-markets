@@ -1,8 +1,8 @@
 [Unit]
-Description=TRIM the ranking cache's drive every six hours
+Description=TRIM the ranking cache's drive once a week
 
 [Timer]
-OnCalendar=*-*-* 00/6:00:00
+OnCalendar=Wed *-*-* 13:00:00
 
 [Install]
 WantedBy=timers.target

@@ -52,10 +52,11 @@ supervisor's TERM trap ends a running cycle. `scripts/deploy/forge_pause.sh` ser
 System units on Forge (#904). The USB drive under `/mnt/t7` reports no thin provisioning, so Linux
 leaves its `provisioning_mode` on `full` after every boot and replug and sends it no UNMAP.
 `pe-t7-trim.service` sets `unmap` for the file system with the recorded UUID, reads it back and runs
-`fstrim` on it; `pe-t7-trim.timer` starts it every six hours, without catch-up. The first switch-on is
-the gap procedure of #904 (safety copy, edge test, the installed cache read back). Check with
-`systemctl list-timers pe-t7-trim.timer` and `sudo journalctl --no-pager -u pe-t7-trim.service -n 3`.
-Undo:
+`fstrim` on it; `pe-t7-trim.timer` starts it on Wednesdays at 13:00 (Forge's time, whatever the loop is
+doing), without catch-up after a power-off. While the mode is set, Linux's own weekly `fstrim.timer`
+(early on Mondays) trims the drive too. The first switch-on is the gap procedure of #904 (safety copy,
+edge test, the installed cache read back). Check with `systemctl list-timers pe-t7-trim.timer` and
+`sudo journalctl --no-pager -u pe-t7-trim.service -n 3`. Undo:
 
 ```bash
 ( set -euo pipefail
