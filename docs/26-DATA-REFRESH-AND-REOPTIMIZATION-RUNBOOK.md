@@ -1654,6 +1654,12 @@ The supervisor unit `pe-rank-loop.service` sets no `Environment`, but the wrappe
 its whole `.env`, including `SQLITE_TMPDIR`, to the collector. Export it for manual
 invocations/resumes from the same retained configuration.
 
+**TRIM for Forge's cache drive (#904).** Linux sends the USB drive under `/mnt/t7` no UNMAP by itself.
+`pe-t7-trim.timer` sets the mode and trims `/mnt/t7` every six hours beside the loop; install, check and
+undo are in [`deploy/systemd/README.md`](../deploy/systemd/README.md#pe-t7-trim). Every run's staging
+hashes the whole installed cache: if a run after the timer was enabled lacks the line `staging_fixed
+quick_check skipped: an accepted activation installed these bytes`, undo it and investigate.
+
 **Interrupted collection.** Use the retained cycle and exact paths through the
 [release procedure](#forge-release-deployment-and-rollback). An unfinished bulk root resumes its
 same command and receipts; never archive the cycle pointer, allocate a replacement candidate or

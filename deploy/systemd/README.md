@@ -47,6 +47,34 @@ supervisor's TERM trap ends a running cycle. `scripts/deploy/forge_pause.sh` ser
 `PE_FORGE_CHECKOUT=$HOME/prediction-markets-15m5m`. Switch and revert steps live in
 [`docs/26`](../../docs/26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md) ("15/5-minute loop").
 
+## pe-t7-trim
+
+System units on Forge (#904). The USB drive under `/mnt/t7` reports no thin provisioning, so Linux
+leaves its `provisioning_mode` on `full` after every boot and replug and sends it no UNMAP.
+`pe-t7-trim.service` sets `unmap` for the file system with the recorded UUID, reads it back and runs
+`fstrim` on it; `pe-t7-trim.timer` starts it every six hours, without catch-up. The first switch-on
+needs the gap procedure of #904 (safety copy, edge test, the installed cache read back). Install:
+
+```bash
+sudo install -m 644 deploy/systemd/pe-t7-trim.service deploy/systemd/pe-t7-trim.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start pe-t7-trim.service && journalctl -u pe-t7-trim.service -n 3
+sudo systemctl enable --now pe-t7-trim.timer
+```
+
+Undo:
+
+```bash
+sudo systemctl disable --now pe-t7-trim.timer
+sudo systemctl stop pe-t7-trim.service
+while pgrep -x fstrim; do sleep 2; done
+test "$(findmnt -no UUID /mnt/t7)" = e949beec-b3b5-457f-87d2-c041365d554d
+mode=$(ls /sys/block/"$(lsblk -no PKNAME "$(findmnt -no SOURCE /mnt/t7)")"/device/scsi_disk/*/provisioning_mode)
+echo full | sudo tee "$mode" && cat "$mode"
+sudo rm /etc/systemd/system/pe-t7-trim.service /etc/systemd/system/pe-t7-trim.timer
+sudo systemctl daemon-reload
+```
+
 ## Install
 
 ```bash

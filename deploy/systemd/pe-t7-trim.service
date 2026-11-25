@@ -1,0 +1,8 @@
+[Unit]
+Description=TRIM the ranking cache's drive (/mnt/t7)
+RequiresMountsFor=/mnt/t7
+
+[Service]
+Type=oneshot
+# The drive reports no thin provisioning, so Linux sends it no UNMAP until the mode is set (after every boot and replug).
+ExecStart=/bin/sh -euc 'test "$$(findmnt -no UUID /mnt/t7)" = e949beec-b3b5-457f-87d2-c041365d554d; d=$$(lsblk -no PKNAME "$$(findmnt -no SOURCE /mnt/t7)"); set -- /sys/block/$$d/device/scsi_disk/*/provisioning_mode; test $$# = 1; echo unmap > "$$1"; test "$$(cat "$$1")" = unmap; exec fstrim --verbose /mnt/t7'
